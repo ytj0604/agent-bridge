@@ -13,6 +13,7 @@ def model_cheat_sheet() -> list[str]:
         "- agent_view_peer <alias> --older : page older lines from that snapshot.",
         "- agent_view_peer <alias> --since-last : view latest changes since your last view.",
         "- agent_view_peer <alias> --search 'text' [--live] : search saved snapshot, or current live screen with --live.",
+        "Receiving: after sending a request, end your turn. The peer's reply arrives automatically as a [bridge:*] result, same delivery path as a user prompt. Do not poll with agent_view_peer or schedule a wakeup to check progress; use agent_view_peer only when you suspect the peer is stuck or need to debug the bridge.",
         "Kinds: request expects one normal peer response; result is a returned peer answer; notice expects no response.",
     ]
 
@@ -35,6 +36,8 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "--older pages older snapshot lines; --since-last shows latest changes; "
         "--search 'text' searches the snapshot; --search 'text' --live searches current live screen. "
         "When a peer request arrives, reply normally; the bridge returns your normal response automatically. "
+        "After you send a request, end your turn — the peer's reply arrives automatically as a [bridge:*] result, same delivery path as a user prompt. "
+        "Do not poll with agent_view_peer or schedule a wakeup to check progress; use agent_view_peer only when you suspect the peer is stuck or need to debug the bridge. "
         "If you forget the protocol, run agent_list_peers. "
         f"Reply exactly: bridge {mode}ed {probe_id}"
     )
