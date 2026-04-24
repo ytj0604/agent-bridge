@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from bridge_attach import pane_locks_file, registry_file
-from bridge_identity import read_live_by_identity
+from bridge_identity import resolve_participant_endpoint
 from bridge_participants import active_participants, format_peer_summary, load_session, save_session_state, session_state_exists
 from bridge_paths import ensure_runtime_writable, libexec_dir, state_root
 from bridge_util import locked_json
@@ -24,7 +24,8 @@ def remove_registry_entries(session: str, alias: str, pane: str, hook_session_id
                     continue
                 if record.get("bridge_session") != session:
                     continue
-                if record.get("alias") == alias or record.get("pane") == pane or record.get("hook_session_id") == hook_session_id:
+                record_session_id = str(record.get("hook_session_id") or record.get("session_id") or "")
+                if record.get("alias") == alias or (hook_session_id and record_session_id == hook_session_id):
                     del records[key]
 
 
@@ -72,10 +73,7 @@ def tmux_send_literal(pane: str, text: str, submit_delay: float = 0.05) -> None:
 
 
 def send_leave_notice(session: str, alias: str, record: dict) -> dict:
-    agent_type = str(record.get("agent_type") or record.get("agent") or "")
-    session_id = str(record.get("hook_session_id") or "")
-    live = read_live_by_identity(agent_type, session_id) if agent_type and session_id else {}
-    pane = str(live.get("pane") or "")
+    pane = resolve_participant_endpoint(session, alias, record)
     if not pane:
         return {"sent": 0, "pane": "", "error": "no verified live endpoint"}
     body = (

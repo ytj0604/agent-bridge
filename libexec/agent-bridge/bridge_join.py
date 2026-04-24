@@ -43,7 +43,8 @@ def update_registry(mapping: dict) -> None:
 
     Full attach replaces all records for a room. Join is intentionally narrower:
     it preserves existing participants and only removes prior records that refer
-    to the same pane, hook session, or alias in this bridge room.
+    to the same hook session or alias in this bridge room. Pane alone is not a
+    stable identity because agents can be killed/resumed in reused tmux panes.
     """
     with locked_json(registry_file(), {"version": 1, "sessions": {}}) as data:
         sessions = data.setdefault("sessions", {})
@@ -51,11 +52,7 @@ def update_registry(mapping: dict) -> None:
         for key, record in list(sessions.items()):
             if record.get("bridge_session") != bridge_session:
                 continue
-            if (
-                record.get("pane") == mapping["pane"]
-                or record.get("session_id") == mapping["session_id"]
-                or record.get("alias") == mapping["alias"]
-            ):
+            if record.get("session_id") == mapping["session_id"] or record.get("alias") == mapping["alias"]:
                 del sessions[key]
         sessions[f"{mapping['agent']}:{mapping['session_id']}"] = mapping
 

@@ -516,16 +516,18 @@ def status_rows(session: str | None = None, all_sessions: bool = False) -> list[
             run_state = "stale"
         else:
             run_state = meta.get("status") or "stopped"
+        participants = active_participants(state)
+        active_aliases = set(participants)
         row = {
             "session": name,
             "status": run_state,
             "pid": pid,
             "mode": state.get("mode") or meta.get("mode") or "",
-            "participants": ",".join(sorted((state.get("participants") or {}).keys())),
+            "participants": ",".join(sorted(participants)),
             "targets": ",".join(
                 f"{alias}={target}"
                 for alias, target in sorted((state.get("targets") or {}).items())
-                if alias not in {"daemon", "log"} and target
+                if alias in active_aliases and target
             ),
             "log_file": str(paths["log"]) if paths["log"].exists() else meta.get("log_file", ""),
         }

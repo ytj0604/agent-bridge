@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 
-from bridge_participants import active_participants, load_session, save_session_state
+from bridge_participants import active_participants, load_session, participants_from_state, save_session_state
 from bridge_paths import state_root
 from bridge_util import locked_json, locked_json_read, utc_now
 
@@ -35,6 +35,42 @@ def read_attached_mapping(agent_type: str, session_id: str) -> dict | None:
     return dict(mapping) if isinstance(mapping, dict) else None
 
 
+def recover_mapping_from_session_state(agent_type: str, session_id: str) -> dict | None:
+    if not agent_type or not session_id:
+        return None
+    candidates: list[dict] = []
+    for path in state_root().glob("*/session.json"):
+        bridge_session = path.parent.name
+        state = load_session(bridge_session)
+        for alias, participant in participants_from_state(state).items():
+            if str(participant.get("agent_type") or "") != agent_type:
+                continue
+            if str(participant.get("hook_session_id") or "") != session_id:
+                continue
+            status = str(participant.get("status") or "active")
+            detach_reason = str(participant.get("detach_reason") or "")
+            if status == "detached" and not detach_reason.endswith(" ended"):
+                continue
+            state_dir = Path(state.get("state_dir") or state_root() / bridge_session)
+            candidates.append(
+                {
+                    "agent": agent_type,
+                    "alias": alias,
+                    "session_id": session_id,
+                    "bridge_session": bridge_session,
+                    "pane": str(participant.get("pane") or ""),
+                    "target": str(participant.get("target") or ""),
+                    "events_file": str(Path(state.get("bus_file") or state_dir / "events.raw.jsonl")),
+                    "public_events_file": str(Path(state.get("events_file") or state_dir / "events.jsonl")),
+                    "queue_file": str(Path(state.get("queue_file") or state_dir / "pending.json")),
+                    "attached_at": str(participant.get("attached_at") or participant.get("last_seen_at") or utc_now()),
+                }
+            )
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
 def read_pane_lock(pane: str) -> dict:
     data = locked_json_read(pane_locks_file(), {"version": 1, "panes": {}})
     record = (data.get("panes") or {}).get(pane) or {}
@@ -47,10 +83,53 @@ def read_live_by_pane(pane: str) -> dict:
     return dict(record) if isinstance(record, dict) else {}
 
 
-def read_live_by_identity(agent_type: str, session_id: str) -> dict:
+def live_record_matches(record: dict, agent_type: str, session_id: str) -> bool:
+    return (
+        bool(record)
+        and str(record.get("agent") or "") == agent_type
+        and str(record.get("session_id") or "") == session_id
+    )
+
+
+def live_records_for_identity(agent_type: str, session_id: str, *, exclude_pane: str = "") -> list[dict]:
+    if not agent_type or not session_id:
+        return []
     data = locked_json_read(live_sessions_file(), {"version": 1, "panes": {}, "sessions": {}})
-    record = (data.get("sessions") or {}).get(identity_key(agent_type, session_id)) or {}
-    return dict(record) if isinstance(record, dict) else {}
+    records: list[dict] = []
+    seen_panes: set[str] = set()
+    for pane, record in (data.get("panes") or {}).items():
+        if not isinstance(record, dict):
+            continue
+        if str(pane) == exclude_pane:
+            continue
+        if live_record_matches(record, agent_type, session_id):
+            copied = dict(record)
+            copied["pane"] = str(copied.get("pane") or pane)
+            records.append(copied)
+            seen_panes.add(str(copied.get("pane") or ""))
+    indexed = (data.get("sessions") or {}).get(identity_key(agent_type, session_id)) or {}
+    indexed_pane = str(indexed.get("pane") or "")
+    if (
+        isinstance(indexed, dict)
+        and indexed_pane
+        and indexed_pane != exclude_pane
+        and indexed_pane not in seen_panes
+        and live_record_matches(indexed, agent_type, session_id)
+    ):
+        records.append(dict(indexed))
+    records.sort(key=lambda record: str(record.get("last_seen_at") or ""))
+    return records
+
+
+def read_live_by_identity(agent_type: str, session_id: str) -> dict:
+    mapping = read_attached_mapping(agent_type, session_id) or recover_mapping_from_session_state(agent_type, session_id)
+    if mapping:
+        pane = str(mapping.get("pane") or "")
+        live = read_live_by_pane(pane) if pane else {}
+        if live_record_matches(live, agent_type, session_id):
+            return live
+    records = live_records_for_identity(agent_type, session_id)
+    return records[-1] if records else {}
 
 
 def tmux_target_for_pane(pane: str) -> str:
@@ -78,7 +157,7 @@ def mapping_matches_lock(mapping: dict, lock: dict) -> bool:
     )
 
 
-def detach_stale_pane_lock(pane: str, reason: str) -> dict:
+def remove_pane_lock(pane: str) -> dict:
     removed: dict = {}
     with locked_json(pane_locks_file(), {"version": 1, "panes": {}}) as data:
         panes = data.setdefault("panes", {})
@@ -86,6 +165,11 @@ def detach_stale_pane_lock(pane: str, reason: str) -> dict:
         if isinstance(record, dict):
             removed = dict(record)
             del panes[pane]
+    return removed
+
+
+def detach_stale_pane_lock(pane: str, reason: str) -> dict:
+    removed = remove_pane_lock(pane)
 
     bridge_session = str(removed.get("bridge_session") or "")
     alias = str(removed.get("alias") or "")
@@ -184,6 +268,7 @@ def update_live_session(
     now = utc_now()
     target = target or tmux_target_for_pane(pane)
     if event == "session_ended":
+        remaining_live: list[dict] = []
         with locked_json(live_sessions_file(), {"version": 1, "panes": {}, "sessions": {}}) as data:
             panes = data.setdefault("panes", {})
             sessions = data.setdefault("sessions", {})
@@ -191,7 +276,15 @@ def update_live_session(
             if pane_record.get("agent") == agent_type and pane_record.get("session_id") == session_id:
                 del panes[pane]
             key = identity_key(agent_type, session_id)
-            if key in sessions and sessions[key].get("pane") == pane:
+            for live_pane, live_record in panes.items():
+                if live_record_matches(live_record, agent_type, session_id):
+                    copied = dict(live_record)
+                    copied["pane"] = str(copied.get("pane") or live_pane)
+                    remaining_live.append(copied)
+            remaining_live.sort(key=lambda record: str(record.get("last_seen_at") or ""))
+            if remaining_live:
+                sessions[key] = remaining_live[-1]
+            elif key in sessions and sessions[key].get("pane") == pane:
                 del sessions[key]
         lock = read_pane_lock(pane)
         if (
@@ -199,7 +292,20 @@ def update_live_session(
             and str(lock.get("agent") or "") == agent_type
             and str(lock.get("hook_session_id") or "") == session_id
         ):
-            detach_stale_pane_lock(pane, f"{agent_type}:{session_id} ended")
+            mapping = read_attached_mapping(agent_type, session_id) or recover_mapping_from_session_state(agent_type, session_id)
+            if (
+                mapping
+                and str(mapping.get("bridge_session") or "") == str(lock.get("bridge_session") or "")
+                and str(mapping.get("alias") or "") == str(lock.get("alias") or "")
+                and str(mapping.get("pane") or "") == pane
+            ):
+                if remaining_live:
+                    replacement = remaining_live[-1]
+                    update_attached_endpoint(mapping, str(replacement.get("pane") or ""), str(replacement.get("target") or ""))
+                else:
+                    detach_stale_pane_lock(pane, f"{agent_type}:{session_id} ended")
+            else:
+                remove_pane_lock(pane)
         return None
 
     record = {
@@ -218,22 +324,37 @@ def update_live_session(
         panes = data.setdefault("panes", {})
         sessions = data.setdefault("sessions", {})
         old_pane_record = dict(panes.get(pane) or {})
-        for existing_pane, existing in list(panes.items()):
-            if existing_pane != pane and existing.get("agent") == agent_type and existing.get("session_id") == session_id:
-                del panes[existing_pane]
         old_key = identity_key(str(old_pane_record.get("agent") or ""), str(old_pane_record.get("session_id") or ""))
         if old_pane_record and old_key in sessions and sessions[old_key].get("pane") == pane:
             del sessions[old_key]
         panes[pane] = record
-        sessions[identity_key(agent_type, session_id)] = record
+        key = identity_key(agent_type, session_id)
+        current_index = sessions.get(key) or {}
+        current_index_pane = str(current_index.get("pane") or "")
+        current_index_live = bool(current_index_pane and live_record_matches(panes.get(current_index_pane) or {}, agent_type, session_id))
+        if not current_index_live:
+            sessions[key] = record
 
-    mapping = read_attached_mapping(agent_type, session_id)
+    mapping = read_attached_mapping(agent_type, session_id) or recover_mapping_from_session_state(agent_type, session_id)
     if mapping:
-        if bridge_session:
-            mapping["bridge_session"] = bridge_session
-        if alias:
-            mapping["alias"] = alias
-        return update_attached_endpoint(mapping, pane, target)
+        mapped_pane = str(mapping.get("pane") or "")
+        mapped_live = read_live_by_pane(mapped_pane) if mapped_pane else {}
+        if mapped_pane == pane or not live_record_matches(mapped_live, agent_type, session_id):
+            if bridge_session:
+                mapping["bridge_session"] = bridge_session
+            if alias:
+                mapping["alias"] = alias
+            return update_attached_endpoint(mapping, pane, target)
+        duplicate_lock = read_pane_lock(pane)
+        if duplicate_lock:
+            if (
+                str(duplicate_lock.get("hook_session_id") or "") == session_id
+                and str(duplicate_lock.get("agent") or "") == agent_type
+            ):
+                remove_pane_lock(pane)
+            else:
+                detach_stale_pane_lock(pane, f"pane now hosts duplicate {agent_type}:{session_id}")
+        return None
 
     lock = read_pane_lock(pane)
     if lock and (
@@ -269,7 +390,10 @@ def resolve_caller_from_pane(
         if pane and (not explicit_session or not explicit_alias):
             live = read_live_by_pane(pane)
             if live:
-                mapping = read_attached_mapping(str(live.get("agent") or ""), str(live.get("session_id") or ""))
+                mapping = read_attached_mapping(str(live.get("agent") or ""), str(live.get("session_id") or "")) or recover_mapping_from_session_state(
+                    str(live.get("agent") or ""),
+                    str(live.get("session_id") or ""),
+                )
                 if mapping:
                     explicit_session = explicit_session or str(mapping.get("bridge_session") or "")
                     explicit_alias = explicit_alias or str(mapping.get("alias") or "")
@@ -294,8 +418,26 @@ def resolve_caller_from_pane(
 
     live = read_live_by_pane(pane)
     if live:
-        mapping = read_attached_mapping(str(live.get("agent") or ""), str(live.get("session_id") or ""))
+        mapping = read_attached_mapping(str(live.get("agent") or ""), str(live.get("session_id") or "")) or recover_mapping_from_session_state(
+            str(live.get("agent") or ""),
+            str(live.get("session_id") or ""),
+        )
         if mapping:
+            mapped_pane = str(mapping.get("pane") or "")
+            mapped_live = read_live_by_pane(mapped_pane) if mapped_pane else {}
+            if mapped_pane != pane and live_record_matches(
+                mapped_live,
+                str(live.get("agent") or ""),
+                str(live.get("session_id") or ""),
+            ):
+                return CallerResolution(
+                    False,
+                    error=(
+                        f"{tool_name}: this pane is a duplicate resume of attached alias "
+                        f"{mapping.get('alias')!r}; the active bridge endpoint is pane {mapped_pane}. "
+                        "Use bridge_manage to join this pane as a different alias, or close the duplicate."
+                    ),
+                )
             mapping = update_attached_endpoint(mapping, pane, str(live.get("target") or ""), persist=False)
             session = str(mapping.get("bridge_session") or "")
             alias = str(mapping.get("alias") or "")
@@ -345,11 +487,16 @@ def resolve_participant_endpoint(bridge_session: str, alias: str, participant: d
     session_id = str(participant.get("hook_session_id") or "")
     pane = str(participant.get("pane") or "")
     if session_id:
-        live = read_live_by_identity(agent_type, session_id)
-        if live:
-            mapping = read_attached_mapping(agent_type, session_id)
-            if mapping and mapping.get("bridge_session") == bridge_session and mapping.get("alias") == alias:
-                mapping = update_attached_endpoint(mapping, str(live.get("pane") or pane), str(live.get("target") or ""), persist=False)
+        mapping = read_attached_mapping(agent_type, session_id) or recover_mapping_from_session_state(agent_type, session_id)
+        if mapping and mapping.get("bridge_session") == bridge_session and mapping.get("alias") == alias:
+            mapped_pane = str(mapping.get("pane") or "")
+            mapped_live = read_live_by_pane(mapped_pane) if mapped_pane else {}
+            if live_record_matches(mapped_live, agent_type, session_id):
+                mapping = update_attached_endpoint(mapping, mapped_pane, str(mapped_live.get("target") or ""), persist=False)
+                return str(mapping.get("pane") or "")
+            live = read_live_by_identity(agent_type, session_id)
+            if live:
+                mapping = update_attached_endpoint(mapping, str(live.get("pane") or pane), str(live.get("target") or ""))
                 return str(mapping.get("pane") or "")
         if pane:
             live_pane = read_live_by_pane(pane)
