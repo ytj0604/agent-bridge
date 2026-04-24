@@ -5,9 +5,11 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from bridge_attach import pane_locks_file, registry_file
+from bridge_identity import read_live_by_identity
 from bridge_participants import active_participants, format_peer_summary, load_session, save_session_state, session_state_exists
 from bridge_paths import ensure_runtime_writable, libexec_dir, state_root
 from bridge_util import locked_json
@@ -44,7 +46,48 @@ def enqueue_membership_notice(session: str, body: str) -> None:
             body,
         ],
         check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
+
+
+def tmux_send_literal(pane: str, text: str, submit_delay: float = 0.05) -> None:
+    subprocess.run(
+        ["tmux", "send-keys", "-t", pane, "-l", text],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if submit_delay > 0:
+        time.sleep(submit_delay)
+    subprocess.run(
+        ["tmux", "send-keys", "-t", pane, "Enter"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def send_leave_notice(session: str, alias: str, record: dict) -> dict:
+    agent_type = str(record.get("agent_type") or record.get("agent") or "")
+    session_id = str(record.get("hook_session_id") or "")
+    live = read_live_by_identity(agent_type, session_id) if agent_type and session_id else {}
+    pane = str(live.get("pane") or "")
+    if not pane:
+        return {"sent": 0, "pane": "", "error": "no verified live endpoint"}
+    body = (
+        f"[bridge:membership] You were removed from bridge room {session} as {alias}. "
+        "Peer routing for this alias has stopped. Do not use agent_send_peer for this room unless the human rejoins you."
+    )
+    try:
+        tmux_send_literal(pane, body)
+        return {"sent": 1, "pane": pane, "error": ""}
+    except (OSError, subprocess.CalledProcessError) as exc:
+        stderr = getattr(exc, "stderr", "") or str(exc)
+        return {"sent": 0, "pane": pane, "error": stderr.strip()}
 
 
 def remove_pending_messages(state: dict, alias: str) -> int:
@@ -83,6 +126,10 @@ def main() -> int:
     if not record:
         raise SystemExit(f"alias not found in {args.session}: {args.alias}")
 
+    leave_notice = {"sent": 0, "pane": "", "error": "suppressed"}
+    if not args.no_notify:
+        leave_notice = send_leave_notice(args.session, args.alias, record)
+
     state.setdefault("participants", {}).pop(args.alias, None)
     state.setdefault("panes", {}).pop(args.alias, None)
     state.setdefault("targets", {}).pop(args.alias, None)
@@ -105,7 +152,10 @@ def main() -> int:
         "left": args.alias,
         "participants": sorted(remaining),
         "removed_pending_messages": removed_messages,
+        "left_notice_sent": leave_notice["sent"],
     }
+    if leave_notice.get("error"):
+        result["left_notice_error"] = leave_notice["error"]
     if args.json:
         print(json.dumps(result, ensure_ascii=True, indent=2))
     else:

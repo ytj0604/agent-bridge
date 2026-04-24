@@ -91,6 +91,9 @@ def enqueue_membership_notice(session: str, body: str) -> None:
             body,
         ],
         check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
 
 
