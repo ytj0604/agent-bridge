@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+from bridge_attach import (
+    AttachProbeTimeout,
+    DISCOVERY_FILE,
+    PANE_LOCKS_FILE,
+    REGISTRY_FILE,
+    infer_agent_type,
+    interactive_select,
+    list_panes,
+    load_process_table,
+    prompt_participant_aliases,
+    resolve_pane,
+    send_prompt,
+    wait_for_probe,
+)
+from bridge_participants import active_participants, format_peer_summary, load_session, normalize_agent_type, participant_record, save_session_state
+from bridge_instructions import probe_prompt
+from bridge_paths import libexec_dir
+from bridge_util import locked_json, locked_json_read, utc_now
+
+
+def next_alias(state: dict, agent_type: str) -> str:
+    participants = active_participants(state)
+    idx = 1
+    while True:
+        alias = f"{agent_type}{idx}"
+        if alias not in participants:
+            return alias
+        idx += 1
+
+
+def update_registry(mapping: dict) -> None:
+    """Incrementally add one participant while replacing stale records for it.
+
+    Full attach replaces all records for a room. Join is intentionally narrower:
+    it preserves existing participants and only removes prior records that refer
+    to the same pane, hook session, or alias in this bridge room.
+    """
+    with locked_json(REGISTRY_FILE, {"version": 1, "sessions": {}}) as data:
+        sessions = data.setdefault("sessions", {})
+        bridge_session = mapping["bridge_session"]
+        for key, record in list(sessions.items()):
+            if record.get("bridge_session") != bridge_session:
+                continue
+            if (
+                record.get("pane") == mapping["pane"]
+                or record.get("session_id") == mapping["session_id"]
+                or record.get("alias") == mapping["alias"]
+            ):
+                del sessions[key]
+        sessions[f"{mapping['agent']}:{mapping['session_id']}"] = mapping
+
+
+def update_pane_lock(mapping: dict) -> None:
+    with locked_json(PANE_LOCKS_FILE, {"version": 1, "panes": {}}) as data:
+        panes = data.setdefault("panes", {})
+        panes[mapping["pane"]] = {
+            "bridge_session": mapping["bridge_session"],
+            "agent": mapping["agent"],
+            "alias": mapping["alias"],
+            "target": mapping["target"],
+            "hook_session_id": mapping["session_id"],
+            "locked_at": mapping["attached_at"],
+        }
+
+
+def enqueue_membership_notice(session: str, body: str) -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            str(libexec_dir() / "bridge_enqueue.py"),
+            "--session",
+            session,
+            "--from",
+            "bridge",
+            "--all",
+            "--kind",
+            "notice",
+            "--intent",
+            "membership_update",
+            "--body",
+            body,
+        ],
+        check=False,
+    )
+
+
+def read_pane_locks() -> dict:
+    data = locked_json_read(PANE_LOCKS_FILE, {"version": 1, "panes": {}})
+    return data.get("panes") or {}
+
+
+def pane_is_registered(pane_id: str, state: dict) -> bool:
+    for record in (state.get("participants") or {}).values():
+        if str(record.get("pane") or "") == pane_id:
+            return True
+    lock = read_pane_locks().get(pane_id)
+    return isinstance(lock, dict) and bool(lock.get("bridge_session"))
+
+
+def select_join_participant(state: dict, args: argparse.Namespace) -> dict:
+    process_table = load_process_table()
+    candidates = []
+    for pane in list_panes():
+        if pane_is_registered(pane["pane_id"], state):
+            continue
+        agent = infer_agent_type(pane, process_table)
+        if agent:
+            candidates.append({"pane": {**pane, "detected_agent": agent}, "agent": agent, "selected": False})
+
+    if not candidates:
+        detail = process_table.get("error") or "all detected Claude Code/Codex panes are already registered"
+        raise SystemExit(f"no unregistered Claude Code/Codex panes available to join ({detail})")
+
+    if not sys.stdin.isatty():
+        raise SystemExit("join requires a TTY to select an unregistered pane; pass --agent and --pane explicitly for non-interactive use")
+
+    panes = [item["pane"] for item in candidates]
+    pane = interactive_select("unregistered agent", panes)
+    agent_type = pane.get("detected_agent") or infer_agent_type(pane, process_table)
+    default_alias = args.alias or next_alias(state, agent_type)
+    participant = {
+        "alias": default_alias,
+        "agent": agent_type,
+        "pane": pane,
+        "session_id": "",
+    }
+    participant = prompt_participant_aliases([participant])[0]
+    return {"alias": participant["alias"], "agent_type": participant["agent"], "pane": pane}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Join an existing Claude/Codex pane to a bridge session.")
+    parser.add_argument("-s", "--session", default="agent-bridge-auto")
+    parser.add_argument("--agent", "--agent-type", dest="agent_type", choices=["claude", "codex"])
+    parser.add_argument("--alias")
+    parser.add_argument("--pane", help="tmux pane id or target to join")
+    parser.add_argument("--pane-target", help="display target to store when --no-resolve-pane is used")
+    parser.add_argument("--cwd", default="")
+    parser.add_argument("--no-resolve-pane", action="store_true", help="advanced/test mode: do not ask tmux to resolve the pane")
+    parser.add_argument("--probe-timeout", type=float, default=45.0)
+    parser.add_argument("--submit-delay", type=float, default=0.4)
+    parser.add_argument("--no-probe", action="store_true")
+    parser.add_argument("--session-id")
+    parser.add_argument("--no-notify", action="store_true")
+    parser.add_argument("--json", action="store_true", help="print join result as JSON")
+    args = parser.parse_args()
+
+    state = load_session(args.session)
+    participants = active_participants(state)
+    if args.agent_type or args.pane:
+        if not args.agent_type or not args.pane:
+            raise SystemExit("use --agent and --pane together, or omit both for interactive pane selection")
+        agent_type = normalize_agent_type(args.agent_type)
+        alias = args.alias or next_alias(state, agent_type)
+        if args.no_resolve_pane:
+            pane = {
+                "pane_id": args.pane,
+                "target": args.pane_target or args.pane,
+                "cwd": args.cwd,
+            }
+        else:
+            pane = resolve_pane(args.pane, list_panes())
+    else:
+        selected = select_join_participant(state, args)
+        agent_type = normalize_agent_type(selected["agent_type"])
+        pane = selected["pane"]
+        alias = args.alias or selected["alias"]
+
+    if alias in participants:
+        raise SystemExit(f"alias already exists in {args.session}: {alias}")
+    if pane_is_registered(pane["pane_id"], state):
+        raise SystemExit(f"pane is already registered: {pane['pane_id']}")
+
+    if args.no_probe:
+        if not args.session_id:
+            raise SystemExit("--no-probe requires --session-id")
+        hook_session_id = args.session_id
+    else:
+        DISCOVERY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DISCOVERY_FILE.touch(exist_ok=True)
+        probe_id = f"{args.session}:{agent_type}:{uuid.uuid4().hex[:10]}"
+        peers = ", ".join(sorted(participants)) or "(none)"
+        prompt = probe_prompt("join", probe_id, alias, peers)
+        print(f"Probing {alias} pane {pane['pane_id']} ({pane['target']})")
+        send_prompt(pane["pane_id"], prompt, args.submit_delay)
+        try:
+            hook_session_id = wait_for_probe(
+                probe_id,
+                agent_type,
+                args.probe_timeout,
+                alias=alias,
+                pane_desc=f"{pane['pane_id']} ({pane['target']})",
+            )["session_id"]
+        except AttachProbeTimeout as exc:
+            raise SystemExit(str(exc)) from exc
+
+    state.setdefault("participants", {})
+    state.setdefault("panes", {})
+    state.setdefault("targets", {})
+    state.setdefault("hook_session_ids", {})
+    state["participants"][alias] = participant_record(
+        alias=alias,
+        agent_type=agent_type,
+        pane=pane["pane_id"],
+        target=pane["target"],
+        session_id=hook_session_id,
+        cwd=pane.get("cwd") or "",
+    )
+    state["panes"][alias] = pane["pane_id"]
+    state["targets"][alias] = pane["target"]
+    state["hook_session_ids"][alias] = hook_session_id
+    save_session_state(state)
+
+    mapping = {
+        "agent": agent_type,
+        "alias": alias,
+        "session_id": hook_session_id,
+        "bridge_session": args.session,
+        "pane": pane["pane_id"],
+        "target": pane["target"],
+        "events_file": str(Path(state.get("bus_file") or Path(state.get("state_dir", "")) / "events.raw.jsonl")),
+        "public_events_file": str(Path(state.get("events_file") or Path(state.get("state_dir", "")) / "events.jsonl")),
+        "queue_file": str(Path(state.get("queue_file") or Path(state.get("state_dir", "")) / "pending.json")),
+        "attached_at": utc_now(),
+    }
+    update_registry(mapping)
+    update_pane_lock(mapping)
+
+    if not args.no_notify:
+        body = (
+            f"Bridge membership: {alias} joined as {agent_type}. "
+            f"{format_peer_summary(state)} "
+            "Use agent_list_peers for details."
+        )
+        enqueue_membership_notice(args.session, body)
+
+    result = {"session": args.session, "joined": alias, "participants": sorted(active_participants(state))}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=True, indent=2))
+    else:
+        print(f"Joined {alias} ({agent_type}) to {args.session}: {pane['pane_id']} {pane['target']}")
+        print(f"Participants: {', '.join(result['participants'])}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

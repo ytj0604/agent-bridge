@@ -1,0 +1,29 @@
+# Runtime artifacts (default AGENT_BRIDGE_STATE_DIR/RUN_DIR/LOG_DIR locations)
+state/
+run/
+log/
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary / lock files that may leak outside state/run/log
+*.tmp
+*.lock
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Virtual envs (if a contributor creates one at the repo root)
+.venv/
+venv/
+env/
