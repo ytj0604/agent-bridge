@@ -194,23 +194,25 @@ def main() -> int:
     if args.no_probe:
         if not args.session_id:
             raise SystemExit("--no-probe requires --session-id")
+        probe_record = {"session_id": args.session_id}
         hook_session_id = args.session_id
     else:
         discovery_file().parent.mkdir(parents=True, exist_ok=True)
         discovery_file().touch(exist_ok=True)
         probe_id = f"{args.session}:{agent_type}:{uuid.uuid4().hex[:10]}"
-        peers = ", ".join(sorted(participants)) or "(none)"
+        peers = format_peer_summary(state)
         prompt = probe_prompt("join", probe_id, alias, peers)
         print(f"Probing {alias} pane {pane['pane_id']} ({pane['target']})")
         send_prompt(pane["pane_id"], prompt, args.submit_delay)
         try:
-            hook_session_id = wait_for_probe(
+            probe_record = wait_for_probe(
                 probe_id,
                 agent_type,
                 args.probe_timeout,
                 alias=alias,
                 pane_desc=f"{pane['pane_id']} ({pane['target']})",
-            )["session_id"]
+            )
+            hook_session_id = probe_record["session_id"]
         except AttachProbeTimeout as exc:
             raise SystemExit(str(exc)) from exc
 
@@ -224,7 +226,8 @@ def main() -> int:
         pane=pane["pane_id"],
         target=pane["target"],
         session_id=hook_session_id,
-        cwd=pane.get("cwd") or "",
+        cwd=probe_record.get("cwd") or pane.get("cwd") or "",
+        model=probe_record.get("model") or "",
     )
     state["panes"][alias] = pane["pane_id"]
     state["targets"][alias] = pane["target"]

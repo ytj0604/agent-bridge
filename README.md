@@ -132,7 +132,7 @@ agent_list_peers
 agent_send_peer --to <alias> 'message'
 agent_send_peer --all 'message'
 agent_send_peer --kind notice --to <alias> 'FYI'
-agent_view_peer <alias> --onboard
+agent_view_peer <alias> --onboard [--tail 50]
 agent_view_peer <alias> --older
 agent_view_peer <alias> --since-last
 agent_view_peer <alias> --search 'text' [--live]
@@ -155,6 +155,7 @@ For rooms with three or more participants, the target must be explicit (`--to al
 - `--since-last` — only the screen output added since this caller last viewed the target
 - `--search 'text'` — search inside the saved snapshot
 - `--search 'text' --live` — search the current live scrollback instead of the snapshot
+- `--tail N` — show N lines for page-style modes (default 50)
 
 When a participant joins or leaves, the daemon sends a `membership_update` notice to the remaining participants.
 
@@ -164,6 +165,7 @@ When a participant joins or leaves, the daemon sends a `membership_update` notic
 - `kind=result`: delivers a result back to a previous requester; the recipient's response is **not** returned again.
 - `kind=notice`: sends information without expecting a response.
 - `agent_send_peer '...'` sends `kind=request` by default.
+- `agent_send_peer --all '...'` sends one request to each peer and returns one aggregated result after every peer replies.
 - When answering a peer request, reply normally — the bridge returns that normal response automatically.
 - Relay depth is capped (default `max_hops=4`) to prevent runaway chains.
 

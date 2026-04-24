@@ -83,9 +83,20 @@ def run_tmux_send(target: str, prompt: str, submit_delay: float) -> None:
     subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True)
 
 
+def run_tmux_enter(target: str) -> None:
+    subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True)
+
+
 def build_peer_prompt(message: dict, nonce: str, max_hops: int) -> str:
     sender = str(message["from"])
     kind = normalize_kind(message.get("kind"), "request")
+    details = [f"from={sender}", f"kind={kind}"]
+    if kind == "result" and message.get("reply_to"):
+        details.append(f"in_reply_to={message.get('reply_to')}")
+    if message.get("causal_id"):
+        details.append(f"causal_id={message.get('causal_id')}")
+    if message.get("aggregate_id"):
+        details.append(f"aggregate_id={message.get('aggregate_id')}")
     if kind == "request":
         label = "Request"
         hint = "Reply normally; bridge returns it."
@@ -96,9 +107,7 @@ def build_peer_prompt(message: dict, nonce: str, max_hops: int) -> str:
         label = "Notice"
         hint = "FYI; no reply needed."
 
-    prefix = one_line(
-        f"[bridge:{nonce}] from={sender} kind={kind}. {hint}"
-    )
+    prefix = one_line(f"[bridge:{nonce}] {' '.join(details)}. {hint}")
     return f"{prefix} {label}: {prompt_body(message['body'])}"
 
 
@@ -155,6 +164,7 @@ class BridgeDaemon:
         self.state_file = Path(args.state_file)
         self.public_state_file = Path(args.public_state_file) if args.public_state_file else None
         self.queue = QueueStore(args.queue_file)
+        self.aggregate_file = Path(args.queue_file).parent / "aggregates.json"
         self.args = args
         self.session_file = Path(args.session_file) if args.session_file else Path(args.queue_file).parent / "session.json"
         self.session_state: dict = {}
@@ -182,6 +192,7 @@ class BridgeDaemon:
         self.last_maintenance = 0.0
         self.last_capture_cleanup = 0.0
         self.stop_logged = False
+        self.last_enter_ts: dict[str, float] = {}
         self.reload_participants()
 
     def start_command_server(self) -> None:
@@ -317,6 +328,8 @@ class BridgeDaemon:
             hop_count=message.get("hop_count"),
             auto_return=message.get("auto_return"),
             reply_to=message.get("reply_to"),
+            aggregate_id=message.get("aggregate_id"),
+            aggregate_expected=message.get("aggregate_expected"),
             source=message.get("source") or "ipc_enqueue",
             body=message.get("body"),
         )
@@ -455,6 +468,8 @@ class BridgeDaemon:
                 hop_count=message["hop_count"],
                 auto_return=message["auto_return"],
                 reply_to=message.get("reply_to"),
+                aggregate_id=message.get("aggregate_id"),
+                aggregate_expected=message.get("aggregate_expected"),
                 source=message.get("source"),
             )
         self.try_deliver(str(message["to"]))
@@ -464,7 +479,7 @@ class BridgeDaemon:
             return None
 
         def mutator(queue: list[dict]) -> dict | None:
-            if any(item.get("to") == target and item.get("status") == "inflight" for item in queue):
+            if any(item.get("to") == target and item.get("status") in {"inflight", "submitted"} for item in queue):
                 return None
             for item in queue:
                 if item.get("to") != target or item.get("status") != "pending":
@@ -520,6 +535,7 @@ class BridgeDaemon:
             )
             return
 
+        self.last_enter_ts[str(message["id"])] = time.time()
         self.log(
             "message_delivery_attempted",
             message_id=message["id"],
@@ -531,6 +547,7 @@ class BridgeDaemon:
             causal_id=message["causal_id"],
             hop_count=message["hop_count"],
             auto_return=message["auto_return"],
+            aggregate_id=message.get("aggregate_id"),
             dry_run=self.dry_run,
         )
 
@@ -547,6 +564,17 @@ class BridgeDaemon:
 
         self.queue.update(mutator)
 
+    def mark_message_submitted(self, message_id: str) -> None:
+        def mutator(queue: list[dict]) -> None:
+            for item in queue:
+                if item.get("id") != message_id:
+                    continue
+                item["status"] = "submitted"
+                item["updated_ts"] = utc_now()
+                item.pop("last_error", None)
+
+        self.queue.update(mutator)
+
     def ack_message(self, nonce: str) -> dict | None:
         def mutator(queue: list[dict]) -> dict | None:
             found = None
@@ -560,6 +588,40 @@ class BridgeDaemon:
             return found
 
         return self.queue.update(mutator)
+
+    def retry_enter_for_inflight(self) -> None:
+        now = time.time()
+        for item in list(self.queue.read()):
+            if item.get("status") != "inflight":
+                continue
+            msg_id = str(item.get("id") or "")
+            if not msg_id:
+                continue
+            last = self.last_enter_ts.get(msg_id)
+            if last is None or now - last < 1.0:
+                continue
+            target = str(item.get("to") or "")
+            pane = self.panes.get(target)
+            if not pane:
+                continue
+            try:
+                if not self.dry_run:
+                    run_tmux_enter(pane)
+            except Exception as exc:
+                self.safe_log(
+                    "enter_retry_failed",
+                    message_id=msg_id,
+                    to=target,
+                    error=str(exc),
+                )
+                continue
+            self.last_enter_ts[msg_id] = now
+            self.log(
+                "enter_retry",
+                message_id=msg_id,
+                to=target,
+                attempts=int(item.get("delivery_attempts") or 0),
+            )
 
     def requeue_stale_inflight(self) -> None:
         now = time.time()
@@ -594,6 +656,7 @@ class BridgeDaemon:
             self.discard_nonce(str(item.get("nonce") or ""))
             if self.reserved.get(target) == item.get("id"):
                 self.reserved[target] = None
+            self.last_enter_ts.pop(str(item.get("id") or ""), None)
             self.log(
                 "message_requeued",
                 message_id=item.get("id"),
@@ -619,6 +682,8 @@ class BridgeDaemon:
             self.discard_nonce(str(nonce))
         if not message:
             message = {}
+        if message.get("id"):
+            self.last_enter_ts.pop(str(message["id"]), None)
 
         self.busy[agent] = True
         self.reserved[agent] = None
@@ -631,6 +696,9 @@ class BridgeDaemon:
             "kind": normalize_kind(message.get("kind"), "notice") if message else None,
             "intent": message.get("intent"),
             "auto_return": bool(message.get("auto_return")),
+            "aggregate_id": message.get("aggregate_id"),
+            "aggregate_expected": message.get("aggregate_expected"),
+            "aggregate_message_ids": message.get("aggregate_message_ids"),
         }
 
         if message.get("id"):
@@ -645,6 +713,7 @@ class BridgeDaemon:
                 causal_id=message.get("causal_id"),
                 hop_count=message.get("hop_count"),
                 auto_return=message.get("auto_return"),
+                aggregate_id=message.get("aggregate_id"),
             )
 
     def response_fingerprint(self, record: dict) -> str:
@@ -660,6 +729,157 @@ class BridgeDaemon:
         )
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
+    def aggregate_expected_from_context(self, context: dict) -> list[str]:
+        raw = context.get("aggregate_expected") or []
+        if not isinstance(raw, list):
+            return []
+        expected = []
+        for item in raw:
+            alias = str(item or "")
+            if alias and alias not in expected:
+                expected.append(alias)
+        return expected
+
+    def aggregate_message_ids_from_context(self, context: dict) -> dict[str, str]:
+        raw = context.get("aggregate_message_ids") or {}
+        if not isinstance(raw, dict):
+            return {}
+        return {str(alias): str(message_id) for alias, message_id in raw.items() if alias and message_id}
+
+    def merge_ordered_aliases(self, existing: list[str], incoming: list[str]) -> list[str]:
+        merged = []
+        for alias in [*existing, *incoming]:
+            alias = str(alias or "")
+            if alias and alias not in merged:
+                merged.append(alias)
+        return merged
+
+    def aggregate_result_body(self, aggregate: dict) -> str:
+        expected = [str(alias) for alias in aggregate.get("expected") or []]
+        replies = aggregate.get("replies") or {}
+        message_ids = aggregate.get("message_ids") or {}
+        lines = [
+            f"Aggregated result for broadcast {aggregate.get('id')} from {aggregate.get('requester')}.",
+            f"causal_id={aggregate.get('causal_id')} expected={', '.join(expected)}",
+            "",
+        ]
+        for alias in expected:
+            reply = replies.get(alias) or {}
+            original_id = message_ids.get(alias) or reply.get("reply_to") or ""
+            lines.append(f"--- {alias} in_reply_to={original_id} ---")
+            body = str(reply.get("body") or "").strip()
+            lines.append(body or "(empty response)")
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
+    def collect_aggregate_response(self, sender: str, text: str, context: dict) -> None:
+        aggregate_id = str(context.get("aggregate_id") or "")
+        if not aggregate_id:
+            return
+
+        requester = str(context.get("from") or "")
+        expected = self.aggregate_expected_from_context(context)
+        message_ids = self.aggregate_message_ids_from_context(context)
+        causal_id = str(context.get("causal_id") or f"causal-{uuid.uuid4().hex[:12]}")
+        original_intent = str(context.get("intent") or "message")
+        hop_count = int(context.get("hop_count") or 0)
+        reply_to = str(context.get("id") or message_ids.get(sender) or "")
+        completed: dict | None = None
+
+        def mutator(data: dict) -> dict | None:
+            data.setdefault("version", 1)
+            aggregates = data.setdefault("aggregates", {})
+            aggregate = aggregates.setdefault(
+                aggregate_id,
+                {
+                    "id": aggregate_id,
+                    "created_ts": utc_now(),
+                    "requester": requester,
+                    "causal_id": causal_id,
+                    "intent": original_intent,
+                    "hop_count": hop_count,
+                    "expected": expected,
+                    "message_ids": message_ids,
+                    "replies": {},
+                    "status": "collecting",
+                    "delivered": False,
+                },
+            )
+            aggregate["updated_ts"] = utc_now()
+            aggregate["requester"] = aggregate.get("requester") or requester
+            aggregate["causal_id"] = aggregate.get("causal_id") or causal_id
+            aggregate["intent"] = aggregate.get("intent") or original_intent
+            aggregate["hop_count"] = int(aggregate.get("hop_count") or hop_count)
+            aggregate["expected"] = self.merge_ordered_aliases(list(aggregate.get("expected") or []), expected)
+            aggregate.setdefault("message_ids", {}).update(message_ids)
+            replies = aggregate.setdefault("replies", {})
+            replies[sender] = {
+                "from": sender,
+                "body": str(text),
+                "reply_to": reply_to,
+                "received_ts": utc_now(),
+            }
+            complete = bool(aggregate.get("expected")) and all(alias in replies for alias in aggregate.get("expected") or [])
+            if complete and not aggregate.get("delivered"):
+                aggregate["status"] = "complete"
+                aggregate["delivered"] = True
+                aggregate["delivered_at"] = utc_now()
+                return dict(aggregate)
+            return None
+
+        with locked_json(self.aggregate_file, {"version": 1, "aggregates": {}}) as data:
+            completed = mutator(data)
+
+        expected_count = len(expected)
+        received_count = 0
+        if completed:
+            received_count = len(completed.get("replies") or {})
+        else:
+            aggregate_data = read_json(self.aggregate_file, {"aggregates": {}})
+            aggregate = (aggregate_data.get("aggregates") or {}).get(aggregate_id) or {}
+            received_count = len(aggregate.get("replies") or {})
+            expected_count = len(aggregate.get("expected") or expected)
+        self.log(
+            "aggregate_reply_collected",
+            aggregate_id=aggregate_id,
+            from_agent=sender,
+            to=requester,
+            reply_to=reply_to,
+            causal_id=causal_id,
+            received_count=received_count,
+            expected_count=expected_count,
+        )
+
+        if not completed:
+            return
+
+        return_intent = f"{completed.get('intent') or original_intent}_aggregate_result"
+        message = make_message(
+            sender="bridge",
+            target=str(completed.get("requester") or requester),
+            intent=return_intent,
+            body=self.aggregate_result_body(completed),
+            causal_id=str(completed.get("causal_id") or causal_id),
+            hop_count=int(completed.get("hop_count") or hop_count),
+            auto_return=False,
+            kind="result",
+            reply_to=aggregate_id,
+            source="aggregate_return",
+        )
+        message["aggregate_id"] = aggregate_id
+        message["aggregate_expected"] = completed.get("expected") or expected
+        self.queue_message(message)
+        self.log(
+            "aggregate_result_queued",
+            message_id=message["id"],
+            aggregate_id=aggregate_id,
+            to=message["to"],
+            kind="result",
+            intent=return_intent,
+            causal_id=message["causal_id"],
+            expected_count=len(completed.get("expected") or []),
+        )
+
     def maybe_return_response(self, sender: str, text: str, context: dict) -> None:
         requester = context.get("from")
         self.reload_participants()
@@ -667,6 +887,11 @@ class BridgeDaemon:
             return
         if not context.get("auto_return"):
             return
+
+        if context.get("aggregate_id"):
+            self.collect_aggregate_response(sender, text, context)
+            return
+
         if not text.strip():
             return
 
@@ -905,6 +1130,7 @@ class BridgeDaemon:
                     if self.stop_requested():
                         break
                     self.requeue_stale_inflight()
+                    self.retry_enter_for_inflight()
                     self.cleanup_capture_responses()
                     if self.stop_requested():
                         break

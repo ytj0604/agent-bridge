@@ -188,7 +188,15 @@ def detach_stale_pane_lock(pane: str, reason: str) -> dict:
     return removed
 
 
-def update_attached_endpoint(mapping: dict, pane: str, target: str | None = None, *, persist: bool = True) -> dict:
+def update_attached_endpoint(
+    mapping: dict,
+    pane: str,
+    target: str | None = None,
+    *,
+    persist: bool = True,
+    cwd: str = "",
+    model: str = "",
+) -> dict:
     if not mapping or not pane:
         return mapping
     agent_type = str(mapping.get("agent") or "")
@@ -204,6 +212,10 @@ def update_attached_endpoint(mapping: dict, pane: str, target: str | None = None
 
     updated = dict(mapping)
     updated.update({"pane": pane, "target": target, "last_seen_at": utc_now()})
+    if cwd:
+        updated["cwd"] = cwd
+    if model:
+        updated["model"] = model
 
     if not persist:
         return updated
@@ -243,6 +255,11 @@ def update_attached_endpoint(mapping: dict, pane: str, target: str | None = None
         participant["target"] = target
         participant["status"] = "active"
         participant["hook_session_id"] = session_id
+        participant["last_seen_at"] = utc_now()
+        if cwd:
+            participant["cwd"] = cwd
+        if model:
+            participant["model"] = model
         participant.pop("detached_at", None)
         participant.pop("detach_reason", None)
         state.setdefault("panes", {})[alias] = pane
@@ -262,6 +279,8 @@ def update_live_session(
     alias: str = "",
     event: str = "",
     target: str = "",
+    cwd: str = "",
+    model: str = "",
 ) -> dict | None:
     if not (agent_type and session_id and pane):
         return None
@@ -301,7 +320,13 @@ def update_live_session(
             ):
                 if remaining_live:
                     replacement = remaining_live[-1]
-                    update_attached_endpoint(mapping, str(replacement.get("pane") or ""), str(replacement.get("target") or ""))
+                    update_attached_endpoint(
+                        mapping,
+                        str(replacement.get("pane") or ""),
+                        str(replacement.get("target") or ""),
+                        cwd=str(replacement.get("cwd") or ""),
+                        model=str(replacement.get("model") or ""),
+                    )
                 else:
                     detach_stale_pane_lock(pane, f"{agent_type}:{session_id} ended")
             else:
@@ -318,6 +343,10 @@ def update_live_session(
         "event": event,
         "last_seen_at": now,
     }
+    if cwd:
+        record["cwd"] = cwd
+    if model:
+        record["model"] = model
 
     old_pane_record: dict = {}
     with locked_json(live_sessions_file(), {"version": 1, "panes": {}, "sessions": {}}) as data:
@@ -344,7 +373,7 @@ def update_live_session(
                 mapping["bridge_session"] = bridge_session
             if alias:
                 mapping["alias"] = alias
-            return update_attached_endpoint(mapping, pane, target)
+            return update_attached_endpoint(mapping, pane, target, cwd=cwd, model=model)
         duplicate_lock = read_pane_lock(pane)
         if duplicate_lock:
             if (
@@ -492,11 +521,24 @@ def resolve_participant_endpoint(bridge_session: str, alias: str, participant: d
             mapped_pane = str(mapping.get("pane") or "")
             mapped_live = read_live_by_pane(mapped_pane) if mapped_pane else {}
             if live_record_matches(mapped_live, agent_type, session_id):
-                mapping = update_attached_endpoint(mapping, mapped_pane, str(mapped_live.get("target") or ""), persist=False)
+                mapping = update_attached_endpoint(
+                    mapping,
+                    mapped_pane,
+                    str(mapped_live.get("target") or ""),
+                    persist=False,
+                    cwd=str(mapped_live.get("cwd") or ""),
+                    model=str(mapped_live.get("model") or ""),
+                )
                 return str(mapping.get("pane") or "")
             live = read_live_by_identity(agent_type, session_id)
             if live:
-                mapping = update_attached_endpoint(mapping, str(live.get("pane") or pane), str(live.get("target") or ""))
+                mapping = update_attached_endpoint(
+                    mapping,
+                    str(live.get("pane") or pane),
+                    str(live.get("target") or ""),
+                    cwd=str(live.get("cwd") or ""),
+                    model=str(live.get("model") or ""),
+                )
                 return str(mapping.get("pane") or "")
         if pane:
             live_pane = read_live_by_pane(pane)

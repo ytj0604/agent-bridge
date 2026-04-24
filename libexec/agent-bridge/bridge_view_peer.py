@@ -19,7 +19,7 @@ from bridge_paths import state_root
 from bridge_util import TmuxCaptureError, append_jsonl, read_json, run_tmux_capture, utc_now, write_json_atomic
 
 
-DEFAULT_LINES = 120
+DEFAULT_LINES = 50
 DEFAULT_MAX_CHARS = 12000
 MAX_LINES = 1000
 MAX_CHARS = 200000
@@ -674,7 +674,8 @@ def main() -> int:
     parser.add_argument("--live", action="store_true", help="with --search, ignore saved snapshot and search current live scrollback")
     parser.add_argument("--snapshot", help="snapshot id to read for --older or --search")
     parser.add_argument("--page", type=int, help="latest-based page number; 0 is newest")
-    parser.add_argument("--lines", type=int, default=DEFAULT_LINES)
+    parser.add_argument("--lines", type=int)
+    parser.add_argument("--tail", type=int, help="alias for --lines; show N latest/relevant lines")
     parser.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS)
     parser.add_argument("--capture-timeout", type=float, default=10.0, help="seconds to wait for daemon-mediated capture fallback")
     parser.add_argument("--context", type=int, default=SEARCH_CONTEXT, help="search context lines")
@@ -693,8 +694,11 @@ def main() -> int:
         raise SystemExit("agent_view_peer: --live and --snapshot cannot be used together")
     if args.page is not None and args.page < 0:
         raise SystemExit("agent_view_peer: --page must be >= 0")
+    if args.tail is not None and args.lines is not None:
+        raise SystemExit("agent_view_peer: use either --tail or --lines, not both")
 
-    lines_count = clamp(args.lines, 1, MAX_LINES)
+    raw_lines = args.tail if args.tail is not None else args.lines
+    lines_count = clamp(raw_lines if raw_lines is not None else DEFAULT_LINES, 1, MAX_LINES)
     max_chars = clamp(args.max_chars, 1000, MAX_CHARS)
     args.context = clamp(args.context, 0, 50)
 

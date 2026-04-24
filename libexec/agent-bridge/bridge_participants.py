@@ -151,6 +151,7 @@ def participant_record(
     target: str = "",
     session_id: str = "",
     cwd: str = "",
+    model: str = "",
     status: str = "active",
 ) -> dict:
     alias = normalize_alias(alias)
@@ -162,6 +163,7 @@ def participant_record(
         "target": str(target or ""),
         "hook_session_id": str(session_id or ""),
         "cwd": str(cwd or ""),
+        "model": str(model or ""),
         "status": status,
     }
 
@@ -252,7 +254,17 @@ def format_peer_list(state: dict, current_alias: str | None = None) -> str:
     for alias in sorted(participants):
         record = participants[alias]
         marker = " (You)" if current_alias and alias == current_alias else ""
-        lines.append(f"- {alias}{marker}: {record.get('agent_type')} pane={record.get('pane')}")
+        details = [
+            f"type={record.get('agent_type')}",
+            f"pane={record.get('pane')}",
+        ]
+        if record.get("target"):
+            details.append(f"target={record.get('target')}")
+        if record.get("model"):
+            details.append(f"model={record.get('model')}")
+        if record.get("cwd"):
+            details.append(f"cwd={record.get('cwd')}")
+        lines.append(f"- {alias}{marker}: {' '.join(details)}")
     return "\n".join(lines)
 
 
@@ -260,8 +272,12 @@ def format_peer_summary(state: dict) -> str:
     participants = active_participants(state)
     if not participants:
         return "No active participants remain."
-    items = [
-        f"{alias}({record.get('agent_type')})"
-        for alias, record in sorted(participants.items())
-    ]
+    items = []
+    for alias, record in sorted(participants.items()):
+        details = [str(record.get("agent_type") or "unknown")]
+        if record.get("model"):
+            details.append(f"model={record.get('model')}")
+        if record.get("cwd"):
+            details.append(f"cwd={record.get('cwd')}")
+        items.append(f"{alias}({', '.join(details)})")
     return f"Participants now ({len(items)}): {', '.join(items)}."

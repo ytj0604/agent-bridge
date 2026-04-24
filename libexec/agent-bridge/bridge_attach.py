@@ -731,10 +731,12 @@ def prepare_room_state_files(
     queue_file: Path,
 ) -> dict:
     legacy_session_migration_file = state_root() / f"session-{session}.json"
+    aggregate_file = state_dir / "aggregates.json"
     candidates = [
         events_file,
         bus_file,
         queue_file,
+        aggregate_file,
         state_dir / "session.json",
         legacy_session_migration_file,
     ]
@@ -760,6 +762,10 @@ def prepare_room_state_files(
             if record:
                 archived_files.append(record)
             write_json_atomic(queue_file, [])
+
+        record = archive_file(aggregate_file, archive_dir, "aggregates.json", "move")
+        if record:
+            archived_files.append(record)
 
         for path, name in (
             (state_dir / "session.json", "session.json"),
@@ -867,7 +873,17 @@ def resolve_participant_specs(specs: list[dict], panes: list[dict]) -> list[dict
 
 
 def peer_names(participants: list[dict], alias: str) -> str:
-    peers = [item["alias"] for item in participants if item["alias"] != alias]
+    peers = []
+    for item in participants:
+        if item["alias"] == alias:
+            continue
+        pane = item.get("pane") or {}
+        details = [f"type={item.get('agent') or 'unknown'}"]
+        if item.get("model"):
+            details.append(f"model={item['model']}")
+        if pane.get("cwd"):
+            details.append(f"cwd={pane['cwd']}")
+        peers.append(f"{item['alias']}({', '.join(details)})")
     return ", ".join(peers) or "(none)"
 
 
@@ -1142,7 +1158,8 @@ def main() -> int:
                 "pane": item["pane"]["pane_id"],
                 "target": item["pane"]["target"],
                 "hook_session_id": probe_records[item["alias"]]["session_id"],
-                "cwd": item["pane"].get("cwd") or "",
+                "cwd": probe_records[item["alias"]].get("cwd") or item["pane"].get("cwd") or "",
+                "model": probe_records[item["alias"]].get("model") or "",
                 "status": "active",
             }
             for item in participants

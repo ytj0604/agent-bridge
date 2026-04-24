@@ -7,9 +7,9 @@ def model_cheat_sheet() -> list[str]:
         "Commands:",
         "- agent_list_peers : list aliases and show this cheat sheet.",
         "- agent_send_peer --to <alias> 'request' : ask one peer; keep working while the bridge returns its result.",
-        "- agent_send_peer --all 'message' : broadcast to every other participant. Do not put an alias before the body.",
+        "- agent_send_peer --all 'message' : broadcast to every other participant; one aggregated result returns after all peers reply. Do not put an alias before the body.",
         "- agent_send_peer --kind notice --to <alias> 'FYI' : send info without expecting a reply.",
-        "- agent_view_peer <alias> --onboard : capture a stable screen/history snapshot.",
+        "- agent_view_peer <alias> --onboard [--tail N] : capture a stable screen/history snapshot.",
         "- agent_view_peer <alias> --older : page older lines from that snapshot.",
         "- agent_view_peer <alias> --since-last : view latest changes since your last view.",
         "- agent_view_peer <alias> --search 'text' [--live] : search saved snapshot, or current live screen with --live.",
@@ -30,10 +30,10 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "Use shell commands for peer collaboration: "
         "agent_list_peers shows aliases and the command cheat sheet; "
         "agent_send_peer --to <alias> 'request' asks one peer and lets you keep working while the result returns later as a [bridge:*] result; "
-        "agent_send_peer --all 'message' broadcasts to every other participant; "
+        "agent_send_peer --all 'message' broadcasts to every other participant and returns one aggregated result after all peers reply; "
         "agent_send_peer --kind notice --to <alias> 'FYI' sends information without expecting a reply; "
         "agent_view_peer <alias> --onboard captures a stable peer screen/history snapshot; "
-        "--older pages older snapshot lines; --since-last shows latest changes; "
+        "--tail N controls how many lines to show; --older pages older snapshot lines; --since-last shows latest changes; "
         "--search 'text' searches the snapshot; --search 'text' --live searches current live screen. "
         "When a peer request arrives, reply normally; the bridge returns your normal response automatically. "
         "After you send a request, end your turn — the peer's reply arrives automatically as a [bridge:*] result, same delivery path as a user prompt. "

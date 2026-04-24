@@ -162,6 +162,9 @@ def main() -> int:
         return 2
 
     causal_id = args.causal_id or f"causal-{uuid.uuid4().hex[:12]}"
+    aggregate_id = ""
+    if args.target_all and kind == "request" and args.sender != "bridge" and len(targets) > 1:
+        aggregate_id = f"agg-{uuid.uuid4().hex}"
     messages_and_records = []
     for target in targets:
         auto_return = not args.no_auto_return and kind == "request" and args.sender != "bridge" and target != "bridge"
@@ -184,6 +187,9 @@ def main() -> int:
             "nonce": None,
             "delivery_attempts": 0,
         }
+        if aggregate_id and auto_return:
+            message["aggregate_id"] = aggregate_id
+            message["aggregate_expected"] = list(targets)
 
         record = {
             "ts": utc_now(),
@@ -201,10 +207,19 @@ def main() -> int:
             "bridge_session": bridge_session,
             "body": message["body"],
         }
+        if aggregate_id and auto_return:
+            record["aggregate_id"] = aggregate_id
+            record["aggregate_expected"] = list(targets)
 
         messages_and_records.append((message, record))
 
     messages = [message for message, _record in messages_and_records]
+    if aggregate_id:
+        aggregate_message_ids = {str(message["to"]): str(message["id"]) for message in messages}
+        for message, record in messages_and_records:
+            if message.get("aggregate_id") == aggregate_id:
+                message["aggregate_message_ids"] = aggregate_message_ids
+                record["aggregate_message_ids"] = aggregate_message_ids
     attempted_ipc, ipc_ids, ipc_error = enqueue_via_daemon_socket(bridge_session, messages)
     if attempted_ipc:
         if ipc_error:

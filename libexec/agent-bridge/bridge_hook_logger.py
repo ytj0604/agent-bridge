@@ -175,6 +175,8 @@ def main() -> int:
         bridge_session=str(record.get("bridge_session") or ""),
         alias=str(record.get("bridge_agent") or ""),
         event=str(record.get("event") or ""),
+        cwd=str(record.get("cwd") or ""),
+        model=str(record.get("model") or ""),
     )
     if live_mapping:
         mapping = live_mapping
