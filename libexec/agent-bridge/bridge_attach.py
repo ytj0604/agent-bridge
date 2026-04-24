@@ -1162,6 +1162,7 @@ def main() -> int:
             "pid": daemon_info.get("pid"),
             "pid_file": daemon_info.get("pid_file"),
             "log_file": daemon_info.get("log_file"),
+            "command_socket": daemon_info.get("command_socket"),
         }
         state["targets"]["daemon"] = f"pid:{daemon_info.get('pid')}"
     write_state(state)

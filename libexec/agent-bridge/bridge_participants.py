@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 import re
 from pathlib import Path
@@ -64,18 +65,71 @@ def process_is_alive(pid: int) -> bool:
         return True
 
 
-def room_inactive_reason(session: str) -> str:
+def pid_probe_namespace_untrusted() -> bool:
+    raw = os.environ.get("AGENT_BRIDGE_PID_PROBE_UNTRUSTED", "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    try:
+        status = Path("/proc/self/status").read_text(encoding="utf-8", errors="replace")
+        for line in status.splitlines():
+            if line.startswith("NSpid:") and len(line.split()) > 2:
+                return True
+    except OSError:
+        pass
+    try:
+        cmdline = Path("/proc/1/cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    lowered = cmdline.lower()
+    markers = (
+        "bwrap",
+        "bubblewrap",
+        "codex-linux-sandbox",
+        "--unshare-pid",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+@dataclass(frozen=True)
+class RoomStatus:
+    state: str
+    reason: str = ""
+    pid: int | None = None
+    pid_probe_untrusted: bool = False
+
+    @property
+    def active_enough_for_read(self) -> bool:
+        return self.state in {"alive", "unknown"}
+
+    @property
+    def active_enough_for_enqueue(self) -> bool:
+        return self.state in {"alive", "unknown"}
+
+
+def room_status(session: str) -> RoomStatus:
     session = str(session or "").strip()
     if not session:
-        return "bridge session is required"
+        return RoomStatus("missing", "bridge session is required")
     if not session_state_exists(session):
-        return f"bridge room {session!r} is not active or was stopped/cleaned up"
+        return RoomStatus("missing", f"bridge room {session!r} is not active or was stopped/cleaned up")
     pid = read_pid(run_root() / f"{session}.pid")
     if pid is None:
-        return f"bridge room {session!r} has no running daemon"
-    if not process_is_alive(pid):
-        return f"bridge room {session!r} daemon pid {pid} is not running"
-    return ""
+        return RoomStatus("dead", f"bridge room {session!r} has no running daemon")
+    if pid_probe_namespace_untrusted():
+        return RoomStatus(
+            "unknown",
+            f"bridge room {session!r} daemon pid {pid} is not visible from this sandbox/PID namespace",
+            pid=pid,
+            pid_probe_untrusted=True,
+        )
+    if process_is_alive(pid):
+        return RoomStatus("alive", pid=pid)
+    return RoomStatus("dead", f"bridge room {session!r} daemon pid {pid} is not running", pid=pid)
+
+
+def room_inactive_reason(session: str) -> str:
+    status = room_status(session)
+    return "" if status.active_enough_for_read else status.reason
 
 
 def load_session(session: str) -> dict:

@@ -37,6 +37,7 @@ def session_paths(session: str) -> dict[str, Path]:
         "meta": run_dir / f"{session}.json",
         "lock": run_dir / f"{session}.lock",
         "stop": run_dir / f"{session}.stop",
+        "socket": run_dir / f"{session}.sock",
         "log": log_dir / f"{session}.daemon.log",
     }
 
@@ -88,6 +89,8 @@ def daemon_command(args: argparse.Namespace) -> list[str]:
         str(state_root() / args.session / "session.json"),
         "--stop-file",
         str(session_paths(args.session)["stop"]),
+        "--command-socket",
+        str(session_paths(args.session)["socket"]),
     ]
     if args.claude_pane:
         cmd += ["--claude-pane", args.claude_pane]
@@ -200,6 +203,7 @@ def cleanup_stopped_session(session: str, paths: dict[str, Path], cleanup: bool)
     paths["pid"].unlink(missing_ok=True)
     paths["meta"].unlink(missing_ok=True)
     paths["stop"].unlink(missing_ok=True)
+    paths["socket"].unlink(missing_ok=True)
     if cleanup:
         cleanup_registry(session)
     # Remove a pre-structured-state file if an older install left one behind.
@@ -259,6 +263,7 @@ def start_under_lock(args: argparse.Namespace, paths: dict[str, Path]) -> dict:
                 raise SystemExit(f"could not replace running bridge daemon {args.session}: {status}")
     elif existing_pid:
         paths["pid"].unlink(missing_ok=True)
+    paths["socket"].unlink(missing_ok=True)
     paths["stop"].unlink(missing_ok=True)
 
     cmd = daemon_command(args)
@@ -269,6 +274,7 @@ def start_under_lock(args: argparse.Namespace, paths: dict[str, Path]) -> dict:
             "command": cmd,
             "pid_file": str(paths["pid"]),
             "log_file": str(paths["log"]),
+            "command_socket": str(paths["socket"]),
         }
 
     log = paths["log"].open("ab", buffering=0)
@@ -296,6 +302,7 @@ def start_under_lock(args: argparse.Namespace, paths: dict[str, Path]) -> dict:
         "status": "running",
         "pid_file": str(paths["pid"]),
         "log_file": str(paths["log"]),
+        "command_socket": str(paths["socket"]),
         "command": cmd,
         "claude_pane": args.claude_pane,
         "codex_pane": args.codex_pane,

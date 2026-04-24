@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import errno
 import fcntl
 import json
 import os
@@ -31,6 +32,7 @@ MIN_OVERLAP_LINES = 10
 SEARCH_CONTEXT = 8
 MAX_MATCHES = 5
 MAX_LINE_CHARS = 1000
+WRITE_FAILURE_ERRNOS = {errno.EROFS, errno.EACCES, errno.EPERM}
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
 
 
@@ -152,6 +154,18 @@ def captures_lock(session: str):
             yield
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def optional_captures_lock(session: str):
+    try:
+        with captures_lock(session):
+            yield True
+    except OSError as exc:
+        if exc.errno in WRITE_FAILURE_ERRNOS:
+            yield False
+            return
+        raise
 
 
 def cursor_path(session: str, caller: str, target: str) -> Path:
@@ -289,11 +303,15 @@ def load_cursor(session: str, caller: str, target: str) -> dict:
     return read_json(legacy_cursor_path(session, caller, target), {})
 
 
-def save_cursor(session: str, caller: str, target: str, cursor: dict) -> None:
+def save_cursor(session: str, caller: str, target: str, cursor: dict, *, cache_writable: bool = True) -> None:
+    if not cache_writable:
+        return
     write_json_atomic(cursor_path(session, caller, target), {**cursor, "updated_at": utc_now()})
 
 
-def update_since_cursor(session: str, caller: str, target: str, lines: list[str], extra: dict | None = None) -> None:
+def update_since_cursor(session: str, caller: str, target: str, lines: list[str], extra: dict | None = None, *, cache_writable: bool = True) -> None:
+    if not cache_writable:
+        return
     tail = lines[-SINCE_TAIL_LINES:]
     cursor = load_cursor(session, caller, target)
     cursor.update({
@@ -391,17 +409,31 @@ def render_output(
     print(f"Next: agent_view_peer {target} --older | agent_view_peer {target} --since-last | agent_view_peer {target} --search '<text>'")
 
 
-def handle_onboard(args: argparse.Namespace, session: str, caller: str, target: str, record: dict, lines_count: int, max_chars: int) -> None:
+def handle_onboard(args: argparse.Namespace, session: str, caller: str, target: str, record: dict, lines_count: int, max_chars: int, cache_writable: bool) -> None:
     text = capture_text(args, str(record["pane"]), -SNAPSHOT_CAPTURE_LINES, None, raw=args.raw)
     lines = clean_lines(text, raw=args.raw)
+    page = args.page or 0
+    start, end = page_bounds(len(lines), lines_count, page)
+    if not cache_writable:
+        render_output(
+            room=session,
+            caller=caller,
+            target=target,
+            target_record=record,
+            mode="onboard-stateless",
+            lines=lines[start:end],
+            total_lines=len(lines),
+            max_chars=max_chars,
+            page=page,
+            note="capture cache is not writable from this sandbox; no snapshot/cursor was saved",
+        )
+        return
     snapshot_id = save_snapshot(
         session,
         target,
         lines,
         {"target": target, "caller": caller, "pane": record.get("pane"), "mode": "onboard"},
     )
-    page = args.page or 0
-    start, end = page_bounds(len(lines), lines_count, page)
     update_since_cursor(session, caller, target, lines, {"snapshot_id": snapshot_id, "snapshot_page": page})
     render_output(
         room=session,
@@ -417,7 +449,7 @@ def handle_onboard(args: argparse.Namespace, session: str, caller: str, target: 
     )
 
 
-def handle_older(args: argparse.Namespace, session: str, caller: str, target: str, record: dict, lines_count: int, max_chars: int) -> None:
+def handle_older(args: argparse.Namespace, session: str, caller: str, target: str, record: dict, lines_count: int, max_chars: int, cache_writable: bool) -> None:
     cursor = load_cursor(session, caller, target)
     snapshot_id = str(args.snapshot or cursor.get("snapshot_id") or "")
     if not snapshot_id:
@@ -426,7 +458,10 @@ def handle_older(args: argparse.Namespace, session: str, caller: str, target: st
     page = args.page if args.page is not None else int(cursor.get("snapshot_page") or 0) + 1
     start, end = page_bounds(len(lines), lines_count, page)
     cursor.update({"snapshot_id": snapshot_id, "snapshot_page": page})
-    save_cursor(session, caller, target, cursor)
+    save_cursor(session, caller, target, cursor, cache_writable=cache_writable)
+    note = str(meta.get("created_at") or "")
+    if not cache_writable:
+        note = f"{note}; capture cache is read-only, page cursor not advanced".strip("; ")
     render_output(
         room=session,
         caller=caller,
@@ -438,11 +473,11 @@ def handle_older(args: argparse.Namespace, session: str, caller: str, target: st
         max_chars=max_chars,
         snapshot_id=snapshot_id,
         page=page,
-        note=str(meta.get("created_at") or ""),
+        note=note,
     )
 
 
-def handle_since_last(args: argparse.Namespace, session: str, caller: str, target: str, record: dict, lines_count: int, max_chars: int) -> None:
+def handle_since_last(args: argparse.Namespace, session: str, caller: str, target: str, record: dict, lines_count: int, max_chars: int, cache_writable: bool) -> None:
     text = capture_text(args, str(record["pane"]), -SINCE_SCAN_LINES, None, raw=args.raw)
     lines = clean_lines(text, raw=args.raw)
     previous = load_cursor(session, caller, target)
@@ -451,7 +486,9 @@ def handle_since_last(args: argparse.Namespace, session: str, caller: str, targe
     if len(delta) > lines_count:
         omitted = len(delta) - lines_count
         note = f"{note}; {omitted} older delta lines omitted; cursor advanced to latest"
-    update_since_cursor(session, caller, target, lines, {"last_since_confidence": confidence})
+    if not cache_writable:
+        note = f"{note}; capture cache is read-only, cursor not advanced"
+    update_since_cursor(session, caller, target, lines, {"last_since_confidence": confidence}, cache_writable=cache_writable)
     render_output(
         room=session,
         caller=caller,
@@ -513,12 +550,15 @@ def handle_search(args: argparse.Namespace, session: str, caller: str, target: s
     )
 
 
-def handle_live(args: argparse.Namespace, session: str, caller: str, target: str, record: dict, lines_count: int, max_chars: int) -> None:
+def handle_live(args: argparse.Namespace, session: str, caller: str, target: str, record: dict, lines_count: int, max_chars: int, cache_writable: bool) -> None:
     page = args.page or 0
     text = capture_text(args, str(record["pane"]), -SNAPSHOT_CAPTURE_LINES, None, raw=args.raw)
     lines = clean_lines(text, raw=args.raw)
     start, end = page_bounds(len(lines), lines_count, page)
-    update_since_cursor(session, caller, target, lines, {"live_page": page})
+    update_since_cursor(session, caller, target, lines, {"live_page": page}, cache_writable=cache_writable)
+    note = "live tmux page; use --onboard for stable historical paging" if page else ""
+    if not cache_writable:
+        note = f"{note}; capture cache is read-only, cursor not advanced".strip("; ")
     render_output(
         room=session,
         caller=caller,
@@ -529,7 +569,7 @@ def handle_live(args: argparse.Namespace, session: str, caller: str, target: str
         total_lines=len(lines),
         max_chars=max_chars,
         page=page,
-        note="live tmux page; use --onboard for stable historical paging" if page else "",
+        note=note,
     )
 
 
@@ -578,17 +618,17 @@ def main() -> int:
     record = resolve_target(state, caller, args.target, args.self)
     target = normalize_alias(args.target)
 
-    with captures_lock(session):
+    with optional_captures_lock(session) as cache_writable:
         if args.onboard:
-            handle_onboard(args, session, caller, target, record, lines_count, max_chars)
+            handle_onboard(args, session, caller, target, record, lines_count, max_chars, cache_writable)
         elif args.older:
-            handle_older(args, session, caller, target, record, lines_count, max_chars)
+            handle_older(args, session, caller, target, record, lines_count, max_chars, cache_writable)
         elif args.since_last:
-            handle_since_last(args, session, caller, target, record, lines_count, max_chars)
+            handle_since_last(args, session, caller, target, record, lines_count, max_chars, cache_writable)
         elif args.search:
             handle_search(args, session, caller, target, record, lines_count, max_chars)
         else:
-            handle_live(args, session, caller, target, record, lines_count, max_chars)
+            handle_live(args, session, caller, target, record, lines_count, max_chars, cache_writable)
     return 0
 
 

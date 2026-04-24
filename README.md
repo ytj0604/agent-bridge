@@ -173,19 +173,30 @@ When a participant joins or leaves, the daemon sends a `membership_update` notic
 
 ## Runtime Files
 
-Default runtime files live under the resolved install root unless overridden:
+Default runtime files live under a writable runtime root, not under the install directory. By default the runtime root is:
 
 ```text
-state/<session>/events.jsonl
-state/<session>/events.raw.jsonl
-state/<session>/pending.json
-state/<session>/captures/snapshots/<alias>/<id>.{txt,json}
-state/<session>/captures/cursors/<caller>@<target>.json
-run/<session>.pid
-run/<session>.json
-run/<session>.stop
-log/<session>.daemon.log
+${TMPDIR:-/tmp}/agent-bridge-$uid/
 ```
+
+This is intentional: Codex/Claude tool sandboxes often see the install directory as read-only, while `/tmp` is commonly bind-mounted writable. You can override the runtime root explicitly with `AGENT_BRIDGE_RUNTIME_DIR`, or override individual roots with `AGENT_BRIDGE_STATE_DIR`, `AGENT_BRIDGE_RUN_DIR`, and `AGENT_BRIDGE_LOG_DIR`.
+
+The runtime layout is:
+
+```text
+<runtime>/state/<session>/events.jsonl
+<runtime>/state/<session>/events.raw.jsonl
+<runtime>/state/<session>/pending.json
+<runtime>/state/<session>/captures/snapshots/<alias>/<id>.{txt,json}
+<runtime>/state/<session>/captures/cursors/<caller>@<target>.json
+<runtime>/run/<session>.pid
+<runtime>/run/<session>.json
+<runtime>/run/<session>.stop
+<runtime>/run/<session>.sock
+<runtime>/log/<session>.daemon.log
+```
+
+Install-root runtime directories such as `<install>/state` are ignored by default because they are not sandbox-safe. Set `AGENT_BRIDGE_ALLOW_INSTALL_ROOT_RUNTIME=1` only for a controlled local setup where every agent can write that path.
 
 Stopping a room from `bridge_manage` first writes the `.stop` sentinel so the daemon exits cooperatively. If that does not complete before the timeout, it falls back to `SIGTERM`/`SIGKILL`. Successful stop also notifies active panes that the room is closed, cleans active registry/pane-lock records, and moves per-room state under `state/.forgotten/` for diagnostics.
 

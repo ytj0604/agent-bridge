@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 import argparse
 import errno
+import json
 import os
+import socket
 import sys
 import uuid
 from pathlib import Path
 
 from bridge_daemon_client import ensure_daemon_running
 from bridge_identity import resolve_caller_from_pane
-from bridge_participants import active_participants, load_session, resolve_targets, room_inactive_reason
-from bridge_paths import state_root
+from bridge_participants import active_participants, load_session, resolve_targets, room_status
+from bridge_paths import run_root, state_root
 from bridge_util import MESSAGE_KINDS, append_jsonl, locked_json, normalize_kind, public_record, utc_now
 
 
-STATE_ROOT = state_root()
 WRITE_FAILURE_ERRNOS = {errno.EROFS, errno.EACCES, errno.EPERM}
 
 
@@ -23,14 +24,44 @@ def update_queue(path: Path, message: dict) -> None:
             queue.append(message)
 
 
-def write_failure_message(path: Path, exc: OSError) -> str:
+def write_failure_message(path: Path, exc: OSError, ipc_error: str = "") -> str:
+    suffix = f" Daemon socket fallback also failed: {ipc_error}." if ipc_error else ""
     if exc.errno in WRITE_FAILURE_ERRNOS:
         return (
             f"agent_send_peer: cannot enqueue message because bridge state is not writable: {path}: {exc.strerror}. "
             "Identity lookup can read existing room state, but sending requires write access to the room queue. "
-            f"Restore write permissions on {path.parent}, or recreate the room with AGENT_BRIDGE_STATE_DIR pointing to a writable filesystem."
+            f"Restore write permissions on {path.parent}, or recreate the room with AGENT_BRIDGE_RUNTIME_DIR/AGENT_BRIDGE_STATE_DIR pointing to a writable filesystem shared by the agents."
+            f"{suffix}"
         )
-    return f"agent_send_peer: failed to write bridge queue/event state: {path}: {exc}"
+    return f"agent_send_peer: failed to write bridge queue/event state: {path}: {exc}.{suffix}"
+
+
+def enqueue_via_daemon_socket(bridge_session: str, messages: list[dict]) -> tuple[bool, list[str], str]:
+    socket_path = run_root() / f"{bridge_session}.sock"
+    if not socket_path.exists():
+        return False, [], ""
+    request = json.dumps({"op": "enqueue", "messages": messages}, ensure_ascii=True) + "\n"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(2.0)
+            client.connect(str(socket_path))
+            client.sendall(request.encode("utf-8"))
+            raw = b""
+            while b"\n" not in raw and len(raw) < 2_000_000:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                raw += chunk
+    except OSError as exc:
+        return False, [], f"{socket_path}: {exc}"
+    try:
+        response = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        return True, [], f"invalid daemon socket response: {exc}"
+    if not response.get("ok"):
+        return True, [], str(response.get("error") or "daemon socket enqueue failed")
+    ids = response.get("ids") or []
+    return True, [str(item) for item in ids], ""
 
 
 def sender_matches_caller(args: argparse.Namespace, bridge_session: str) -> bool:
@@ -81,14 +112,14 @@ def main() -> int:
         print(f"agent_send_peer: {ensure_error}", file=sys.stderr)
         return 2
 
-    inactive_reason = room_inactive_reason(bridge_session)
-    if inactive_reason:
-        print(f"agent_send_peer: {inactive_reason}; reattach/start a bridge room before sending.", file=sys.stderr)
+    status = room_status(bridge_session)
+    if not status.active_enough_for_enqueue:
+        print(f"agent_send_peer: {status.reason}; reattach/start a bridge room before sending.", file=sys.stderr)
         return 2
     if not sender_matches_caller(args, bridge_session):
         return 2
 
-    session_dir = STATE_ROOT / bridge_session
+    session_dir = state_root() / bridge_session
     default_state_file = session_dir / "events.raw.jsonl"
     default_public_state_file = session_dir / "events.jsonl"
     default_queue_file = session_dir / "pending.json"
@@ -131,7 +162,7 @@ def main() -> int:
         return 2
 
     causal_id = args.causal_id or f"causal-{uuid.uuid4().hex[:12]}"
-    ids = []
+    messages_and_records = []
     for target in targets:
         auto_return = not args.no_auto_return and kind == "request" and args.sender != "bridge" and target != "bridge"
         message = {
@@ -171,22 +202,35 @@ def main() -> int:
             "body": message["body"],
         }
 
+        messages_and_records.append((message, record))
+
+    messages = [message for message, _record in messages_and_records]
+    attempted_ipc, ipc_ids, ipc_error = enqueue_via_daemon_socket(bridge_session, messages)
+    if attempted_ipc:
+        if ipc_error:
+            print(f"agent_send_peer: {ipc_error}", file=sys.stderr)
+            return 1
+        print("\n".join(ipc_ids))
+        return 0
+
+    ids = []
+    for message, record in messages_and_records:
         try:
             update_queue(queue_file, message)
         except OSError as exc:
-            print(write_failure_message(queue_file, exc), file=sys.stderr)
+            print(write_failure_message(queue_file, exc, ipc_error), file=sys.stderr)
             return 1
         try:
             append_jsonl(state_file, record)
         except OSError as exc:
-            print(write_failure_message(state_file, exc), file=sys.stderr)
+            print(write_failure_message(state_file, exc, ipc_error), file=sys.stderr)
             return 1
         if public_state_file and Path(public_state_file) != state_file:
             public_path = Path(public_state_file)
             try:
                 append_jsonl(public_path, public_record(record))
             except OSError as exc:
-                print(write_failure_message(public_path, exc), file=sys.stderr)
+                print(write_failure_message(public_path, exc, ipc_error), file=sys.stderr)
                 return 1
         ids.append(message["id"])
     print("\n".join(ids))

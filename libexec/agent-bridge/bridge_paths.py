@@ -70,16 +70,64 @@ def _pinned_path(key: str) -> Path | None:
 
 
 def _user_state_base() -> Path:
-    candidates: list[Path] = []
+    uid = getattr(os, "getuid", lambda: "user")()
+    candidates: list[Path] = [
+        Path(tempfile.gettempdir()) / f"{APP_NAME}-{uid}",
+    ]
     if os.environ.get("XDG_STATE_HOME"):
         candidates.append(_expand(os.environ["XDG_STATE_HOME"]) / APP_NAME)
     candidates.append(Path.home().expanduser() / ".local" / "state" / APP_NAME)
-    uid = getattr(os, "getuid", lambda: "user")()
-    candidates.append(Path(tempfile.gettempdir()) / f"{APP_NAME}-{uid}")
     for candidate in candidates:
         if _can_write_dir(candidate):
             return candidate.resolve()
     return candidates[-1].resolve()
+
+
+def _allow_install_root_runtime() -> bool:
+    raw = os.environ.get("AGENT_BRIDGE_ALLOW_INSTALL_ROOT_RUNTIME", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _is_under(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+    except OSError:
+        return False
+
+
+def _is_install_root_runtime(path: Path) -> bool:
+    return _is_under(path, install_root())
+
+
+def _portable_runtime_root() -> Path:
+    override = os.environ.get("AGENT_BRIDGE_RUNTIME_DIR")
+    if override:
+        return _expand(override)
+    uid = getattr(os, "getuid", lambda: "user")()
+    return (Path(tempfile.gettempdir()) / f"{APP_NAME}-{uid}").resolve()
+
+
+def _default_runtime_root(kind: str) -> Path:
+    root = _portable_runtime_root()
+    if kind == "state_root":
+        return root / "state"
+    if kind == "run_root":
+        return root / "run"
+    if kind == "log_root":
+        return root / "log"
+    raise ValueError(f"unknown runtime root kind: {kind}")
+
+
+def _usable_pinned_path(key: str) -> Path | None:
+    pinned = _pinned_path(key)
+    if pinned is None:
+        return None
+    if _is_install_root_runtime(pinned) and not _allow_install_root_runtime():
+        return None
+    return pinned
 
 
 def _runtime_dir(
@@ -92,11 +140,16 @@ def _runtime_dir(
     override = os.environ.get(env_name)
     if override:
         return _expand(override)
-    pinned = _pinned_path(pin_key)
+    if os.environ.get("AGENT_BRIDGE_RUNTIME_DIR"):
+        return _default_runtime_root(pin_key)
+    pinned = _usable_pinned_path(pin_key)
     if pinned is not None:
         return pinned
+    portable = _default_runtime_root(pin_key)
+    if _can_write_dir(portable):
+        return portable
     legacy = install_root() / legacy_name
-    if _can_write_dir(legacy):
+    if _allow_install_root_runtime() and _can_write_dir(legacy):
         return legacy
     base = _user_state_base()
     return base if fallback_subdir is None else base / fallback_subdir
@@ -133,11 +186,16 @@ def run_root() -> Path:
     override = os.environ.get("AGENT_BRIDGE_RUN_DIR")
     if override:
         return _expand(override)
-    pinned = _pinned_path("run_root")
+    if os.environ.get("AGENT_BRIDGE_RUNTIME_DIR"):
+        return _default_runtime_root("run_root")
+    pinned = _usable_pinned_path("run_root")
     if pinned is not None:
         return pinned
+    portable = _default_runtime_root("run_root")
+    if _can_write_dir(portable):
+        return portable
     legacy = install_root() / "run"
-    if _can_write_dir(legacy):
+    if _allow_install_root_runtime() and _can_write_dir(legacy):
         return legacy
     xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
     if xdg_runtime:
@@ -159,7 +217,7 @@ def require_writable_dir(path: Path, label: str) -> None:
         return
     raise RuntimeError(
         f"Agent Bridge {label} is not writable: {path}. "
-        "Fix the directory permissions, or stop/recreate the bridge room with AGENT_BRIDGE_STATE_DIR/AGENT_BRIDGE_RUN_DIR/AGENT_BRIDGE_LOG_DIR pointing to writable paths."
+        "Fix the directory permissions, or stop/recreate the bridge room with AGENT_BRIDGE_RUNTIME_DIR (or AGENT_BRIDGE_STATE_DIR/AGENT_BRIDGE_RUN_DIR/AGENT_BRIDGE_LOG_DIR) pointing to writable paths shared by the agents."
     )
 
 

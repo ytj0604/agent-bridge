@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import os
 import sys
@@ -9,7 +10,7 @@ import sys
 from bridge_daemon_client import ensure_daemon_running
 from bridge_identity import resolve_caller_from_pane
 from bridge_instructions import model_cheat_sheet_text
-from bridge_participants import active_participants, format_peer_list, load_session, room_inactive_reason
+from bridge_participants import active_participants, format_peer_list, load_session, room_status
 
 
 def main() -> int:
@@ -43,14 +44,15 @@ def main() -> int:
         )
         return 2
 
-    ensure_error = ensure_daemon_running(session)
-    if ensure_error:
-        print(f"agent_list_peers: {ensure_error}", file=sys.stderr)
-        return 2
-
-    inactive_reason = room_inactive_reason(session)
-    if inactive_reason:
-        print(f"agent_list_peers: {inactive_reason}; reattach/start a bridge room first.", file=sys.stderr)
+    status = room_status(session)
+    if status.state not in {"alive", "unknown"}:
+        ensure_error = ensure_daemon_running(session)
+        if ensure_error:
+            print(f"agent_list_peers: {ensure_error}", file=sys.stderr)
+            return 2
+        status = room_status(session)
+    if not status.active_enough_for_read:
+        print(f"agent_list_peers: {status.reason}; reattach/start a bridge room first.", file=sys.stderr)
         return 2
 
     state = load_session(session)
@@ -65,9 +67,11 @@ def main() -> int:
         return 2
     participants = state.get("participants") or {}
     if args.json:
-        print(json.dumps({"session": session, "current": sender, "participants": participants}, ensure_ascii=True, indent=2))
+        print(json.dumps({"session": session, "current": sender, "daemon_status": asdict(status), "participants": participants}, ensure_ascii=True, indent=2))
     else:
         print(f"Bridge session: {session}")
+        if status.state == "unknown":
+            print(f"Warning: {status.reason}; showing read-only session state.")
         print(format_peer_list(state, sender))
         print("")
         print(model_cheat_sheet_text())

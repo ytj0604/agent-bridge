@@ -5,8 +5,11 @@ import hashlib
 import json
 import os
 import signal
+import socket
+import struct
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -14,9 +17,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from bridge_identity import resolve_participant_endpoint
-from bridge_participants import active_participants, load_session, participant_record, session_file
+from bridge_participants import active_participants, participant_record
 from bridge_paths import model_bin_dir, state_root
-from bridge_util import append_jsonl, locked_json, normalize_kind, public_record, utc_now
+from bridge_util import append_jsonl, locked_json, normalize_kind, public_record, read_json, utc_now
 
 
 PHYSICAL_AGENT_TYPES = {"claude", "codex"}
@@ -163,6 +166,9 @@ class BridgeDaemon:
         self.stdout_events = args.stdout_events
         self.bridge_session = args.bridge_session
         self.stop_file = Path(args.stop_file) if args.stop_file else None
+        self.command_socket = Path(args.command_socket) if args.command_socket else None
+        self.command_server_thread: threading.Thread | None = None
+        self.command_server_socket: socket.socket | None = None
         self.once = args.once
         self.busy: dict[str, bool] = {}
         self.reserved: dict[str, str | None] = {}
@@ -172,6 +178,143 @@ class BridgeDaemon:
         self.last_maintenance = 0.0
         self.stop_logged = False
         self.reload_participants()
+
+    def start_command_server(self) -> None:
+        if not self.command_socket:
+            return
+        if self.dry_run:
+            return
+        path = self.command_socket
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            server.bind(str(path))
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+            server.listen(16)
+            server.settimeout(0.25)
+        except OSError as exc:
+            try:
+                server.close()
+            finally:
+                self.command_server_socket = None
+            self.log("command_socket_unavailable", command_socket=str(path), error=str(exc))
+            return
+        self.command_server_socket = server
+        self.command_server_thread = threading.Thread(target=self.command_server_loop, name="bridge-command-socket", daemon=True)
+        self.command_server_thread.start()
+
+    def stop_command_server(self) -> None:
+        server = self.command_server_socket
+        if server is not None:
+            try:
+                server.close()
+            except OSError:
+                pass
+            self.command_server_socket = None
+        if self.command_socket:
+            try:
+                self.command_socket.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+    def command_server_loop(self) -> None:
+        server = self.command_server_socket
+        if server is None:
+            return
+        while not self.stop_requested():
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with conn:
+                response = self.handle_command_connection(conn)
+                try:
+                    conn.sendall((json.dumps(response, ensure_ascii=True) + "\n").encode("utf-8"))
+                except OSError:
+                    pass
+
+    def handle_command_connection(self, conn: socket.socket) -> dict:
+        peer_uid = self.peer_uid(conn)
+        if peer_uid is not None and peer_uid != os.getuid():
+            return {"ok": False, "error": f"peer uid {peer_uid} is not allowed"}
+        try:
+            raw = b""
+            while b"\n" not in raw and len(raw) < 2_000_000:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                raw += chunk
+            request = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            return {"ok": False, "error": f"invalid request: {exc}"}
+
+        if not isinstance(request, dict) or request.get("op") != "enqueue":
+            return {"ok": False, "error": "unsupported command"}
+        messages = request.get("messages")
+        if not isinstance(messages, list):
+            return {"ok": False, "error": "messages must be a list"}
+        ids = []
+        self.reload_participants()
+        for message in messages:
+            if not isinstance(message, dict):
+                return {"ok": False, "error": "message entry must be an object"}
+            if self.bridge_session and message.get("bridge_session") not in {None, "", self.bridge_session}:
+                return {"ok": False, "error": "bridge_session mismatch"}
+            sender = str(message.get("from") or "")
+            target = str(message.get("to") or "")
+            if sender != "bridge" and sender not in self.participants:
+                return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
+            if target not in self.participants:
+                return {"ok": False, "error": f"target {target!r} is not an active participant"}
+            if not message.get("id"):
+                message["id"] = f"msg-{uuid.uuid4().hex}"
+            message["bridge_session"] = self.bridge_session
+            self.enqueue_ipc_message(message)
+            ids.append(message["id"])
+        return {"ok": True, "ids": ids}
+
+    def peer_uid(self, conn: socket.socket) -> int | None:
+        so_peercred = getattr(socket, "SO_PEERCRED", None)
+        if so_peercred is None:
+            return None
+        try:
+            creds = conn.getsockopt(socket.SOL_SOCKET, so_peercred, struct.calcsize("3i"))
+            _pid, uid, _gid = struct.unpack("3i", creds)
+            return int(uid)
+        except OSError:
+            return None
+
+    def enqueue_ipc_message(self, message: dict) -> None:
+        def mutator(queue: list[dict]) -> None:
+            if not any(item.get("id") == message["id"] for item in queue):
+                queue.append(message)
+
+        self.queue.update(mutator)
+        self.log(
+            "message_queued",
+            message_id=message["id"],
+            from_agent=message.get("from"),
+            to=message.get("to"),
+            kind=message.get("kind"),
+            intent=message.get("intent"),
+            causal_id=message.get("causal_id"),
+            hop_count=message.get("hop_count"),
+            auto_return=message.get("auto_return"),
+            reply_to=message.get("reply_to"),
+            source=message.get("source") or "ipc_enqueue",
+            body=message.get("body"),
+        )
 
     def fallback_session_state(self) -> dict:
         participants = {}
@@ -188,7 +331,7 @@ class BridgeDaemon:
     def reload_participants(self) -> None:
         state = {}
         if self.bridge_session:
-            path = session_file(self.bridge_session)
+            path = self.session_file
             try:
                 mtime_ns = path.stat().st_mtime_ns
             except FileNotFoundError:
@@ -196,7 +339,7 @@ class BridgeDaemon:
             if mtime_ns == self.session_mtime_ns and self.participants:
                 return
             self.session_mtime_ns = mtime_ns
-            state = load_session(self.bridge_session)
+            state = read_json(path, {"session": self.bridge_session})
         if not active_participants(state):
             state = self.fallback_session_state()
         self.session_state = state
@@ -592,43 +735,48 @@ class BridgeDaemon:
     def follow(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state_file.touch(exist_ok=True)
+        self.start_command_server()
 
-        with self.state_file.open("r", encoding="utf-8") as stream:
-            if not self.from_start:
-                stream.seek(0, os.SEEK_END)
+        try:
+            with self.state_file.open("r", encoding="utf-8") as stream:
+                if not self.from_start:
+                    stream.seek(0, os.SEEK_END)
 
-            self.log(
-                "daemon_started",
-                participants=sorted(self.participants),
-                panes=self.panes,
-                bridge_session=self.bridge_session,
-                max_hops=self.max_hops,
-                dry_run=self.dry_run,
-            )
+                self.log(
+                    "daemon_started",
+                    participants=sorted(self.participants),
+                    panes=self.panes,
+                    bridge_session=self.bridge_session,
+                    max_hops=self.max_hops,
+                    dry_run=self.dry_run,
+                    command_socket=str(self.command_socket) if self.command_socket else "",
+                )
 
-            self.try_deliver()
+                self.try_deliver()
 
-            while True:
-                if self.stop_requested():
-                    break
-                self.requeue_stale_inflight()
-                if self.stop_requested():
-                    break
-                line = stream.readline()
-                if not line:
-                    if self.once:
+                while True:
+                    if self.stop_requested():
                         break
-                    time.sleep(0.25)
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                self.handle_record(record)
-                if self.stop_requested():
-                    break
+                    self.requeue_stale_inflight()
+                    if self.stop_requested():
+                        break
+                    line = stream.readline()
+                    if not line:
+                        if self.once:
+                            break
+                        time.sleep(0.25)
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    self.handle_record(record)
+                    if self.stop_requested():
+                        break
 
-            self.log("daemon_stopped")
+                self.log("daemon_stopped")
+        finally:
+            self.stop_command_server()
 
 
 def main() -> int:
@@ -646,6 +794,7 @@ def main() -> int:
     parser.add_argument("--bridge-session")
     parser.add_argument("--session-file")
     parser.add_argument("--stop-file")
+    parser.add_argument("--command-socket")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--stdout-events", action="store_true", help="also print daemon event JSON to stdout")
     args = parser.parse_args()
