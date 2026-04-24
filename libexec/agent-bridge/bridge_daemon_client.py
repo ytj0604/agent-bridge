@@ -5,7 +5,7 @@ import os
 import subprocess
 
 from bridge_paths import libexec_dir, python_exe
-from bridge_participants import room_status
+from bridge_participants import pid_probe_namespace_untrusted, room_status
 
 
 def auto_restart_enabled() -> bool:
@@ -20,6 +20,12 @@ def ensure_daemon_running(session: str) -> str:
     status = room_status(session)
     if status.state in {"alive", "unknown"}:
         return ""
+    if pid_probe_namespace_untrusted():
+        return (
+            f"{status.reason}. This command is running inside a sandbox/PID namespace, "
+            "so it will not auto-start a bridge daemon that would lack host tmux access. "
+            "Restart or reattach the bridge room from the host tmux shell."
+        )
     if not auto_restart_enabled():
         return ""
     proc = subprocess.run(

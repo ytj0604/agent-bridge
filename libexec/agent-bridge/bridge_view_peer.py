@@ -9,15 +9,14 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
 import sys
 import time
 import uuid
 
 from bridge_identity import resolve_caller_from_pane
-from bridge_participants import active_participants, load_session, normalize_alias
+from bridge_participants import active_participants, load_session, normalize_alias, room_status
 from bridge_paths import state_root
-from bridge_util import read_json, utc_now, write_json_atomic
+from bridge_util import TmuxCaptureError, append_jsonl, read_json, run_tmux_capture, utc_now, write_json_atomic
 
 
 DEFAULT_LINES = 120
@@ -79,22 +78,112 @@ def resolve_target(state: dict, caller: str, target: str, allow_self: bool) -> d
     return record
 
 
-def run_tmux_capture(pane: str, start: int, end: int | str | None = None, raw: bool = False) -> str:
-    cmd = ["tmux", "capture-pane", "-p", "-t", pane, "-S", str(start)]
-    if end is not None and str(end) != "-1":
-        cmd += ["-E", str(end)]
-    if raw:
-        cmd.insert(2, "-e")
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if proc.returncode != 0:
-        raise SystemExit(f"agent_view_peer: tmux capture failed for pane {pane}: {(proc.stderr or proc.stdout).strip()}")
-    return proc.stdout
+def capture_response_dir(session: str) -> Path:
+    return state_root() / session / "captures" / "responses"
 
 
-def capture_text(args: argparse.Namespace, pane: str, start: int, end: int | str | None = None, raw: bool = False) -> str:
+def capture_bus_file(session: str, state: dict | None = None) -> Path:
+    if state:
+        raw = state.get("bus_file") or state.get("state_file")
+        if raw:
+            return Path(str(raw))
+    return state_root() / session / "events.raw.jsonl"
+
+
+def capture_via_daemon(
+    args: argparse.Namespace,
+    *,
+    session: str,
+    caller: str,
+    target: str,
+    state: dict,
+    pane: str,
+    start: int,
+    end: int | str | None = None,
+    raw: bool = False,
+    direct_error: str = "",
+) -> str:
+    request_id = f"cap-{uuid.uuid4().hex}"
+    status = room_status(session)
+    if status.state not in {"alive", "unknown"}:
+        raise SystemExit(
+            "agent_view_peer: local tmux capture failed and daemon capture is unavailable. "
+            f"tmux error: {direct_error}. daemon status: {status.reason}. "
+            "Restart or reattach the bridge room from the host tmux shell."
+        )
+    response_file = capture_response_dir(session) / f"{request_id}.json"
+    request = {
+        "ts": utc_now(),
+        "agent": "bridge",
+        "event": "capture_request",
+        "bridge_session": session,
+        "request_id": request_id,
+        "from_agent": caller,
+        "target": target,
+        "pane": pane,
+        "start": start,
+        "end": end,
+        "raw": bool(raw),
+        "response_file": str(response_file),
+        "direct_error": direct_error,
+    }
+    try:
+        response_file.parent.mkdir(parents=True, exist_ok=True)
+        append_jsonl(capture_bus_file(session, state), request)
+    except OSError as exc:
+        raise SystemExit(
+            "agent_view_peer: local tmux capture failed and daemon capture could not be requested. "
+            f"tmux error: {direct_error}. request error: {exc}. "
+            "Recreate the room with AGENT_BRIDGE_RUNTIME_DIR pointing to a writable path shared by the agents."
+        ) from exc
+
+    deadline = time.time() + max(0.1, float(args.capture_timeout))
+    while time.time() < deadline:
+        if response_file.exists():
+            response = read_json(response_file, {})
+            response_file.unlink(missing_ok=True)
+            if response.get("ok"):
+                return str(response.get("text") or "")
+            raise SystemExit(f"agent_view_peer: daemon capture failed for pane {pane}: {response.get('error') or 'unknown error'}")
+        time.sleep(0.1)
+
+    response_file.unlink(missing_ok=True)
+    raise SystemExit(
+        "agent_view_peer: local tmux capture failed and daemon capture timed out. "
+        f"tmux error: {direct_error}. "
+        "Check that the bridge daemon is running and that the room runtime is writable/shared."
+    )
+
+
+def capture_text(
+    args: argparse.Namespace,
+    *,
+    session: str,
+    caller: str,
+    target: str,
+    state: dict,
+    pane: str,
+    start: int,
+    end: int | str | None = None,
+    raw: bool = False,
+) -> str:
     if args.capture_file:
         return Path(args.capture_file).read_text(encoding="utf-8", errors="replace")
-    return run_tmux_capture(pane, start, end, raw=raw)
+    try:
+        return run_tmux_capture(pane, start, end, raw=raw)
+    except TmuxCaptureError as exc:
+        return capture_via_daemon(
+            args,
+            session=session,
+            caller=caller,
+            target=target,
+            state=state,
+            pane=pane,
+            start=start,
+            end=end,
+            raw=raw,
+            direct_error=str(exc),
+        )
 
 
 def clean_lines(text: str, raw: bool = False) -> list[str]:
@@ -409,8 +498,8 @@ def render_output(
     print(f"Next: agent_view_peer {target} --older | agent_view_peer {target} --since-last | agent_view_peer {target} --search '<text>'")
 
 
-def handle_onboard(args: argparse.Namespace, session: str, caller: str, target: str, record: dict, lines_count: int, max_chars: int, cache_writable: bool) -> None:
-    text = capture_text(args, str(record["pane"]), -SNAPSHOT_CAPTURE_LINES, None, raw=args.raw)
+def handle_onboard(args: argparse.Namespace, session: str, caller: str, target: str, state: dict, record: dict, lines_count: int, max_chars: int, cache_writable: bool) -> None:
+    text = capture_text(args, session=session, caller=caller, target=target, state=state, pane=str(record["pane"]), start=-SNAPSHOT_CAPTURE_LINES, end=None, raw=args.raw)
     lines = clean_lines(text, raw=args.raw)
     page = args.page or 0
     start, end = page_bounds(len(lines), lines_count, page)
@@ -477,8 +566,8 @@ def handle_older(args: argparse.Namespace, session: str, caller: str, target: st
     )
 
 
-def handle_since_last(args: argparse.Namespace, session: str, caller: str, target: str, record: dict, lines_count: int, max_chars: int, cache_writable: bool) -> None:
-    text = capture_text(args, str(record["pane"]), -SINCE_SCAN_LINES, None, raw=args.raw)
+def handle_since_last(args: argparse.Namespace, session: str, caller: str, target: str, state: dict, record: dict, lines_count: int, max_chars: int, cache_writable: bool) -> None:
+    text = capture_text(args, session=session, caller=caller, target=target, state=state, pane=str(record["pane"]), start=-SINCE_SCAN_LINES, end=None, raw=args.raw)
     lines = clean_lines(text, raw=args.raw)
     previous = load_cursor(session, caller, target)
     delta, confidence, note = compute_since_delta(previous, lines)
@@ -503,7 +592,7 @@ def handle_since_last(args: argparse.Namespace, session: str, caller: str, targe
     )
 
 
-def handle_search(args: argparse.Namespace, session: str, caller: str, target: str, record: dict, lines_count: int, max_chars: int) -> None:
+def handle_search(args: argparse.Namespace, session: str, caller: str, target: str, state: dict, record: dict, lines_count: int, max_chars: int) -> None:
     cursor = load_cursor(session, caller, target)
     snapshot_id = "" if args.live else str(args.snapshot or cursor.get("snapshot_id") or "")
     snapshot_age = ""
@@ -512,7 +601,7 @@ def handle_search(args: argparse.Namespace, session: str, caller: str, target: s
         snapshot_age = human_age_from_iso(str(meta.get("created_at") or ""))
         source = f"snapshot={snapshot_id} ({snapshot_age})"
     else:
-        text = capture_text(args, str(record["pane"]), -SNAPSHOT_CAPTURE_LINES, None, raw=args.raw)
+        text = capture_text(args, session=session, caller=caller, target=target, state=state, pane=str(record["pane"]), start=-SNAPSHOT_CAPTURE_LINES, end=None, raw=args.raw)
         lines = clean_lines(text, raw=args.raw)
         source = "live scrollback"
     query = str(args.search)
@@ -550,9 +639,9 @@ def handle_search(args: argparse.Namespace, session: str, caller: str, target: s
     )
 
 
-def handle_live(args: argparse.Namespace, session: str, caller: str, target: str, record: dict, lines_count: int, max_chars: int, cache_writable: bool) -> None:
+def handle_live(args: argparse.Namespace, session: str, caller: str, target: str, state: dict, record: dict, lines_count: int, max_chars: int, cache_writable: bool) -> None:
     page = args.page or 0
-    text = capture_text(args, str(record["pane"]), -SNAPSHOT_CAPTURE_LINES, None, raw=args.raw)
+    text = capture_text(args, session=session, caller=caller, target=target, state=state, pane=str(record["pane"]), start=-SNAPSHOT_CAPTURE_LINES, end=None, raw=args.raw)
     lines = clean_lines(text, raw=args.raw)
     start, end = page_bounds(len(lines), lines_count, page)
     update_since_cursor(session, caller, target, lines, {"live_page": page}, cache_writable=cache_writable)
@@ -587,6 +676,7 @@ def main() -> int:
     parser.add_argument("--page", type=int, help="latest-based page number; 0 is newest")
     parser.add_argument("--lines", type=int, default=DEFAULT_LINES)
     parser.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS)
+    parser.add_argument("--capture-timeout", type=float, default=10.0, help="seconds to wait for daemon-mediated capture fallback")
     parser.add_argument("--context", type=int, default=SEARCH_CONTEXT, help="search context lines")
     parser.add_argument("--raw", action="store_true", help="preserve raw capture text as much as possible")
     parser.add_argument("--self", action="store_true", help="allow viewing the caller's own pane")
@@ -620,15 +710,15 @@ def main() -> int:
 
     with optional_captures_lock(session) as cache_writable:
         if args.onboard:
-            handle_onboard(args, session, caller, target, record, lines_count, max_chars, cache_writable)
+            handle_onboard(args, session, caller, target, state, record, lines_count, max_chars, cache_writable)
         elif args.older:
             handle_older(args, session, caller, target, record, lines_count, max_chars, cache_writable)
         elif args.since_last:
-            handle_since_last(args, session, caller, target, record, lines_count, max_chars, cache_writable)
+            handle_since_last(args, session, caller, target, state, record, lines_count, max_chars, cache_writable)
         elif args.search:
-            handle_search(args, session, caller, target, record, lines_count, max_chars)
+            handle_search(args, session, caller, target, state, record, lines_count, max_chars)
         else:
-            handle_live(args, session, caller, target, record, lines_count, max_chars, cache_writable)
+            handle_live(args, session, caller, target, state, record, lines_count, max_chars, cache_writable)
     return 0
 
 

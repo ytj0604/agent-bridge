@@ -8,11 +8,16 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import subprocess
 from typing import Any, Callable, Iterator
 
 
 MESSAGE_KINDS = {"request", "result", "notice"}
 DEFAULT_REDACT_FIELDS = {"prompt", "last_assistant_message", "body", "tool_input", "transcript_path"}
+
+
+class TmuxCaptureError(RuntimeError):
+    pass
 
 
 def utc_now() -> str:
@@ -93,6 +98,18 @@ def append_jsonl(path: Path, record: dict) -> None:
         os.write(fd, line.encode("utf-8"))
     finally:
         os.close(fd)
+
+
+def run_tmux_capture(target: str, start: int, end: int | str | None = None, raw: bool = False) -> str:
+    cmd = ["tmux", "capture-pane", "-p", "-t", target, "-S", str(start)]
+    if end is not None and str(end) != "-1":
+        cmd += ["-E", str(end)]
+    if raw:
+        cmd.insert(2, "-e")
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        raise TmuxCaptureError((proc.stderr or proc.stdout).strip() or f"tmux capture-pane exited {proc.returncode}")
+    return proc.stdout
 
 
 def public_record(

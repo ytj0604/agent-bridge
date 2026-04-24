@@ -107,13 +107,16 @@ def detach_stale_pane_lock(pane: str, reason: str) -> dict:
 def update_attached_endpoint(mapping: dict, pane: str, target: str | None = None, *, persist: bool = True) -> dict:
     if not mapping or not pane:
         return mapping
-    target = target or tmux_target_for_pane(pane)
     agent_type = str(mapping.get("agent") or "")
     session_id = str(mapping.get("session_id") or "")
     bridge_session = str(mapping.get("bridge_session") or "")
     alias = str(mapping.get("alias") or "")
     if not (agent_type and session_id and bridge_session and alias):
         return mapping
+    if persist:
+        target = target or tmux_target_for_pane(pane)
+    else:
+        target = target or str(mapping.get("target") or "") or pane
 
     updated = dict(mapping)
     updated.update({"pane": pane, "target": target, "last_seen_at": utc_now()})

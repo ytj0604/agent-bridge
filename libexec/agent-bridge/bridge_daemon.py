@@ -19,13 +19,16 @@ from typing import Any, Callable
 from bridge_identity import resolve_participant_endpoint
 from bridge_participants import active_participants, participant_record
 from bridge_paths import model_bin_dir, state_root
-from bridge_util import append_jsonl, locked_json, normalize_kind, public_record, read_json, utc_now
+from bridge_util import append_jsonl, locked_json, normalize_kind, public_record, read_json, run_tmux_capture, utc_now
 
 
 PHYSICAL_AGENT_TYPES = {"claude", "codex"}
 MAX_BODY_CHARS = 12000
 MAX_PROCESSED_RETURNS = 4096
 MAX_NONCE_CACHE = 1024
+MAX_PROCESSED_CAPTURE_REQUESTS = 4096
+MAX_CAPTURE_REQUEST_AGE_SECONDS = 60
+CAPTURE_RESPONSE_TTL_SECONDS = 60 * 60
 _STOP_SIGNAL: int | None = None
 
 
@@ -175,7 +178,9 @@ class BridgeDaemon:
         self.current_prompt_by_agent: dict[str, dict] = {}
         self.injected_by_nonce: OrderedDict[str, dict] = OrderedDict()
         self.processed_returns = BoundedSet(MAX_PROCESSED_RETURNS)
+        self.processed_capture_requests = BoundedSet(MAX_PROCESSED_CAPTURE_REQUESTS)
         self.last_maintenance = 0.0
+        self.last_capture_cleanup = 0.0
         self.stop_logged = False
         self.reload_participants()
 
@@ -380,6 +385,12 @@ class BridgeDaemon:
             append_jsonl(self.public_state_file, public_record(record))
         if self.stdout_events:
             print(json.dumps(record, ensure_ascii=True), flush=True)
+
+    def safe_log(self, event: str, **fields) -> None:
+        try:
+            self.log(event, **fields)
+        except OSError:
+            pass
 
     def remember_nonce(self, nonce: str, message: dict) -> None:
         self.injected_by_nonce[nonce] = dict(message)
@@ -714,28 +725,164 @@ class BridgeDaemon:
         if target in self.participants:
             self.try_deliver(str(target))
 
-    def handle_record(self, record: dict) -> None:
-        if self.bridge_session:
-            record_session = record.get("bridge_session")
-            if record.get("agent") in PHYSICAL_AGENT_TYPES and record_session != self.bridge_session:
-                return
-            if record.get("event") == "message_queued" and record_session and record_session != self.bridge_session:
-                return
+    def record_age_seconds(self, record: dict) -> float | None:
+        raw = str(record.get("ts") or "")
+        if not raw:
+            return None
+        try:
+            stamp = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+            return max(0.0, time.time() - datetime.fromisoformat(stamp).timestamp())
+        except (TypeError, ValueError):
+            return None
 
-        event = record.get("event")
-        if event == "message_queued":
-            self.handle_external_message_queued(record)
+    def cleanup_capture_responses(self, *, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self.last_capture_cleanup < 60.0:
             return
-        if event == "prompt_submitted":
-            self.handle_prompt_submitted(record)
+        self.last_capture_cleanup = now
+        root = self.state_file.parent / "captures" / "responses"
+        if not root.exists():
             return
-        if event == "response_finished":
-            self.handle_response_finished(record)
+        for path in root.glob("*.json"):
+            try:
+                if now - path.stat().st_mtime > CAPTURE_RESPONSE_TTL_SECONDS:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                continue
+
+    def safe_response_file(self, raw: object) -> Path | None:
+        if not raw:
+            return None
+        try:
+            path = Path(str(raw)).resolve()
+            allowed = (self.state_file.parent / "captures" / "responses").resolve()
+            path.relative_to(allowed)
+            return path
+        except (OSError, ValueError):
+            return None
+
+    def write_capture_response(self, response_file: Path | None, payload: dict) -> None:
+        if response_file is None:
+            return
+        try:
+            response_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = response_file.with_suffix(response_file.suffix + f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=True) + "\n", encoding="utf-8")
+            os.replace(tmp, response_file)
+        except OSError as exc:
+            self.safe_log("capture_response_write_failed", response_file=str(response_file), error=str(exc))
+
+    def handle_capture_request(self, record: dict) -> None:
+        request_id = str(record.get("request_id") or "")
+        requester = str(record.get("from_agent") or "")
+        target = str(record.get("target") or "")
+        response_file = self.safe_response_file(record.get("response_file"))
+        self.reload_participants()
+
+        def fail(error: str) -> None:
+            self.write_capture_response(response_file, {"ok": False, "request_id": request_id, "error": error})
+            self.safe_log("capture_failed", request_id=request_id, from_agent=requester, target=target, error=error)
+
+        if not request_id:
+            fail("missing request_id")
+            return
+        if not self.processed_capture_requests.add(request_id):
+            self.safe_log("capture_skipped", request_id=request_id, from_agent=requester, target=target, reason="duplicate_request")
+            return
+        age = self.record_age_seconds(record)
+        if age is not None and age > MAX_CAPTURE_REQUEST_AGE_SECONDS:
+            self.safe_log("capture_skipped", request_id=request_id, from_agent=requester, target=target, reason="stale_request", age_seconds=round(age, 3))
+            return
+        if requester not in self.participants:
+            fail(f"requester {requester!r} is not an active participant")
+            return
+        participant = self.participants.get(target)
+        if not participant:
+            fail(f"target {target!r} is not an active participant")
+            return
+        endpoint = resolve_participant_endpoint(self.bridge_session or "", target, participant)
+        if not endpoint:
+            fail(f"target {target!r} has no verified live pane")
+            return
+
+        try:
+            start = int(record.get("start") or -1000)
+        except (TypeError, ValueError):
+            start = -1000
+        start = max(-200000, min(0, start))
+        raw_end = record.get("end")
+        end: int | str | None
+        if raw_end in {None, "", "-"}:
+            end = None
+        else:
+            try:
+                end = int(raw_end)
+            except (TypeError, ValueError):
+                end = str(raw_end)
+        raw = bool(record.get("raw"))
+
+        try:
+            text = run_tmux_capture(endpoint, start, end, raw)
+        except Exception as exc:
+            fail(str(exc))
+            return
+
+        self.write_capture_response(
+            response_file,
+            {
+                "ok": True,
+                "request_id": request_id,
+                "target": target,
+                "pane": endpoint,
+                "text": text,
+                "captured_at": utc_now(),
+            },
+        )
+        self.log(
+            "capture_completed",
+            request_id=request_id,
+            from_agent=requester,
+            target=target,
+            pane=endpoint,
+            text_chars=len(text),
+        )
+
+    def handle_record(self, record: dict) -> None:
+        try:
+            if self.bridge_session:
+                record_session = record.get("bridge_session")
+                if record.get("agent") in PHYSICAL_AGENT_TYPES and record_session != self.bridge_session:
+                    return
+                if record.get("event") == "message_queued" and record_session and record_session != self.bridge_session:
+                    return
+                if record.get("event") == "capture_request" and record_session and record_session != self.bridge_session:
+                    return
+
+            event = record.get("event")
+            if event == "message_queued":
+                self.handle_external_message_queued(record)
+                return
+            if event == "capture_request":
+                self.handle_capture_request(record)
+                return
+            if event == "prompt_submitted":
+                self.handle_prompt_submitted(record)
+                return
+            if event == "response_finished":
+                self.handle_response_finished(record)
+        except Exception as exc:
+            self.safe_log(
+                "record_handler_failed",
+                handled_event=record.get("event"),
+                record_agent=record.get("agent"),
+                error=repr(exc),
+            )
 
     def follow(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state_file.touch(exist_ok=True)
         self.start_command_server()
+        self.cleanup_capture_responses(force=True)
 
         try:
             with self.state_file.open("r", encoding="utf-8") as stream:
@@ -758,6 +905,7 @@ class BridgeDaemon:
                     if self.stop_requested():
                         break
                     self.requeue_stale_inflight()
+                    self.cleanup_capture_responses()
                     if self.stop_requested():
                         break
                     line = stream.readline()
