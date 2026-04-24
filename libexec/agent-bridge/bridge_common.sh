@@ -17,12 +17,19 @@ BRIDGE_BIN_DIR="$BRIDGE_ROOT/bin"
 BRIDGE_MODEL_BIN_DIR="$BRIDGE_ROOT/model-bin"
 BRIDGE_HOOK_DIR="$BRIDGE_ROOT/hooks"
 BRIDGE_LIBEXEC_DIR="$BRIDGE_ROOT/libexec/agent-bridge"
-BRIDGE_STATE_DIR="${AGENT_BRIDGE_STATE_DIR:-$BRIDGE_ROOT/state}"
-BRIDGE_RUN_DIR="${AGENT_BRIDGE_RUN_DIR:-$BRIDGE_ROOT/run}"
-BRIDGE_LOG_DIR="${AGENT_BRIDGE_LOG_DIR:-$BRIDGE_ROOT/log}"
 BRIDGE_PYTHON="${AGENT_BRIDGE_PYTHON:-python3}"
 
 export AGENT_BRIDGE_HOME="$BRIDGE_ROOT"
+
+bridge_runtime_path() {
+  local kind="$1"
+  local fallback="$2"
+  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_paths.py" "$kind" 2>/dev/null || printf '%s\n' "$fallback"
+}
+
+BRIDGE_STATE_DIR="${AGENT_BRIDGE_STATE_DIR:-$(bridge_runtime_path state "$BRIDGE_ROOT/state")}"
+BRIDGE_RUN_DIR="${AGENT_BRIDGE_RUN_DIR:-$(bridge_runtime_path run "$BRIDGE_ROOT/run")}"
+BRIDGE_LOG_DIR="${AGENT_BRIDGE_LOG_DIR:-$(bridge_runtime_path log "$BRIDGE_ROOT/log")}"
 
 bridge_select_menu() {
   local title="$1"

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import errno
 import fcntl
 import json
 import os
@@ -70,8 +71,13 @@ def locked_json(path: Path, default: Any | None = None) -> Iterator[Any]:
 def locked_json_read(path: Path, default: Any | None = None) -> Any:
     if not path.exists():
         return _default_copy({} if default is None else default)
-    with path_lock(path, fcntl.LOCK_SH):
-        return read_json(path, default)
+    try:
+        with path_lock(path, fcntl.LOCK_SH):
+            return read_json(path, default)
+    except OSError as exc:
+        if exc.errno in {errno.EROFS, errno.EACCES, errno.EPERM}:
+            return read_json(path, default)
+        raise
 
 
 def update_locked_json(path: Path, default: Any, mutator: Callable[[Any], Any]) -> Any:
