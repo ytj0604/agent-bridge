@@ -5,6 +5,7 @@ import os
 import subprocess
 
 from bridge_paths import libexec_dir, python_exe
+from bridge_participants import room_inactive_reason
 
 
 def auto_restart_enabled() -> bool:
@@ -13,6 +14,10 @@ def auto_restart_enabled() -> bool:
 
 
 def ensure_daemon_running(session: str) -> str:
+    # Fast path must be read-only: listing/sending should not take daemon locks
+    # when the pid file already proves the room daemon is alive.
+    if not room_inactive_reason(session):
+        return ""
     if not auto_restart_enabled():
         return ""
     proc = subprocess.run(

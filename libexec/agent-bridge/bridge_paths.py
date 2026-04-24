@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import json
 from pathlib import Path
 
 
@@ -25,6 +26,49 @@ def _can_write_dir(path: Path) -> bool:
         return False
 
 
+def _config_base() -> Path:
+    override = os.environ.get("AGENT_BRIDGE_CONFIG_DIR")
+    if override:
+        return _expand(override)
+    if os.environ.get("XDG_CONFIG_HOME"):
+        return _expand(os.environ["XDG_CONFIG_HOME"]) / APP_NAME
+    return Path.home().expanduser() / ".config" / APP_NAME
+
+
+def runtime_config_file() -> Path:
+    override = os.environ.get("AGENT_BRIDGE_RUNTIME_FILE")
+    if override:
+        return _expand(override)
+    return _config_base() / "runtime.json"
+
+
+def _read_runtime_config() -> dict:
+    path = runtime_config_file()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_runtime_config(data: dict) -> None:
+    path = runtime_config_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _pinned_path(key: str) -> Path | None:
+    raw = (_read_runtime_config().get("runtime") or {}).get(key)
+    if not raw:
+        return None
+    try:
+        return _expand(str(raw))
+    except OSError:
+        return None
+
+
 def _user_state_base() -> Path:
     candidates: list[Path] = []
     if os.environ.get("XDG_STATE_HOME"):
@@ -38,10 +82,19 @@ def _user_state_base() -> Path:
     return candidates[-1].resolve()
 
 
-def _runtime_dir(env_name: str, legacy_name: str, fallback_subdir: str | None = None) -> Path:
+def _runtime_dir(
+    env_name: str,
+    legacy_name: str,
+    fallback_subdir: str | None = None,
+    *,
+    pin_key: str,
+) -> Path:
     override = os.environ.get(env_name)
     if override:
         return _expand(override)
+    pinned = _pinned_path(pin_key)
+    if pinned is not None:
+        return pinned
     legacy = install_root() / legacy_name
     if _can_write_dir(legacy):
         return legacy
@@ -73,13 +126,16 @@ def libexec_dir() -> Path:
 
 
 def state_root() -> Path:
-    return _runtime_dir("AGENT_BRIDGE_STATE_DIR", "state")
+    return _runtime_dir("AGENT_BRIDGE_STATE_DIR", "state", pin_key="state_root")
 
 
 def run_root() -> Path:
     override = os.environ.get("AGENT_BRIDGE_RUN_DIR")
     if override:
         return _expand(override)
+    pinned = _pinned_path("run_root")
+    if pinned is not None:
+        return pinned
     legacy = install_root() / "run"
     if _can_write_dir(legacy):
         return legacy
@@ -88,11 +144,53 @@ def run_root() -> Path:
         runtime = _expand(xdg_runtime) / APP_NAME
         if _can_write_dir(runtime):
             return runtime
-    return state_root() / "run"
+    state_run = state_root() / "run"
+    if _can_write_dir(state_run):
+        return state_run
+    return _user_state_base() / "run"
 
 
 def log_root() -> Path:
-    return _runtime_dir("AGENT_BRIDGE_LOG_DIR", "log", "log")
+    return _runtime_dir("AGENT_BRIDGE_LOG_DIR", "log", "log", pin_key="log_root")
+
+
+def require_writable_dir(path: Path, label: str) -> None:
+    if _can_write_dir(path):
+        return
+    raise RuntimeError(
+        f"Agent Bridge {label} is not writable: {path}. "
+        "Fix the directory permissions, or stop/recreate the bridge room with AGENT_BRIDGE_STATE_DIR/AGENT_BRIDGE_RUN_DIR/AGENT_BRIDGE_LOG_DIR pointing to writable paths."
+    )
+
+
+def ensure_runtime_writable() -> None:
+    require_writable_dir(state_root(), "state_root")
+    require_writable_dir(run_root(), "run_root")
+    require_writable_dir(log_root(), "log_root")
+
+
+def pin_runtime_roots() -> dict:
+    roots = {
+        "state_root": str(state_root()),
+        "run_root": str(run_root()),
+        "log_root": str(log_root()),
+    }
+    for label, raw in roots.items():
+        require_writable_dir(Path(raw), label)
+    config = _read_runtime_config()
+    if (config.get("runtime") or {}) == roots:
+        return config
+    config["version"] = 1
+    config["install_root"] = str(install_root())
+    config["runtime"] = roots
+    try:
+        _write_runtime_config(config)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Agent Bridge cannot write runtime config: {runtime_config_file()}: {exc}. "
+            "Fix permissions or set AGENT_BRIDGE_RUNTIME_FILE to a writable config path."
+        ) from exc
+    return config
 
 
 def python_exe() -> str:
@@ -108,8 +206,9 @@ def internal_path(name: str) -> Path:
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or sys.argv[1] not in {"install", "bin", "model-bin", "hook", "libexec", "state", "run", "log"}:
-        print("usage: bridge_paths.py install|bin|model-bin|hook|libexec|state|run|log", file=sys.stderr)
+    keys = {"install", "bin", "model-bin", "hook", "libexec", "state", "run", "log", "runtime-config"}
+    if len(sys.argv) != 2 or sys.argv[1] not in keys:
+        print("usage: bridge_paths.py install|bin|model-bin|hook|libexec|state|run|log|runtime-config", file=sys.stderr)
         return 2
     key = sys.argv[1]
     paths = {
@@ -121,6 +220,7 @@ def main() -> int:
         "state": state_root,
         "run": run_root,
         "log": log_root,
+        "runtime-config": runtime_config_file,
     }
     print(paths[key]())
     return 0

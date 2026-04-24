@@ -104,7 +104,7 @@ def detach_stale_pane_lock(pane: str, reason: str) -> dict:
     return removed
 
 
-def update_attached_endpoint(mapping: dict, pane: str, target: str | None = None) -> dict:
+def update_attached_endpoint(mapping: dict, pane: str, target: str | None = None, *, persist: bool = True) -> dict:
     if not mapping or not pane:
         return mapping
     target = target or tmux_target_for_pane(pane)
@@ -117,6 +117,9 @@ def update_attached_endpoint(mapping: dict, pane: str, target: str | None = None
 
     updated = dict(mapping)
     updated.update({"pane": pane, "target": target, "last_seen_at": utc_now()})
+
+    if not persist:
+        return updated
 
     with locked_json(attached_sessions_file(), {"version": 1, "sessions": {}}) as data:
         sessions = data.setdefault("sessions", {})
@@ -290,7 +293,7 @@ def resolve_caller_from_pane(
     if live:
         mapping = read_attached_mapping(str(live.get("agent") or ""), str(live.get("session_id") or ""))
         if mapping:
-            mapping = update_attached_endpoint(mapping, pane, str(live.get("target") or ""))
+            mapping = update_attached_endpoint(mapping, pane, str(live.get("target") or ""), persist=False)
             session = str(mapping.get("bridge_session") or "")
             alias = str(mapping.get("alias") or "")
             if explicit_session and explicit_session != session:
@@ -307,13 +310,18 @@ def resolve_caller_from_pane(
             )
 
         lock = read_pane_lock(pane)
+        stale_detail = ""
         if lock:
-            detach_stale_pane_lock(pane, "pane live session is not attached to this bridge room")
+            stale_detail = (
+                f" A stale pane lock still points at room {lock.get('bridge_session')!r} "
+                f"alias {lock.get('alias')!r}, but this live session is different."
+            )
         return CallerResolution(
             False,
             error=(
                 f"{tool_name}: current pane hosts {live.get('agent')} session {live.get('session_id')}, "
-                "which is not attached to any active bridge room. Use bridge_manage to join it."
+                "which is not attached to any active bridge room."
+                f"{stale_detail} Use bridge_manage to join it."
             ),
         )
 
@@ -338,7 +346,7 @@ def resolve_participant_endpoint(bridge_session: str, alias: str, participant: d
         if live:
             mapping = read_attached_mapping(agent_type, session_id)
             if mapping and mapping.get("bridge_session") == bridge_session and mapping.get("alias") == alias:
-                mapping = update_attached_endpoint(mapping, str(live.get("pane") or pane), str(live.get("target") or ""))
+                mapping = update_attached_endpoint(mapping, str(live.get("pane") or pane), str(live.get("target") or ""), persist=False)
                 return str(mapping.get("pane") or "")
         if pane:
             live_pane = read_live_by_pane(pane)

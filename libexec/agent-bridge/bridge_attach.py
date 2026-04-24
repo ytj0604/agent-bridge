@@ -18,17 +18,25 @@ from pathlib import Path
 from bridge_participants import ALIAS_RE
 from bridge_identity import detach_stale_pane_lock
 from bridge_instructions import probe_prompt
-from bridge_paths import install_root, libexec_dir, model_bin_dir, run_root, state_root
+from bridge_paths import install_root, libexec_dir, model_bin_dir, pin_runtime_roots, run_root, state_root
 from bridge_ui import read_key, terminal_cells, terminal_width, truncate_to_cells
 from bridge_util import locked_json, path_lock, utc_now, write_json_atomic
 
 
 ROOT = install_root()
-STATE_ROOT = state_root()
-REGISTRY_FILE = STATE_ROOT / "attached-sessions.json"
-PANE_LOCKS_FILE = STATE_ROOT / "pane-locks.json"
-DISCOVERY_FILE = STATE_ROOT / "attach-discovery.jsonl"
 VALID_AGENTS = {"claude", "codex"}
+
+
+def registry_file() -> Path:
+    return state_root() / "attached-sessions.json"
+
+
+def pane_locks_file() -> Path:
+    return state_root() / "pane-locks.json"
+
+
+def discovery_file() -> Path:
+    return state_root() / "attach-discovery.jsonl"
 
 
 class AttachCancelled(KeyboardInterrupt):
@@ -639,19 +647,20 @@ def wait_for_probe(probe_id: str, agent: str, timeout: float, alias: str = "", p
     offset = 0
     frame = 0
     label = f"{alias or agent} ({agent})"
-    DISCOVERY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DISCOVERY_FILE.touch(exist_ok=True)
+    path = discovery_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(exist_ok=True)
     while time.time() < deadline:
         elapsed = time.time() - started
         render_probe_wait(label, elapsed, timeout, frame)
         frame += 1
         try:
-            size = DISCOVERY_FILE.stat().st_size
+            size = path.stat().st_size
         except FileNotFoundError:
             size = 0
         if size < offset:
             offset = 0
-        with DISCOVERY_FILE.open("r", encoding="utf-8") as stream:
+        with path.open("r", encoding="utf-8") as stream:
             stream.seek(offset)
             for line in stream:
                 line = line.strip()
@@ -677,7 +686,7 @@ def wait_for_probe(probe_id: str, agent: str, timeout: float, alias: str = "", p
 
 
 def update_registry(mappings: list[dict], bridge_session: str) -> None:
-    with locked_json(REGISTRY_FILE, {"version": 1, "sessions": {}}) as data:
+    with locked_json(registry_file(), {"version": 1, "sessions": {}}) as data:
         sessions = data.setdefault("sessions", {})
         for key in list(sessions):
             if sessions[key].get("bridge_session") == bridge_session:
@@ -721,7 +730,7 @@ def prepare_room_state_files(
     bus_file: Path,
     queue_file: Path,
 ) -> dict:
-    legacy_session_migration_file = STATE_ROOT / f"session-{session}.json"
+    legacy_session_migration_file = state_root() / f"session-{session}.json"
     candidates = [
         events_file,
         bus_file,
@@ -775,7 +784,7 @@ def prepare_room_state_files(
 
 
 def update_pane_locks(mappings: list[dict], bridge_session: str, replace: bool) -> None:
-    with locked_json(PANE_LOCKS_FILE, {"version": 1, "panes": {}}) as data:
+    with locked_json(pane_locks_file(), {"version": 1, "panes": {}}) as data:
         panes = data.setdefault("panes", {})
         for pane_id, record in list(panes.items()):
             if record.get("bridge_session") == bridge_session:
@@ -1039,13 +1048,24 @@ def main() -> int:
                 print(f"- {item['alias']} ({item['agent']}): {pane.get('pane_id')} {pane.get('target')}")
         return 0
 
-    state_dir = STATE_ROOT / args.session
+    try:
+        pin_runtime_roots()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    state_dir = state_root() / args.session
     events_file = state_dir / "events.jsonl"
     bus_file = state_dir / "events.raw.jsonl"
     queue_file = state_dir / "pending.json"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    DISCOVERY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DISCOVERY_FILE.touch(exist_ok=True)
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        discovery_file().parent.mkdir(parents=True, exist_ok=True)
+        discovery_file().touch(exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(
+            f"Agent Bridge state root is not writable while creating room {args.session!r}: {state_root()}: {exc}. "
+            "Restore write permissions, or recreate the room with AGENT_BRIDGE_STATE_DIR pointing to a writable filesystem."
+        ) from exc
 
     probe_records = {}
     if args.no_probe:

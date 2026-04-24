@@ -7,14 +7,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-from bridge_attach import PANE_LOCKS_FILE, REGISTRY_FILE
-from bridge_participants import active_participants, format_peer_summary, load_session, save_session_state
-from bridge_paths import libexec_dir
+from bridge_attach import pane_locks_file, registry_file
+from bridge_participants import active_participants, format_peer_summary, load_session, save_session_state, session_state_exists
+from bridge_paths import ensure_runtime_writable, libexec_dir, state_root
 from bridge_util import locked_json
 
 
 def remove_registry_entries(session: str, alias: str, pane: str, hook_session_id: str) -> None:
-    for path, top_key in ((REGISTRY_FILE, "sessions"), (PANE_LOCKS_FILE, "panes")):
+    for path, top_key in ((registry_file(), "sessions"), (pane_locks_file(), "panes")):
         with locked_json(path, {"version": 1, top_key: {}}) as data:
             records = data.setdefault(top_key, {})
             for key, record in list(records.items()):
@@ -66,6 +66,16 @@ def main() -> int:
     parser.add_argument("--no-notify", action="store_true")
     parser.add_argument("--json", action="store_true", help="print leave result as JSON")
     args = parser.parse_args()
+
+    try:
+        ensure_runtime_writable()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    if not session_state_exists(args.session):
+        raise SystemExit(
+            f"bridge room {args.session!r} is not present under pinned state root {state_root()}. "
+            "Use bridge_run to create/attach the room, or check the runtime config path with bridge_healthcheck."
+        )
 
     state = load_session(args.session)
     participants = active_participants(state)

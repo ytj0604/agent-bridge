@@ -10,21 +10,21 @@ from pathlib import Path
 
 from bridge_attach import (
     AttachProbeTimeout,
-    DISCOVERY_FILE,
-    PANE_LOCKS_FILE,
-    REGISTRY_FILE,
+    discovery_file,
     infer_agent_type,
     interactive_select,
     list_panes,
     load_process_table,
+    pane_locks_file,
     prompt_participant_aliases,
+    registry_file,
     resolve_pane,
     send_prompt,
     wait_for_probe,
 )
-from bridge_participants import active_participants, format_peer_summary, load_session, normalize_agent_type, participant_record, save_session_state
+from bridge_participants import active_participants, format_peer_summary, load_session, normalize_agent_type, participant_record, save_session_state, session_state_exists
 from bridge_instructions import probe_prompt
-from bridge_paths import libexec_dir
+from bridge_paths import ensure_runtime_writable, libexec_dir, state_root
 from bridge_util import locked_json, locked_json_read, utc_now
 
 
@@ -45,7 +45,7 @@ def update_registry(mapping: dict) -> None:
     it preserves existing participants and only removes prior records that refer
     to the same pane, hook session, or alias in this bridge room.
     """
-    with locked_json(REGISTRY_FILE, {"version": 1, "sessions": {}}) as data:
+    with locked_json(registry_file(), {"version": 1, "sessions": {}}) as data:
         sessions = data.setdefault("sessions", {})
         bridge_session = mapping["bridge_session"]
         for key, record in list(sessions.items()):
@@ -61,7 +61,7 @@ def update_registry(mapping: dict) -> None:
 
 
 def update_pane_lock(mapping: dict) -> None:
-    with locked_json(PANE_LOCKS_FILE, {"version": 1, "panes": {}}) as data:
+    with locked_json(pane_locks_file(), {"version": 1, "panes": {}}) as data:
         panes = data.setdefault("panes", {})
         panes[mapping["pane"]] = {
             "bridge_session": mapping["bridge_session"],
@@ -95,7 +95,7 @@ def enqueue_membership_notice(session: str, body: str) -> None:
 
 
 def read_pane_locks() -> dict:
-    data = locked_json_read(PANE_LOCKS_FILE, {"version": 1, "panes": {}})
+    data = locked_json_read(pane_locks_file(), {"version": 1, "panes": {}})
     return data.get("panes") or {}
 
 
@@ -155,6 +155,16 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="print join result as JSON")
     args = parser.parse_args()
 
+    try:
+        ensure_runtime_writable()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    if not session_state_exists(args.session):
+        raise SystemExit(
+            f"bridge room {args.session!r} is not present under pinned state root {state_root()}. "
+            "Use bridge_run to create/attach the room, or check the runtime config path with bridge_healthcheck."
+        )
+
     state = load_session(args.session)
     participants = active_participants(state)
     if args.agent_type or args.pane:
@@ -186,8 +196,8 @@ def main() -> int:
             raise SystemExit("--no-probe requires --session-id")
         hook_session_id = args.session_id
     else:
-        DISCOVERY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        DISCOVERY_FILE.touch(exist_ok=True)
+        discovery_file().parent.mkdir(parents=True, exist_ok=True)
+        discovery_file().touch(exist_ok=True)
         probe_id = f"{args.session}:{agent_type}:{uuid.uuid4().hex[:10]}"
         peers = ", ".join(sorted(participants)) or "(none)"
         prompt = probe_prompt("join", probe_id, alias, peers)

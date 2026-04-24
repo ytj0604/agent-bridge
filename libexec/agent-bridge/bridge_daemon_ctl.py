@@ -12,27 +12,32 @@ from pathlib import Path
 
 from bridge_participants import active_participants, load_session, session_state_exists
 from bridge_identity import resolve_participant_endpoint
-from bridge_paths import install_root, libexec_dir, log_root, python_exe, run_root, state_root
+from bridge_paths import ensure_runtime_writable, install_root, libexec_dir, log_root, python_exe, run_root, state_root
 from bridge_util import locked_json, read_json, utc_now, write_json_atomic as write_json
 
 
 ROOT = install_root()
-RUN_DIR = run_root()
-LOG_DIR = log_root()
-STATE_DIR = state_root()
-REGISTRY_FILE = STATE_DIR / "attached-sessions.json"
-PANE_LOCKS_FILE = STATE_DIR / "pane-locks.json"
 PYTHON = python_exe()
 DAEMON = libexec_dir() / "bridge_daemon.py"
 
 
+def registry_file() -> Path:
+    return state_root() / "attached-sessions.json"
+
+
+def pane_locks_file() -> Path:
+    return state_root() / "pane-locks.json"
+
+
 def session_paths(session: str) -> dict[str, Path]:
+    run_dir = run_root()
+    log_dir = log_root()
     return {
-        "pid": RUN_DIR / f"{session}.pid",
-        "meta": RUN_DIR / f"{session}.json",
-        "lock": RUN_DIR / f"{session}.lock",
-        "stop": RUN_DIR / f"{session}.stop",
-        "log": LOG_DIR / f"{session}.daemon.log",
+        "pid": run_dir / f"{session}.pid",
+        "meta": run_dir / f"{session}.json",
+        "lock": run_dir / f"{session}.lock",
+        "stop": run_dir / f"{session}.stop",
+        "log": log_dir / f"{session}.daemon.log",
     }
 
 
@@ -168,8 +173,7 @@ def wait_until_dead(pid: int, timeout: float) -> bool:
 
 
 def cleanup_registry(session: str) -> None:
-    for path in (REGISTRY_FILE, PANE_LOCKS_FILE):
-        top_key = "sessions" if path == REGISTRY_FILE else "panes"
+    for path, top_key in ((registry_file(), "sessions"), (pane_locks_file(), "panes")):
         with locked_json(path, {"version": 1, top_key: {}}) as data:
             records = data.setdefault(top_key, {})
             for key in list(records):
@@ -178,10 +182,11 @@ def cleanup_registry(session: str) -> None:
 
 
 def archive_session_state(session: str) -> str:
-    state_dir = STATE_DIR / session
+    current_state_root = state_root()
+    state_dir = current_state_root / session
     if not state_dir.exists():
         return ""
-    archive_root = STATE_DIR / ".forgotten"
+    archive_root = current_state_root / ".forgotten"
     archive_root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     dest = archive_root / f"{session}-{stamp}"
@@ -198,7 +203,7 @@ def cleanup_stopped_session(session: str, paths: dict[str, Path], cleanup: bool)
     if cleanup:
         cleanup_registry(session)
     # Remove a pre-structured-state file if an older install left one behind.
-    (STATE_DIR / f"session-{session}.json").unlink(missing_ok=True)
+    (state_root() / f"session-{session}.json").unlink(missing_ok=True)
     return archive_session_state(session)
 
 
@@ -304,8 +309,12 @@ def start_under_lock(args: argparse.Namespace, paths: dict[str, Path]) -> dict:
 
 
 def start(args: argparse.Namespace) -> dict:
-    RUN_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        ensure_runtime_writable()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    run_root().mkdir(parents=True, exist_ok=True)
+    log_root().mkdir(parents=True, exist_ok=True)
     paths = session_paths(args.session)
     with paths["lock"].open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -331,11 +340,11 @@ def update_session_daemon_info(session: str, state: dict, daemon_info: dict) -> 
     }
     if daemon_info.get("pid"):
         state["targets"]["daemon"] = f"pid:{daemon_info.get('pid')}"
-    write_json(STATE_DIR / session / "session.json", state)
+    write_json(state_root() / session / "session.json", state)
 
 
 def ensure_args_from_state(session: str, state: dict, args: argparse.Namespace) -> argparse.Namespace:
-    state_dir = Path(state.get("state_dir") or STATE_DIR / session)
+    state_dir = Path(state.get("state_dir") or state_root() / session)
     return argparse.Namespace(
         session=session,
         claude_pane=first_participant_pane(state, "claude"),
@@ -354,8 +363,12 @@ def ensure_args_from_state(session: str, state: dict, args: argparse.Namespace) 
 
 
 def ensure_one(session: str, args: argparse.Namespace) -> dict:
-    RUN_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        ensure_runtime_writable()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    run_root().mkdir(parents=True, exist_ok=True)
+    log_root().mkdir(parents=True, exist_ok=True)
     paths = session_paths(session)
     with paths["lock"].open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -401,6 +414,10 @@ def ensure_one(session: str, args: argparse.Namespace) -> dict:
 
 
 def stop_one(session: str, timeout: float, cleanup: bool) -> dict:
+    try:
+        ensure_runtime_writable()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     paths = session_paths(session)
     remove_lock = False
     with paths["lock"].open("a+", encoding="utf-8") as lock:
@@ -438,6 +455,10 @@ def stop_one(session: str, timeout: float, cleanup: bool) -> dict:
 
 
 def forget_one(session: str, cleanup: bool) -> dict:
+    try:
+        ensure_runtime_writable()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     paths = session_paths(session)
     archived_state = ""
     with paths["lock"].open("a+", encoding="utf-8") as lock:
@@ -456,11 +477,13 @@ def forget_one(session: str, cleanup: bool) -> dict:
 
 def known_sessions() -> list[str]:
     names = set()
-    if RUN_DIR.exists():
-        names.update(path.stem for path in RUN_DIR.glob("*.pid"))
-        names.update(path.stem for path in RUN_DIR.glob("*.json"))
-    if STATE_DIR.exists():
-        for path in STATE_DIR.glob("*/session.json"):
+    current_run_root = run_root()
+    current_state_root = state_root()
+    if current_run_root.exists():
+        names.update(path.stem for path in current_run_root.glob("*.pid"))
+        names.update(path.stem for path in current_run_root.glob("*.json"))
+    if current_state_root.exists():
+        for path in current_state_root.glob("*/session.json"):
             names.add(path.parent.name)
     return sorted(names)
 
@@ -471,7 +494,7 @@ def status_rows(session: str | None = None, all_sessions: bool = False) -> list[
     for name in sessions:
         paths = session_paths(name)
         meta = read_json(paths["meta"], {"session": name})
-        state = read_json(STATE_DIR / name / "session.json", {})
+        state = read_json(state_root() / name / "session.json", {})
         pid = read_pid(paths["pid"])
         alive = bool(pid and is_alive(pid))
         if alive and paths["stop"].exists() and meta.get("status") == "permission_denied":

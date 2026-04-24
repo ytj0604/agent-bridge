@@ -7,7 +7,7 @@ import os
 import shutil
 from pathlib import Path
 
-from bridge_paths import bin_dir, hook_dir, install_root, libexec_dir, log_root, model_bin_dir, run_root, state_root
+from bridge_paths import bin_dir, hook_dir, install_root, libexec_dir, log_root, model_bin_dir, run_root, runtime_config_file, state_root
 
 
 def check_writable(path: Path) -> tuple[bool, str]:
@@ -60,6 +60,9 @@ def main() -> int:
     add("model_bin_dir", model_bin_dir().exists(), str(model_bin_dir()))
     add("hook_dir", hook_dir().exists(), str(hook_dir()))
     add("libexec_dir", libexec_dir().exists(), str(libexec_dir()))
+    add("runtime_config", True, str(runtime_config_file()))
+    ok, detail = check_writable(runtime_config_file().parent)
+    add("runtime_config_dir", ok, detail)
     for label, path in (("state_dir", state_root()), ("run_dir", run_root()), ("log_dir", log_root())):
         ok, detail = check_writable(path)
         add(label, ok, detail)
@@ -89,7 +92,7 @@ def main() -> int:
             status = "ok" if check["ok"] else "fail"
             print(f"{status:4} {check['name']}: {check['detail']}")
 
-    hard_failures = {"install_root", "bin_dir", "model_bin_dir", "hook_dir", "libexec_dir", "state_dir", "run_dir", "log_dir", "python3", "tmux", "agent_send_peer_on_path", "agent_list_peers_on_path", "agent_view_peer_on_path", "bridge_peer_not_on_path", "list_peer_not_on_path", "agent_send_peer_model_tool", "agent_list_peers_model_tool", "agent_view_peer_model_tool", "bridge_hook_entrypoint"}
+    hard_failures = {"install_root", "bin_dir", "model_bin_dir", "hook_dir", "libexec_dir", "runtime_config_dir", "state_dir", "run_dir", "log_dir", "python3", "tmux", "agent_send_peer_on_path", "agent_list_peers_on_path", "agent_view_peer_on_path", "bridge_peer_not_on_path", "list_peer_not_on_path", "agent_send_peer_model_tool", "agent_list_peers_model_tool", "agent_view_peer_model_tool", "bridge_hook_entrypoint"}
     return 1 if any((not c["ok"]) and c["name"] in hard_failures for c in checks) else 0
 
 

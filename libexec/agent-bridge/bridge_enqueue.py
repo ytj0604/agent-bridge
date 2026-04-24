@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import errno
 import os
 import sys
 import uuid
@@ -13,12 +14,23 @@ from bridge_util import MESSAGE_KINDS, append_jsonl, locked_json, normalize_kind
 
 
 STATE_ROOT = state_root()
+WRITE_FAILURE_ERRNOS = {errno.EROFS, errno.EACCES, errno.EPERM}
 
 
 def update_queue(path: Path, message: dict) -> None:
     with locked_json(path, []) as queue:
         if not any(item.get("id") == message["id"] for item in queue):
             queue.append(message)
+
+
+def write_failure_message(path: Path, exc: OSError) -> str:
+    if exc.errno in WRITE_FAILURE_ERRNOS:
+        return (
+            f"agent_send_peer: cannot enqueue message because bridge state is not writable: {path}: {exc.strerror}. "
+            "Identity lookup can read existing room state, but sending requires write access to the room queue. "
+            f"Restore write permissions on {path.parent}, or recreate the room with AGENT_BRIDGE_STATE_DIR pointing to a writable filesystem."
+        )
+    return f"agent_send_peer: failed to write bridge queue/event state: {path}: {exc}"
 
 
 def sender_matches_caller(args: argparse.Namespace, bridge_session: str) -> bool:
@@ -159,10 +171,23 @@ def main() -> int:
             "body": message["body"],
         }
 
-        update_queue(queue_file, message)
-        append_jsonl(state_file, record)
+        try:
+            update_queue(queue_file, message)
+        except OSError as exc:
+            print(write_failure_message(queue_file, exc), file=sys.stderr)
+            return 1
+        try:
+            append_jsonl(state_file, record)
+        except OSError as exc:
+            print(write_failure_message(state_file, exc), file=sys.stderr)
+            return 1
         if public_state_file and Path(public_state_file) != state_file:
-            append_jsonl(Path(public_state_file), public_record(record))
+            public_path = Path(public_state_file)
+            try:
+                append_jsonl(public_path, public_record(record))
+            except OSError as exc:
+                print(write_failure_message(public_path, exc), file=sys.stderr)
+                return 1
         ids.append(message["id"])
     print("\n".join(ids))
     return 0
