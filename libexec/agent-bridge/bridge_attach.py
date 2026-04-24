@@ -53,8 +53,21 @@ def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
 
 
+def require_tmux() -> None:
+    if shutil.which("tmux"):
+        return
+    raise SystemExit(
+        "tmux is not installed or not on PATH. Agent Bridge attaches to tmux panes, so tmux is required.\n"
+        "Install tmux (e.g., `apt install tmux`, `brew install tmux`, or your distro's package manager), then rerun bridge_run."
+    )
+
+
 def tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return run(["tmux", *args], check=check)
+    try:
+        return run(["tmux", *args], check=check)
+    except FileNotFoundError:
+        require_tmux()
+        raise  # unreachable; require_tmux raises SystemExit
 
 
 def sanitize_name(value: str) -> str:
@@ -955,6 +968,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="print full attached bridge state as JSON")
     args = parser.parse_args()
 
+    require_tmux()
     panes = [] if args.no_resolve_pane and args.participant else list_panes()
     if not panes and not (args.no_resolve_pane and args.participant):
         raise SystemExit("no tmux panes found. Start a tmux session with Claude Code/Codex panes, then rerun bridge_run.")

@@ -111,4 +111,9 @@ if [[ "$install_hooks" == "1" ]]; then
   fi
 fi
 
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "warning: tmux not found on PATH. Agent Bridge attaches to tmux panes, so bridge_run will fail until tmux is installed." >&2
+  echo "         install with your package manager, e.g. 'apt install tmux' or 'brew install tmux'." >&2
+fi
+
 echo "run: $bin_dir/bridge_healthcheck"

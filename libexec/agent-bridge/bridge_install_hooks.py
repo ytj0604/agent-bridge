@@ -97,6 +97,18 @@ def install_json_hooks(path: Path, events: dict[str, str | None], command: str, 
     return actions
 
 
+def write_codex_config(path: Path, text: str, dry_run: bool) -> None:
+    if dry_run:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+    except PermissionError as exc:
+        raise SystemExit(f"{path}: permission denied while writing codex config ({exc})")
+
+
 def ensure_codex_hooks_feature(path: Path, dry_run: bool) -> str:
     try:
         text = path.read_text(encoding="utf-8")
@@ -114,15 +126,38 @@ def ensure_codex_hooks_feature(path: Path, dry_run: bool) -> str:
         suffix = "" if text.endswith("\n") or not text else "\n"
         new_text = f"{text}{suffix}\n[features]\ncodex_hooks = true\n"
 
-    if not dry_run:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        try:
-            tmp.write_text(new_text, encoding="utf-8")
-            tmp.replace(path)
-        except PermissionError as exc:
-            raise SystemExit(f"{path}: permission denied while writing codex config ({exc})")
+    write_codex_config(path, new_text, dry_run)
     return f"{path}: codex_hooks enabled"
+
+
+def ensure_disable_paste_burst(path: Path, dry_run: bool) -> str:
+    # bridge_run sends the ~1100-char probe prompt via `tmux send-keys -l`; codex's
+    # TUI paste-burst heuristic swallows it as a "[Pasted Content N chars]" block
+    # and the following Enter fails to submit, so the UserPromptSubmit hook never
+    # fires and attach times out. Forcing this off at install time keeps probes submittable.
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+
+    if re.search(r"(?m)^\s*disable_paste_burst\s*=\s*true\s*$", text):
+        return f"{path}: disable_paste_burst already enabled"
+
+    if re.search(r"(?m)^\s*disable_paste_burst\s*=", text):
+        new_text = re.sub(r"(?m)^(\s*disable_paste_burst\s*=\s*).*$", r"\1true", text)
+    else:
+        match = re.search(r"(?m)^\[", text)
+        if match:
+            prefix = text[: match.start()]
+            rest = text[match.start():]
+            sep = "" if prefix.endswith("\n") or not prefix else "\n"
+            new_text = f"{prefix}{sep}disable_paste_burst = true\n{rest}"
+        else:
+            suffix = "" if text.endswith("\n") or not text else "\n"
+            new_text = f"{text}{suffix}disable_paste_burst = true\n"
+
+    write_codex_config(path, new_text, dry_run)
+    return f"{path}: disable_paste_burst enabled"
 
 
 def main() -> int:
@@ -144,6 +179,7 @@ def main() -> int:
         command = f"{args.hook_command} --agent codex"
         actions.extend(install_json_hooks(Path(args.codex_hooks), CODEX_EVENTS, command, "codex", args.dry_run))
         actions.append(ensure_codex_hooks_feature(Path(args.codex_config), args.dry_run))
+        actions.append(ensure_disable_paste_burst(Path(args.codex_config), args.dry_run))
 
     for action in actions:
         print(action)
