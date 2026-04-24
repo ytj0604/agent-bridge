@@ -6,9 +6,10 @@ import uuid
 from pathlib import Path
 
 from bridge_daemon_client import ensure_daemon_running
+from bridge_identity import resolve_caller_from_pane
 from bridge_participants import active_participants, load_session, resolve_targets, room_inactive_reason
 from bridge_paths import state_root
-from bridge_util import MESSAGE_KINDS, append_jsonl, locked_json, normalize_kind, public_record, read_json, utc_now
+from bridge_util import MESSAGE_KINDS, append_jsonl, locked_json, normalize_kind, public_record, utc_now
 
 
 STATE_ROOT = state_root()
@@ -20,39 +21,18 @@ def update_queue(path: Path, message: dict) -> None:
             queue.append(message)
 
 
-def infer_from_pane(pane: str) -> tuple[str, str]:
-    path = Path(os.environ.get("AGENT_BRIDGE_PANE_LOCKS", str(STATE_ROOT / "pane-locks.json")))
-    data = read_json(path, {"version": 1, "panes": {}})
-    record = (data.get("panes") or {}).get(pane) or {}
-    return str(record.get("bridge_session") or ""), str(record.get("alias") or "")
-
-
 def sender_matches_caller(args: argparse.Namespace, bridge_session: str) -> bool:
     if args.sender == "bridge" or args.allow_spoof:
         return True
-    pane = os.environ.get("TMUX_PANE")
-    if not pane:
-        print(
-            "agent_send_peer: refusing explicit sender outside an attached tmux pane. "
-            "Use --allow-spoof only for explicit admin/test sends.",
-            file=sys.stderr,
-        )
-        return False
-    locked_session, locked_sender = infer_from_pane(pane)
-    if not locked_session or not locked_sender:
-        print(
-            "agent_send_peer: refusing sender from a tmux pane that is not attached to this bridge room. "
-            "Use --allow-spoof only for explicit admin/test sends.",
-            file=sys.stderr,
-        )
-        return False
-    if locked_session == bridge_session and locked_sender == args.sender:
-        return True
-    print(
-        f"agent_send_peer: refusing spoofed sender {args.sender!r}; caller pane is {locked_sender!r} in room {locked_session!r}. "
-        "Use --allow-spoof only for explicit admin/test sends.",
-        file=sys.stderr,
+    resolution = resolve_caller_from_pane(
+        pane=os.environ.get("TMUX_PANE"),
+        explicit_session=bridge_session,
+        explicit_alias=args.sender,
+        tool_name="agent_send_peer",
     )
+    if resolution.ok and resolution.session == bridge_session and resolution.alias == args.sender:
+        return True
+    print(resolution.error or f"agent_send_peer: refusing spoofed sender {args.sender!r}", file=sys.stderr)
     return False
 
 

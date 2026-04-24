@@ -5,64 +5,25 @@ import argparse
 import os
 import subprocess
 import sys
-from pathlib import Path
 
+from bridge_identity import resolve_caller_from_pane
 from bridge_participants import active_participants, load_session
-from bridge_paths import libexec_dir, python_exe, state_root
-from bridge_util import MESSAGE_KINDS, read_json
-
-
-def infer_from_pane(pane: str, pane_locks_file: Path) -> tuple[str, str]:
-    data = read_json(pane_locks_file, {"version": 1, "panes": {}})
-    record = (data.get("panes") or {}).get(pane) or {}
-    return str(record.get("bridge_session") or ""), str(record.get("alias") or "")
+from bridge_paths import libexec_dir, python_exe
+from bridge_util import MESSAGE_KINDS
 
 
 def validate_caller_identity(args: argparse.Namespace, session: str, sender: str) -> tuple[str, str] | None:
-    pane = os.environ.get("TMUX_PANE")
-    if not pane:
-        if args.allow_spoof:
-            return session, sender
-        if args.session or args.sender:
-            print(
-                "agent_send_peer: refusing explicit --session/--from outside an attached tmux pane; "
-                "pass --allow-spoof only for an explicit admin/test send",
-                file=sys.stderr,
-            )
-            return None
-        return session, sender
-
-    pane_locks_file = Path(os.environ.get("AGENT_BRIDGE_PANE_LOCKS", str(state_root() / "pane-locks.json")))
-    locked_session, locked_sender = infer_from_pane(pane, pane_locks_file)
-
-    if args.allow_spoof:
-        return session or locked_session, sender or locked_sender
-
-    if not locked_session or not locked_sender:
-        if args.session or args.sender:
-            print(
-                "agent_send_peer: refusing --session/--from from a tmux pane that is not attached to this bridge room; "
-                "run from an attached agent pane or pass --allow-spoof for an explicit admin/test send",
-                file=sys.stderr,
-            )
-            return None
-        return session, sender
-
-    if args.session and args.session != locked_session:
-        print(
-            f"agent_send_peer: --session {args.session!r} does not match caller pane room {locked_session!r}; "
-            "pass --allow-spoof only for an explicit admin/test send",
-            file=sys.stderr,
-        )
+    resolution = resolve_caller_from_pane(
+        pane=os.environ.get("TMUX_PANE"),
+        explicit_session=session,
+        explicit_alias=sender,
+        allow_spoof=args.allow_spoof,
+        tool_name="agent_send_peer",
+    )
+    if not resolution.ok:
+        print(resolution.error, file=sys.stderr)
         return None
-    if args.sender and args.sender != locked_sender:
-        print(
-            f"agent_send_peer: --from {args.sender!r} does not match caller pane alias {locked_sender!r}; "
-            "pass --allow-spoof only for an explicit admin/test send",
-            file=sys.stderr,
-        )
-        return None
-    return session or locked_session, sender or locked_sender
+    return session or resolution.session, sender or resolution.alias
 
 
 def parse_body_and_target(args: argparse.Namespace, session: str) -> tuple[str | None, str]:

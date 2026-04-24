@@ -5,19 +5,11 @@ import argparse
 import json
 import os
 import sys
-from pathlib import Path
 
 from bridge_daemon_client import ensure_daemon_running
+from bridge_identity import resolve_caller_from_pane
 from bridge_instructions import model_cheat_sheet_text
 from bridge_participants import active_participants, format_peer_list, load_session, room_inactive_reason
-from bridge_paths import state_root
-from bridge_util import locked_json_read
-
-
-def infer_from_pane(pane: str, pane_locks_file: Path) -> tuple[str, str] | tuple[None, None]:
-    data = locked_json_read(pane_locks_file, {"version": 1, "panes": {}})
-    record = (data.get("panes") or {}).get(pane) or {}
-    return record.get("bridge_session"), record.get("alias") or record.get("agent")
 
 
 def main() -> int:
@@ -25,15 +17,23 @@ def main() -> int:
     parser.add_argument("--session")
     parser.add_argument("--from", dest="sender")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--pane-locks-file", default=str(state_root() / "pane-locks.json"))
     args = parser.parse_args()
 
     session = args.session or os.environ.get("AGENT_BRIDGE_SESSION")
     sender = args.sender or os.environ.get("AGENT_BRIDGE_AGENT")
-    if (not session or not sender) and os.environ.get("TMUX_PANE"):
-        inferred_session, inferred_sender = infer_from_pane(os.environ["TMUX_PANE"], Path(args.pane_locks_file))
-        session = session or inferred_session
-        sender = sender or inferred_sender
+    if not session or not sender or os.environ.get("TMUX_PANE"):
+        resolution = resolve_caller_from_pane(
+            pane=os.environ.get("TMUX_PANE"),
+            explicit_session=session or "",
+            explicit_alias=sender or "",
+            tool_name="agent_list_peers",
+            allow_explicit_without_pane=True,
+        )
+        if not resolution.ok:
+            print(resolution.error, file=sys.stderr)
+            return 2
+        session = session or resolution.session
+        sender = sender or resolution.alias
 
     if not session:
         print(

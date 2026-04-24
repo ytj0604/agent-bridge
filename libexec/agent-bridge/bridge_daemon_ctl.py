@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bridge_participants import active_participants, load_session, session_state_exists
+from bridge_identity import resolve_participant_endpoint
 from bridge_paths import install_root, libexec_dir, log_root, python_exe, run_root, state_root
 from bridge_util import locked_json, read_json, utc_now, write_json_atomic as write_json
 
@@ -229,7 +230,7 @@ def send_room_closed_notices(session: str) -> dict:
     sent = 0
     errors = []
     for alias, record in active_participants(state).items():
-        pane = str(record.get("pane") or "")
+        pane = resolve_participant_endpoint(session, alias, record)
         if not pane:
             continue
         try:

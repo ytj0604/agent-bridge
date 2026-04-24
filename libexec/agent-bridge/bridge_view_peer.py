@@ -13,6 +13,7 @@ import sys
 import time
 import uuid
 
+from bridge_identity import resolve_caller_from_pane
 from bridge_participants import active_participants, load_session, normalize_alias
 from bridge_paths import state_root
 from bridge_util import read_json, utc_now, write_json_atomic
@@ -41,45 +42,19 @@ def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
 
-def infer_from_pane(pane: str) -> tuple[str, str]:
-    data = read_json(state_root() / "pane-locks.json", {"version": 1, "panes": {}})
-    record = (data.get("panes") or {}).get(pane) or {}
-    return str(record.get("bridge_session") or ""), str(record.get("alias") or "")
-
-
 def validate_caller(args: argparse.Namespace) -> tuple[str, str]:
     session = args.session or os.environ.get("AGENT_BRIDGE_SESSION") or ""
     caller = args.sender or os.environ.get("AGENT_BRIDGE_AGENT") or ""
-    pane = os.environ.get("TMUX_PANE")
-
-    if args.allow_spoof:
-        if pane and (not session or not caller):
-            locked_session, locked_caller = infer_from_pane(pane)
-            session = session or locked_session
-            caller = caller or locked_caller
-        return session, caller
-
-    if not pane:
-        raise SystemExit(
-            "agent_view_peer: refusing explicit view outside an attached tmux pane; "
-            "pass --allow-spoof only for an explicit admin/test view"
-        )
-
-    locked_session, locked_caller = infer_from_pane(pane)
-    if not locked_session or not locked_caller:
-        raise SystemExit(
-            "agent_view_peer: caller tmux pane is not attached to an active bridge room; "
-            "run from an attached agent pane"
-        )
-    if args.session and args.session != locked_session:
-        raise SystemExit(
-            f"agent_view_peer: --session {args.session!r} does not match caller pane room {locked_session!r}"
-        )
-    if args.sender and args.sender != locked_caller:
-        raise SystemExit(
-            f"agent_view_peer: --from {args.sender!r} does not match caller pane alias {locked_caller!r}"
-        )
-    return locked_session, locked_caller
+    resolution = resolve_caller_from_pane(
+        pane=os.environ.get("TMUX_PANE"),
+        explicit_session=session,
+        explicit_alias=caller,
+        allow_spoof=args.allow_spoof,
+        tool_name="agent_view_peer",
+    )
+    if not resolution.ok:
+        raise SystemExit(resolution.error)
+    return session or resolution.session, caller or resolution.alias
 
 
 def resolve_target(state: dict, caller: str, target: str, allow_self: bool) -> dict:

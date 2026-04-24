@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bridge_participants import ALIAS_RE
+from bridge_identity import detach_stale_pane_lock
 from bridge_instructions import probe_prompt
 from bridge_paths import install_root, libexec_dir, model_bin_dir, run_root, state_root
 from bridge_ui import read_key, terminal_cells, terminal_width, truncate_to_cells
@@ -786,6 +787,8 @@ def update_pane_locks(mappings: list[dict], bridge_session: str, replace: bool) 
                 raise SystemExit(
                     f"pane {pane_id} is already locked by {existing.get('bridge_session')}; use replacement mode or stop that bridge"
                 )
+            if existing and existing.get("bridge_session") != bridge_session and replace:
+                detach_stale_pane_lock(pane_id, f"pane reattached to {bridge_session}")
             panes[pane_id] = {
                 "bridge_session": bridge_session,
                 "agent": mapping["agent"],

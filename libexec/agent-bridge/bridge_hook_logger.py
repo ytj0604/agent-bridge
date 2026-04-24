@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from bridge_paths import state_root
+from bridge_identity import update_live_session
 from bridge_util import append_jsonl, locked_json_read, public_record as redact_public_record, utc_now
 
 
@@ -103,6 +104,7 @@ def build_record(agent: str, payload: dict) -> dict:
         "title": payload.get("title"),
         "message": payload.get("message"),
         "stop_hook_active": payload.get("stop_hook_active"),
+        "pane": os.environ.get("TMUX_PANE"),
     }
     return {key: value for key, value in record.items() if value is not None}
 
@@ -165,8 +167,20 @@ def main() -> int:
             bridge_session = mapping.get("bridge_session")
             record["bridge_session"] = bridge_session
             record["bridge_agent"] = mapping.get("alias") or args.agent
-            if mapping.get("pane"):
-                record["pane"] = mapping.get("pane")
+
+    live_mapping = update_live_session(
+        agent_type=args.agent,
+        session_id=str(payload.get("session_id") or ""),
+        pane=str(os.environ.get("TMUX_PANE") or ""),
+        bridge_session=str(record.get("bridge_session") or ""),
+        alias=str(record.get("bridge_agent") or ""),
+        event=str(record.get("event") or ""),
+    )
+    if live_mapping:
+        mapping = live_mapping
+        record["bridge_session"] = live_mapping.get("bridge_session")
+        record["bridge_agent"] = live_mapping.get("alias") or args.agent
+        record["pane"] = live_mapping.get("pane") or record.get("pane")
 
     should_log_unscoped = os.environ.get("AGENT_BRIDGE_LOG_UNSCOPED") == "1"
 

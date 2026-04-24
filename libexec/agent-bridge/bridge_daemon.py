@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from bridge_identity import resolve_participant_endpoint
 from bridge_participants import active_participants, load_session, participant_record, session_file
 from bridge_paths import model_bin_dir, state_root
 from bridge_util import append_jsonl, locked_json, normalize_kind, public_record, utc_now
@@ -337,7 +338,11 @@ class BridgeDaemon:
     def deliver_reserved(self, message: dict) -> None:
         target = str(message["to"])
         nonce = str(message["nonce"])
-        if target not in self.panes:
+        participant = self.participants.get(target)
+        endpoint = resolve_participant_endpoint(self.bridge_session or "", target, participant or {}) if participant else ""
+        if endpoint:
+            self.panes[target] = endpoint
+        if target not in self.panes or not self.panes.get(target):
             self.mark_message_pending(str(message["id"]), "unknown_target")
             self.log("message_delivery_failed", message_id=message["id"], to=target, nonce=nonce, error="unknown_target")
             return
