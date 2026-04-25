@@ -1658,6 +1658,127 @@ def scenario_prune_concurrent_stat_safe(label: str, tmpdir: Path) -> None:
     print(f"  PASS  {label}")
 
 
+# ---------- v1.5.x: list_peers model-safe view ----------
+
+def _model_state(aliases_with_extras: dict) -> dict:
+    """Build a state with full participant records (including pane/target/hook_session_id)."""
+    return {
+        "session": "test-session",
+        "participants": {
+            alias: {
+                "alias": alias,
+                "agent_type": rec.get("agent_type", "codex"),
+                "pane": rec.get("pane", "%99"),
+                "target": rec.get("target", "0:1.99"),
+                "hook_session_id": rec.get("hook_session_id", "uuid-secret"),
+                "model": rec.get("model", "gpt-test"),
+                "cwd": rec.get("cwd", "/tmp/x"),
+                "status": "active",
+            }
+            for alias, rec in aliases_with_extras.items()
+        },
+        "hook_session_ids": {alias: "uuid-secret" for alias in aliases_with_extras},
+    }
+
+
+def scenario_format_peer_list_model_safe_default(label: str, tmpdir: Path) -> None:
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    if str(libexec) not in sys.path:
+        sys.path.insert(0, str(libexec))
+    import importlib
+    bp = importlib.import_module("bridge_participants")
+    importlib.reload(bp)
+    state = _model_state({"codex1": {}, "codex2": {}})
+    out = bp.format_peer_list(state, "codex1")
+    assert_true("pane=" not in out, f"{label}: text mode default must NOT include pane=, got: {out!r}")
+    assert_true("target=" not in out, f"{label}: text mode default must NOT include target=, got: {out!r}")
+    assert_true("hook_session_id" not in out, f"{label}: never expose hook_session_id")
+    # Should still include type, model, cwd
+    assert_true("type=" in out, f"{label}: type still present")
+    assert_true("model=" in out, f"{label}: model still present")
+    assert_true("cwd=" in out, f"{label}: cwd still present (operator confirmed)")
+    print(f"  PASS  {label}")
+
+
+def scenario_format_peer_list_full_includes_operator_fields(label: str, tmpdir: Path) -> None:
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    if str(libexec) not in sys.path:
+        sys.path.insert(0, str(libexec))
+    import importlib
+    bp = importlib.import_module("bridge_participants")
+    importlib.reload(bp)
+    state = _model_state({"codex1": {}})
+    out = bp.format_peer_list(state, "codex1", full=True)
+    assert_true("pane=" in out, f"{label}: full mode includes pane=, got: {out!r}")
+    assert_true("target=" in out, f"{label}: full mode includes target=")
+    print(f"  PASS  {label}")
+
+
+def scenario_model_safe_participants_uses_active_only(label: str, tmpdir: Path) -> None:
+    """JSON view should match text view: only active participants."""
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    if str(libexec) not in sys.path:
+        sys.path.insert(0, str(libexec))
+    import importlib
+    bp = importlib.import_module("bridge_participants")
+    importlib.reload(bp)
+    state = {
+        "session": "test-session",
+        "participants": {
+            "codex1": {"alias": "codex1", "agent_type": "codex", "pane": "%0", "model": "m", "cwd": "/x", "status": "active"},
+            "stale": {"alias": "stale", "agent_type": "codex", "pane": "%99", "model": "m", "cwd": "/y", "status": "left"},
+        },
+    }
+    safe = bp.model_safe_participants(state)
+    assert_true("codex1" in safe, f"{label}: active codex1 included")
+    assert_true("stale" not in safe, f"{label}: inactive 'stale' must NOT be exposed: {safe}")
+    print(f"  PASS  {label}")
+
+
+def scenario_list_peers_json_daemon_status_strips_pid(label: str, tmpdir: Path) -> None:
+    """Default JSON output's daemon_status must not contain pid; --full does."""
+    helper = "/root/agent-bridge/libexec/agent-bridge/bridge_list_peers.py"
+    # Use existing live session to drive the CLI
+    proc = subprocess.run(
+        [sys.executable, helper, "--session", "agent-bridge-auto", "--json"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if proc.returncode != 0:
+        # If live session not present (CI or fresh checkout), skip silently
+        print(f"  SKIP  {label}: no live session ({proc.stderr.strip()[:60]})")
+        return
+    data = json.loads(proc.stdout)
+    ds = data.get("daemon_status") or {}
+    assert_true("pid" not in ds, f"{label}: default JSON daemon_status must NOT include pid, got {ds}")
+    proc_full = subprocess.run(
+        [sys.executable, helper, "--session", "agent-bridge-auto", "--json", "--full"],
+        capture_output=True, text=True, timeout=10,
+    )
+    data_full = json.loads(proc_full.stdout)
+    ds_full = data_full.get("daemon_status") or {}
+    # pid is in the full view (may be None when not available, but the key should be present)
+    assert_true("pid" in ds_full, f"{label}: --full JSON daemon_status must include pid key: {ds_full}")
+    print(f"  PASS  {label}")
+
+
+def scenario_model_safe_participants_strips_endpoints(label: str, tmpdir: Path) -> None:
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    if str(libexec) not in sys.path:
+        sys.path.insert(0, str(libexec))
+    import importlib
+    bp = importlib.import_module("bridge_participants")
+    importlib.reload(bp)
+    state = _model_state({"codex1": {}, "codex2": {}})
+    safe = bp.model_safe_participants(state)
+    for alias, record in safe.items():
+        assert_true("pane" not in record, f"{label}: {alias} record must not include pane")
+        assert_true("target" not in record, f"{label}: {alias} record must not include target")
+        assert_true("hook_session_id" not in record, f"{label}: {alias} record must not include hook_session_id")
+        assert_true(record.get("agent_type"), f"{label}: agent_type retained")
+        assert_true(record.get("cwd"), f"{label}: cwd retained")
+    print(f"  PASS  {label}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--keep-tmp", action="store_true")
@@ -1738,6 +1859,11 @@ def main() -> int:
             ("recover_orphan_delivered", scenario_recover_orphan_delivered),
             ("recover_orphan_delivered_aggregate_member", scenario_recover_orphan_delivered_aggregate_member),
             ("prune_concurrent_stat_safe", scenario_prune_concurrent_stat_safe),
+            ("format_peer_list_model_safe_default", scenario_format_peer_list_model_safe_default),
+            ("format_peer_list_full_includes_operator_fields", scenario_format_peer_list_full_includes_operator_fields),
+            ("model_safe_participants_strips_endpoints", scenario_model_safe_participants_strips_endpoints),
+            ("model_safe_participants_uses_active_only", scenario_model_safe_participants_uses_active_only),
+            ("list_peers_json_daemon_status_strips_pid", scenario_list_peers_json_daemon_status_strips_pid),
         ]
         passes = 0
         fails = 0

@@ -10,7 +10,7 @@ import sys
 from bridge_daemon_client import ensure_daemon_running
 from bridge_identity import resolve_caller_from_pane
 from bridge_instructions import model_cheat_sheet_text
-from bridge_participants import active_participants, format_peer_list, load_session, room_status
+from bridge_participants import active_participants, format_peer_list, load_session, model_safe_participants, room_status
 
 
 def main() -> int:
@@ -18,6 +18,11 @@ def main() -> int:
     parser.add_argument("--session")
     parser.add_argument("--from", dest="sender")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="include operator-only fields (tmux pane/target, hook_session_id). Default output is model-safe.",
+    )
     args = parser.parse_args()
 
     session = args.session or os.environ.get("AGENT_BRIDGE_SESSION")
@@ -65,14 +70,22 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    participants = state.get("participants") or {}
     if args.json:
-        print(json.dumps({"session": session, "current": sender, "daemon_status": asdict(status), "participants": participants}, ensure_ascii=True, indent=2))
+        if args.full:
+            payload_participants = state.get("participants") or {}
+            daemon_payload = asdict(status)
+        else:
+            payload_participants = model_safe_participants(state)
+            # Operator-only fields (process pid, pid-probe trust signal) are
+            # stripped from the model-safe JSON view to match the text-mode
+            # redaction. Use --full for full daemon diagnostic info.
+            daemon_payload = {"state": status.state, "reason": status.reason}
+        print(json.dumps({"session": session, "current": sender, "daemon_status": daemon_payload, "participants": payload_participants}, ensure_ascii=True, indent=2))
     else:
         print(f"Bridge session: {session}")
         if status.state == "unknown":
             print(f"Warning: {status.reason}; showing read-only session state.")
-        print(format_peer_list(state, sender))
+        print(format_peer_list(state, sender, full=args.full))
         print("")
         print(model_cheat_sheet_text())
     return 0

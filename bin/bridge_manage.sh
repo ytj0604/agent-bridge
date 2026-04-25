@@ -68,7 +68,7 @@ choose_room() {
 }
 
 print_agents() {
-  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_list_peers.py" --session "$session"
+  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_list_peers.py" --session "$session" --full
 }
 
 list_aliases() {
@@ -118,6 +118,10 @@ stop_room() {
   fi
 }
 
+reload_daemon() {
+  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_daemon_ctl.py" restart -s "$session"
+}
+
 show_status() {
   "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_daemon_ctl.py" status -s "$session"
 }
@@ -165,6 +169,7 @@ while true; do
     "Show daemon status" \
     "Tail daemon log" \
     "Clear peer view cache" \
+    "Reload daemon" \
     "Stop daemon" \
     "Back/select another room" \
     "Quit")"; then
@@ -176,9 +181,10 @@ while true; do
     2) show_status ;;
     3) tail_daemon_log ;;
     4) clear_peer_view_cache ;;
-    5) stop_room ;;
-    6) session=""; choose_room ;;
-    7) exit 0 ;;
+    5) reload_daemon ;;
+    6) stop_room ;;
+    7) session=""; choose_room ;;
+    8) exit 0 ;;
     *) echo "invalid action" >&2 ;;
   esac
 done

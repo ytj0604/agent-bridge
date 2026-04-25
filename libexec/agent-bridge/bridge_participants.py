@@ -288,7 +288,15 @@ def resolve_targets(state: dict, sender: str, target: str | None) -> list[str]:
     return resolved
 
 
-def format_peer_list(state: dict, current_alias: str | None = None) -> str:
+def format_peer_list(state: dict, current_alias: str | None = None, *, full: bool = False) -> str:
+    """Format the peer roster for display.
+
+    Default (full=False) is model-safe: omits tmux pane id, tmux target,
+    and any hook_session_id. Models do not need raw tmux endpoints — the
+    bridge protocol covers all peer interaction — and exposing them
+    invites bypass via direct `tmux send-keys`. Operators (bridge_manage
+    et al.) pass full=True to see pane/target for debugging.
+    """
     participants = active_participants(state)
     if not participants:
         return "No active bridge participants."
@@ -296,18 +304,37 @@ def format_peer_list(state: dict, current_alias: str | None = None) -> str:
     for alias in sorted(participants):
         record = participants[alias]
         marker = " (You)" if current_alias and alias == current_alias else ""
-        details = [
-            f"type={record.get('agent_type')}",
-            f"pane={record.get('pane')}",
-        ]
-        if record.get("target"):
-            details.append(f"target={record.get('target')}")
+        details = [f"type={record.get('agent_type')}"]
+        if full:
+            details.append(f"pane={record.get('pane')}")
+            if record.get("target"):
+                details.append(f"target={record.get('target')}")
         if record.get("model"):
             details.append(f"model={record.get('model')}")
         if record.get("cwd"):
             details.append(f"cwd={record.get('cwd')}")
         lines.append(f"- {alias}{marker}: {' '.join(details)}")
     return "\n".join(lines)
+
+
+# Fields exposed to models via agent_list_peers (text + JSON). Operators
+# get the full participant record by passing --full.
+MODEL_SAFE_PARTICIPANT_FIELDS = ("alias", "agent_type", "model", "cwd", "status")
+
+
+def model_safe_participants(state: dict) -> dict:
+    """Return a participants dict with operator-only fields stripped.
+
+    Iterates `active_participants(state)` so the JSON view matches the
+    text view (which uses `active_participants` via `format_peer_list`).
+    Inactive / stale participants are not exposed.
+    """
+    out: dict[str, dict] = {}
+    for alias, record in active_participants(state).items():
+        if not isinstance(record, dict):
+            continue
+        out[alias] = {key: record.get(key) for key in MODEL_SAFE_PARTICIPANT_FIELDS if record.get(key) is not None}
+    return out
 
 
 def format_peer_summary(state: dict) -> str:
