@@ -100,10 +100,11 @@ fallback ingress).
 
 ### Symptom
 
-`agent_send_peer` invoked from inside a codex pane prints
-`daemon socket unavailable; falling back to direct file write` and
-writes the message directly to `pending.json` and `events.raw.jsonl`
-instead of going through the unix socket.
+`agent_send_peer` invoked from inside a codex pane may write the message
+directly to `pending.json` and `events.raw.jsonl` instead of going through
+the unix socket. Current versions keep this successful fallback silent in
+the model pane and record an operator-only `enqueue_file_fallback` event
+in `events.raw.jsonl`.
 
 ### Root cause
 

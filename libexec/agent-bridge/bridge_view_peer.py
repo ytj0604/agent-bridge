@@ -31,6 +31,7 @@ MIN_OVERLAP_LINES = 10
 SEARCH_CONTEXT = 8
 MAX_MATCHES = 5
 MAX_LINE_CHARS = 1000
+SNAPSHOT_REF_CHARS = 6
 WRITE_FAILURE_ERRNOS = {errno.EROFS, errno.EACCES, errno.EPERM}
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
 
@@ -41,6 +42,19 @@ def clamp(value: int, minimum: int, maximum: int) -> int:
 
 def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+
+
+def snapshot_ref(snapshot_id: str) -> str:
+    snapshot_id = str(snapshot_id or "")
+    return snapshot_id[-SNAPSHOT_REF_CHARS:] if len(snapshot_id) > SNAPSHOT_REF_CHARS else snapshot_id
+
+
+def model_safe_capture_error(value: str, pane: str) -> str:
+    text = str(value or "").replace("\n", " ")
+    if pane:
+        text = text.replace(str(pane), "<target-pane>")
+    text = re.sub(r"%\d+", "<pane>", text)
+    return text[:200]
 
 
 def validate_caller(args: argparse.Namespace) -> tuple[str, str]:
@@ -105,10 +119,11 @@ def capture_via_daemon(
 ) -> str:
     request_id = short_id("cap")
     status = room_status(session)
+    display_error = model_safe_capture_error(direct_error, pane)
     if status.state not in {"alive", "unknown"}:
         raise SystemExit(
             "agent_view_peer: local tmux capture failed and daemon capture is unavailable. "
-            f"tmux error: {direct_error}. daemon status: {status.reason}. "
+            f"tmux error: {display_error}. daemon status: {status.reason}. "
             "Restart or reattach the bridge room from the host tmux shell."
         )
     response_file = capture_response_dir(session) / f"{request_id}.json"
@@ -133,7 +148,7 @@ def capture_via_daemon(
     except OSError as exc:
         raise SystemExit(
             "agent_view_peer: local tmux capture failed and daemon capture could not be requested. "
-            f"tmux error: {direct_error}. request error: {exc}. "
+            f"tmux error: {display_error}. request error: {exc}. "
             "Recreate the room with AGENT_BRIDGE_RUNTIME_DIR pointing to a writable path shared by the agents."
         ) from exc
 
@@ -144,13 +159,14 @@ def capture_via_daemon(
             response_file.unlink(missing_ok=True)
             if response.get("ok"):
                 return str(response.get("text") or "")
-            raise SystemExit(f"agent_view_peer: daemon capture failed for pane {pane}: {response.get('error') or 'unknown error'}")
+            error = model_safe_capture_error(str(response.get("error") or "unknown error"), pane)
+            raise SystemExit(f"agent_view_peer: daemon capture failed for target {target}: {error}")
         time.sleep(0.1)
 
     response_file.unlink(missing_ok=True)
     raise SystemExit(
         "agent_view_peer: local tmux capture failed and daemon capture timed out. "
-        f"tmux error: {direct_error}. "
+        f"tmux error: {display_error}. "
         "Check that the bridge daemon is running and that the room runtime is writable/shared."
     )
 
@@ -279,6 +295,47 @@ def snapshot_paths(session: str, target: str, snapshot_id: str) -> tuple[Path, P
     return root / f"{snapshot_id}.txt", root / f"{snapshot_id}.json"
 
 
+def snapshot_ids(session: str, target: str) -> set[str]:
+    root = snapshot_root(session, target)
+    if not root.exists():
+        return set()
+    ids = {path.stem for path in root.glob("*.txt")}
+    ids.update(path.stem for path in root.glob("*.json"))
+    return ids
+
+
+def snapshot_display_ref(session: str, target: str, snapshot_id: str) -> str:
+    snapshot_id = str(snapshot_id or "")
+    if not snapshot_id:
+        return ""
+    ids = snapshot_ids(session, target)
+    if snapshot_id not in ids:
+        return snapshot_ref(snapshot_id)
+    for width in range(min(SNAPSHOT_REF_CHARS, len(snapshot_id)), len(snapshot_id) + 1):
+        ref = snapshot_id[-width:]
+        if sum(1 for ident in ids if ident.endswith(ref)) == 1:
+            return ref
+    return snapshot_id
+
+
+def resolve_snapshot_id(session: str, target: str, snapshot_id: str) -> str:
+    snapshot_id = str(snapshot_id or "")
+    if not snapshot_id:
+        return snapshot_id
+    text_path, _meta_path = snapshot_paths(session, target, snapshot_id)
+    if text_path.exists():
+        return snapshot_id
+
+    ids = snapshot_ids(session, target)
+    matches = sorted(ident for ident in ids if ident.endswith(snapshot_id))
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        refs = ", ".join(snapshot_display_ref(session, target, item) for item in matches[:5])
+        raise SystemExit(f"agent_view_peer: ambiguous snapshot ref {snapshot_ref(snapshot_id)!r}; matching refs: {refs}")
+    return snapshot_id
+
+
 def save_snapshot(session: str, target: str, lines: list[str], meta: dict) -> str:
     snapshot_id = new_snapshot_id()
     text_path, meta_path = snapshot_paths(session, target, snapshot_id)
@@ -354,11 +411,14 @@ def prune_snapshots(session: str, protect: set[tuple[str, str]] | None = None) -
 
 
 def load_snapshot(session: str, target: str, snapshot_id: str) -> tuple[list[str], dict]:
+    snapshot_id = resolve_snapshot_id(session, target, snapshot_id)
     text_path, meta_path = snapshot_paths(session, target, snapshot_id)
     if not text_path.exists():
-        raise SystemExit(f"agent_view_peer: snapshot not found: {snapshot_id}")
+        raise SystemExit(f"agent_view_peer: snapshot not found: {snapshot_display_ref(session, target, snapshot_id) or '(empty)'}")
     text = text_path.read_text(encoding="utf-8", errors="replace")
-    return text.splitlines(), read_json(meta_path, {})
+    meta = read_json(meta_path, {})
+    meta.setdefault("snapshot_id", snapshot_id)
+    return text.splitlines(), meta
 
 
 def human_age_from_iso(value: str) -> str:
@@ -474,10 +534,11 @@ def render_output(
     confidence: str = "",
 ) -> None:
     shown, truncated = cap_lines(lines, max_chars)
-    print(f"Peer view: {target} ({target_record.get('agent_type')}) pane={target_record.get('pane')} room={room}")
-    parts = [f"mode={mode}", f"viewer={caller}", f"lines={len(shown)}/{total_lines}"]
+    agent_type = target_record.get("agent_type") or "unknown"
+    print(f"Peer view: {target} ({agent_type})")
+    parts = [f"mode={mode}", f"lines={len(shown)}/{total_lines}"]
     if snapshot_id:
-        parts.append(f"snapshot={snapshot_id}")
+        parts.append(f"snapshot={snapshot_display_ref(room, target, snapshot_id)}")
     if page is not None:
         parts.append(f"page={page}")
     if confidence:
@@ -544,11 +605,12 @@ def handle_older(args: argparse.Namespace, session: str, caller: str, target: st
     if not snapshot_id:
         raise SystemExit(f"agent_view_peer: no snapshot cursor for {target}; run: agent_view_peer {target} --onboard")
     lines, meta = load_snapshot(session, target, snapshot_id)
+    snapshot_id = str(meta.get("snapshot_id") or snapshot_id)
     page = args.page if args.page is not None else int(cursor.get("snapshot_page") or 0) + 1
     start, end = page_bounds(len(lines), lines_count, page)
     cursor.update({"snapshot_id": snapshot_id, "snapshot_page": page})
     save_cursor(session, caller, target, cursor, cache_writable=cache_writable)
-    note = str(meta.get("created_at") or "")
+    note = f"saved snapshot {snapshot_display_ref(session, target, snapshot_id)} ({human_age_from_iso(str(meta.get('created_at') or ''))})"
     if not cache_writable:
         note = f"{note}; capture cache is read-only, page cursor not advanced".strip("; ")
     render_output(
@@ -598,8 +660,9 @@ def handle_search(args: argparse.Namespace, session: str, caller: str, target: s
     snapshot_age = ""
     if snapshot_id:
         lines, meta = load_snapshot(session, target, snapshot_id)
+        snapshot_id = str(meta.get("snapshot_id") or snapshot_id)
         snapshot_age = human_age_from_iso(str(meta.get("created_at") or ""))
-        source = f"snapshot={snapshot_id} ({snapshot_age})"
+        source = f"saved snapshot {snapshot_display_ref(session, target, snapshot_id)} ({snapshot_age})"
     else:
         text = capture_text(args, session=session, caller=caller, target=target, state=state, pane=str(record["pane"]), start=-SNAPSHOT_CAPTURE_LINES, end=None, raw=args.raw)
         lines = clean_lines(text, raw=args.raw)

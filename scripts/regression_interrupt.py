@@ -16,6 +16,7 @@ Exits non-zero if any scenario fails.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import shutil
@@ -2073,6 +2074,288 @@ def scenario_model_safe_participants_strips_endpoints(label: str, tmpdir: Path) 
     print(f"  PASS  {label}")
 
 
+def _import_view_peer():
+    import importlib
+    bv = importlib.import_module("bridge_view_peer")
+    return importlib.reload(bv)
+
+
+def scenario_view_peer_render_output_model_safe(label: str, tmpdir: Path) -> None:
+    bv = _import_view_peer()
+    import contextlib
+    import io
+    full_snapshot_id = "20260425T000000Z-abcdef12"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        bv.render_output(
+            room="room-secret",
+            caller="viewer-secret",
+            target="codex1",
+            target_record={"agent_type": "codex", "pane": "%99"},
+            mode="onboard",
+            lines=["hello"],
+            total_lines=1,
+            max_chars=12000,
+            snapshot_id=full_snapshot_id,
+            page=2,
+            confidence="high",
+        )
+    out = buf.getvalue()
+    assert_true("Peer view: codex1 (codex)" in out, f"{label}: header keeps alias/type: {out!r}")
+    for forbidden in ("pane=", "%99", "room-secret", "viewer=", "viewer-secret", full_snapshot_id):
+        assert_true(forbidden not in out, f"{label}: output must not expose {forbidden!r}: {out!r}")
+    assert_true("snapshot=cdef12" in out, f"{label}: short snapshot ref retained: {out!r}")
+    assert_true("page=2" in out and "confidence=high" in out, f"{label}: public paging fields retained: {out!r}")
+    assert_true("Next: agent_view_peer codex1 --older" in out, f"{label}: next hint retained: {out!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_view_peer_search_explicit_snapshot_uses_safe_ref(label: str, tmpdir: Path) -> None:
+    bv = _import_view_peer()
+    import contextlib
+    import io
+    saved = os.environ.get("AGENT_BRIDGE_STATE_DIR")
+    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
+    try:
+        full_snapshot_id = "20260425T000000Z-abcdef12"
+        text_path, meta_path = bv.snapshot_paths("test-session", "codex1", full_snapshot_id)
+        text_path.parent.mkdir(parents=True, exist_ok=True)
+        text_path.write_text("alpha\nneedle\nomega\n", encoding="utf-8")
+        meta_path.write_text(json.dumps({"snapshot_id": full_snapshot_id, "created_at": bv.utc_now()}), encoding="utf-8")
+        args = argparse.Namespace(live=False, snapshot="cdef12", search="needle", context=0, raw=False, capture_file=None)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            bv.handle_search(
+                args,
+                "test-session",
+                "viewer",
+                "codex1",
+                {},
+                {"agent_type": "codex", "pane": "%99"},
+                20,
+                12000,
+            )
+        out = buf.getvalue()
+        assert_true(full_snapshot_id not in out, f"{label}: full snapshot id must stay hidden: {out!r}")
+        assert_true("source=saved snapshot cdef12" in out, f"{label}: search source uses short ref: {out!r}")
+        assert_true("source=snapshot=" not in out, f"{label}: search note must not expose raw snapshot source: {out!r}")
+        assert_true("needle" in out, f"{label}: match content shown: {out!r}")
+    finally:
+        if saved is None:
+            os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
+        else:
+            os.environ["AGENT_BRIDGE_STATE_DIR"] = saved
+    print(f"  PASS  {label}")
+
+
+def scenario_view_peer_snapshot_ref_collision_unique(label: str, tmpdir: Path) -> None:
+    bv = _import_view_peer()
+    import contextlib
+    import io
+    saved = os.environ.get("AGENT_BRIDGE_STATE_DIR")
+    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
+    try:
+        ids = ["20260425T000000Z-xaaaaaa", "20260425T000001Z-yaaaaaa"]
+        for idx, snapshot_id in enumerate(ids):
+            text_path, meta_path = bv.snapshot_paths("test-session", "codex1", snapshot_id)
+            text_path.parent.mkdir(parents=True, exist_ok=True)
+            text_path.write_text(f"snapshot {idx}\n", encoding="utf-8")
+            meta_path.write_text(json.dumps({"snapshot_id": snapshot_id, "created_at": bv.utc_now()}), encoding="utf-8")
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            bv.render_output(
+                room="test-session",
+                caller="viewer",
+                target="codex1",
+                target_record={"agent_type": "codex", "pane": "%99"},
+                mode="onboard",
+                lines=["hello"],
+                total_lines=1,
+                max_chars=12000,
+                snapshot_id=ids[0],
+            )
+        out = buf.getvalue()
+        assert_true("snapshot=xaaaaaa" in out, f"{label}: displayed ref expands past colliding 6-char suffix: {out!r}")
+        assert_true("snapshot=aaaaaa" not in out, f"{label}: colliding 6-char ref must not be displayed: {out!r}")
+        assert_true(bv.resolve_snapshot_id("test-session", "codex1", "xaaaaaa") == ids[0], f"{label}: expanded ref resolves")
+        assert_true(bv.resolve_snapshot_id("test-session", "codex1", "") == "", f"{label}: empty ref does not match every snapshot")
+        try:
+            bv.resolve_snapshot_id("test-session", "codex1", "aaaaaa")
+        except SystemExit as exc:
+            msg = str(exc)
+        else:
+            raise AssertionError(f"{label}: ambiguous 6-char suffix must fail")
+        assert_true("ambiguous snapshot ref" in msg, f"{label}: ambiguous error explains issue: {msg!r}")
+        assert_true("xaaaaaa" in msg and "yaaaaaa" in msg, f"{label}: ambiguous error lists actionable refs: {msg!r}")
+        assert_true(ids[0] not in msg and ids[1] not in msg, f"{label}: ambiguous error hides full ids: {msg!r}")
+    finally:
+        if saved is None:
+            os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
+        else:
+            os.environ["AGENT_BRIDGE_STATE_DIR"] = saved
+    print(f"  PASS  {label}")
+
+
+def scenario_view_peer_capture_errors_sanitized(label: str, tmpdir: Path) -> None:
+    bv = _import_view_peer()
+    saved = os.environ.get("AGENT_BRIDGE_STATE_DIR")
+    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
+    old_short_id = bv.short_id
+    old_room_status = bv.room_status
+    try:
+        safe = bv.model_safe_capture_error("can't find pane %99\nrelated pane %12" + ("x" * 300), "%99")
+        assert_true("%99" not in safe and "%12" not in safe and "\n" not in safe, f"{label}: pane ids/newlines redacted: {safe!r}")
+        assert_true("<target-pane>" in safe and "<pane>" in safe, f"{label}: redaction markers present: {safe!r}")
+        assert_true(len(safe) <= 200, f"{label}: error capped: {len(safe)}")
+
+        bv.short_id = lambda prefix: "cap-fixed"
+        bv.room_status = lambda session: argparse.Namespace(state="alive", reason="ok")
+        response_file = bv.capture_response_dir("test-session") / "cap-fixed.json"
+        response_file.parent.mkdir(parents=True, exist_ok=True)
+        response_file.write_text(json.dumps({"ok": False, "error": "can't find pane %99\nother pane %12"}), encoding="utf-8")
+        args = argparse.Namespace(capture_timeout=0.1)
+        try:
+            bv.capture_via_daemon(
+                args,
+                session="test-session",
+                caller="viewer",
+                target="codex1",
+                state={"state_file": str(tmpdir / "state" / "test-session" / "events.raw.jsonl")},
+                pane="%99",
+                start=-10,
+            )
+        except SystemExit as exc:
+            msg = str(exc)
+        else:
+            raise AssertionError(f"{label}: daemon error response must raise")
+        assert_true("target codex1" in msg, f"{label}: target alias used: {msg!r}")
+        assert_true("%99" not in msg and "%12" not in msg and "\n" not in msg, f"{label}: daemon response error sanitized: {msg!r}")
+    finally:
+        bv.short_id = old_short_id
+        bv.room_status = old_room_status
+        if saved is None:
+            os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
+        else:
+            os.environ["AGENT_BRIDGE_STATE_DIR"] = saved
+    print(f"  PASS  {label}")
+
+
+def scenario_view_peer_snapshot_not_found_hides_full_id(label: str, tmpdir: Path) -> None:
+    bv = _import_view_peer()
+    saved = os.environ.get("AGENT_BRIDGE_STATE_DIR")
+    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
+    try:
+        full_snapshot_id = "20260425T000000Z-hidden12"
+        try:
+            bv.load_snapshot("test-session", "codex1", full_snapshot_id)
+        except SystemExit as exc:
+            msg = str(exc)
+        else:
+            raise AssertionError(f"{label}: missing snapshot must raise")
+        assert_true(full_snapshot_id not in msg, f"{label}: full id hidden: {msg!r}")
+        assert_true("hidden12"[-6:] in msg, f"{label}: short ref retained: {msg!r}")
+    finally:
+        if saved is None:
+            os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
+        else:
+            os.environ["AGENT_BRIDGE_STATE_DIR"] = saved
+    print(f"  PASS  {label}")
+
+
+def _import_enqueue_module():
+    import importlib
+    be = importlib.import_module("bridge_enqueue")
+    return importlib.reload(be)
+
+
+def _run_enqueue_main(be, argv: list[str]) -> tuple[int, str, str]:
+    import contextlib
+    import io
+    old_argv = sys.argv[:]
+    out = io.StringIO()
+    err = io.StringIO()
+    try:
+        sys.argv = ["bridge_enqueue.py", *argv]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = be.main()
+    finally:
+        sys.argv = old_argv
+    return int(code), out.getvalue(), err.getvalue()
+
+
+def _patch_enqueue_for_unit(be, state: dict, *, socket_error: str = "") -> None:
+    be.ensure_daemon_running = lambda session: ""
+    be.room_status = lambda session: argparse.Namespace(active_enough_for_enqueue=True, reason="ok")
+    be.sender_matches_caller = lambda args, session: True
+    be.load_session = lambda session: state
+    be.enqueue_via_daemon_socket = lambda session, messages: (False, [], socket_error)
+
+
+def scenario_enqueue_fallback_success_silent_with_raw_diagnostic(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state, socket_error="/tmp/secret.sock: permission denied\nextra line")
+    queue_file = tmpdir / "pending.json"
+    state_file = tmpdir / "events.raw.jsonl"
+    public_file = tmpdir / "events.jsonl"
+    queue_file.write_text("[]", encoding="utf-8")
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "alice",
+            "--to", "bob",
+            "--body", "hello",
+            "--queue-file", str(queue_file),
+            "--state-file", str(state_file),
+            "--public-state-file", str(public_file),
+        ],
+    )
+    assert_true(code == 0, f"{label}: enqueue succeeds: code={code}, stderr={err!r}")
+    assert_true(out.strip().startswith("msg-"), f"{label}: stdout contains message id: {out!r}")
+    assert_true(err == "", f"{label}: successful fallback must be silent on stderr: {err!r}")
+    assert_true("daemon socket unavailable" not in err and "falling back to direct file" not in err, f"{label}: warning suppressed")
+    queue = json.loads(queue_file.read_text(encoding="utf-8"))
+    assert_true(queue and queue[0].get("status") == "ingressing", f"{label}: queue item is ingressing: {queue}")
+    raw_events = read_events(state_file)
+    public_events = read_events(public_file)
+    assert_true(any(item.get("event") == "message_queued" for item in raw_events), f"{label}: message_queued raw event present")
+    fallback_events = [item for item in raw_events if item.get("event") == "enqueue_file_fallback"]
+    assert_true(len(fallback_events) == 1, f"{label}: one raw fallback diagnostic: {raw_events}")
+    assert_true(all(item.get("event") != "enqueue_file_fallback" for item in public_events), f"{label}: fallback diagnostic not public: {public_events}")
+    socket_error = str(fallback_events[0].get("socket_error") or "")
+    assert_true("\n" not in socket_error and len(socket_error) <= 200, f"{label}: socket_error sanitized: {socket_error!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_fallback_write_failure_preserves_stderr(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+
+    def fail_update_queue(path: Path, message: dict) -> None:
+        raise OSError(errno.EACCES, "denied")
+
+    be.update_queue = fail_update_queue
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "alice",
+            "--to", "bob",
+            "--body", "hello",
+            "--queue-file", str(tmpdir / "pending.json"),
+            "--state-file", str(tmpdir / "events.raw.jsonl"),
+            "--public-state-file", str(tmpdir / "events.jsonl"),
+        ],
+    )
+    assert_true(code == 1, f"{label}: write failure exits 1, got {code}")
+    assert_true(out == "", f"{label}: no stdout on write failure: {out!r}")
+    assert_true("cannot enqueue message" in err or "failed to write bridge queue" in err, f"{label}: stderr preserves failure: {err!r}")
+    print(f"  PASS  {label}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--keep-tmp", action="store_true")
@@ -2169,6 +2452,13 @@ def main() -> int:
             ("model_safe_participants_strips_endpoints", scenario_model_safe_participants_strips_endpoints),
             ("model_safe_participants_uses_active_only", scenario_model_safe_participants_uses_active_only),
             ("list_peers_json_daemon_status_strips_pid", scenario_list_peers_json_daemon_status_strips_pid),
+            ("view_peer_render_output_model_safe", scenario_view_peer_render_output_model_safe),
+            ("view_peer_search_explicit_snapshot_uses_safe_ref", scenario_view_peer_search_explicit_snapshot_uses_safe_ref),
+            ("view_peer_snapshot_ref_collision_unique", scenario_view_peer_snapshot_ref_collision_unique),
+            ("view_peer_capture_errors_sanitized", scenario_view_peer_capture_errors_sanitized),
+            ("view_peer_snapshot_not_found_hides_full_id", scenario_view_peer_snapshot_not_found_hides_full_id),
+            ("enqueue_fallback_success_silent_with_raw_diagnostic", scenario_enqueue_fallback_success_silent_with_raw_diagnostic),
+            ("enqueue_fallback_write_failure_preserves_stderr", scenario_enqueue_fallback_write_failure_preserves_stderr),
         ]
         passes = 0
         fails = 0

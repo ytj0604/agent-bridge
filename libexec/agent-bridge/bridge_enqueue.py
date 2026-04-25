@@ -54,6 +54,10 @@ def _resolve_default_watchdog_seconds() -> float | None:
 WRITE_FAILURE_ERRNOS = {errno.EROFS, errno.EACCES, errno.EPERM}
 
 
+def diagnostic_error(value: str, limit: int = 200) -> str:
+    return str(value or "").replace("\n", " ")[:limit]
+
+
 def update_queue(path: Path, message: dict) -> None:
     with locked_json(path, []) as queue:
         if not any(item.get("id") == message["id"] for item in queue):
@@ -310,15 +314,8 @@ def main() -> int:
     # pending). If the daemon is down, the message sits as "ingressing"
     # until daemon startup recovery promotes it (alarms cancelled at that
     # point are in-memory only and lost across the restart, so the
-    # recovery skips alarm cancel). Either way, the operator should
-    # know the socket was unreachable.
-    print(
-        "agent_send_peer: WARNING — daemon socket unavailable; falling back to direct file write. "
-        "Bridge semantics (alarm cancel, default watchdog arming) apply once the daemon picks up the "
-        "ingressing message. If the daemon is down, alarms registered before this write are lost on "
-        "restart; verify with bridge_manage status.",
-        file=sys.stderr,
-    )
+    # recovery skips alarm cancel). This successful fallback is silent to
+    # the model pane; operator diagnostics are recorded in raw events.
 
     ids = []
     for message, record in messages_and_records:
@@ -340,6 +337,23 @@ def main() -> int:
                 print(write_failure_message(public_path, exc, ipc_error), file=sys.stderr)
                 return 1
         ids.append(message["id"])
+    fallback_record = {
+        "ts": utc_now(),
+        "agent": "bridge",
+        "event": "enqueue_file_fallback",
+        "bridge_session": bridge_session,
+        "from_agent": args.sender,
+        "targets": list(targets),
+        "kind": kind,
+        "message_ids": list(ids),
+        "reason": "daemon_socket_unavailable",
+    }
+    if ipc_error:
+        fallback_record["socket_error"] = diagnostic_error(ipc_error)
+    try:
+        append_jsonl(state_file, fallback_record)
+    except OSError:
+        pass
     print("\n".join(ids))
     return 0
 
