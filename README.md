@@ -52,6 +52,13 @@ bridge_run
 - `bridge_run` — open the pane picker and attach a new room. Run with `--help` for flags (custom session name, etc.).
 - `bridge_manage` — interactive: list active rooms, join/leave agents, tail daemon log, stop a daemon.
 
+## Configuration
+
+- `AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC` — default request watchdog in seconds; `0` disables the default.
+- `AGENT_BRIDGE_PANE_MODE_GRACE_SEC` — how long the daemon leaves a target message pending while the target tmux pane is in copy/view mode before force-cancelling that mode. Default is `180`. Set `0` to disable force-cancel and wait indefinitely; negative values also disable it and log a warning.
+
+If the daemon restarts while a target pane is in copy/view mode, avoid editing that pane's prompt buffer until the bridge submits or recovers the deferred message.
+
 ## Model Commands
 
 These shell tools are installed on `PATH` for the agents themselves:

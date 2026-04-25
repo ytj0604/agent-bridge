@@ -29,6 +29,25 @@ MAX_NONCE_CACHE = 1024
 MAX_PROCESSED_CAPTURE_REQUESTS = 4096
 MAX_CAPTURE_REQUEST_AGE_SECONDS = 60
 CAPTURE_RESPONSE_TTL_SECONDS = 60 * 60
+PANE_MODE_GRACE_DEFAULT_SECONDS = 180.0
+PANE_MODE_PROBE_TIMEOUT_SECONDS = 0.3
+PANE_MODE_FORCE_CANCEL_MODES = {"copy-mode", "copy-mode-vi", "view-mode"}
+PANE_MODE_METADATA_KEYS = (
+    "pane_mode_blocked_since",
+    "pane_mode_blocked_since_ts",
+    "pane_mode_blocked_mode",
+    "pane_mode_block_count",
+    "pane_mode_unforceable_logged",
+    "pane_mode_cancel_failed_logged",
+    "pane_mode_probe_failed_logged",
+    "last_pane_mode_cancel_error",
+    "last_pane_mode_probe_error",
+)
+PANE_MODE_ENTER_DEFER_KEYS = (
+    "pane_mode_enter_deferred_since",
+    "pane_mode_enter_deferred_since_ts",
+    "pane_mode_enter_deferred_mode",
+)
 _STOP_SIGNAL: int | None = None
 
 
@@ -83,8 +102,73 @@ def run_tmux_send(target: str, prompt: str, submit_delay: float) -> None:
     subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True)
 
 
+def run_tmux_send_literal(target: str, prompt: str) -> None:
+    subprocess.run(["tmux", "send-keys", "-t", target, "-l", prompt], check=True)
+
+
 def run_tmux_enter(target: str) -> None:
     subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True)
+
+
+def probe_tmux_pane_mode(target: str) -> dict:
+    try:
+        proc = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", target, "#{pane_in_mode}\t#{pane_mode}"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=PANE_MODE_PROBE_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        return {"in_mode": False, "mode": "", "error": str(exc)}
+    flag, _, mode = proc.stdout.rstrip("\n").partition("\t")
+    return {"in_mode": flag.strip() == "1", "mode": mode.strip(), "error": ""}
+
+
+def cancel_tmux_pane_mode(target: str) -> tuple[bool, str]:
+    try:
+        subprocess.run(
+            ["tmux", "send-keys", "-t", target, "-X", "cancel"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=PANE_MODE_PROBE_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def resolve_pane_mode_grace_seconds() -> tuple[float | None, str | None]:
+    raw = os.environ.get("AGENT_BRIDGE_PANE_MODE_GRACE_SEC")
+    if raw is None or str(raw).strip() == "":
+        return PANE_MODE_GRACE_DEFAULT_SECONDS, None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return PANE_MODE_GRACE_DEFAULT_SECONDS, f"invalid AGENT_BRIDGE_PANE_MODE_GRACE_SEC={raw!r}; using 180"
+    if value <= 0:
+        if value < 0:
+            return None, f"AGENT_BRIDGE_PANE_MODE_GRACE_SEC={raw!r} is negative; force-cancel disabled"
+        return None, None
+    return value, None
+
+
+def pane_mode_block_since_ts(item: dict) -> float | None:
+    raw_ts = item.get("pane_mode_blocked_since_ts")
+    try:
+        return float(raw_ts)
+    except (TypeError, ValueError):
+        pass
+    raw_iso = item.get("pane_mode_blocked_since")
+    if not raw_iso:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw_iso).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
 
 
 def build_peer_prompt(message: dict, nonce: str, max_hops: int) -> str:
@@ -174,6 +258,7 @@ class BridgeDaemon:
         self.max_hops = args.max_hops
         self.submit_delay = args.submit_delay
         self.submit_timeout = args.submit_timeout
+        self.pane_mode_grace_seconds, self.pane_mode_grace_warning = resolve_pane_mode_grace_seconds()
         self.from_start = args.from_start
         self.dry_run = args.dry_run
         self.stdout_events = args.stdout_events
@@ -390,16 +475,25 @@ class BridgeDaemon:
         if op == "status":
             self.reload_participants()
             target = str(request.get("target") or "")
+            peers = []
             with self.state_lock:
                 queue_snapshot = list(self.queue.read())
                 aliases = [target] if target else sorted(self.participants)
-                peers = []
                 for alias in aliases:
                     if alias not in self.participants:
                         peers.append({"alias": alias, "active": False})
                         continue
+                    participant = self.participants.get(alias) or {}
                     held = self.held_interrupt.get(alias)
                     cur = self.current_prompt_by_agent.get(alias) or {}
+                    pane = str(participant.get("pane") or self.panes.get(alias) or "")
+                    first_pending = next(
+                        (
+                            it for it in queue_snapshot
+                            if it.get("to") == alias and it.get("status") == "pending"
+                        ),
+                        {},
+                    )
                     delivered_count = sum(
                         1 for it in queue_snapshot
                         if it.get("to") == alias and it.get("status") == "delivered"
@@ -422,10 +516,25 @@ class BridgeDaemon:
                         "current_prompt_turn_id": cur.get("turn_id"),
                         "held": held is not None,
                         "held_info": held or {},
+                        "_pane": pane,
+                        "pane_mode_blocked_since": first_pending.get("pane_mode_blocked_since"),
+                        "pane_mode_blocked_mode": first_pending.get("pane_mode_blocked_mode"),
+                        "pane_mode_block_count": int(first_pending.get("pane_mode_block_count") or 0),
                         "delivered_count": delivered_count,
                         "inflight_count": inflight_count,
                         "pending_count": pending_count,
                     })
+            for peer in peers:
+                pane = peer.pop("_pane", "")
+                if not peer.get("active") or not pane:
+                    peer["pane_in_mode"] = False
+                    peer["pane_mode"] = ""
+                    continue
+                status = self.pane_mode_status(str(pane))
+                peer["pane_in_mode"] = bool(status.get("in_mode"))
+                peer["pane_mode"] = str(status.get("mode") or "")
+                if status.get("error"):
+                    peer["pane_mode_error"] = status.get("error")
             return {"ok": True, "peers": peers}
         return {"ok": False, "error": "unsupported command"}
 
@@ -708,6 +817,348 @@ class BridgeDaemon:
             time.sleep(min(0.25, deadline - time.time()))
         return self.stop_requested()
 
+    def pane_mode_status(self, pane: str) -> dict:
+        if self.dry_run:
+            return {"in_mode": False, "mode": "", "error": ""}
+        return probe_tmux_pane_mode(pane)
+
+    def force_cancel_pane_mode(self, pane: str, mode: str) -> tuple[bool, str]:
+        if self.dry_run:
+            return True, ""
+        return cancel_tmux_pane_mode(pane)
+
+    def resolve_target_pane(self, target: str) -> str:
+        participant = self.participants.get(target)
+        endpoint = resolve_participant_endpoint(self.bridge_session or "", target, participant or {}) if participant else ""
+        if endpoint:
+            self.panes[target] = endpoint
+        return self.panes.get(target) or ""
+
+    def next_pending_candidate(self, target: str) -> dict | None:
+        if target in self.held_interrupt:
+            return None
+        if self.busy.get(target) or self.reserved.get(target):
+            return None
+
+        def mutator(queue: list[dict]) -> dict | None:
+            if any(item.get("to") == target and item.get("status") in {"inflight", "submitted", "delivered"} for item in queue):
+                return None
+            for item in queue:
+                if item.get("to") == target and item.get("status") == "pending":
+                    return dict(item)
+            return None
+
+        return self.queue.update(mutator)
+
+    def annotate_pending_pane_mode_block(self, target: str, message_id: str, mode: str) -> dict | None:
+        now_ts = time.time()
+        now_iso = utc_now()
+
+        def mutator(queue: list[dict]) -> dict | None:
+            for item in queue:
+                if item.get("id") != message_id or item.get("to") != target or item.get("status") != "pending":
+                    continue
+                prior_mode = str(item.get("pane_mode_blocked_mode") or "")
+                since_ts = pane_mode_block_since_ts(item)
+                started = since_ts is None
+                if since_ts is None:
+                    since_ts = now_ts
+                    item["pane_mode_blocked_since"] = now_iso
+                    item["pane_mode_blocked_since_ts"] = now_ts
+                if prior_mode and prior_mode != mode:
+                    item.pop("pane_mode_unforceable_logged", None)
+                    item.pop("pane_mode_cancel_failed_logged", None)
+                item.pop("pane_mode_probe_failed_logged", None)
+                item.pop("last_pane_mode_probe_error", None)
+                item["pane_mode_blocked_mode"] = mode
+                item["pane_mode_block_count"] = int(item.get("pane_mode_block_count") or 0) + 1
+                item["last_error"] = "pane_in_mode"
+                item["updated_ts"] = now_iso
+                result = dict(item)
+                result["_pane_mode_started"] = started
+                result["_pane_mode_blocked_age"] = max(0.0, now_ts - float(since_ts))
+                return result
+            return None
+
+        return self.queue.update(mutator)
+
+    def clear_pane_mode_metadata(self, message_id: str) -> dict | None:
+        def mutator(queue: list[dict]) -> dict | None:
+            for item in queue:
+                if item.get("id") != message_id:
+                    continue
+                had_metadata = any(key in item for key in PANE_MODE_METADATA_KEYS)
+                if not had_metadata:
+                    return None
+                prior = dict(item)
+                for key in PANE_MODE_METADATA_KEYS:
+                    item.pop(key, None)
+                if item.get("last_error") in {"pane_in_mode", "pane_mode_unforceable", "pane_mode_cancel_failed", "pane_mode_probe_failed"}:
+                    item.pop("last_error", None)
+                item["updated_ts"] = utc_now()
+                return prior
+            return None
+
+        return self.queue.update(mutator)
+
+    def mark_pane_mode_unforceable(self, message_id: str) -> bool:
+        def mutator(queue: list[dict]) -> bool:
+            for item in queue:
+                if item.get("id") != message_id:
+                    continue
+                already = bool(item.get("pane_mode_unforceable_logged"))
+                item["pane_mode_unforceable_logged"] = True
+                item["last_error"] = "pane_mode_unforceable"
+                item["updated_ts"] = utc_now()
+                return not already
+            return False
+
+        return bool(self.queue.update(mutator))
+
+    def mark_pane_mode_cancel_failed(self, message_id: str, error: str) -> bool:
+        def mutator(queue: list[dict]) -> bool:
+            for item in queue:
+                if item.get("id") != message_id:
+                    continue
+                already = bool(item.get("pane_mode_cancel_failed_logged"))
+                item["pane_mode_cancel_failed_logged"] = True
+                item["last_error"] = "pane_mode_cancel_failed"
+                item["last_pane_mode_cancel_error"] = error
+                item["updated_ts"] = utc_now()
+                return not already
+            return False
+
+        return bool(self.queue.update(mutator))
+
+    def mark_pane_mode_probe_failed(self, message_id: str, error: str) -> bool:
+        def mutator(queue: list[dict]) -> bool:
+            for item in queue:
+                if item.get("id") != message_id:
+                    continue
+                already = bool(item.get("pane_mode_probe_failed_logged"))
+                item["pane_mode_probe_failed_logged"] = True
+                item["last_error"] = "pane_mode_probe_failed"
+                item["last_pane_mode_probe_error"] = error
+                item["updated_ts"] = utc_now()
+                return not already
+            return False
+
+        return bool(self.queue.update(mutator))
+
+    def defer_inflight_for_pane_mode_probe_failed(self, message: dict, error: str) -> dict | None:
+        message_id = str(message.get("id") or "")
+        target = str(message.get("to") or "")
+        now_iso = utc_now()
+
+        def mutator(queue: list[dict]) -> dict | None:
+            for item in queue:
+                if item.get("id") != message_id or item.get("to") != target or item.get("status") != "inflight":
+                    continue
+                already = bool(item.get("pane_mode_probe_failed_logged"))
+                item["status"] = "pending"
+                item["nonce"] = None
+                item["delivery_attempts"] = max(0, int(item.get("delivery_attempts") or 0) - 1)
+                item["pane_mode_probe_failed_logged"] = True
+                item["last_error"] = "pane_mode_probe_failed"
+                item["last_pane_mode_probe_error"] = error
+                item["updated_ts"] = now_iso
+                result = dict(item)
+                result["_pane_mode_probe_failed_first"] = not already
+                return result
+            return None
+
+        return self.queue.update(mutator)
+
+    def blocked_duration(self, item: dict | None) -> float | None:
+        if not item:
+            return None
+        since_ts = pane_mode_block_since_ts(item)
+        if since_ts is None:
+            return None
+        return max(0.0, time.time() - since_ts)
+
+    def maybe_defer_for_pane_mode(self, target: str, pane: str, message: dict) -> bool:
+        status = self.pane_mode_status(pane)
+        if status.get("error"):
+            if self.mark_pane_mode_probe_failed(str(message.get("id") or ""), str(status.get("error") or "")):
+                self.safe_log(
+                    "pane_mode_probe_failed",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    error=status.get("error"),
+                    phase="pre_reserve",
+                )
+            return True
+        if not status.get("in_mode"):
+            cleared = self.clear_pane_mode_metadata(str(message.get("id") or ""))
+            if cleared:
+                self.log(
+                    "pane_mode_block_cleared",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    mode=cleared.get("pane_mode_blocked_mode"),
+                    blocked_duration_sec=self.blocked_duration(cleared),
+                )
+            return False
+
+        mode = str(status.get("mode") or "")
+        blocked = self.annotate_pending_pane_mode_block(target, str(message.get("id") or ""), mode)
+        if not blocked:
+            return True
+        if blocked.get("_pane_mode_started"):
+            self.log(
+                "pane_mode_block_started",
+                target=target,
+                pane=pane,
+                message_id=message.get("id"),
+                mode=mode,
+            )
+        age = float(blocked.get("_pane_mode_blocked_age") or 0.0)
+        if self.pane_mode_grace_seconds is None or age < self.pane_mode_grace_seconds:
+            return True
+        if mode not in PANE_MODE_FORCE_CANCEL_MODES:
+            if self.mark_pane_mode_unforceable(str(message.get("id") or "")):
+                self.log(
+                    "pane_mode_block_unforceable",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    mode=mode,
+                    blocked_duration_sec=age,
+                )
+            return True
+
+        ok, error = self.force_cancel_pane_mode(pane, mode)
+        if not ok:
+            if self.mark_pane_mode_cancel_failed(str(message.get("id") or ""), error):
+                self.log(
+                    "pane_mode_force_cancelled",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    mode=mode,
+                    blocked_duration_sec=age,
+                    success=False,
+                    error=error,
+                )
+            return True
+
+        after = self.pane_mode_status(pane)
+        if after.get("error"):
+            error = str(after.get("error"))
+            if self.mark_pane_mode_cancel_failed(str(message.get("id") or ""), error):
+                self.log(
+                    "pane_mode_force_cancelled",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    mode=mode,
+                    blocked_duration_sec=age,
+                    success=False,
+                    error=error,
+                )
+            return True
+        if after.get("in_mode"):
+            error = f"pane still in mode {after.get('mode') or ''}".strip()
+            if self.mark_pane_mode_cancel_failed(str(message.get("id") or ""), error):
+                self.log(
+                    "pane_mode_force_cancelled",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    mode=mode,
+                    blocked_duration_sec=age,
+                    success=False,
+                    error=error,
+                )
+            return True
+
+        self.clear_pane_mode_metadata(str(message.get("id") or ""))
+        self.log(
+            "pane_mode_force_cancelled",
+            target=target,
+            pane=pane,
+            message_id=message.get("id"),
+            mode=mode,
+            blocked_duration_sec=age,
+            success=True,
+        )
+        return False
+
+    def defer_inflight_for_pane_mode(self, message: dict, mode: str) -> dict | None:
+        message_id = str(message.get("id") or "")
+        target = str(message.get("to") or "")
+        now_ts = time.time()
+        now_iso = utc_now()
+
+        def mutator(queue: list[dict]) -> dict | None:
+            for item in queue:
+                if item.get("id") != message_id or item.get("to") != target or item.get("status") != "inflight":
+                    continue
+                since_ts = pane_mode_block_since_ts(item)
+                started = since_ts is None
+                if since_ts is None:
+                    since_ts = pane_mode_block_since_ts(message) or now_ts
+                    item["pane_mode_blocked_since"] = message.get("pane_mode_blocked_since") or now_iso
+                    item["pane_mode_blocked_since_ts"] = since_ts
+                item["status"] = "pending"
+                item["nonce"] = None
+                item["pane_mode_blocked_mode"] = mode
+                item["pane_mode_block_count"] = int(item.get("pane_mode_block_count") or 0) + 1
+                item["delivery_attempts"] = max(0, int(item.get("delivery_attempts") or 0) - 1)
+                item["last_error"] = "pane_in_mode"
+                item["updated_ts"] = now_iso
+                result = dict(item)
+                result["_pane_mode_started"] = started
+                result["_pane_mode_blocked_age"] = max(0.0, now_ts - float(since_ts))
+                return result
+            return None
+
+        return self.queue.update(mutator)
+
+    def mark_enter_deferred_for_pane_mode(self, message_id: str, target: str, mode: str, error: str = "") -> dict | None:
+        now_ts = time.time()
+        now_iso = utc_now()
+
+        def mutator(queue: list[dict]) -> dict | None:
+            for item in queue:
+                if item.get("id") != message_id or item.get("to") != target or item.get("status") != "inflight":
+                    continue
+                started = "pane_mode_enter_deferred_since_ts" not in item
+                if started:
+                    item["pane_mode_enter_deferred_since"] = now_iso
+                    item["pane_mode_enter_deferred_since_ts"] = now_ts
+                item["pane_mode_enter_deferred_mode"] = mode
+                if error:
+                    item["last_pane_mode_probe_error"] = error
+                    item["last_error"] = "pane_mode_probe_failed_waiting_enter"
+                else:
+                    item.pop("last_pane_mode_probe_error", None)
+                    item["last_error"] = "pane_in_mode_waiting_enter"
+                item["updated_ts"] = now_iso
+                result = dict(item)
+                result["_pane_mode_enter_defer_started"] = started
+                return result
+            return None
+
+        return self.queue.update(mutator)
+
+    def clear_enter_deferred_metadata(self, message_id: str) -> None:
+        def mutator(queue: list[dict]) -> None:
+            for item in queue:
+                if item.get("id") != message_id:
+                    continue
+                for key in PANE_MODE_ENTER_DEFER_KEYS:
+                    item.pop(key, None)
+                item.pop("last_pane_mode_probe_error", None)
+                if item.get("last_error") in {"pane_in_mode_waiting_enter", "pane_mode_probe_failed_waiting_enter"}:
+                    item.pop("last_error", None)
+                item["updated_ts"] = utc_now()
+
+        self.queue.update(mutator)
+
     def queue_message(self, message: dict, log_event: bool = True) -> None:
         def mutator(queue: list[dict]) -> None:
             if not any(item.get("id") == message["id"] for item in queue):
@@ -768,6 +1219,12 @@ class BridgeDaemon:
             for agent in targets:
                 if agent not in self.participants:
                     continue
+                candidate = self.next_pending_candidate(agent)
+                if not candidate:
+                    continue
+                pane = self.resolve_target_pane(agent)
+                if pane and self.maybe_defer_for_pane_mode(agent, pane, candidate):
+                    continue
                 message = self.reserve_next(agent)
                 if not message:
                     continue
@@ -784,13 +1241,74 @@ class BridgeDaemon:
             self.mark_message_pending(str(message["id"]), "unknown_target")
             self.log("message_delivery_failed", message_id=message["id"], to=target, nonce=nonce, error="unknown_target")
             return
+        pane = self.panes[target]
+        mode_status = self.pane_mode_status(pane)
+        if mode_status.get("error"):
+            deferred = self.defer_inflight_for_pane_mode_probe_failed(message, str(mode_status.get("error") or ""))
+            if deferred and deferred.get("_pane_mode_probe_failed_first"):
+                self.safe_log(
+                    "pane_mode_probe_failed",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    error=mode_status.get("error"),
+                    phase="pre_send",
+                )
+            return
+        elif mode_status.get("in_mode"):
+            mode = str(mode_status.get("mode") or "")
+            blocked = self.defer_inflight_for_pane_mode(message, mode)
+            if blocked and blocked.get("_pane_mode_started"):
+                self.log(
+                    "pane_mode_block_started",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    mode=mode,
+                    phase="pre_send",
+                )
+            self.last_enter_ts.pop(str(message.get("id") or ""), None)
+            return
+        else:
+            self.clear_pane_mode_metadata(str(message.get("id") or ""))
+
         self.reserved[target] = str(message["id"])
         self.remember_nonce(nonce, message)
         prompt = build_peer_prompt(message, nonce, self.max_hops)
+        enter_deferred = False
 
         try:
             if not self.dry_run:
-                run_tmux_send(self.panes[target], prompt, self.submit_delay)
+                run_tmux_send_literal(pane, prompt)
+                time.sleep(self.submit_delay)
+                enter_status = self.pane_mode_status(pane)
+                if enter_status.get("error"):
+                    enter_deferred = True
+                    error = str(enter_status.get("error") or "")
+                    defer_info = self.mark_enter_deferred_for_pane_mode(str(message["id"]), target, "probe_error", error=error)
+                    if defer_info and defer_info.get("_pane_mode_enter_defer_started"):
+                        self.safe_log(
+                            "pane_mode_probe_failed",
+                            target=target,
+                            pane=pane,
+                            message_id=message.get("id"),
+                            error=error,
+                            phase="pre_enter",
+                        )
+                elif enter_status.get("in_mode"):
+                    enter_deferred = True
+                    mode = str(enter_status.get("mode") or "")
+                    defer_info = self.mark_enter_deferred_for_pane_mode(str(message["id"]), target, mode)
+                    if defer_info and defer_info.get("_pane_mode_enter_defer_started"):
+                        self.log(
+                            "enter_deferred_pane_mode",
+                            message_id=message["id"],
+                            to=target,
+                            mode=mode,
+                        )
+                else:
+                    self.clear_enter_deferred_metadata(str(message["id"]))
+                    run_tmux_enter(pane)
         except Exception as exc:
             self.mark_message_pending(str(message["id"]), str(exc))
             self.reserved[target] = None
@@ -818,6 +1336,7 @@ class BridgeDaemon:
             auto_return=message["auto_return"],
             aggregate_id=message.get("aggregate_id"),
             dry_run=self.dry_run,
+            enter_deferred=enter_deferred,
         )
 
     def mark_message_pending(self, message_id: str, error: str | None = None) -> None:
@@ -830,6 +1349,9 @@ class BridgeDaemon:
                 item["updated_ts"] = utc_now()
                 if error:
                     item["last_error"] = error
+                    if not str(error).startswith("pane_"):
+                        for key in PANE_MODE_METADATA_KEYS + PANE_MODE_ENTER_DEFER_KEYS:
+                            item.pop(key, None)
 
         self.queue.update(mutator)
 
@@ -879,6 +1401,8 @@ class BridgeDaemon:
                 item["delivered_ts"] = utc_now()
                 item["updated_ts"] = utc_now()
                 item.pop("last_error", None)
+                for key in PANE_MODE_METADATA_KEYS + PANE_MODE_ENTER_DEFER_KEYS:
+                    item.pop(key, None)
                 return dict(item)
             return None
 
@@ -962,12 +1486,44 @@ class BridgeDaemon:
                 if not msg_id:
                     continue
                 last = self.last_enter_ts.get(msg_id)
-                if last is None or now - last < 1.0:
+                enter_deferred = bool(item.get("pane_mode_enter_deferred_since_ts"))
+                if last is None and not enter_deferred:
+                    continue
+                if last is not None and now - last < 1.0:
                     continue
                 target = str(item.get("to") or "")
                 pane = self.panes.get(target)
                 if not pane:
                     continue
+                mode_status = self.pane_mode_status(pane)
+                if mode_status.get("error"):
+                    error = str(mode_status.get("error") or "")
+                    defer_info = self.mark_enter_deferred_for_pane_mode(msg_id, target, "probe_error", error=error)
+                    self.last_enter_ts[msg_id] = now
+                    if defer_info and defer_info.get("_pane_mode_enter_defer_started"):
+                        self.safe_log(
+                            "pane_mode_probe_failed",
+                            target=target,
+                            pane=pane,
+                            message_id=msg_id,
+                            error=error,
+                            phase="enter_retry",
+                        )
+                    continue
+                elif mode_status.get("in_mode"):
+                    mode = str(mode_status.get("mode") or "")
+                    defer_info = self.mark_enter_deferred_for_pane_mode(msg_id, target, mode)
+                    self.last_enter_ts[msg_id] = now
+                    if defer_info and defer_info.get("_pane_mode_enter_defer_started"):
+                        self.log(
+                            "enter_retry_deferred_pane_mode",
+                            message_id=msg_id,
+                            to=target,
+                            mode=mode,
+                        )
+                    continue
+                else:
+                    self.clear_enter_deferred_metadata(msg_id)
                 try:
                     if not self.dry_run:
                         run_tmux_enter(pane)
@@ -1481,6 +2037,11 @@ class BridgeDaemon:
             stale = []
             for item in queue:
                 if item.get("status") != "inflight":
+                    continue
+                if item.get("pane_mode_enter_deferred_since_ts"):
+                    item["updated_ts"] = utc_now()
+                    if item.get("last_error") not in {"pane_mode_probe_failed_waiting_enter"}:
+                        item["last_error"] = "pane_in_mode_waiting_enter"
                     continue
                 updated = item.get("updated_ts") or item.get("created_ts")
                 try:
@@ -2317,7 +2878,10 @@ class BridgeDaemon:
                     max_hops=self.max_hops,
                     dry_run=self.dry_run,
                     command_socket=str(self.command_socket) if self.command_socket else "",
+                    pane_mode_grace_seconds=self.pane_mode_grace_seconds,
                 )
+                if self.pane_mode_grace_warning:
+                    self.log("pane_mode_grace_config_warning", warning=self.pane_mode_grace_warning)
 
                 # Recover any messages left in the transient "ingressing"
                 # state by a previous daemon crash or by file-fallback
