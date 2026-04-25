@@ -21,6 +21,16 @@ def check_writable(path: Path) -> tuple[bool, str]:
         return False, f"{path}: {exc}"
 
 
+def check_executable(path: Path) -> tuple[bool, str]:
+    if not path.exists():
+        return False, f"{path}: missing"
+    if not path.is_file():
+        return False, f"{path}: not a file"
+    if not os.access(path, os.X_OK):
+        return False, f"{path}: exists but is not executable"
+    return True, str(path)
+
+
 def hook_command_status(path: Path, agent: str) -> tuple[bool, str]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -79,13 +89,21 @@ def main() -> int:
     add("agent_extend_wait_on_path", shutil.which("agent_extend_wait") is not None, shutil.which("agent_extend_wait") or "not found")
     add("bridge_peer_not_on_path", shutil.which("bridge_peer") is None, shutil.which("bridge_peer") or "not found")
     add("list_peer_not_on_path", shutil.which("list_peer") is None, shutil.which("list_peer") or "not found")
-    add("agent_send_peer_model_tool", (model_bin_dir() / "agent_send_peer").exists(), str(model_bin_dir() / "agent_send_peer"))
-    add("agent_list_peers_model_tool", (model_bin_dir() / "agent_list_peers").exists(), str(model_bin_dir() / "agent_list_peers"))
-    add("agent_view_peer_model_tool", (model_bin_dir() / "agent_view_peer").exists(), str(model_bin_dir() / "agent_view_peer"))
-    add("agent_alarm_model_tool", (model_bin_dir() / "agent_alarm").exists(), str(model_bin_dir() / "agent_alarm"))
-    add("agent_interrupt_peer_model_tool", (model_bin_dir() / "agent_interrupt_peer").exists(), str(model_bin_dir() / "agent_interrupt_peer"))
-    add("agent_extend_wait_model_tool", (model_bin_dir() / "agent_extend_wait").exists(), str(model_bin_dir() / "agent_extend_wait"))
-    add("bridge_hook_entrypoint", (hook_dir() / "bridge-hook").exists(), str(hook_dir() / "bridge-hook"))
+    executable_targets = [
+        ("bridge_run_target", bin_dir() / "bridge_run.sh"),
+        ("bridge_manage_target", bin_dir() / "bridge_manage.sh"),
+        ("bridge_healthcheck_target", bin_dir() / "bridge_healthcheck.sh"),
+        ("agent_send_peer_model_tool", model_bin_dir() / "agent_send_peer"),
+        ("agent_list_peers_model_tool", model_bin_dir() / "agent_list_peers"),
+        ("agent_view_peer_model_tool", model_bin_dir() / "agent_view_peer"),
+        ("agent_alarm_model_tool", model_bin_dir() / "agent_alarm"),
+        ("agent_interrupt_peer_model_tool", model_bin_dir() / "agent_interrupt_peer"),
+        ("agent_extend_wait_model_tool", model_bin_dir() / "agent_extend_wait"),
+        ("bridge_hook_entrypoint", hook_dir() / "bridge-hook"),
+    ]
+    for label, path in executable_targets:
+        ok, detail = check_executable(path)
+        add(label, ok, detail)
     ok, detail = hook_command_status(Path.home() / ".claude" / "settings.json", "claude")
     add("claude_hooks", ok, detail)
     ok, detail = hook_command_status(Path.home() / ".codex" / "hooks.json", "codex")
@@ -98,7 +116,37 @@ def main() -> int:
             status = "ok" if check["ok"] else "fail"
             print(f"{status:4} {check['name']}: {check['detail']}")
 
-    hard_failures = {"install_root", "bin_dir", "model_bin_dir", "hook_dir", "libexec_dir", "runtime_config_dir", "state_dir", "run_dir", "log_dir", "python3", "tmux", "agent_send_peer_on_path", "agent_list_peers_on_path", "agent_view_peer_on_path", "agent_alarm_on_path", "agent_interrupt_peer_on_path", "agent_extend_wait_on_path", "bridge_peer_not_on_path", "list_peer_not_on_path", "agent_send_peer_model_tool", "agent_list_peers_model_tool", "agent_view_peer_model_tool", "agent_alarm_model_tool", "agent_interrupt_peer_model_tool", "agent_extend_wait_model_tool", "bridge_hook_entrypoint"}
+    hard_failures = {
+        "install_root",
+        "bin_dir",
+        "model_bin_dir",
+        "hook_dir",
+        "libexec_dir",
+        "runtime_config_dir",
+        "state_dir",
+        "run_dir",
+        "log_dir",
+        "python3",
+        "tmux",
+        "agent_send_peer_on_path",
+        "agent_list_peers_on_path",
+        "agent_view_peer_on_path",
+        "agent_alarm_on_path",
+        "agent_interrupt_peer_on_path",
+        "agent_extend_wait_on_path",
+        "bridge_peer_not_on_path",
+        "list_peer_not_on_path",
+        "bridge_run_target",
+        "bridge_manage_target",
+        "bridge_healthcheck_target",
+        "agent_send_peer_model_tool",
+        "agent_list_peers_model_tool",
+        "agent_view_peer_model_tool",
+        "agent_alarm_model_tool",
+        "agent_interrupt_peer_model_tool",
+        "agent_extend_wait_model_tool",
+        "bridge_hook_entrypoint",
+    }
     return 1 if any((not c["ok"]) and c["name"] in hard_failures for c in checks) else 0
 
 

@@ -67,8 +67,8 @@ choose_room() {
   IFS=$'\t' read -r session _ <<< "${rooms[$choice]}"
 }
 
-print_agents() {
-  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_list_peers.py" --session "$session" --full
+room_summary() {
+  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_manage_summary.py" --session "$session"
 }
 
 list_aliases() {
@@ -160,9 +160,9 @@ clear_peer_view_cache() {
 choose_room
 
 while true; do
-  room_summary="$(print_agents 2>/dev/null || true)"
+  summary_text="$(room_summary 2>/dev/null || true)"
   menu_title="Room: $session"
-  [[ -n "$room_summary" ]] && menu_title="$menu_title"$'\n'"$room_summary"
+  [[ -n "$summary_text" ]] && menu_title="$menu_title"$'\n'"$summary_text"
   if ! action="$(bridge_select_menu "$menu_title" \
     "Join agent pane" \
     "Leave agent" \

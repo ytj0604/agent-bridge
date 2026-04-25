@@ -31,6 +31,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LIBEXEC = ROOT / "libexec" / "agent-bridge"
+DIRECT_EXECUTABLE_TARGETS = (
+    ("bridge_run_target", Path("bin/bridge_run.sh")),
+    ("bridge_manage_target", Path("bin/bridge_manage.sh")),
+    ("bridge_healthcheck_target", Path("bin/bridge_healthcheck.sh")),
+    ("agent_send_peer_model_tool", Path("model-bin/agent_send_peer")),
+    ("agent_list_peers_model_tool", Path("model-bin/agent_list_peers")),
+    ("agent_view_peer_model_tool", Path("model-bin/agent_view_peer")),
+    ("agent_alarm_model_tool", Path("model-bin/agent_alarm")),
+    ("agent_interrupt_peer_model_tool", Path("model-bin/agent_interrupt_peer")),
+    ("agent_extend_wait_model_tool", Path("model-bin/agent_extend_wait")),
+    ("bridge_hook_entrypoint", Path("hooks/bridge-hook")),
+)
+INSTALL_SHIM_TARGETS = DIRECT_EXECUTABLE_TARGETS[:-1]
 sys.path.insert(0, str(LIBEXEC))
 
 import bridge_daemon  # noqa: E402
@@ -1849,7 +1862,7 @@ def scenario_nonce_missing_stops_enter_retry(label: str, tmpdir: Path) -> None:
 
 def scenario_hook_logger_anchored_regex(label: str, tmpdir: Path) -> None:
     """Direct unit-style coverage for the hook-side anchored regex."""
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     sys.path.insert(0, str(libexec))
     try:
         import importlib
@@ -1926,7 +1939,7 @@ def _participants_state(aliases: list[str]) -> dict:
 
 
 def scenario_resolve_targets_single(label: str, tmpdir: Path) -> None:
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     sys.path.insert(0, str(libexec))
     try:
         import importlib
@@ -1939,7 +1952,7 @@ def scenario_resolve_targets_single(label: str, tmpdir: Path) -> None:
 
 
 def scenario_resolve_targets_multi_basic(label: str, tmpdir: Path) -> None:
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     sys.path.insert(0, str(libexec))
     try:
         import importlib
@@ -1953,7 +1966,7 @@ def scenario_resolve_targets_multi_basic(label: str, tmpdir: Path) -> None:
 
 
 def scenario_resolve_targets_order_preserved(label: str, tmpdir: Path) -> None:
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     sys.path.insert(0, str(libexec))
     try:
         import importlib
@@ -1967,7 +1980,7 @@ def scenario_resolve_targets_order_preserved(label: str, tmpdir: Path) -> None:
 
 
 def scenario_resolve_targets_dedup(label: str, tmpdir: Path) -> None:
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     sys.path.insert(0, str(libexec))
     try:
         import importlib
@@ -1983,7 +1996,7 @@ def scenario_resolve_targets_dedup(label: str, tmpdir: Path) -> None:
 
 
 def scenario_resolve_targets_strip_empties(label: str, tmpdir: Path) -> None:
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     sys.path.insert(0, str(libexec))
     try:
         import importlib
@@ -2001,7 +2014,7 @@ def scenario_resolve_targets_strip_empties(label: str, tmpdir: Path) -> None:
 
 
 def scenario_resolve_targets_reserved_alone(label: str, tmpdir: Path) -> None:
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     sys.path.insert(0, str(libexec))
     try:
         import importlib
@@ -2019,7 +2032,7 @@ def scenario_resolve_targets_reserved_alone(label: str, tmpdir: Path) -> None:
 
 
 def scenario_resolve_targets_reserved_mix_rejected(label: str, tmpdir: Path) -> None:
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     sys.path.insert(0, str(libexec))
     try:
         import importlib
@@ -2037,7 +2050,7 @@ def scenario_resolve_targets_reserved_mix_rejected(label: str, tmpdir: Path) -> 
 
 
 def scenario_resolve_targets_unknown_rejected(label: str, tmpdir: Path) -> None:
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     sys.path.insert(0, str(libexec))
     try:
         import importlib
@@ -2055,7 +2068,7 @@ def scenario_resolve_targets_unknown_rejected(label: str, tmpdir: Path) -> None:
 
 
 def scenario_resolve_targets_sender_in_list_rejected(label: str, tmpdir: Path) -> None:
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     sys.path.insert(0, str(libexec))
     try:
         import importlib
@@ -2073,7 +2086,7 @@ def scenario_resolve_targets_sender_in_list_rejected(label: str, tmpdir: Path) -
 
 
 def scenario_resolve_targets_empty_after_strip_rejected(label: str, tmpdir: Path) -> None:
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     sys.path.insert(0, str(libexec))
     try:
         import importlib
@@ -2091,7 +2104,7 @@ def scenario_resolve_targets_empty_after_strip_rejected(label: str, tmpdir: Path
 
 
 def scenario_short_id_format(label: str, tmpdir: Path) -> None:
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     sys.path.insert(0, str(libexec))
     try:
         import importlib
@@ -2114,7 +2127,7 @@ def scenario_short_id_format(label: str, tmpdir: Path) -> None:
 # ---------- v1.5.x scenarios: aggregate trigger guards (unit-style) ----------
 
 def _import_aggregate_helper():
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     if str(libexec) not in sys.path:
         sys.path.insert(0, str(libexec))
     import importlib
@@ -2155,7 +2168,7 @@ def scenario_aggregate_trigger_no_auto_return_no(label: str, tmpdir: Path) -> No
 # ---------- v1.5.x scenarios: forgotten retention + restart guards ----------
 
 def _import_daemon_ctl():
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     if str(libexec) not in sys.path:
         sys.path.insert(0, str(libexec))
     import importlib
@@ -2304,7 +2317,7 @@ def scenario_queue_status_counts_missing_file(label: str, tmpdir: Path) -> None:
 
 
 def scenario_uninstall_helper_print_paths(label: str, tmpdir: Path) -> None:
-    helper = "/root/agent-bridge/libexec/agent-bridge/bridge_uninstall_state.py"
+    helper = str(LIBEXEC / "bridge_uninstall_state.py")
     proc = subprocess.run([sys.executable, helper, "--print-paths"], capture_output=True, text=True, timeout=10)
     assert_true(proc.returncode == 0, f"{label}: helper exit 0, got {proc.returncode}: {proc.stderr}")
     payload = json.loads(proc.stdout)
@@ -2315,12 +2328,120 @@ def scenario_uninstall_helper_print_paths(label: str, tmpdir: Path) -> None:
 
 
 def scenario_uninstall_helper_refuses_dangerous_path(label: str, tmpdir: Path) -> None:
-    helper = "/root/agent-bridge/libexec/agent-bridge/bridge_uninstall_state.py"
+    helper = str(LIBEXEC / "bridge_uninstall_state.py")
     env = dict(os.environ)
     env["AGENT_BRIDGE_STATE_DIR"] = "/etc"  # dangerous
     proc = subprocess.run([sys.executable, helper, "--dry-run"], env=env, capture_output=True, text=True, timeout=10)
     assert_true(proc.returncode != 0, f"{label}: must refuse dangerous path, exit was {proc.returncode}")
     assert_true("refuses" in proc.stderr.lower() or "dangerous" in proc.stderr.lower(), f"{label}: stderr explains refusal: {proc.stderr!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_direct_exec_targets_executable(label: str, tmpdir: Path) -> None:
+    missing = []
+    not_executable = []
+    for name, relative in DIRECT_EXECUTABLE_TARGETS:
+        path = ROOT / relative
+        if not path.exists():
+            missing.append(f"{name}={path}")
+        elif not os.access(path, os.X_OK):
+            not_executable.append(f"{name}={path}")
+    assert_true(not missing, f"{label}: direct exec targets missing: {missing}")
+    assert_true(not not_executable, f"{label}: direct exec targets not executable: {not_executable}")
+    print(f"  PASS  {label}")
+
+
+def scenario_healthcheck_executable_helper_distinguishes_states(label: str, tmpdir: Path) -> None:
+    import importlib
+    hc = importlib.import_module("bridge_healthcheck")
+    importlib.reload(hc)
+
+    missing = tmpdir / "missing-tool"
+    ok, detail = hc.check_executable(missing)
+    assert_true(not ok, f"{label}: missing path must fail")
+    assert_true("missing" in detail and "not executable" not in detail, f"{label}: missing detail must be distinct: {detail!r}")
+
+    tool = tmpdir / "tool"
+    tool.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    os.chmod(tool, 0o644)
+    ok, detail = hc.check_executable(tool)
+    assert_true(not ok, f"{label}: non-executable file must fail")
+    assert_true("exists but is not executable" in detail, f"{label}: non-executable detail must be distinct: {detail!r}")
+
+    os.chmod(tool, 0o755)
+    ok, detail = hc.check_executable(tool)
+    assert_true(ok and detail == str(tool), f"{label}: executable file must pass, got ok={ok} detail={detail!r}")
+    print(f"  PASS  {label}")
+
+
+def _write_fake_install_tree(root: Path, *, omit: Path | None = None) -> None:
+    shutil.copy2(ROOT / "install.sh", root / "install.sh")
+    for _, relative in INSTALL_SHIM_TARGETS:
+        if omit is not None and relative == omit:
+            continue
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        os.chmod(target, 0o644)
+
+
+def _run_fake_install(root: Path, bin_dir: Path, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [
+            "bash",
+            str(root / "install.sh"),
+            "--yes",
+            "--bin-dir",
+            str(bin_dir),
+            "--skip-hooks",
+            "--no-shell-rc",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+
+def scenario_install_sh_chmods_target_or_fails(label: str, tmpdir: Path) -> None:
+    positive_root = tmpdir / "install-positive"
+    positive_root.mkdir()
+    _write_fake_install_tree(positive_root)
+    alarm_target = positive_root / "model-bin" / "agent_alarm"
+    assert_true(not os.access(alarm_target, os.X_OK), f"{label}: precondition target starts non-executable")
+    proc = _run_fake_install(positive_root, tmpdir / "shims-positive")
+    assert_true(proc.returncode == 0, f"{label}: install should recover non-executable targets, got {proc.returncode}: {proc.stderr}")
+    assert_true(os.access(alarm_target, os.X_OK), f"{label}: install should chmod shim target executable")
+    assert_true(os.access(tmpdir / "shims-positive" / "agent_alarm", os.X_OK), f"{label}: shim itself should be executable")
+
+    missing_root = tmpdir / "install-missing"
+    missing_root.mkdir()
+    _write_fake_install_tree(missing_root, omit=Path("model-bin/agent_alarm"))
+    proc = _run_fake_install(missing_root, tmpdir / "shims-missing")
+    assert_true(proc.returncode != 0, f"{label}: missing shim target must hard fail")
+    assert_true("missing shim target for agent_alarm" in proc.stderr, f"{label}: missing-target stderr should name shim: {proc.stderr!r}")
+
+    failing_root = tmpdir / "install-failing"
+    failing_root.mkdir()
+    _write_fake_install_tree(failing_root)
+    fakebin = tmpdir / "fakebin"
+    fakebin.mkdir()
+    fake_chmod = fakebin / "chmod"
+    fake_chmod.write_text(
+        "#!/usr/bin/env bash\n"
+        "case \"$*\" in\n"
+        "  *model-bin/agent_alarm*) echo fake chmod failure >&2; exit 42 ;;\n"
+        "esac\n"
+        "exec /bin/chmod \"$@\"\n",
+        encoding="utf-8",
+    )
+    os.chmod(fake_chmod, 0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{fakebin}:{env.get('PATH', '')}"
+    proc = _run_fake_install(failing_root, tmpdir / "shims-failing", env=env)
+    assert_true(proc.returncode != 0, f"{label}: chmod failure must hard fail")
+    assert_true("cannot make shim target executable for agent_alarm" in proc.stderr, f"{label}: chmod failure stderr should name shim: {proc.stderr!r}")
+    assert_true(not os.access(failing_root / "model-bin" / "agent_alarm", os.X_OK), f"{label}: failed chmod target should remain non-executable")
     print(f"  PASS  {label}")
 
 
@@ -2490,7 +2611,7 @@ def _model_state(aliases_with_extras: dict) -> dict:
 
 
 def scenario_format_peer_list_model_safe_default(label: str, tmpdir: Path) -> None:
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     if str(libexec) not in sys.path:
         sys.path.insert(0, str(libexec))
     import importlib
@@ -2509,7 +2630,7 @@ def scenario_format_peer_list_model_safe_default(label: str, tmpdir: Path) -> No
 
 
 def scenario_format_peer_list_full_includes_operator_fields(label: str, tmpdir: Path) -> None:
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     if str(libexec) not in sys.path:
         sys.path.insert(0, str(libexec))
     import importlib
@@ -2522,9 +2643,110 @@ def scenario_format_peer_list_full_includes_operator_fields(label: str, tmpdir: 
     print(f"  PASS  {label}")
 
 
+def scenario_bridge_manage_summary_concise(label: str, tmpdir: Path) -> None:
+    import importlib
+    bms = importlib.import_module("bridge_manage_summary")
+    importlib.reload(bms)
+    state = {
+        "session": "test-session",
+        "participants": {
+            "z-codex": {
+                "alias": "z-codex",
+                "agent_type": "codex",
+                "pane": "%9",
+                "target": "0:1.9",
+                "status": "active",
+                "model": "gpt-test",
+            },
+            "a-claude": {
+                "alias": "a-claude",
+                "agent_type": "claude",
+                "pane": "%1",
+                "target": "0:1.1",
+                "status": "active",
+                "model": "",
+            },
+            "inactive": {
+                "alias": "inactive",
+                "agent_type": "codex",
+                "pane": "%8",
+                "target": "0:1.8",
+                "status": "left",
+            },
+        },
+    }
+    out1 = bms.format_room_summary(state)
+    out2 = bms.format_room_summary(state)
+    assert_true(out1 == out2, f"{label}: output must be deterministic")
+    lines = out1.splitlines()
+    assert_true(lines[0] == "Agents:", f"{label}: starts with Agents:, got {out1!r}")
+    assert_true(lines[1].startswith("- a-claude claude active target=0:1.1 pane=%1"), f"{label}: sorted a-claude first: {out1!r}")
+    assert_true(lines[2].startswith("- z-codex codex active target=0:1.9 pane=%9 model=gpt-test"), f"{label}: z-codex fields/model: {out1!r}")
+    assert_true("inactive" not in out1, f"{label}: inactive participants omitted: {out1!r}")
+    assert_true("model=" not in lines[1], f"{label}: empty model omitted: {lines[1]!r}")
+    forbidden = ("agent_send_peer", "Commands:", "Kinds and routing contract", "Reply normally")
+    for needle in forbidden:
+        assert_true(needle not in out1, f"{label}: summary must not include cheat sheet text {needle!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_manage_summary_defaults(label: str, tmpdir: Path) -> None:
+    import importlib
+    bms = importlib.import_module("bridge_manage_summary")
+    importlib.reload(bms)
+    state = {
+        "session": "test-session",
+        "participants": {
+            "loose": {
+                "alias": "loose",
+                "agent_type": "",
+                "pane": "",
+                "target": "",
+                "status": "",
+            }
+        },
+    }
+    out = bms.format_room_summary(state)
+    assert_true("- loose unknown unknown target=? pane=?" in out, f"{label}: missing fields use stable defaults: {out!r}")
+    assert_true("model=" not in out, f"{label}: missing model omitted: {out!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_manage_summary_legacy_state_fallback(label: str, tmpdir: Path) -> None:
+    import importlib
+    bms = importlib.import_module("bridge_manage_summary")
+    importlib.reload(bms)
+    state = {
+        "session": "test-session",
+        "panes": {"claude": "%1", "codex": "%2"},
+        "targets": {"claude": "0:1.1", "codex": "0:1.2"},
+    }
+    out = bms.format_room_summary(state)
+    assert_true("- claude claude active target=0:1.1 pane=%1" in out, f"{label}: legacy claude rendered: {out!r}")
+    assert_true("- codex codex active target=0:1.2 pane=%2" in out, f"{label}: legacy codex rendered: {out!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_manage_summary_missing_session_exits(label: str, tmpdir: Path) -> None:
+    script = ROOT / "libexec" / "agent-bridge" / "bridge_manage_summary.py"
+    env = os.environ.copy()
+    env["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
+    proc = subprocess.run(
+        [sys.executable, str(script), "--session", "missing-room"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert_true(proc.returncode == 2, f"{label}: missing session should exit 2, got {proc.returncode}")
+    assert_true(proc.stdout == "", f"{label}: missing session should not print summary: {proc.stdout!r}")
+    assert_true("not active or was stopped" in proc.stderr, f"{label}: stderr should explain missing room: {proc.stderr!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_model_safe_participants_uses_active_only(label: str, tmpdir: Path) -> None:
     """JSON view should match text view: only active participants."""
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     if str(libexec) not in sys.path:
         sys.path.insert(0, str(libexec))
     import importlib
@@ -2545,7 +2767,7 @@ def scenario_model_safe_participants_uses_active_only(label: str, tmpdir: Path) 
 
 def scenario_list_peers_json_daemon_status_strips_pid(label: str, tmpdir: Path) -> None:
     """Default JSON output's daemon_status must not contain pid; --full does."""
-    helper = "/root/agent-bridge/libexec/agent-bridge/bridge_list_peers.py"
+    helper = str(LIBEXEC / "bridge_list_peers.py")
     # Use existing live session to drive the CLI
     proc = subprocess.run(
         [sys.executable, helper, "--session", "agent-bridge-auto", "--json"],
@@ -2570,7 +2792,7 @@ def scenario_list_peers_json_daemon_status_strips_pid(label: str, tmpdir: Path) 
 
 
 def scenario_model_safe_participants_strips_endpoints(label: str, tmpdir: Path) -> None:
-    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    libexec = LIBEXEC
     if str(libexec) not in sys.path:
         sys.path.insert(0, str(libexec))
     import importlib
@@ -3235,12 +3457,19 @@ def main() -> int:
             ("queue_status_counts_missing_file", scenario_queue_status_counts_missing_file),
             ("uninstall_helper_print_paths", scenario_uninstall_helper_print_paths),
             ("uninstall_helper_refuses_dangerous_path", scenario_uninstall_helper_refuses_dangerous_path),
+            ("direct_exec_targets_executable", scenario_direct_exec_targets_executable),
+            ("healthcheck_executable_helper_distinguishes_states", scenario_healthcheck_executable_helper_distinguishes_states),
+            ("install_sh_chmods_target_or_fails", scenario_install_sh_chmods_target_or_fails),
             ("restart_dry_run_no_side_effect", scenario_restart_dry_run_no_side_effect),
             ("recover_orphan_delivered", scenario_recover_orphan_delivered),
             ("recover_orphan_delivered_aggregate_member", scenario_recover_orphan_delivered_aggregate_member),
             ("prune_concurrent_stat_safe", scenario_prune_concurrent_stat_safe),
             ("format_peer_list_model_safe_default", scenario_format_peer_list_model_safe_default),
             ("format_peer_list_full_includes_operator_fields", scenario_format_peer_list_full_includes_operator_fields),
+            ("bridge_manage_summary_concise", scenario_bridge_manage_summary_concise),
+            ("bridge_manage_summary_defaults", scenario_bridge_manage_summary_defaults),
+            ("bridge_manage_summary_legacy_state_fallback", scenario_bridge_manage_summary_legacy_state_fallback),
+            ("bridge_manage_summary_missing_session_exits", scenario_bridge_manage_summary_missing_session_exits),
             ("model_safe_participants_strips_endpoints", scenario_model_safe_participants_strips_endpoints),
             ("model_safe_participants_uses_active_only", scenario_model_safe_participants_uses_active_only),
             ("list_peers_json_daemon_status_strips_pid", scenario_list_peers_json_daemon_status_strips_pid),

@@ -56,6 +56,20 @@ write_shim() {
   if [[ "$dry_run" == "1" ]]; then
     return
   fi
+  if [[ ! -e "$target" ]]; then
+    echo "install.sh: missing shim target for $name: $target" >&2
+    exit 1
+  fi
+  if [[ ! -f "$target" ]]; then
+    echo "install.sh: shim target is not a file for $name: $target" >&2
+    exit 1
+  fi
+  if [[ ! -x "$target" ]]; then
+    if ! chmod +x "$target"; then
+      echo "install.sh: cannot make shim target executable for $name: $target" >&2
+      exit 1
+    fi
+  fi
   mkdir -p "$bin_dir"
   cat > "$path" <<EOF
 #!/usr/bin/env bash
