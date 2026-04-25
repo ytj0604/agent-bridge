@@ -74,11 +74,17 @@ def main() -> int:
     add("agent_send_peer_on_path", shutil.which("agent_send_peer") is not None, shutil.which("agent_send_peer") or "not found")
     add("agent_list_peers_on_path", shutil.which("agent_list_peers") is not None, shutil.which("agent_list_peers") or "not found")
     add("agent_view_peer_on_path", shutil.which("agent_view_peer") is not None, shutil.which("agent_view_peer") or "not found")
+    add("agent_alarm_on_path", shutil.which("agent_alarm") is not None, shutil.which("agent_alarm") or "not found")
+    add("agent_interrupt_peer_on_path", shutil.which("agent_interrupt_peer") is not None, shutil.which("agent_interrupt_peer") or "not found")
+    add("agent_extend_wait_on_path", shutil.which("agent_extend_wait") is not None, shutil.which("agent_extend_wait") or "not found")
     add("bridge_peer_not_on_path", shutil.which("bridge_peer") is None, shutil.which("bridge_peer") or "not found")
     add("list_peer_not_on_path", shutil.which("list_peer") is None, shutil.which("list_peer") or "not found")
     add("agent_send_peer_model_tool", (model_bin_dir() / "agent_send_peer").exists(), str(model_bin_dir() / "agent_send_peer"))
     add("agent_list_peers_model_tool", (model_bin_dir() / "agent_list_peers").exists(), str(model_bin_dir() / "agent_list_peers"))
     add("agent_view_peer_model_tool", (model_bin_dir() / "agent_view_peer").exists(), str(model_bin_dir() / "agent_view_peer"))
+    add("agent_alarm_model_tool", (model_bin_dir() / "agent_alarm").exists(), str(model_bin_dir() / "agent_alarm"))
+    add("agent_interrupt_peer_model_tool", (model_bin_dir() / "agent_interrupt_peer").exists(), str(model_bin_dir() / "agent_interrupt_peer"))
+    add("agent_extend_wait_model_tool", (model_bin_dir() / "agent_extend_wait").exists(), str(model_bin_dir() / "agent_extend_wait"))
     add("bridge_hook_entrypoint", (hook_dir() / "bridge-hook").exists(), str(hook_dir() / "bridge-hook"))
     ok, detail = hook_command_status(Path.home() / ".claude" / "settings.json", "claude")
     add("claude_hooks", ok, detail)
@@ -92,7 +98,7 @@ def main() -> int:
             status = "ok" if check["ok"] else "fail"
             print(f"{status:4} {check['name']}: {check['detail']}")
 
-    hard_failures = {"install_root", "bin_dir", "model_bin_dir", "hook_dir", "libexec_dir", "runtime_config_dir", "state_dir", "run_dir", "log_dir", "python3", "tmux", "agent_send_peer_on_path", "agent_list_peers_on_path", "agent_view_peer_on_path", "bridge_peer_not_on_path", "list_peer_not_on_path", "agent_send_peer_model_tool", "agent_list_peers_model_tool", "agent_view_peer_model_tool", "bridge_hook_entrypoint"}
+    hard_failures = {"install_root", "bin_dir", "model_bin_dir", "hook_dir", "libexec_dir", "runtime_config_dir", "state_dir", "run_dir", "log_dir", "python3", "tmux", "agent_send_peer_on_path", "agent_list_peers_on_path", "agent_view_peer_on_path", "agent_alarm_on_path", "agent_interrupt_peer_on_path", "agent_extend_wait_on_path", "bridge_peer_not_on_path", "list_peer_not_on_path", "agent_send_peer_model_tool", "agent_list_peers_model_tool", "agent_view_peer_model_tool", "agent_alarm_model_tool", "agent_interrupt_peer_model_tool", "agent_extend_wait_model_tool", "bridge_hook_entrypoint"}
     return 1 if any((not c["ok"]) and c["name"] in hard_failures for c in checks) else 0
 
 

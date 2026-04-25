@@ -81,7 +81,10 @@ if [[ "$remove_shims" == "1" ]]; then
     bridge_healthcheck \
     agent_send_peer \
     agent_list_peers \
-    agent_view_peer
+    agent_view_peer \
+    agent_alarm \
+    agent_interrupt_peer \
+    agent_extend_wait
   do
     path="$bin_dir/$name"
     if [[ -e "$path" || -L "$path" ]]; then

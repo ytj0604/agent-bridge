@@ -125,17 +125,23 @@ bridge_manage
 
 ## Model-Facing Commands
 
-Models communicate through three shell tools exposed on `PATH`:
+Models communicate through these shell tools exposed on `PATH`:
 
 ```bash
 agent_list_peers
 agent_send_peer --to <alias> 'message'
 agent_send_peer --all 'message'
 agent_send_peer --kind notice --to <alias> 'FYI'
+agent_send_peer [--to <alias>|--all] --watchdog <sec> 'request'
 agent_view_peer <alias> --onboard [--tail 50]
 agent_view_peer <alias> --older
 agent_view_peer <alias> --since-last
 agent_view_peer <alias> --search 'text' [--live]
+agent_alarm <sec> [--note 'text']
+agent_extend_wait <message_id> <sec>
+agent_interrupt_peer <alias>
+agent_interrupt_peer <alias> --clear-hold
+agent_interrupt_peer [<alias>] --status
 ```
 
 If exactly two participants are active, the shorter form is valid:
@@ -161,13 +167,62 @@ When a participant joins or leaves, the daemon sends a `membership_update` notic
 
 ## Routing Semantics
 
-- `kind=request`: asks the peer to do work; the peer's next normal response is returned to the requester once.
+- `kind=request`: asks the peer to do work; the peer's next normal response is returned to the requester once via auto-routing.
 - `kind=result`: delivers a result back to a previous requester; the recipient's response is **not** returned again.
-- `kind=notice`: sends information without expecting a response.
+- `kind=notice`: sends information **with no return route**. Even if the peer chooses to write a response, the bridge will not deliver it back to the sender — only `agent_view_peer` can observe it. Body text saying "please reply" does not change this; the kind on the wire decides routing. Use `request` when you actually need an answer.
 - `agent_send_peer '...'` sends `kind=request` by default.
 - `agent_send_peer --all '...'` sends one request to each peer and returns one aggregated result after every peer replies.
 - When answering a peer request, reply normally — the bridge returns that normal response automatically.
 - Relay depth is capped (default `max_hops=4`) to prevent runaway chains.
+
+## Watchdogs, Alarms, and Interrupt
+
+### Watchdogs (request only)
+
+- `agent_send_peer --to <alias> --watchdog <sec> 'request body'` adds a watchdog. Counted from the moment the prompt is **delivered** to the peer (the `prompt_submitted` hook fires), not from enqueue. If the peer has not produced a `response_finished` after `<sec>` seconds since delivery, the bridge sends a `[bridge:watchdog]` notice back to the sender.
+- `kind=request` (the default) gets a default 5-minute watchdog automatically. Override the default via the env `AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC` (set 0 or a non-positive value to disable the default globally). On a per-call basis, `--watchdog 0` explicitly disables the watchdog for that one request.
+- `--watchdog` is rejected for `kind=notice` (and any other non-request). Notices do not have a return route, so a watchdog watching for "no reply" is meaningless. Use `agent_alarm` instead.
+- The watchdog is automatically cancelled when the peer's reply is auto-routed back (single request) or when the aggregate completes (`--all`). It fires only if the peer takes too long.
+- The wake notice tells the sender exactly which actions are appropriate:
+  - `agent_extend_wait <msg_id> <sec>` to keep waiting on the same request,
+  - `agent_interrupt_peer <alias>` to cancel and stop the peer,
+  - `agent_view_peer <alias>` to first inspect what the peer is doing.
+- The wake notice also describes the message status: if the request never reached the peer (still pending or inflight, e.g. the peer is in `held_interrupt`), the wake notice flags that and recommends `agent_interrupt_peer --status` / `--clear-hold` instead of `agent_extend_wait`.
+- `agent_extend_wait <message_id> <sec>` re-arms the watchdog for the same request, counted from now + `<sec>`. Only the original sender can extend; aggregate-member messages are not supported in v1.5 (`aggregate_extend_not_supported`). Watchdog fires are one-shot — without an explicit `agent_extend_wait`, you will not be reminded again about that request.
+
+### Alarms (self-wake; cancelled by qualifying incoming messages)
+
+- `agent_alarm <sec> --note '<desc>'` schedules a self-addressed wake notice. End your turn after setting it; the bridge will deliver the notice when the deadline elapses, **unless** the alarm is cancelled first.
+- An alarm is cancelled the moment a "qualifying" peer message is enqueued for the alarm owner. Qualifying = `kind != "result"`, `from != alarm_owner`, `from != "bridge"`. So peer-initiated `request` and `notice` messages from another agent both cancel; system-internal `result` (auto-returned replies) and bridge-synthetic notices (watchdog wakes, interrupt notices, alarm notices) do **not** cancel.
+- When an alarm is cancelled by an incoming message, that triggering message is delivered with a short `[bridge:alarm_cancelled]` notice **prepended** to its body so you cannot miss it under truncation. The notice tells you to re-arm with `agent_alarm` if the message is not what you were waiting for.
+- Alarms are best for "I delegated something via notice and want a safety wake if no follow-up arrives". They are **not** the right tool for waiting on `auto_return` reply results — use `--watchdog` and `agent_extend_wait` for that.
+
+### Interrupt and held_interrupt
+
+- `agent_interrupt_peer <alias>` sends ESC to the peer's pane and **cancels** the active in-flight message (the message is removed; pending messages stay queued). The peer is placed in a `held_interrupt` state and stops receiving new deliveries until either:
+  - the next `response_finished` event from that peer arrives (the bridge interprets it as the drain Stop and auto-releases the hold without routing the response), or
+  - you run `agent_interrupt_peer <alias> --clear-hold` to force the release manually.
+  If `tmux send-keys` fails (no pane / tmux error), the bridge fail-closes — no state changes.
+- `agent_interrupt_peer <alias> --clear-hold` is **unsafe** if the peer might still be running, because forcing release before the drain Stop arrives can cause the late response to be misrouted to the next prompt. Always inspect with `--status` first.
+- `agent_interrupt_peer [<alias>] --status` prints `busy`, `held`, `current_prompt_id`, and `delivered` / `pending` queue counts for the target (or all peers). Use it before clearing a hold or to debug delivery stalls.
+
+### Large payloads
+
+For design docs, code dumps, long plans, or any body longer than a few hundred characters: write to a shared path (e.g. `/tmp/agent-bridge-share/...`) and send only the path plus a brief description. Peers run on the same host and can Read the file directly. Inlining large bodies forces `tmux send-keys` to inject every character into the peer's pane, which is slow and can trip paste-burst submit.
+
+### Limits
+
+- `held_interrupt`, watchdogs, and alarms are kept in daemon memory only and do not survive a daemon restart. After restart, run `agent_interrupt_peer --status` to inspect for `delivered` queue items that may need manual intervention.
+- The interrupt design relies on the next `response_finished` from the held peer to release the hold. If the peer never produces one (e.g. it ignored ESC), the hold is preserved indefinitely — manual `--clear-hold` is required, with the routing risk noted above.
+- Watchdogs are armed at delivery time. If the message never delivers (e.g. peer permanently held or unreachable), the watchdog also never arms. Use `agent_interrupt_peer --status` to spot stuck `pending`/`inflight` items.
+- The file-write fallback in `agent_send_peer` (used when the daemon socket is unreachable, e.g. from a sandboxed peer) writes the message in a transient `status="ingressing"` state. The daemon's main loop detects the new `message_queued` event and runs the same finalize step as the socket path — alarm cancel + body prepend, then promote to `status="pending"`. So both ingress paths reach the same end state. If the daemon is **down** at the time of the fallback write, the message stays as `ingressing` until daemon startup recovery promotes it (alarm cancel is skipped in that recovery, since alarms are in-memory). The CLI prints a stderr warning on every fallback so the operator notices.
+
+## Known Issues
+
+See [`docs/known-issues.md`](docs/known-issues.md) for the current list of v1.5 limitations and design caveats. Notable:
+- **I-01** (open): claude `response_finished` auto-routes indefinitely until the next `UserPromptSubmit` resets the daemon's per-agent prompt slot. A peer request can absorb multiple unrelated claude turns. Fix planned for v2 (consume-once auto-route).
+- **I-02** (mitigated): codex sandbox cannot connect to the daemon socket; fallback file-write path now applies the same alarm-cancel semantics under a transient `status="ingressing"`.
+- **I-03** (open): daemon in-memory state (`held_interrupt`, watchdogs, alarms) is lost on restart. Persist to disk in a future revision.
 
 ## Sender Identity and Spoofing
 

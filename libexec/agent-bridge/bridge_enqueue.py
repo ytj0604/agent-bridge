@@ -14,6 +14,25 @@ from bridge_participants import active_participants, load_session, resolve_targe
 from bridge_paths import run_root, state_root
 from bridge_util import MESSAGE_KINDS, append_jsonl, locked_json, normalize_kind, public_record, utc_now
 
+# v1.5: enforce request-only watchdog and provide a default delay for
+# requests. Default 5 minutes, override via env. The watchdog itself is
+# armed at delivery time inside the daemon (mark_message_delivered uses
+# the watchdog_delay_sec metadata).
+USER_SENDABLE_KINDS = sorted({"request", "notice"})
+
+
+def _resolve_default_watchdog_seconds() -> float | None:
+    raw = os.environ.get("AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC")
+    if raw is None:
+        return 300.0
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return 300.0
+    if val <= 0:
+        return None
+    return val
+
 
 WRITE_FAILURE_ERRNOS = {errno.EROFS, errno.EACCES, errno.EPERM}
 
@@ -85,7 +104,7 @@ def main() -> int:
     parser.add_argument("--to", dest="target")
     parser.add_argument("--all", dest="target_all", action="store_true")
     parser.add_argument("--intent", default="message")
-    parser.add_argument("--kind", choices=sorted(MESSAGE_KINDS), default="request")
+    parser.add_argument("--kind", choices=USER_SENDABLE_KINDS, default="request")
     parser.add_argument("--body")
     parser.add_argument("--stdin", action="store_true")
     parser.add_argument("--causal-id")
@@ -96,6 +115,12 @@ def main() -> int:
     parser.add_argument("--queue-file")
     parser.add_argument("--session", dest="bridge_session")
     parser.add_argument("--allow-spoof", action="store_true")
+    parser.add_argument(
+        "--watchdog",
+        type=float,
+        default=None,
+        help="seconds from now at which to wake the sender if the message has not been resolved",
+    )
     args = parser.parse_args()
 
     bridge_session = args.bridge_session or os.environ.get("AGENT_BRIDGE_SESSION")
@@ -165,6 +190,30 @@ def main() -> int:
     aggregate_id = ""
     if args.target_all and kind == "request" and args.sender != "bridge" and len(targets) > 1:
         aggregate_id = f"agg-{uuid.uuid4().hex}"
+
+    # v1.5 watchdog: enforce request-only at the enqueue boundary as well
+    # (defense-in-depth; bridge_send_peer also rejects). Resolve the delay
+    # in seconds: explicit --watchdog overrides; if unset for kind=request,
+    # apply the env-driven default. --watchdog 0 disables.
+    if args.watchdog is not None and kind != "request":
+        print(
+            f"agent_send_peer: --watchdog only applies to --kind request (got {kind!r}). For notice, use agent_alarm.",
+            file=sys.stderr,
+        )
+        return 2
+    watchdog_delay_sec: float | None = None
+    if args.watchdog is not None:
+        try:
+            val = float(args.watchdog)
+        except (TypeError, ValueError):
+            print(f"agent_send_peer: invalid --watchdog value {args.watchdog!r}", file=sys.stderr)
+            return 2
+        if val > 0:
+            watchdog_delay_sec = val
+        else:
+            watchdog_delay_sec = None  # explicit disable
+    elif kind == "request" and args.sender != "bridge":
+        watchdog_delay_sec = _resolve_default_watchdog_seconds()
     messages_and_records = []
     for target in targets:
         auto_return = not args.no_auto_return and kind == "request" and args.sender != "bridge" and target != "bridge"
@@ -183,13 +232,21 @@ def main() -> int:
             "reply_to": None,
             "source": "external_enqueue",
             "bridge_session": bridge_session,
-            "status": "pending",
+            # Transient ingress status. The daemon promotes it to "pending"
+            # inside _apply_alarm_cancel_to_queued_message after applying
+            # alarm cancel, all under state_lock so it cannot be picked up
+            # by reserve_next mid-ingest. This is what closes the race
+            # where the file-fallback path (codex sandbox) wrote queue.json
+            # before the daemon had a chance to apply alarm cancel.
+            "status": "ingressing",
             "nonce": None,
             "delivery_attempts": 0,
         }
         if aggregate_id and auto_return:
             message["aggregate_id"] = aggregate_id
             message["aggregate_expected"] = list(targets)
+        if watchdog_delay_sec is not None:
+            message["watchdog_delay_sec"] = watchdog_delay_sec
 
         record = {
             "ts": utc_now(),
@@ -227,6 +284,24 @@ def main() -> int:
             return 1
         print("\n".join(ipc_ids))
         return 0
+
+    # File-write fallback: the message is written directly to queue.json
+    # in the transient status="ingressing" state and the message_queued
+    # event is appended to events.raw.jsonl. If the daemon is alive, it
+    # will pick up the event in its tail loop and run the same finalize
+    # step as the socket path (alarm cancel + body prepend + promote to
+    # pending). If the daemon is down, the message sits as "ingressing"
+    # until daemon startup recovery promotes it (alarms cancelled at that
+    # point are in-memory only and lost across the restart, so the
+    # recovery skips alarm cancel). Either way, the operator should
+    # know the socket was unreachable.
+    print(
+        "agent_send_peer: WARNING — daemon socket unavailable; falling back to direct file write. "
+        "Bridge semantics (alarm cancel, default watchdog arming) apply once the daemon picks up the "
+        "ingressing message. If the daemon is down, alarms registered before this write are lost on "
+        "restart; verify with bridge_manage status.",
+        file=sys.stderr,
+    )
 
     ids = []
     for message, record in messages_and_records:

@@ -11,8 +11,8 @@ from bridge_identity import update_live_session
 from bridge_util import append_jsonl, locked_json_read, public_record as redact_public_record, utc_now
 
 
-NONCE_PATTERN = re.compile(r"\[bridge:([^\]]+)\]")
-ATTACH_PROBE_PATTERN = re.compile(r"\[bridge-probe:([^\]]+)\]")
+NONCE_PATTERN = re.compile(r"\[bridge:([^\]\s]+)\]")
+ATTACH_PROBE_PATTERN = re.compile(r"\[bridge-probe:([^\]\s]+)\]")
 STATE_ROOT = state_root()
 ATTACH_REGISTRY = STATE_ROOT / "attached-sessions.json"
 ATTACH_DISCOVERY = STATE_ROOT / "attach-discovery.jsonl"
@@ -40,16 +40,22 @@ PUBLIC_RECORD_FIELDS = (
 
 
 def extract_nonce(text: str | None) -> str | None:
+    # Match only at the start of the prompt (after leading whitespace).
+    # Bridge always injects peer prompts with [bridge:<nonce>] as the first
+    # token; quoted bridge text mid-prompt (e.g., user pastes a peer pane
+    # snapshot) must NOT be picked up as a delivery confirmation.
+    # The daemon treats this nonce as a hint only; authoritative identity
+    # comes from daemon state (see handle_prompt_submitted in bridge_daemon).
     if not text:
         return None
-    match = NONCE_PATTERN.search(text)
+    match = NONCE_PATTERN.match(text.lstrip())
     return match.group(1) if match else None
 
 
 def extract_attach_probe(text: str | None) -> str | None:
     if not text:
         return None
-    match = ATTACH_PROBE_PATTERN.search(text)
+    match = ATTACH_PROBE_PATTERN.match(text.lstrip())
     return match.group(1) if match else None
 
 

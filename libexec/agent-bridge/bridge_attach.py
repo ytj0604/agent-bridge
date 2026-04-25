@@ -641,7 +641,7 @@ def clear_probe_wait() -> None:
         sys.stdout.flush()
 
 
-def wait_for_probe(probe_id: str, agent: str, timeout: float, alias: str = "", pane_desc: str = "") -> dict:
+def wait_for_probe(probe_id: str, agent: str, timeout: float, alias: str = "", pane_desc: str = "", pane_id: str = "") -> dict:
     deadline = time.time() + timeout
     started = time.time()
     offset = 0
@@ -650,6 +650,14 @@ def wait_for_probe(probe_id: str, agent: str, timeout: float, alias: str = "", p
     path = discovery_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.touch(exist_ok=True)
+    # Mirrors the daemon's retry-enter mechanism for peer message delivery:
+    # the initial send_prompt() already sent Enter once, but a long probe
+    # prompt can be swallowed by codex/claude TUI's paste-burst path so the
+    # Enter is treated as part of the input buffer rather than as submit.
+    # We re-send Enter every ~1s while the probe ack has not arrived; an
+    # already-submitted prompt makes subsequent Enters into harmless empty
+    # submits (which the TUI ignores).
+    last_enter_ts = time.time()
     while time.time() < deadline:
         elapsed = time.time() - started
         render_probe_wait(label, elapsed, timeout, frame)
@@ -675,6 +683,12 @@ def wait_for_probe(probe_id: str, agent: str, timeout: float, alias: str = "", p
                     print(f"Probe confirmed: {label}")
                     return record
             offset = stream.tell()
+        if pane_id and time.time() - last_enter_ts >= 1.0:
+            try:
+                tmux("send-keys", "-t", pane_id, "Enter")
+            except Exception:
+                pass
+            last_enter_ts = time.time()
         time.sleep(0.25)
     clear_probe_wait()
     location = f" pane {pane_desc}" if pane_desc else ""
@@ -1108,6 +1122,7 @@ def main() -> int:
                     args.probe_timeout,
                     alias=alias,
                     pane_desc=f"{pane['pane_id']} ({pane['target']})",
+                    pane_id=pane["pane_id"],
                 )
             except AttachProbeTimeout as exc:
                 raise SystemExit(str(exc)) from exc

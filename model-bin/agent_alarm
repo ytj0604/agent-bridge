@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+_bridge_bin_dir="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent)' "${BASH_SOURCE[0]}")"
+_bridge_root="$(cd "$_bridge_bin_dir/.." >/dev/null 2>&1 && pwd -P)"
+source "$_bridge_root/libexec/agent-bridge/bridge_common.sh"
+exec "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_alarm.py" "$@"

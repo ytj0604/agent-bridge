@@ -71,6 +71,9 @@ write_shim bridge_healthcheck "$root/bin/bridge_healthcheck.sh"
 write_shim agent_send_peer "$root/model-bin/agent_send_peer"
 write_shim agent_list_peers "$root/model-bin/agent_list_peers"
 write_shim agent_view_peer "$root/model-bin/agent_view_peer"
+write_shim agent_alarm "$root/model-bin/agent_alarm"
+write_shim agent_interrupt_peer "$root/model-bin/agent_interrupt_peer"
+write_shim agent_extend_wait "$root/model-bin/agent_extend_wait"
 
 case ":$PATH:" in
   *":$bin_dir:"*) path_ok="1" ;;
