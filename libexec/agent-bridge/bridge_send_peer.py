@@ -86,6 +86,7 @@ def main() -> int:
         help="schedule a watchdog wake after SEC seconds since the prompt is delivered to the peer. Request only. Use 0 to explicitly disable the default watchdog.",
     )
     parser.add_argument("--allow-spoof", action="store_true", help="allow --from/--session to differ from the caller tmux pane lock")
+    parser.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("message", nargs="*")
     args = parser.parse_args()
 
@@ -147,6 +148,8 @@ def main() -> int:
     ]
     if args.allow_spoof:
         cmd.append("--allow-spoof")
+    if args.force:
+        cmd.append("--force")
     if args.watchdog is not None:
         cmd += ["--watchdog", str(args.watchdog)]
     if args.target_all:

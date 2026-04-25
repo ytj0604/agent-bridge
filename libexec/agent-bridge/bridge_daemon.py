@@ -19,6 +19,11 @@ from typing import Any, Callable
 from bridge_identity import resolve_participant_endpoint
 from bridge_participants import active_participants, participant_record
 from bridge_paths import model_bin_dir, state_root
+from bridge_response_guard import (
+    context_from_current_prompt,
+    format_response_send_violation,
+    response_send_violation,
+)
 from bridge_util import append_jsonl, locked_json, normalize_kind, public_record, read_json, run_tmux_capture, short_id, utc_now
 
 
@@ -183,7 +188,7 @@ def build_peer_prompt(message: dict, nonce: str, max_hops: int) -> str:
         details.append(f"aggregate_id={message.get('aggregate_id')}")
     if kind == "request":
         label = "Request"
-        hint = "Reply normally; bridge returns it."
+        hint = "Reply normally; do not call agent_send_peer; bridge auto-returns your reply."
     elif kind == "result":
         label = "Result"
         hint = "Use locally; do not reply to peer."
@@ -364,6 +369,48 @@ class BridgeDaemon:
                 except OSError:
                     pass
 
+    def handle_enqueue_command(self, messages: list, force_response_send: bool = False) -> dict:
+        if not isinstance(messages, list):
+            return {"ok": False, "error": "messages must be a list"}
+        ids = []
+        self.reload_participants()
+        with self.state_lock:
+            validated: list[dict] = []
+            for message in messages:
+                if not isinstance(message, dict):
+                    return {"ok": False, "error": "message entry must be an object"}
+                if self.bridge_session and message.get("bridge_session") not in {None, "", self.bridge_session}:
+                    return {"ok": False, "error": "bridge_session mismatch"}
+                sender = str(message.get("from") or "")
+                target = str(message.get("to") or "")
+                if sender != "bridge" and sender not in self.participants:
+                    return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
+                if target not in self.participants:
+                    return {"ok": False, "error": f"target {target!r} is not an active participant"}
+                if not message.get("id"):
+                    message["id"] = short_id("msg")
+                message["bridge_session"] = self.bridge_session
+                context = self.current_prompt_by_agent.get(sender) or {}
+                violation = response_send_violation(
+                    sender=sender,
+                    targets=[target],
+                    outgoing_kind=normalize_kind(message.get("kind"), "request"),
+                    force=bool(force_response_send),
+                    contexts=[context_from_current_prompt(sender, context)] if context else [],
+                    source="current_prompt",
+                )
+                if violation:
+                    return {
+                        "ok": False,
+                        "error": format_response_send_violation(violation),
+                        "error_kind": "response_send_guard",
+                    }
+                validated.append(message)
+            for message in validated:
+                self.enqueue_ipc_message(message)
+                ids.append(message["id"])
+        return {"ok": True, "ids": ids}
+
     def handle_command_connection(self, conn: socket.socket) -> dict:
         peer_uid = self.peer_uid(conn)
         if peer_uid is not None and peer_uid != os.getuid():
@@ -383,28 +430,10 @@ class BridgeDaemon:
             return {"ok": False, "error": "unsupported command"}
         op = request.get("op")
         if op == "enqueue":
-            messages = request.get("messages")
-            if not isinstance(messages, list):
-                return {"ok": False, "error": "messages must be a list"}
-            ids = []
-            self.reload_participants()
-            for message in messages:
-                if not isinstance(message, dict):
-                    return {"ok": False, "error": "message entry must be an object"}
-                if self.bridge_session and message.get("bridge_session") not in {None, "", self.bridge_session}:
-                    return {"ok": False, "error": "bridge_session mismatch"}
-                sender = str(message.get("from") or "")
-                target = str(message.get("to") or "")
-                if sender != "bridge" and sender not in self.participants:
-                    return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
-                if target not in self.participants:
-                    return {"ok": False, "error": f"target {target!r} is not an active participant"}
-                if not message.get("id"):
-                    message["id"] = short_id("msg")
-                message["bridge_session"] = self.bridge_session
-                self.enqueue_ipc_message(message)
-                ids.append(message["id"])
-            return {"ok": True, "ids": ids}
+            return self.handle_enqueue_command(
+                request.get("messages"),
+                force_response_send=bool(request.get("force_response_send")),
+            )
         if op == "alarm":
             self.reload_participants()
             sender = str(request.get("from") or "")

@@ -20,9 +20,11 @@ import errno
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -320,6 +322,150 @@ def _qualifying_message(sender: str, target: str, kind: str = "notice", body: st
         "reply_to": None, "source": "test", "bridge_session": "test-session",
         "status": "ingressing", "nonce": None, "delivery_attempts": 0,
     }
+
+
+def _set_response_context(
+    d,
+    responder: str,
+    requester: str,
+    *,
+    auto_return: bool = True,
+    message_id: str = "msg-active-response",
+    aggregate_id: str | None = None,
+) -> None:
+    d.current_prompt_by_agent[responder] = {
+        "id": message_id,
+        "nonce": "n-active-response",
+        "causal_id": "c",
+        "hop_count": 1,
+        "from": requester,
+        "kind": "request",
+        "intent": "test",
+        "auto_return": auto_return,
+        "aggregate_id": aggregate_id,
+        "aggregate_expected": [responder] if aggregate_id else None,
+        "aggregate_message_ids": {responder: message_id} if aggregate_id else None,
+        "turn_id": "t-active-response",
+    }
+
+
+def _delivered_request(message_id: str, requester: str, responder: str, *, auto_return: bool = True) -> dict:
+    msg = _qualifying_message(requester, responder, kind="request", body="delivered request")
+    msg.update({
+        "id": message_id,
+        "status": "delivered",
+        "auto_return": auto_return,
+        "nonce": f"n-{message_id}",
+        "delivered_ts": utc_now(),
+    })
+    return msg
+
+
+def scenario_response_send_guard_socket_request_notice(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91", "status": "active"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "status": "active"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _set_response_context(d, "bob", "alice")
+
+    request_msg = _qualifying_message("bob", "alice", kind="request", body="wrong request")
+    result = d.handle_enqueue_command([request_msg])
+    assert_true(not result.get("ok"), f"{label}: request to requester must be blocked")
+    assert_true(result.get("error_kind") == "response_send_guard", f"{label}: guard block must carry structured error_kind: {result}")
+    assert_true("do not call agent_send_peer" in str(result.get("error")), f"{label}: error must explain normal reply: {result}")
+
+    notice_msg = _qualifying_message("bob", "alice", kind="notice", body="wrong notice")
+    result2 = d.handle_enqueue_command([notice_msg])
+    assert_true(not result2.get("ok"), f"{label}: notice to requester must be blocked")
+    assert_true(d.queue.read() == [], f"{label}: blocked socket sends must not enqueue")
+    assert_true(not any(e.get("event") == "message_queued" for e in read_events(tmpdir / "events.raw.jsonl")), f"{label}: blocked socket sends must not log message_queued")
+    print(f"  PASS  {label}")
+
+
+def scenario_response_send_guard_socket_force_and_other_peer(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91", "status": "active"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "status": "active"},
+        "carol": {"alias": "carol", "agent_type": "codex", "pane": "%93", "status": "active"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _set_response_context(d, "bob", "alice")
+
+    other_msg = _qualifying_message("bob", "carol", kind="request", body="allowed")
+    result = d.handle_enqueue_command([other_msg])
+    assert_true(result.get("ok"), f"{label}: send to other peer must be allowed: {result}")
+
+    forced_msg = _qualifying_message("bob", "alice", kind="notice", body="forced")
+    result2 = d.handle_enqueue_command([forced_msg], force_response_send=True)
+    assert_true(result2.get("ok"), f"{label}: forced send to requester must be allowed: {result2}")
+    queued = d.queue.read()
+    assert_true(any(m.get("to") == "carol" for m in queued), f"{label}: other peer message queued")
+    assert_true(any(m.get("to") == "alice" for m in queued), f"{label}: forced requester message queued")
+    print(f"  PASS  {label}")
+
+
+def scenario_response_send_guard_socket_no_auto_return_allowed(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91", "status": "active"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "status": "active"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _set_response_context(d, "bob", "alice", auto_return=False)
+    msg = _qualifying_message("bob", "alice", kind="request", body="manual reply")
+    result = d.handle_enqueue_command([msg])
+    assert_true(result.get("ok"), f"{label}: no-auto-return context must not block manual send: {result}")
+    assert_true(any(m.get("to") == "alice" for m in d.queue.read()), f"{label}: manual reply queued")
+    print(f"  PASS  {label}")
+
+
+def scenario_response_send_guard_socket_atomic_multi(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91", "status": "active"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "status": "active"},
+        "carol": {"alias": "carol", "agent_type": "codex", "pane": "%93", "status": "active"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _set_response_context(d, "bob", "alice")
+    msg_to_carol = _qualifying_message("bob", "carol", kind="request", body="first")
+    msg_to_alice = _qualifying_message("bob", "alice", kind="request", body="second")
+    result = d.handle_enqueue_command([msg_to_carol, msg_to_alice])
+    assert_true(not result.get("ok"), f"{label}: multi-message payload including requester must be blocked")
+    assert_true(d.queue.read() == [], f"{label}: socket guard must leave queue unchanged")
+    assert_true(not any(e.get("event") == "message_queued" for e in read_events(tmpdir / "events.raw.jsonl")), f"{label}: socket guard must not append message_queued")
+    print(f"  PASS  {label}")
+
+
+def scenario_response_send_guard_socket_aggregate_and_held(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91", "status": "active"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "status": "active"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _set_response_context(d, "bob", "alice", aggregate_id="agg-active")
+    aggregate_result = d.handle_enqueue_command([_qualifying_message("bob", "alice", kind="request", body="agg follow-up")])
+    assert_true(not aggregate_result.get("ok"), f"{label}: aggregate response context must block send to requester")
+
+    d.held_interrupt["bob"] = {"since": utc_now(), "since_ts": time.time(), "prior_message_id": "msg-active-response"}
+    held_result = d.handle_enqueue_command([_qualifying_message("bob", "alice", kind="notice", body="held follow-up")])
+    assert_true(not held_result.get("ok"), f"{label}: held response context must still block send to requester")
+    forced = d.handle_enqueue_command([_qualifying_message("bob", "alice", kind="notice", body="held forced")], force_response_send=True)
+    assert_true(forced.get("ok"), f"{label}: force must escape held-context guard: {forced}")
+    print(f"  PASS  {label}")
+
+
+def scenario_response_send_guard_after_response_finished_allowed(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91", "status": "active"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "status": "active"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_inflight(d, "msg-race-1", frm="alice", to="bob", nonce="n-race-1")
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": "n-race-1", "turn_id": "t-race", "prompt": "[bridge:n-race-1] from=alice kind=request"})
+    d.handle_response_finished({"agent": "bob", "bridge_agent": "bob", "turn_id": "t-race", "last_assistant_message": "done"})
+    result = d.handle_enqueue_command([_qualifying_message("bob", "alice", kind="request", body="new request")])
+    assert_true(result.get("ok"), f"{label}: send after response context is consumed must be allowed: {result}")
+    print(f"  PASS  {label}")
 
 
 def scenario_alarm_cancelled_by_qualifying_request(label: str, tmpdir: Path) -> None:
@@ -1257,7 +1403,7 @@ def scenario_matching_nonce_contaminated_body_documents_residual(label: str, tmp
     d.handle_prompt_submitted({
         "agent": "claude", "bridge_agent": "claude",
         "nonce": "live-nonce", "turn_id": "t-cb",
-        "prompt": "[bridge:live-nonce] from=codex kind=request causal_id=c. Reply normally; bridge returns it. Request: hello\nUSER PASTED EXTRA CONTENT HERE",
+        "prompt": "[bridge:live-nonce] from=codex kind=request causal_id=c. Reply normally; do not call agent_send_peer; bridge auto-returns your reply. Request: hello\nUSER PASTED EXTRA CONTENT HERE",
     })
     item = next((it for it in d.queue.read() if it.get("id") == "msg-cb-1"), None)
     assert_true(item is not None and item.get("status") == "delivered", f"{label}: residual hole — body not verified, candidate is marked delivered")
@@ -2289,7 +2435,270 @@ def _patch_enqueue_for_unit(be, state: dict, *, socket_error: str = "") -> None:
     be.room_status = lambda session: argparse.Namespace(active_enough_for_enqueue=True, reason="ok")
     be.sender_matches_caller = lambda args, session: True
     be.load_session = lambda session: state
-    be.enqueue_via_daemon_socket = lambda session, messages: (False, [], socket_error)
+    be.enqueue_via_daemon_socket = lambda session, messages, **kwargs: (False, [], socket_error, "")
+
+
+def _write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+
+
+def scenario_response_send_guard_socket_cli_error_kind(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    guard_error = (
+        "agent_send_peer: you are currently responding to a peer request from alice. "
+        "Reply normally; do not call agent_send_peer; bridge auto-returns your reply. "
+        "If you really intend to send a separate request/notice to alice, retry with --force."
+    )
+    be.enqueue_via_daemon_socket = lambda session, messages, **kwargs: (True, [], guard_error, "response_send_guard")
+
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "bob",
+            "--to", "alice",
+            "--body", "wrong response path",
+            "--queue-file", str(tmpdir / "pending.json"),
+            "--state-file", str(tmpdir / "events.raw.jsonl"),
+            "--public-state-file", str(tmpdir / "events.jsonl"),
+        ],
+    )
+    assert_true(code == 2, f"{label}: socket guard exits 2, got {code}")
+    assert_true(out == "", f"{label}: socket guard has no stdout: {out!r}")
+    assert_true(err.count("agent_send_peer:") == 1, f"{label}: socket guard must not double-prefix stderr: {err!r}")
+    assert_true("do not call agent_send_peer" in err and "--force" in err, f"{label}: canonical guard text present: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_response_send_guard_socket_error_kind_parse(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    run_dir = Path(tempfile.mkdtemp(prefix="abrs-", dir="/tmp"))
+    socket_path = run_dir / "test-session.sock"
+    response = {
+        "ok": False,
+        "error": "agent_send_peer: guard blocked",
+        "error_kind": "response_send_guard",
+    }
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(socket_path))
+    server.listen(1)
+    received: list[dict] = []
+
+    def serve_once() -> None:
+        conn, _ = server.accept()
+        with conn:
+            raw = b""
+            while b"\n" not in raw:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                raw += chunk
+            received.append(json.loads(raw.decode("utf-8")))
+            conn.sendall((json.dumps(response, ensure_ascii=True) + "\n").encode("utf-8"))
+        server.close()
+
+    thread = threading.Thread(target=serve_once)
+    old_run_root = be.run_root
+    try:
+        be.run_root = lambda: run_dir
+        thread.start()
+        attempted, ids, error, error_kind = be.enqueue_via_daemon_socket(
+            "test-session",
+            [{"id": "msg-test", "from": "bob", "to": "alice"}],
+            force_response_send=True,
+        )
+        thread.join(timeout=2.0)
+    finally:
+        be.run_root = old_run_root
+        try:
+            server.close()
+        except OSError:
+            pass
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    assert_true(attempted, f"{label}: socket was attempted")
+    assert_true(ids == [], f"{label}: rejected socket response has no ids: {ids}")
+    assert_true(error == response["error"], f"{label}: error string preserved: {error!r}")
+    assert_true(error_kind == "response_send_guard", f"{label}: error_kind surfaced: {error_kind!r}")
+    assert_true(received and received[0].get("force_response_send") is True, f"{label}: force flag sent over socket: {received}")
+    print(f"  PASS  {label}")
+
+
+def scenario_response_send_guard_fallback_blocks_unchanged(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob", "carol"])
+    _patch_enqueue_for_unit(be, state)
+    queue_file = tmpdir / "pending.json"
+    state_file = tmpdir / "events.raw.jsonl"
+    public_file = tmpdir / "events.jsonl"
+    _write_json(queue_file, [_delivered_request("msg-delivered-fb", "alice", "bob")])
+    state_file.write_text(json.dumps({"event": "initial_raw"}) + "\n", encoding="utf-8")
+    public_file.write_text(json.dumps({"event": "initial_public"}) + "\n", encoding="utf-8")
+    before = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
+
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "bob",
+            "--to", "alice",
+            "--body", "should be normal reply",
+            "--queue-file", str(queue_file),
+            "--state-file", str(state_file),
+            "--public-state-file", str(public_file),
+        ],
+    )
+    assert_true(code == 2, f"{label}: blocked fallback exits 2, got {code}, err={err!r}")
+    assert_true(out == "", f"{label}: blocked fallback has no stdout: {out!r}")
+    assert_true("do not call agent_send_peer" in err, f"{label}: blocked fallback explains normal reply: {err!r}")
+    after = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
+    assert_true(before == after, f"{label}: blocked fallback must leave queue and event files byte-identical")
+    print(f"  PASS  {label}")
+
+
+def scenario_response_send_guard_fallback_all_blocks_unchanged(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob", "carol"])
+    _patch_enqueue_for_unit(be, state)
+    queue_file = tmpdir / "pending.json"
+    state_file = tmpdir / "events.raw.jsonl"
+    public_file = tmpdir / "events.jsonl"
+    _write_json(queue_file, [_delivered_request("msg-delivered-all", "alice", "bob")])
+    state_file.write_text("raw-before\n", encoding="utf-8")
+    public_file.write_text("public-before\n", encoding="utf-8")
+    before = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
+
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "bob",
+            "--all",
+            "--body", "broadcast while replying",
+            "--queue-file", str(queue_file),
+            "--state-file", str(state_file),
+            "--public-state-file", str(public_file),
+        ],
+    )
+    assert_true(code == 2, f"{label}: --all including requester must be blocked, got {code}, err={err!r}")
+    assert_true(out == "", f"{label}: blocked --all has no stdout: {out!r}")
+    assert_true("target list includes alice" in err, f"{label}: --all error should mention requester inclusion: {err!r}")
+    after = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
+    assert_true(before == after, f"{label}: blocked --all fallback must leave files unchanged")
+    print(f"  PASS  {label}")
+
+
+def scenario_response_send_guard_fallback_force_allows(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    queue_file = tmpdir / "pending.json"
+    state_file = tmpdir / "events.raw.jsonl"
+    public_file = tmpdir / "events.jsonl"
+    _write_json(queue_file, [_delivered_request("msg-delivered-force", "alice", "bob")])
+    state_file.touch()
+    public_file.touch()
+
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "bob",
+            "--to", "alice",
+            "--kind", "notice",
+            "--force",
+            "--body", "separate forced notice",
+            "--queue-file", str(queue_file),
+            "--state-file", str(state_file),
+            "--public-state-file", str(public_file),
+        ],
+    )
+    assert_true(code == 0, f"{label}: --force fallback succeeds, got {code}, err={err!r}")
+    assert_true(out.strip().startswith("msg-"), f"{label}: forced fallback returns message id: {out!r}")
+    queue = json.loads(queue_file.read_text(encoding="utf-8"))
+    assert_true(len(queue) == 2, f"{label}: forced fallback appends queue item: {queue}")
+    assert_true(any(item.get("from") == "bob" and item.get("to") == "alice" for item in queue), f"{label}: forced message queued")
+    assert_true(any(e.get("event") == "message_queued" for e in read_events(state_file)), f"{label}: raw message_queued written")
+    assert_true(any(e.get("event") == "message_queued" for e in read_events(public_file)), f"{label}: public message_queued written")
+    print(f"  PASS  {label}")
+
+
+def scenario_response_send_guard_fallback_no_auto_return_allowed(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    queue_file = tmpdir / "pending.json"
+    state_file = tmpdir / "events.raw.jsonl"
+    public_file = tmpdir / "events.jsonl"
+    _write_json(queue_file, [_delivered_request("msg-delivered-noauto", "alice", "bob", auto_return=False)])
+    state_file.touch()
+    public_file.touch()
+
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "bob",
+            "--to", "alice",
+            "--body", "manual reply allowed",
+            "--queue-file", str(queue_file),
+            "--state-file", str(state_file),
+            "--public-state-file", str(public_file),
+        ],
+    )
+    assert_true(code == 0, f"{label}: no-auto-return fallback should allow manual send, got {code}, err={err!r}")
+    assert_true(out.strip().startswith("msg-"), f"{label}: no-auto-return fallback returns message id: {out!r}")
+    queue = json.loads(queue_file.read_text(encoding="utf-8"))
+    assert_true(len(queue) == 2, f"{label}: no-auto-return fallback appends queue item: {queue}")
+    print(f"  PASS  {label}")
+
+
+def scenario_response_send_guard_fallback_false_positive_resistance(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob", "carol"])
+    _patch_enqueue_for_unit(be, state)
+    queue_file = tmpdir / "pending.json"
+    state_file = tmpdir / "events.raw.jsonl"
+    public_file = tmpdir / "events.jsonl"
+
+    pending = _qualifying_message("alice", "bob", kind="request", body="pending")
+    pending["id"] = "msg-nonqual-pending"
+    pending["status"] = "pending"
+    ingressing = _qualifying_message("alice", "bob", kind="request", body="ingressing")
+    ingressing["id"] = "msg-nonqual-ingressing"
+    inflight = _qualifying_message("alice", "bob", kind="request", body="inflight")
+    inflight["id"] = "msg-nonqual-inflight"
+    inflight["status"] = "inflight"
+    no_auto = _delivered_request("msg-nonqual-noauto", "alice", "bob", auto_return=False)
+    other_responder = _delivered_request("msg-nonqual-other-responder", "alice", "carol")
+    notice = _qualifying_message("alice", "bob", kind="notice", body="delivered notice")
+    notice.update({"id": "msg-nonqual-notice", "status": "delivered", "auto_return": False})
+    _write_json(queue_file, [pending, ingressing, inflight, no_auto, other_responder, notice])
+    state_file.touch()
+    public_file.touch()
+
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "bob",
+            "--to", "alice",
+            "--body", "allowed despite stale non-qualifying rows",
+            "--queue-file", str(queue_file),
+            "--state-file", str(state_file),
+            "--public-state-file", str(public_file),
+        ],
+    )
+    assert_true(code == 0, f"{label}: non-qualifying queue rows must not block fallback send, got {code}, err={err!r}")
+    assert_true(out.strip().startswith("msg-"), f"{label}: allowed fallback returns message id: {out!r}")
+    queue = json.loads(queue_file.read_text(encoding="utf-8"))
+    assert_true(len(queue) == 7, f"{label}: allowed fallback appends exactly one item: {queue}")
+    assert_true(any(item.get("from") == "bob" and item.get("to") == "alice" for item in queue), f"{label}: bob to alice message queued")
+    print(f"  PASS  {label}")
 
 
 def scenario_enqueue_fallback_success_silent_with_raw_diagnostic(label: str, tmpdir: Path) -> None:
@@ -2371,6 +2780,12 @@ def main() -> int:
             ("watchdog_cancel_on_empty_response", scenario_watchdog_cancel_on_empty_response),
             ("alarm_cancelled_by_qualifying_request", scenario_alarm_cancelled_by_qualifying_request),
             ("socket_path_alarm_cancel", scenario_socket_path_alarm_cancel),
+            ("response_send_guard_socket_request_notice", scenario_response_send_guard_socket_request_notice),
+            ("response_send_guard_socket_force_and_other_peer", scenario_response_send_guard_socket_force_and_other_peer),
+            ("response_send_guard_socket_no_auto_return_allowed", scenario_response_send_guard_socket_no_auto_return_allowed),
+            ("response_send_guard_socket_atomic_multi", scenario_response_send_guard_socket_atomic_multi),
+            ("response_send_guard_socket_aggregate_and_held", scenario_response_send_guard_socket_aggregate_and_held),
+            ("response_send_guard_after_response_finished_allowed", scenario_response_send_guard_after_response_finished_allowed),
             ("fallback_path_alarm_cancel", scenario_fallback_path_alarm_cancel),
             ("ingressing_not_delivered_before_finalize", scenario_ingressing_not_delivered_before_finalize),
             ("replay_does_not_cancel_later_alarm", scenario_replay_does_not_cancel_later_alarm),
@@ -2457,8 +2872,15 @@ def main() -> int:
             ("view_peer_snapshot_ref_collision_unique", scenario_view_peer_snapshot_ref_collision_unique),
             ("view_peer_capture_errors_sanitized", scenario_view_peer_capture_errors_sanitized),
             ("view_peer_snapshot_not_found_hides_full_id", scenario_view_peer_snapshot_not_found_hides_full_id),
+            ("response_send_guard_socket_cli_error_kind", scenario_response_send_guard_socket_cli_error_kind),
+            ("response_send_guard_socket_error_kind_parse", scenario_response_send_guard_socket_error_kind_parse),
             ("enqueue_fallback_success_silent_with_raw_diagnostic", scenario_enqueue_fallback_success_silent_with_raw_diagnostic),
             ("enqueue_fallback_write_failure_preserves_stderr", scenario_enqueue_fallback_write_failure_preserves_stderr),
+            ("response_send_guard_fallback_blocks_unchanged", scenario_response_send_guard_fallback_blocks_unchanged),
+            ("response_send_guard_fallback_all_blocks_unchanged", scenario_response_send_guard_fallback_all_blocks_unchanged),
+            ("response_send_guard_fallback_force_allows", scenario_response_send_guard_fallback_force_allows),
+            ("response_send_guard_fallback_no_auto_return_allowed", scenario_response_send_guard_fallback_no_auto_return_allowed),
+            ("response_send_guard_fallback_false_positive_resistance", scenario_response_send_guard_fallback_false_positive_resistance),
         ]
         passes = 0
         fails = 0

@@ -12,7 +12,12 @@ from bridge_daemon_client import ensure_daemon_running
 from bridge_identity import resolve_caller_from_pane
 from bridge_participants import active_participants, load_session, resolve_targets, room_status
 from bridge_paths import run_root, state_root
-from bridge_util import MESSAGE_KINDS, append_jsonl, locked_json, normalize_kind, public_record, short_id, utc_now
+from bridge_response_guard import (
+    contexts_from_queue,
+    format_response_send_violation,
+    response_send_violation,
+)
+from bridge_util import MESSAGE_KINDS, append_jsonl, locked_json, locked_json_read, normalize_kind, public_record, short_id, utc_now
 
 # v1.5: enforce request-only watchdog and provide a default delay for
 # requests. Default 5 minutes, override via env. The watchdog itself is
@@ -76,11 +81,14 @@ def write_failure_message(path: Path, exc: OSError, ipc_error: str = "") -> str:
     return f"agent_send_peer: failed to write bridge queue/event state: {path}: {exc}.{suffix}"
 
 
-def enqueue_via_daemon_socket(bridge_session: str, messages: list[dict]) -> tuple[bool, list[str], str]:
+def enqueue_via_daemon_socket(bridge_session: str, messages: list[dict], *, force_response_send: bool = False) -> tuple[bool, list[str], str, str]:
     socket_path = run_root() / f"{bridge_session}.sock"
     if not socket_path.exists():
-        return False, [], ""
-    request = json.dumps({"op": "enqueue", "messages": messages}, ensure_ascii=True) + "\n"
+        return False, [], "", ""
+    payload = {"op": "enqueue", "messages": messages}
+    if force_response_send:
+        payload["force_response_send"] = True
+    request = json.dumps(payload, ensure_ascii=True) + "\n"
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(2.0)
@@ -93,15 +101,20 @@ def enqueue_via_daemon_socket(bridge_session: str, messages: list[dict]) -> tupl
                     break
                 raw += chunk
     except OSError as exc:
-        return False, [], f"{socket_path}: {exc}"
+        return False, [], f"{socket_path}: {exc}", ""
     try:
         response = json.loads(raw.decode("utf-8"))
     except Exception as exc:
-        return True, [], f"invalid daemon socket response: {exc}"
+        return True, [], f"invalid daemon socket response: {exc}", ""
     if not response.get("ok"):
-        return True, [], str(response.get("error") or "daemon socket enqueue failed")
+        return (
+            True,
+            [],
+            str(response.get("error") or "daemon socket enqueue failed"),
+            str(response.get("error_kind") or ""),
+        )
     ids = response.get("ids") or []
-    return True, [str(item) for item in ids], ""
+    return True, [str(item) for item in ids], "", ""
 
 
 def sender_matches_caller(args: argparse.Namespace, bridge_session: str) -> bool:
@@ -136,6 +149,7 @@ def main() -> int:
     parser.add_argument("--queue-file")
     parser.add_argument("--session", dest="bridge_session")
     parser.add_argument("--allow-spoof", action="store_true")
+    parser.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--watchdog",
         type=float,
@@ -298,13 +312,28 @@ def main() -> int:
             if message.get("aggregate_id") == aggregate_id:
                 message["aggregate_message_ids"] = aggregate_message_ids
                 record["aggregate_message_ids"] = aggregate_message_ids
-    attempted_ipc, ipc_ids, ipc_error = enqueue_via_daemon_socket(bridge_session, messages)
+    attempted_ipc, ipc_ids, ipc_error, ipc_error_kind = enqueue_via_daemon_socket(bridge_session, messages, force_response_send=args.force)
     if attempted_ipc:
         if ipc_error:
+            if ipc_error_kind == "response_send_guard":
+                print(ipc_error, file=sys.stderr)
+                return 2
             print(f"agent_send_peer: {ipc_error}", file=sys.stderr)
             return 1
         print("\n".join(ipc_ids))
         return 0
+
+    violation = response_send_violation(
+        sender=args.sender,
+        targets=targets,
+        outgoing_kind=kind,
+        force=args.force,
+        contexts=contexts_from_queue(args.sender, locked_json_read(queue_file, [])),
+        source="queue",
+    )
+    if violation:
+        print(format_response_send_violation(violation), file=sys.stderr)
+        return 2
 
     # File-write fallback: the message is written directly to queue.json
     # in the transient status="ingressing" state and the message_queued
