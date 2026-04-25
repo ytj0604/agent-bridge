@@ -1817,6 +1817,89 @@ class BridgeDaemon:
             synthetic_message_id=synthetic["id"],
         )
 
+    def _cancel_active_messages_for_target(
+        self,
+        target: str,
+        *,
+        active_context: dict | None,
+        reason: str,
+        by_sender: str,
+        cancel_statuses: set[str],
+        notify_sources: bool,
+    ) -> list[dict]:
+        active_context = active_context or {}
+        cancelled: list[dict] = []
+
+        def cancel_mut(queue: list[dict]) -> None:
+            kept = []
+            for item in queue:
+                if item.get("to") == target and item.get("status") in cancel_statuses:
+                    cancelled.append(dict(item))
+                    continue
+                kept.append(item)
+            queue[:] = kept
+
+        self.queue.update(cancel_mut)
+
+        for cm in cancelled:
+            msg_id = cm.get("id")
+            cm_nonce = cm.get("nonce")
+            if cm_nonce:
+                self.discard_nonce(str(cm_nonce))
+            if msg_id:
+                self.last_enter_ts.pop(str(msg_id), None)
+            agg_id = cm.get("aggregate_id")
+            if not agg_id and msg_id:
+                self.cancel_watchdogs_for_message(str(msg_id), reason=reason)
+
+        # Active context's message_id should normally be in `cancelled`
+        # when cancelling delivered messages, but defend against state that
+        # already lost the queue row.
+        cancelled_ids = {cm.get("id") for cm in cancelled}
+        act_id = active_context.get("id")
+        if act_id and act_id not in cancelled_ids:
+            if not active_context.get("aggregate_id"):
+                self.cancel_watchdogs_for_message(str(act_id), reason=reason)
+
+        for cm in cancelled:
+            msg_id = cm.get("id")
+            self.log(
+                "delivered_message_cancelled",
+                message_id=msg_id,
+                from_agent=cm.get("from"),
+                to=cm.get("to"),
+                status=cm.get("status"),
+                aggregate_id=cm.get("aggregate_id"),
+                reason=reason,
+                by_sender=by_sender,
+            )
+
+        if notify_sources:
+            notified: set[str] = set()
+            act_from = str(active_context.get("from") or "")
+            if act_from and act_from != by_sender and act_from != "bridge" and act_from in self.participants:
+                notified.add(act_from)
+            for cm in cancelled:
+                src = str(cm.get("from") or "")
+                if src and src != by_sender and src != "bridge" and src in self.participants:
+                    notified.add(src)
+            for recipient in sorted(notified):
+                notice = self._build_interrupt_notice(
+                    recipient,
+                    target,
+                    by_sender,
+                    cancelled,
+                    active_context,
+                    reason=reason,
+                )
+                self.queue_message(notice)
+
+        for cm in cancelled:
+            if cm.get("aggregate_id"):
+                self._record_aggregate_interrupted_reply(cm, by_sender=by_sender, reason=reason)
+
+        return cancelled
+
     def handle_interrupt(self, sender: str, target: str) -> dict:
         # v1 semantics:
         #   1. ESC fail-closed: if tmux send-keys fails, no state mutation.
@@ -1839,7 +1922,6 @@ class BridgeDaemon:
         # v1 correctness/perf trade-off and is documented in the lock
         # ordering comment in __init__.
         self.reload_participants()
-        cancelled: list[dict] = []
         with self.state_lock:
             participant = self.participants.get(target)
             endpoint = resolve_participant_endpoint(self.bridge_session or "", target, participant or {}) if participant else ""
@@ -1857,37 +1939,14 @@ class BridgeDaemon:
                     return {"esc_sent": False, "esc_error": str(exc), "held": False, "cancelled_message_ids": []}
 
             active_context = self.current_prompt_by_agent.pop(target, {}) or {}
-
-            def cancel_mut(queue: list[dict]) -> None:
-                kept = []
-                for item in queue:
-                    if item.get("to") == target and item.get("status") in {"delivered", "inflight", "submitted"}:
-                        cancelled.append(dict(item))
-                        continue
-                    kept.append(item)
-                queue[:] = kept
-
-            self.queue.update(cancel_mut)
-
-            for cm in cancelled:
-                msg_id = cm.get("id")
-                cm_nonce = cm.get("nonce")
-                if cm_nonce:
-                    self.discard_nonce(str(cm_nonce))
-                if msg_id:
-                    self.last_enter_ts.pop(str(msg_id), None)
-                agg_id = cm.get("aggregate_id")
-                if not agg_id and msg_id:
-                    self.cancel_watchdogs_for_message(msg_id, reason="interrupted")
-
-            # Active context's message_id should be in `cancelled` under the
-            # new lifecycle (delivered messages stay in queue), but defend
-            # against the case where the queue item was already gone.
-            cancelled_ids = {cm.get("id") for cm in cancelled}
-            act_id = active_context.get("id")
-            if act_id and act_id not in cancelled_ids:
-                if not active_context.get("aggregate_id"):
-                    self.cancel_watchdogs_for_message(act_id, reason="interrupted")
+            cancelled = self._cancel_active_messages_for_target(
+                target,
+                active_context=active_context,
+                reason="interrupted",
+                by_sender=sender,
+                cancel_statuses={"delivered", "inflight", "submitted"},
+                notify_sources=True,
+            )
 
             self.busy[target] = False
             self.reserved[target] = None
@@ -1911,34 +1970,6 @@ class BridgeDaemon:
                 cancelled_message_ids=held_record["cancelled_message_ids"],
             )
 
-            for cm in cancelled:
-                msg_id = cm.get("id")
-                self.log(
-                    "delivered_message_cancelled",
-                    message_id=msg_id,
-                    from_agent=cm.get("from"),
-                    to=cm.get("to"),
-                    aggregate_id=cm.get("aggregate_id"),
-                    reason="interrupted",
-                    by_sender=sender,
-                )
-
-            notified: set[str] = set()
-            act_from = str(active_context.get("from") or "")
-            if act_from and act_from != sender and act_from != "bridge" and act_from in self.participants:
-                notified.add(act_from)
-            for cm in cancelled:
-                src = str(cm.get("from") or "")
-                if src and src != sender and src != "bridge" and src in self.participants:
-                    notified.add(src)
-            for recipient in sorted(notified):
-                notice = self._build_interrupt_notice(recipient, target, sender, cancelled, active_context)
-                self.queue_message(notice)
-
-            for cm in cancelled:
-                if cm.get("aggregate_id"):
-                    self._record_aggregate_interrupted_reply(cm, by_sender=sender)
-
         # Kick delivery to other targets (held target still blocked by hold).
         self.try_deliver()
         return {
@@ -1949,16 +1980,33 @@ class BridgeDaemon:
             "held": True,
         }
 
-    def _build_interrupt_notice(self, recipient: str, target: str, by_sender: str, cancelled: list[dict], active_context: dict) -> dict:
+    def _build_interrupt_notice(
+        self,
+        recipient: str,
+        target: str,
+        by_sender: str,
+        cancelled: list[dict],
+        active_context: dict,
+        *,
+        reason: str,
+    ) -> dict:
         cancelled_ids = ", ".join(str(cm.get("id") or "") for cm in cancelled if cm.get("id")) or "(none)"
-        body = (
-            f"[bridge:interrupted] Your active message to {target} was cancelled by "
-            f"{by_sender or 'bridge'}. The peer is now in held_interrupt state and will not "
-            "receive new messages until the next response_finished arrives OR a manual "
-            "'agent_interrupt_peer <alias> --clear-hold' is issued. Affected message_ids: "
-            f"{cancelled_ids}. Pending messages (status=pending) stay queued and will "
-            "deliver normally once the hold is released."
-        )
+        if reason == "prompt_intercepted":
+            body = (
+                f"[bridge:interrupted] Your active message to {target} was cancelled because "
+                f"{target} started a new prompt before responding. The peer is processing "
+                "that new prompt now; pending messages will continue to deliver normally. "
+                f"Affected message_ids: {cancelled_ids}."
+            )
+        else:
+            body = (
+                f"[bridge:interrupted] Your active message to {target} was cancelled by "
+                f"{by_sender or 'bridge'}. The peer is now in held_interrupt state and will not "
+                "receive new messages until the next response_finished arrives OR a manual "
+                "'agent_interrupt_peer <alias> --clear-hold' is issued. Affected message_ids: "
+                f"{cancelled_ids}. Pending messages (status=pending) stay queued and will "
+                "deliver normally once the hold is released."
+            )
         return {
             "id": short_id("msg"),
             "created_ts": utc_now(),
@@ -1979,7 +2027,7 @@ class BridgeDaemon:
             "delivery_attempts": 0,
         }
 
-    def _record_aggregate_interrupted_reply(self, cancelled_msg: dict, by_sender: str) -> None:
+    def _record_aggregate_interrupted_reply(self, cancelled_msg: dict, by_sender: str, *, reason: str) -> None:
         # Inject a synthetic "[interrupted]" reply for this peer into the
         # aggregate's reply set so the aggregate can still progress (and
         # eventually complete or hit its watchdog) without depending on a
@@ -1998,9 +2046,14 @@ class BridgeDaemon:
             "id": cancelled_msg.get("id"),
         }
         synthetic_sender = str(cancelled_msg.get("to") or "")
-        synthetic_text = (
-            f"[interrupted by {by_sender or 'bridge'}: peer did not respond before being asked to stop]"
-        )
+        if reason == "prompt_intercepted":
+            synthetic_text = (
+                "[intercepted by user prompt: peer accepted a new prompt before this aggregate request finished]"
+            )
+        else:
+            synthetic_text = (
+                f"[interrupted by {by_sender or 'bridge'}: peer did not respond before being asked to stop]"
+            )
         try:
             self.collect_aggregate_response(synthetic_sender, synthetic_text, synthetic_context)
         except Exception as exc:
@@ -2110,8 +2163,38 @@ class BridgeDaemon:
         if agent not in self.participants:
             return
 
+        intercepted = False
         with self.state_lock:
             observed_nonce = record.get("nonce")
+            record_turn_id = record.get("turn_id")
+            current_context = self.current_prompt_by_agent.get(agent, {}) or {}
+            current_context_id = str(current_context.get("id") or "")
+            current_context_turn_id = current_context.get("turn_id")
+            duplicate_by_nonce = (
+                observed_nonce
+                and current_context.get("nonce")
+                and observed_nonce == current_context.get("nonce")
+                and record_turn_id == current_context_turn_id
+            )
+            duplicate_by_turn = False
+            if current_context_id and record_turn_id is not None and record_turn_id == current_context_turn_id:
+                duplicate_by_turn = any(
+                    item.get("id") == current_context_id
+                    and item.get("to") == agent
+                    and item.get("status") == "delivered"
+                    for item in self.queue.read()
+                )
+            if duplicate_by_nonce or duplicate_by_turn:
+                self.log(
+                    "duplicate_prompt_submitted",
+                    agent=agent,
+                    nonce=observed_nonce,
+                    turn_id=record_turn_id,
+                    existing_message_id=current_context.get("id"),
+                    duplicate_match="nonce_turn" if duplicate_by_nonce else "turn_delivered",
+                )
+                return
+
             # v1.5.2: daemon state is the authoritative identity. Find the
             # message the daemon believes was just delivered to this agent;
             # the hook-extracted nonce is treated as a hint that must
@@ -2182,6 +2265,36 @@ class BridgeDaemon:
             if message.get("id"):
                 self.last_enter_ts.pop(str(message["id"]), None)
 
+            if not message.get("id"):
+                queue_now = list(self.queue.read())
+                delivered_rows = [
+                    item for item in queue_now
+                    if item.get("to") == agent and item.get("status") == "delivered"
+                ]
+                active_context = self.current_prompt_by_agent.get(agent, {}) or {}
+                if active_context.get("id") or delivered_rows:
+                    active_context = self.current_prompt_by_agent.pop(agent, {}) or {}
+                    cancelled = self._cancel_active_messages_for_target(
+                        agent,
+                        active_context=active_context,
+                        reason="prompt_intercepted",
+                        by_sender="bridge",
+                        cancel_statuses={"delivered"},
+                        notify_sources=True,
+                    )
+                    intercepted = True
+                    self.log(
+                        "active_prompt_intercepted",
+                        agent=agent,
+                        prior_message_id=active_context.get("id"),
+                        turn_id=record_turn_id,
+                        reason="prompt_intercepted",
+                        cancelled_message_ids=[cm.get("id") for cm in cancelled],
+                        cancelled_count=len(cancelled),
+                        observed_nonce_present=bool(observed_nonce),
+                        candidate_message_id=candidate.get("id") if candidate else None,
+                    )
+
             self.busy[agent] = True
             self.reserved[agent] = None
             self.current_prompt_by_agent[agent] = {
@@ -2217,6 +2330,8 @@ class BridgeDaemon:
                 auto_return=message.get("auto_return"),
                 aggregate_id=message.get("aggregate_id"),
             )
+        if intercepted:
+            self.try_deliver()
 
     def response_fingerprint(self, record: dict) -> str:
         material = json.dumps(
@@ -2444,7 +2559,7 @@ class BridgeDaemon:
         # peer that is still mid-turn.
         with self.state_lock:
             text = record.get("last_assistant_message") or ""
-            context = self.current_prompt_by_agent.get(sender, {})
+            context = self.current_prompt_by_agent.get(sender) or {}
             response_turn_id = record.get("turn_id")
             context_turn_id = context.get("turn_id") if context else None
             held_info = self.held_interrupt.get(sender)
@@ -2461,17 +2576,32 @@ class BridgeDaemon:
                 # The held-target interrupt is being drained: this Stop
                 # event confirms the peer aborted the interrupted turn
                 # and is now idle. Release hold but do NOT route the
-                # (possibly partial) text. busy/reserved/current_prompt
-                # were already cleared when the interrupt was applied.
+                # (possibly partial) text. If a new prompt_submitted
+                # arrived while held, a late Stop for the old turn must
+                # release the hold without clobbering the new active ctx.
+                held_drain_matches_current = (
+                    response_turn_id == context_turn_id
+                    or (not context.get("id") and not context_turn_id)
+                )
                 if first_time:
-                    self.log(
-                        "response_skipped_stale",
-                        agent=sender,
-                        reason="held_drain",
-                        response_turn_id=response_turn_id,
-                        active_turn_id=context_turn_id,
-                        prior_message_id=held_info.get("prior_message_id"),
-                    )
+                    if held_drain_matches_current:
+                        self.log(
+                            "response_skipped_stale",
+                            agent=sender,
+                            reason="held_drain",
+                            response_turn_id=response_turn_id,
+                            active_turn_id=context_turn_id,
+                            prior_message_id=held_info.get("prior_message_id"),
+                        )
+                    else:
+                        self.log(
+                            "held_drain_stale_stop",
+                            agent=sender,
+                            response_turn_id=response_turn_id,
+                            active_turn_id=context_turn_id,
+                            active_message_id=context.get("id"),
+                            prior_message_id=held_info.get("prior_message_id"),
+                        )
                 self.held_interrupt.pop(sender, None)
                 hold_duration_ms = None
                 since_ts = held_info.get("since_ts")
@@ -2484,7 +2614,11 @@ class BridgeDaemon:
                     prior_message_id=held_info.get("prior_message_id"),
                     hold_duration_ms=hold_duration_ms,
                 )
-                self.try_deliver(sender)
+                if held_drain_matches_current:
+                    self.busy[sender] = False
+                    self.reserved[sender] = None
+                    self.current_prompt_by_agent.pop(sender, None)
+                    self.try_deliver(sender)
                 self.try_deliver()
                 return
 

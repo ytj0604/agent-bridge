@@ -34,6 +34,7 @@ LIBEXEC = ROOT / "libexec" / "agent-bridge"
 sys.path.insert(0, str(LIBEXEC))
 
 import bridge_daemon  # noqa: E402
+import bridge_response_guard  # noqa: E402
 from bridge_util import utc_now  # noqa: E402
 
 
@@ -1214,7 +1215,19 @@ def scenario_pane_mode_grace_zero_disables_cancel(label: str, tmpdir: Path) -> N
 
 # ---------- v1.5.2 scenarios: state-based delivery matching + consume-once ----------
 
-def _make_inflight(d, message_id: str, frm: str, to: str, nonce: str, *, auto_return: bool = True, kind: str = "request") -> None:
+def _make_inflight(
+    d,
+    message_id: str,
+    frm: str,
+    to: str,
+    nonce: str,
+    *,
+    auto_return: bool = True,
+    kind: str = "request",
+    aggregate_id: str | None = None,
+    aggregate_expected: list[str] | None = None,
+    aggregate_message_ids: dict[str, str] | None = None,
+) -> None:
     """Plant a queue item already in inflight state (as if try_deliver ran)."""
     msg = {
         "id": message_id,
@@ -1228,11 +1241,82 @@ def _make_inflight(d, message_id: str, frm: str, to: str, nonce: str, *, auto_re
         "reply_to": None, "source": "test", "bridge_session": "test-session",
         "status": "inflight", "nonce": nonce, "delivery_attempts": 1,
     }
+    if aggregate_id:
+        msg["aggregate_id"] = aggregate_id
+        msg["aggregate_expected"] = aggregate_expected or [to]
+        msg["aggregate_message_ids"] = aggregate_message_ids or {to: message_id}
     def add(queue):
         queue.append(msg)
         return None
     d.queue.update(add)
     d.reserved[to] = message_id
+
+
+def _make_delivered_context(
+    d,
+    message_id: str,
+    frm: str,
+    to: str,
+    nonce: str,
+    *,
+    auto_return: bool = True,
+    kind: str = "request",
+    source: str = "test",
+    turn_id: str | None = None,
+    aggregate_id: str | None = None,
+    aggregate_expected: list[str] | None = None,
+    aggregate_message_ids: dict[str, str] | None = None,
+    watchdog: bool = False,
+) -> dict:
+    msg = {
+        "id": message_id,
+        "created_ts": utc_now(),
+        "updated_ts": utc_now(),
+        "delivered_ts": utc_now(),
+        "from": frm, "to": to,
+        "kind": kind, "intent": "test",
+        "body": "hello",
+        "causal_id": f"causal-{uuid.uuid4().hex[:12]}",
+        "hop_count": 1, "auto_return": auto_return,
+        "reply_to": None, "source": source, "bridge_session": "test-session",
+        "status": "delivered", "nonce": nonce, "delivery_attempts": 1,
+    }
+    if aggregate_id:
+        msg["aggregate_id"] = aggregate_id
+        msg["aggregate_expected"] = aggregate_expected or [to]
+        msg["aggregate_message_ids"] = aggregate_message_ids or {to: message_id}
+    def add(queue):
+        queue.append(msg)
+        return None
+    d.queue.update(add)
+    d.current_prompt_by_agent[to] = {
+        "id": message_id,
+        "nonce": nonce,
+        "causal_id": msg["causal_id"],
+        "hop_count": 1,
+        "from": frm,
+        "kind": kind,
+        "intent": "test",
+        "auto_return": auto_return,
+        "aggregate_id": aggregate_id,
+        "aggregate_expected": msg.get("aggregate_expected"),
+        "aggregate_message_ids": msg.get("aggregate_message_ids"),
+        "turn_id": turn_id,
+    }
+    if watchdog:
+        d.watchdogs[f"wake-{message_id}"] = {
+            "sender": frm,
+            "deadline": time.time() + 600.0,
+            "ref_message_id": message_id,
+            "ref_aggregate_id": None,
+            "ref_to": to,
+            "is_alarm": False,
+        }
+    return msg
+
+
+def _queue_item(d, message_id: str) -> dict | None:
+    return next((item for item in d.queue.read() if item.get("id") == message_id), None)
 
 
 def scenario_orphan_nonce_in_user_prompt(label: str, tmpdir: Path) -> None:
@@ -1251,6 +1335,287 @@ def scenario_orphan_nonce_in_user_prompt(label: str, tmpdir: Path) -> None:
     assert_true(not ctx.get("auto_return"), f"{label}: orphan ctx must not enable auto_return")
     events = read_events(tmpdir / "events.raw.jsonl")
     assert_true(any(e.get("event") == "orphan_nonce_in_user_prompt" for e in events), f"{label}: orphan_nonce_in_user_prompt log expected")
+    print(f"  PASS  {label}")
+
+
+def scenario_prompt_intercept_request_notice_body(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_delivered_context(d, "msg-pi-req", "alice", "bob", "n-pi-req", turn_id="t-old", watchdog=True)
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": None, "turn_id": "t-user", "prompt": "user typed"})
+
+    assert_true(_queue_item(d, "msg-pi-req") is None, f"{label}: intercepted delivered request must be removed")
+    assert_true(not any(wd.get("ref_message_id") == "msg-pi-req" for wd in d.watchdogs.values()), f"{label}: request watchdog must be cancelled")
+    ctx = d.current_prompt_by_agent.get("bob") or {}
+    assert_true(ctx.get("id") is None and ctx.get("turn_id") == "t-user", f"{label}: new user turn must own empty ctx")
+    notices = [m for m in d.queue.read() if m.get("source") == "interrupt_notice" and m.get("to") == "alice"]
+    assert_true(notices, f"{label}: requester must receive prompt-intercept notice")
+    body = str(notices[0].get("body") or "")
+    assert_true("held_interrupt state" not in body, f"{label}: prompt-intercept notice must not claim held_interrupt: {body!r}")
+    assert_true("started a new prompt" in body, f"{label}: prompt-intercept notice must explain new prompt: {body!r}")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    intercept = next((e for e in events if e.get("event") == "active_prompt_intercepted"), None)
+    assert_true(intercept is not None, f"{label}: intercept event expected")
+    assert_true(intercept.get("cancelled_count") == 1, f"{label}: intercept cancelled_count expected")
+    assert_true(intercept.get("cancelled_message_ids") == ["msg-pi-req"], f"{label}: intercept cancelled ids expected")
+    assert_true(intercept.get("observed_nonce_present") is False, f"{label}: observed nonce field expected")
+    assert_true("candidate_message_id" in intercept, f"{label}: candidate_message_id field expected")
+    print(f"  PASS  {label}")
+
+
+def scenario_prompt_intercept_bridge_notice_no_source_notice(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_delivered_context(
+        d,
+        "msg-pi-bridge",
+        "bridge",
+        "bob",
+        "n-pi-bridge",
+        auto_return=False,
+        kind="notice",
+        source="watchdog_fire",
+        turn_id="t-bridge",
+    )
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": None, "turn_id": "t-user", "prompt": "user typed"})
+
+    assert_true(_queue_item(d, "msg-pi-bridge") is None, f"{label}: intercepted bridge notice must be removed")
+    assert_true(not any(m.get("source") == "interrupt_notice" for m in d.queue.read()), f"{label}: bridge-origin intercept must not notify bridge")
+    print(f"  PASS  {label}")
+
+
+def scenario_prompt_intercept_response_guard_queue_allows(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_delivered_context(d, "msg-pi-guard", "alice", "bob", "n-pi-guard", turn_id="t-old")
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": None, "turn_id": "t-user", "prompt": "user typed"})
+
+    contexts = bridge_response_guard.contexts_from_queue("bob", d.queue.read())
+    violation = bridge_response_guard.response_send_violation(
+        sender="bob",
+        targets=["alice"],
+        outgoing_kind="request",
+        force=False,
+        contexts=contexts,
+        source="queue_fallback",
+    )
+    assert_true(violation is None, f"{label}: stale delivered row must not false-block response-send guard")
+    print(f"  PASS  {label}")
+
+
+def scenario_prompt_intercept_mixed_inflight_requeues(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+        "carol": {"alias": "carol", "agent_type": "claude", "pane": "%93"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_delivered_context(d, "msg-pi-old", "alice", "bob", "n-pi-old", turn_id="t-old")
+    _make_inflight(d, "msg-pi-new", "carol", "bob", "n-pi-new")
+
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": None, "turn_id": "t-user", "prompt": "user typed"})
+    assert_true(_queue_item(d, "msg-pi-old") is None, f"{label}: old delivered row must be removed")
+    new_item = _queue_item(d, "msg-pi-new")
+    assert_true(new_item is not None and new_item.get("status") == "inflight", f"{label}: new inflight row must survive intercept")
+
+    def age_new(queue):
+        for item in queue:
+            if item.get("id") == "msg-pi-new":
+                item["updated_ts"] = "1970-01-01T00:00:00.000000Z"
+        return None
+    d.queue.update(age_new)
+    d.last_maintenance = 0.0
+    d.requeue_stale_inflight()
+    new_item = _queue_item(d, "msg-pi-new")
+    assert_true(new_item is not None and new_item.get("status") == "pending", f"{label}: surviving inflight must requeue for retry")
+    print(f"  PASS  {label}")
+
+
+def scenario_prompt_submitted_duplicate_noop(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_inflight(d, "msg-dupe", "alice", "bob", "n-dupe")
+    record = {"agent": "bob", "bridge_agent": "bob", "nonce": "n-dupe", "turn_id": "t-dupe", "prompt": "[bridge:n-dupe]"}
+    d.handle_prompt_submitted(record)
+    d.handle_prompt_submitted(record)
+
+    item = _queue_item(d, "msg-dupe")
+    assert_true(item is not None and item.get("status") == "delivered", f"{label}: duplicate UPS must leave delivered row active")
+    ctx = d.current_prompt_by_agent.get("bob") or {}
+    assert_true(ctx.get("id") == "msg-dupe", f"{label}: duplicate UPS must not overwrite ctx")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(any(e.get("event") == "duplicate_prompt_submitted" for e in events), f"{label}: duplicate log expected")
+    assert_true(not any(e.get("event") == "active_prompt_intercepted" for e in events), f"{label}: duplicate must not intercept")
+
+    d.handle_response_finished({"agent": "bob", "bridge_agent": "bob", "turn_id": "t-dupe", "last_assistant_message": "done"})
+    assert_true(_queue_item(d, "msg-dupe") is None, f"{label}: normal terminal cleanup must still remove message")
+    assert_true(any(m.get("to") == "alice" and m.get("reply_to") == "msg-dupe" for m in d.queue.read()), f"{label}: auto-return must still queue")
+    print(f"  PASS  {label}")
+
+
+def scenario_prompt_submitted_duplicate_without_nonce_noop(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_inflight(d, "msg-dupe-nononce", "alice", "bob", "n-dupe-nononce")
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": "n-dupe-nononce", "turn_id": "t-dupe-nononce", "prompt": "[bridge:n-dupe-nononce]"})
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": None, "turn_id": "t-dupe-nononce", "prompt": "[bridge prefix stripped]"})
+
+    item = _queue_item(d, "msg-dupe-nononce")
+    assert_true(item is not None and item.get("status") == "delivered", f"{label}: nonce-less duplicate must leave delivered row active")
+    ctx = d.current_prompt_by_agent.get("bob") or {}
+    assert_true(ctx.get("id") == "msg-dupe-nononce", f"{label}: nonce-less duplicate must not overwrite ctx")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    duplicate = next((e for e in events if e.get("event") == "duplicate_prompt_submitted"), None)
+    assert_true(duplicate is not None and duplicate.get("duplicate_match") == "turn_delivered", f"{label}: duplicate should log turn_delivered match")
+    assert_true(not any(e.get("event") == "active_prompt_intercepted" for e in events), f"{label}: nonce-less duplicate must not intercept")
+    print(f"  PASS  {label}")
+
+
+def scenario_prompt_intercept_aggregate_completes(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+        "carol": {"alias": "carol", "agent_type": "codex", "pane": "%93"},
+    }
+    d = make_daemon(tmpdir, participants)
+    agg_id = "agg-pi"
+    expected = ["bob", "carol"]
+    message_ids = {"bob": "msg-agg-bob", "carol": "msg-agg-carol"}
+    _make_delivered_context(
+        d,
+        "msg-agg-bob",
+        "alice",
+        "bob",
+        "n-agg-bob",
+        turn_id="t-bob-old",
+        aggregate_id=agg_id,
+        aggregate_expected=expected,
+        aggregate_message_ids=message_ids,
+    )
+    _make_delivered_context(
+        d,
+        "msg-agg-carol",
+        "alice",
+        "carol",
+        "n-agg-carol",
+        turn_id="t-carol",
+        aggregate_id=agg_id,
+        aggregate_expected=expected,
+        aggregate_message_ids=message_ids,
+    )
+
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": None, "turn_id": "t-user", "prompt": "user typed"})
+    d.handle_response_finished({"agent": "carol", "bridge_agent": "carol", "turn_id": "t-carol", "last_assistant_message": "carol ok"})
+
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(any(e.get("event") == "aggregate_result_queued" and e.get("aggregate_id") == agg_id for e in events), f"{label}: aggregate must complete after intercept + real reply")
+    aggregate_data = json.loads(Path(d.aggregate_file).read_text(encoding="utf-8"))
+    replies = aggregate_data.get("aggregates", {}).get(agg_id, {}).get("replies", {})
+    assert_true("[intercepted by user prompt:" in str(replies.get("bob", {}).get("body") or ""), f"{label}: bob aggregate slot must use intercept text")
+    assert_true("carol ok" in str(replies.get("carol", {}).get("body") or ""), f"{label}: carol real reply must be preserved")
+    print(f"  PASS  {label}")
+
+
+def scenario_prompt_intercept_held_drain_noop(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.held_interrupt["bob"] = {
+        "since": utc_now(),
+        "since_ts": time.time(),
+        "prior_message_id": "msg-held",
+        "prior_sender": "alice",
+        "reason": "interrupt_by_sender",
+        "by_sender": "alice",
+        "cancelled_message_ids": ["msg-held"],
+    }
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": None, "turn_id": "t-held-user", "prompt": "user typed"})
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(not any(e.get("event") == "active_prompt_intercepted" for e in events), f"{label}: held drain prompt must not trigger intercept")
+
+    d.handle_response_finished({"agent": "bob", "bridge_agent": "bob", "turn_id": "t-held-user", "last_assistant_message": "drain"})
+    assert_true("bob" not in d.held_interrupt, f"{label}: held drain must still release hold")
+    assert_true(not d.busy.get("bob"), f"{label}: held drain must leave target idle")
+    assert_true("bob" not in d.current_prompt_by_agent, f"{label}: held drain must clear any empty prompt ctx")
+    print(f"  PASS  {label}")
+
+
+def scenario_held_drain_stale_stop_preserves_new_ctx(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.held_interrupt["bob"] = {
+        "since": utc_now(),
+        "since_ts": time.time(),
+        "prior_message_id": "msg-old-held",
+        "prior_sender": "alice",
+        "reason": "interrupt_by_sender",
+        "by_sender": "alice",
+        "cancelled_message_ids": ["msg-old-held"],
+    }
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": None, "turn_id": "t-new", "prompt": "new prompt"})
+    pending = test_message("msg-pending-held-stale", frm="alice", to="bob", status="pending")
+    def add_pending(queue):
+        queue.append(pending)
+        return None
+    d.queue.update(add_pending)
+
+    d.handle_response_finished({"agent": "bob", "bridge_agent": "bob", "turn_id": "t-old", "last_assistant_message": "old stop"})
+    assert_true("bob" not in d.held_interrupt, f"{label}: stale held Stop must release hold")
+    ctx = d.current_prompt_by_agent.get("bob") or {}
+    assert_true(ctx.get("turn_id") == "t-new", f"{label}: stale held Stop must preserve new ctx, got {ctx}")
+    assert_true(d.busy.get("bob") is True, f"{label}: stale held Stop must preserve busy=True")
+    item = _queue_item(d, "msg-pending-held-stale")
+    assert_true(item is not None and item.get("status") == "pending", f"{label}: pending message must not deliver over active prompt")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(any(e.get("event") == "held_drain_stale_stop" for e in events), f"{label}: stale Stop log expected")
+    assert_true(not any(e.get("event") == "message_delivery_attempted" and e.get("message_id") == "msg-pending-held-stale" for e in events), f"{label}: no delivery attempt expected")
+    print(f"  PASS  {label}")
+
+
+def scenario_prompt_intercept_inflight_only_requeues(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_inflight(d, "msg-inflight-only", "alice", "bob", "n-inflight-only")
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": None, "turn_id": "t-user", "prompt": "user typed"})
+
+    item = _queue_item(d, "msg-inflight-only")
+    assert_true(item is not None and item.get("status") == "inflight", f"{label}: inflight-only nonce miss must not be cancelled")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(not any(e.get("event") == "active_prompt_intercepted" for e in events), f"{label}: no delivered/ctx means no intercept")
+
+    def age_item(queue):
+        for row in queue:
+            if row.get("id") == "msg-inflight-only":
+                row["updated_ts"] = "1970-01-01T00:00:00.000000Z"
+        return None
+    d.queue.update(age_item)
+    d.last_maintenance = 0.0
+    d.requeue_stale_inflight()
+    item = _queue_item(d, "msg-inflight-only")
+    assert_true(item is not None and item.get("status") == "pending", f"{label}: inflight-only row must requeue after timeout")
     print(f"  PASS  {label}")
 
 
@@ -1355,7 +1720,7 @@ def scenario_ambiguous_inflight_fail_closed(label: str, tmpdir: Path) -> None:
     print(f"  PASS  {label}")
 
 
-def scenario_stale_reserved_rejected(label: str, tmpdir: Path) -> None:
+def scenario_stale_reserved_orphan_swept(label: str, tmpdir: Path) -> None:
     """reserved[agent] points to a message that is NOT in inflight status
     (e.g., already delivered or cancelled). Candidate must be rejected, not
     incorrectly mark a non-inflight item as delivered."""
@@ -1379,9 +1744,11 @@ def scenario_stale_reserved_rejected(label: str, tmpdir: Path) -> None:
     # Hook reports the same nonce. find_inflight_candidate should reject (status mismatch)
     d.handle_prompt_submitted({"agent": "claude", "bridge_agent": "claude", "nonce": "n-stale", "turn_id": "t-stale", "prompt": "[bridge:n-stale]"})
     item = next((it for it in d.queue.read() if it.get("id") == "msg-stale-1"), None)
-    assert_true(item is not None and item.get("status") == "delivered", f"{label}: stale reserved must not flip an already-delivered item, status={item.get('status') if item else None}")
+    assert_true(item is None, f"{label}: stale delivered orphan must be removed, got {item}")
     ctx = d.current_prompt_by_agent.get("claude") or {}
     assert_true(ctx.get("id") is None, f"{label}: ctx must not bind to stale reserved item")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(any(e.get("event") == "active_prompt_intercepted" for e in events), f"{label}: stale delivered cleanup should log intercept")
     print(f"  PASS  {label}")
 
 
@@ -2819,13 +3186,23 @@ def main() -> int:
             ("pre_enter_probe_failure_defers_enter", scenario_pre_enter_probe_failure_defers_enter),
             ("pane_mode_grace_zero_disables_cancel", scenario_pane_mode_grace_zero_disables_cancel),
             ("orphan_nonce_in_user_prompt", scenario_orphan_nonce_in_user_prompt),
+            ("prompt_intercept_request_notice_body", scenario_prompt_intercept_request_notice_body),
+            ("prompt_intercept_bridge_notice_no_source_notice", scenario_prompt_intercept_bridge_notice_no_source_notice),
+            ("prompt_intercept_response_guard_queue_allows", scenario_prompt_intercept_response_guard_queue_allows),
+            ("prompt_intercept_mixed_inflight_requeues", scenario_prompt_intercept_mixed_inflight_requeues),
+            ("prompt_submitted_duplicate_noop", scenario_prompt_submitted_duplicate_noop),
+            ("prompt_submitted_duplicate_without_nonce_noop", scenario_prompt_submitted_duplicate_without_nonce_noop),
+            ("prompt_intercept_aggregate_completes", scenario_prompt_intercept_aggregate_completes),
+            ("prompt_intercept_held_drain_noop", scenario_prompt_intercept_held_drain_noop),
+            ("held_drain_stale_stop_preserves_new_ctx", scenario_held_drain_stale_stop_preserves_new_ctx),
+            ("prompt_intercept_inflight_only_requeues", scenario_prompt_intercept_inflight_only_requeues),
             ("consume_once_basic", scenario_consume_once_basic),
             ("consume_once_empty_response", scenario_consume_once_empty_response),
             ("nonce_mismatch_fail_closed", scenario_nonce_mismatch_fail_closed),
             ("no_observed_nonce_with_candidate_fail_closed", scenario_no_observed_nonce_with_candidate_fail_closed),
             ("daemon_restart_queue_scan", scenario_daemon_restart_queue_scan),
             ("ambiguous_inflight_fail_closed", scenario_ambiguous_inflight_fail_closed),
-            ("stale_reserved_rejected", scenario_stale_reserved_rejected),
+            ("stale_reserved_orphan_swept", scenario_stale_reserved_orphan_swept),
             ("held_drain_skips_consume_once", scenario_held_drain_skips_consume_once),
             ("matching_nonce_contaminated_body_residual", scenario_matching_nonce_contaminated_body_documents_residual),
             ("aggregate_consume_once_no_overwrite", scenario_aggregate_consume_once_no_overwrite),
