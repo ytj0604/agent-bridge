@@ -3,6 +3,7 @@ import argparse
 import fcntl
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -184,6 +185,81 @@ def cleanup_registry(session: str) -> None:
                     del records[key]
 
 
+DEFAULT_FORGOTTEN_RETENTION = 10
+
+
+def _resolve_forgotten_retention() -> int:
+    raw = os.environ.get("AGENT_BRIDGE_FORGOTTEN_RETENTION_COUNT")
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_FORGOTTEN_RETENTION
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        sys.stderr.write(
+            f"agent-bridge: invalid AGENT_BRIDGE_FORGOTTEN_RETENTION_COUNT={raw!r}; using default {DEFAULT_FORGOTTEN_RETENTION}\n"
+        )
+        return DEFAULT_FORGOTTEN_RETENTION
+    if value < 0:
+        sys.stderr.write(
+            f"agent-bridge: AGENT_BRIDGE_FORGOTTEN_RETENTION_COUNT={value} is negative; using default {DEFAULT_FORGOTTEN_RETENTION}\n"
+        )
+        return DEFAULT_FORGOTTEN_RETENTION
+    return value
+
+
+def prune_forgotten_archives(retention_count: int | None = None) -> dict:
+    """Remove old `.forgotten/` archives, keeping the most recent N directories.
+
+    `retention_count` (or env `AGENT_BRIDGE_FORGOTTEN_RETENTION_COUNT`) is the
+    number to keep. 0 disables pruning. Concurrent / missing-archive races
+    are tolerated silently — partial success returns a `removed` list and an
+    `errors` map.
+    """
+    if retention_count is None:
+        retention_count = _resolve_forgotten_retention()
+    if retention_count <= 0:
+        return {"retention": retention_count, "kept": 0, "removed": [], "errors": {}}
+    archive_root = state_root() / ".forgotten"
+    if not archive_root.exists():
+        return {"retention": retention_count, "kept": 0, "removed": [], "errors": {}}
+    try:
+        entries = [p for p in archive_root.iterdir() if p.is_dir()]
+    except OSError as exc:
+        return {"retention": retention_count, "kept": 0, "removed": [], "errors": {"_root": str(exc)}}
+    # P2: stat() can race with concurrent prune (FileNotFoundError) on
+    # entries that another writer removed between iterdir and now. Treat
+    # missing entries as "already pruned": skip them silently.
+    def _safe_mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except FileNotFoundError:
+            return -1.0
+        except OSError:
+            return 0.0
+
+    entries = [(p, _safe_mtime(p)) for p in entries]
+    entries = [(p, mt) for p, mt in entries if mt >= 0]
+    entries.sort(key=lambda item: item[1], reverse=True)
+    entries = [p for p, _ in entries]
+    to_remove = entries[retention_count:]
+    removed: list[str] = []
+    errors: dict[str, str] = {}
+    for stale in to_remove:
+        try:
+            shutil.rmtree(stale)
+            removed.append(stale.name)
+        except FileNotFoundError:
+            removed.append(stale.name)  # already gone — concurrent prune is fine
+        except OSError as exc:
+            errors[stale.name] = str(exc)
+    return {
+        "retention": retention_count,
+        "kept": min(len(entries), retention_count),
+        "removed": removed,
+        "errors": errors,
+    }
+
+
 def archive_session_state(session: str) -> str:
     current_state_root = state_root()
     state_dir = current_state_root / session
@@ -196,6 +272,12 @@ def archive_session_state(session: str) -> str:
     if dest.exists():
         dest = archive_root / f"{session}-{stamp}-{os.getpid()}"
     state_dir.rename(dest)
+    # Best-effort prune of older archives. Failures are logged via the
+    # returned dict but never block the stop/cleanup path.
+    try:
+        prune_forgotten_archives()
+    except Exception as exc:  # noqa: BLE001 — defensive: prune must not fail stop
+        sys.stderr.write(f"agent-bridge: forgotten-archive prune failed (non-fatal): {exc}\n")
     return str(dest)
 
 
@@ -461,6 +543,152 @@ def stop_one(session: str, timeout: float, cleanup: bool) -> dict:
     return meta
 
 
+def _read_queue_status_counts(queue_file: Path) -> dict[str, int]:
+    """Read queue.json (best-effort) and return per-status counts."""
+    counts: dict[str, int] = {}
+    try:
+        items = json.loads(queue_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return counts
+    if not isinstance(items, list):
+        return counts
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _build_restart_warnings(counts: dict[str, int]) -> list[str]:
+    delivered_count = counts.get("delivered", 0)
+    inflight_count = counts.get("inflight", 0)
+    out: list[str] = []
+    if delivered_count:
+        out.append(
+            f"{delivered_count} delivered message(s) at restart; their reply routing context "
+            "is lost. Affected peers may need agent_interrupt_peer to recover."
+        )
+    if inflight_count:
+        out.append(
+            f"{inflight_count} inflight message(s) at restart; the new daemon will requeue "
+            "them after submit_timeout."
+        )
+    out.append(
+        "in-memory state (held_interrupt, watchdogs, alarms, current_prompt) is reset; "
+        "see I-03 in docs/known-issues.md."
+    )
+    return out
+
+
+def restart_one(session: str, args: argparse.Namespace) -> dict:
+    """Stop the daemon and start a fresh one for the same session, preserving
+    queue.json / events.raw.jsonl / session.json (no archive).
+
+    Use after a daemon code update or to recover from an unhealthy daemon
+    without losing pending messages. In-memory state (held_interrupt,
+    watchdogs, current_prompt_by_agent, last_enter_ts) is lost — see I-03
+    in known-issues.md.
+
+    Refuses by default if the queue contains `delivered` items, because
+    those depend on `current_prompt_by_agent` to route the matching
+    response_finished. The new daemon's startup sweep removes those
+    orphan items so the queue does not stay wedged, but the originating
+    senders lose their auto-routed reply. Pass `--force` to proceed
+    regardless; the result will include warning fields.
+
+    The delivered guard is best-effort: counts are read inside the
+    daemon-ctl lock, but the live daemon's queue mutations do not take
+    that same lock, so an inflight item may flip to delivered between
+    the count read and the stop. The orphan sweep on startup keeps the
+    queue from wedging in that race; routing for the racing item is
+    still lost. See I-03 in docs/known-issues.md.
+    """
+    try:
+        ensure_runtime_writable()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    run_root().mkdir(parents=True, exist_ok=True)
+    log_root().mkdir(parents=True, exist_ok=True)
+    paths = session_paths(session)
+    if not session_state_exists(session):
+        raise SystemExit(
+            f"cannot restart bridge room {session}: session state is missing. "
+            "Use `bridge_daemon_ctl start ...` or `bridge_run` to (re)create it."
+        )
+
+    state = load_session(session)
+    state_dir = Path(state.get("state_dir") or state_root() / session)
+    queue_file = Path(state.get("queue_file") or state_dir / "pending.json")
+
+    new_args = ensure_args_from_state(session, state, args)
+    new_args.replace = True
+    new_args.dry_run = bool(getattr(args, "dry_run", False))
+    new_args.json = bool(getattr(args, "json", False))
+
+    # Dry-run path MUST NOT mutate live state. start_under_lock unconditionally
+    # stops any existing daemon when replace=True (regardless of dry_run);
+    # to keep --dry-run a true preview we synthesize the would-be result here
+    # without entering start_under_lock at all. Match the schema that
+    # start_under_lock returns for dry_run so callers see a consistent dict.
+    if new_args.dry_run:
+        counts_dry = _read_queue_status_counts(queue_file)
+        cmd = daemon_command(new_args)
+        return {
+            "session": session,
+            "dry_run": True,
+            "preview_note": "counts are a snapshot read without taking the daemon-ctl lock; the live queue may have shifted since this read",
+            "command": cmd,
+            "pid_file": str(paths["pid"]),
+            "log_file": str(paths["log"]),
+            "command_socket": str(paths["socket"]),
+            "restart": True,
+            "queue_counts_before_restart": {
+                "pending": counts_dry.get("pending", 0),
+                "inflight": counts_dry.get("inflight", 0),
+                "delivered": counts_dry.get("delivered", 0),
+            },
+            "warnings": _build_restart_warnings(counts_dry),
+        }
+
+    # Real restart: hold the daemon-ctl lock for both the delivered guard
+    # check and the start. Re-reading counts inside the lock reduces the
+    # stale-read window vs. doing it before the lock, but it does NOT
+    # fully close the race: the live daemon's queue mutations
+    # (mark_message_delivered_by_id etc.) do not take this same lock,
+    # so an inflight item can still flip to delivered between this
+    # count read and the actual stop. The startup orphan-sweep on the
+    # new daemon keeps the queue from wedging if that race lands; the
+    # affected request just loses its auto-route. See I-03.
+    with paths["lock"].open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        counts = _read_queue_status_counts(queue_file)
+        delivered_count = counts.get("delivered", 0)
+        if delivered_count and not getattr(args, "force", False):
+            raise SystemExit(
+                f"refusing restart for {session}: queue has {delivered_count} delivered "
+                "message(s) whose routing context will be lost across restart. "
+                "Inspect via `agent_interrupt_peer --status` and either let the peers "
+                "finish, run `agent_interrupt_peer <alias>`, or pass --force."
+            )
+        result = start_under_lock(new_args, paths)
+
+    result = dict(result)
+    result["restart"] = True
+    result["queue_counts_before_restart"] = {
+        "pending": counts.get("pending", 0),
+        "inflight": counts.get("inflight", 0),
+        "delivered": delivered_count,
+    }
+    result["warnings"] = _build_restart_warnings(counts)
+    # P2 fix: keep session.json's daemon info in sync (mirrors ensure_one).
+    try:
+        update_session_daemon_info(session, state, result)
+    except Exception as exc:  # noqa: BLE001 — non-fatal: restart already succeeded
+        sys.stderr.write(f"agent-bridge: restart succeeded but session daemon info update failed: {exc}\n")
+    return result
+
+
 def forget_one(session: str, cleanup: bool) -> dict:
     try:
         ensure_runtime_writable()
@@ -599,6 +827,39 @@ def main() -> int:
     p_forget.add_argument("--no-cleanup", dest="cleanup", action="store_false", default=True)
     p_forget.add_argument("--json", action="store_true")
 
+    p_restart = sub.add_parser(
+        "restart",
+        help="stop the daemon and start a fresh one for the same session, preserving queue/events state",
+    )
+    p_restart.add_argument("-s", "--session", required=True)
+    p_restart.add_argument(
+        "--force",
+        action="store_true",
+        help="proceed even if delivered messages exist (their reply routing context will be lost across restart)",
+    )
+    p_restart.add_argument("--health-delay", type=float, default=0.35)
+    p_restart.add_argument("--stop-timeout", type=float, default=5.0)
+    p_restart.add_argument("--max-hops", type=int)
+    p_restart.add_argument("--submit-delay", type=float)
+    p_restart.add_argument("--submit-timeout", type=float)
+    p_restart.add_argument("--dry-run", action="store_true")
+    p_restart.add_argument("--json", action="store_true")
+
+    p_prune = sub.add_parser(
+        "prune-archives",
+        help="remove old archives in <state_root>/.forgotten/ (defaults to keeping the most recent 10)",
+    )
+    p_prune.add_argument(
+        "--keep",
+        type=int,
+        default=None,
+        help=(
+            "number of newest archives to keep (default: env "
+            "AGENT_BRIDGE_FORGOTTEN_RETENTION_COUNT or 10; 0 disables pruning)"
+        ),
+    )
+    p_prune.add_argument("--json", action="store_true")
+
     args = parser.parse_args()
 
     if args.command == "start":
@@ -653,6 +914,46 @@ def main() -> int:
             print(json.dumps(result, ensure_ascii=True, indent=2))
         else:
             print(f"{result['session']}: {result['status']}")
+        return 0
+
+    if args.command == "restart":
+        result = restart_one(args.session, args)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=True, indent=2))
+        else:
+            if result.get("dry_run"):
+                print(" ".join(result["command"]))
+            else:
+                print(f"restarted bridge daemon {result['session']} pid={result['pid']} log={result['log_file']}")
+            counts = result.get("queue_counts_before_restart") or {}
+            if counts:
+                print(
+                    f"  queue at restart: pending={counts.get('pending', 0)} "
+                    f"inflight={counts.get('inflight', 0)} delivered={counts.get('delivered', 0)}"
+                )
+            for warning in result.get("warnings") or []:
+                print(f"  warning: {warning}")
+        return 0
+
+    if args.command == "prune-archives":
+        result = prune_forgotten_archives(args.keep)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=True, indent=2))
+        else:
+            removed = result.get("removed") or []
+            kept = result.get("kept", 0)
+            retention = result.get("retention", 0)
+            if retention <= 0:
+                print(f"prune-archives: pruning disabled (retention={retention})")
+            elif not removed:
+                print(f"prune-archives: kept {kept}/{retention}, nothing to remove")
+            else:
+                print(f"prune-archives: removed {len(removed)} archive(s); kept newest {kept}")
+                for name in removed:
+                    print(f"  removed: {name}")
+            errors = result.get("errors") or {}
+            for name, err in errors.items():
+                print(f"  error: {name}: {err}", file=sys.stderr)
         return 0
 
     return 2

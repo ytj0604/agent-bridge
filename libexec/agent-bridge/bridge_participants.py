@@ -229,21 +229,63 @@ def peer_aliases(state: dict, sender: str | None = None) -> list[str]:
 
 
 def resolve_targets(state: dict, sender: str, target: str | None) -> list[str]:
+    """Resolve a `--to` value into a list of target aliases.
+
+    Accepts:
+      - empty / None: implicit single peer if exactly one peer is active
+      - reserved token ("all" / "ALL" / "*"): all peers except sender
+      - single alias: returns [alias]
+      - comma-separated aliases (e.g. "alice,bob"): partial broadcast,
+        order-preserving, deduplicated, mixed-with-reserved rejected
+
+    Whitespace around comma-separated tokens is stripped; empty tokens
+    (e.g. trailing comma, "alice,,bob") are dropped silently. Reserved
+    tokens cannot be combined with explicit aliases. Sender included in
+    an explicit list is rejected.
+    """
     participants = active_participants(state)
     sender = str(sender or "")
     raw = str(target or "").strip()
-    if raw in RESERVED_TARGETS:
-        return [alias for alias in sorted(participants) if alias != sender]
+
     if not raw:
         peers = [alias for alias in sorted(participants) if alias != sender]
         if len(peers) == 1:
             return peers
-        raise ValueError("target is required when more than two participants are active; use --to alias or --all")
-    if raw not in participants:
-        raise ValueError(f"unknown target alias {raw!r}; active aliases: {', '.join(sorted(participants))}")
-    if raw == sender:
-        raise ValueError("target must differ from sender")
-    return [raw]
+        raise ValueError(
+            "target is required when more than two participants are active; "
+            "use --to <alias>, --to <a>,<b>, or --all"
+        )
+
+    # Tokenize. A single alias has no commas, so tokens == [raw].
+    tokens = [tok.strip() for tok in raw.split(",")]
+    tokens = [tok for tok in tokens if tok]
+    if not tokens:
+        raise ValueError("target list is empty after stripping commas/whitespace")
+
+    has_reserved = any(tok in RESERVED_TARGETS for tok in tokens)
+    if has_reserved:
+        if len(tokens) > 1:
+            raise ValueError(
+                "reserved target token (all/ALL/*) cannot be combined with explicit aliases; "
+                "use either --all or --to <a>,<b>"
+            )
+        return [alias for alias in sorted(participants) if alias != sender]
+
+    # Order-preserving dedup of explicit aliases.
+    seen: set[str] = set()
+    resolved: list[str] = []
+    for tok in tokens:
+        if tok in seen:
+            continue
+        if tok not in participants:
+            raise ValueError(
+                f"unknown target alias {tok!r}; active aliases: {', '.join(sorted(participants))}"
+            )
+        if tok == sender:
+            raise ValueError(f"target must differ from sender ({sender!r})")
+        seen.add(tok)
+        resolved.append(tok)
+    return resolved
 
 
 def format_peer_list(state: dict, current_alias: str | None = None) -> str:

@@ -16,7 +16,7 @@ import uuid
 from bridge_identity import resolve_caller_from_pane
 from bridge_participants import active_participants, load_session, normalize_alias, room_status
 from bridge_paths import state_root
-from bridge_util import TmuxCaptureError, append_jsonl, read_json, run_tmux_capture, utc_now, write_json_atomic
+from bridge_util import TmuxCaptureError, append_jsonl, read_json, run_tmux_capture, short_id, utc_now, write_json_atomic
 
 
 DEFAULT_LINES = 50
@@ -103,7 +103,7 @@ def capture_via_daemon(
     raw: bool = False,
     direct_error: str = "",
 ) -> str:
-    request_id = f"cap-{uuid.uuid4().hex}"
+    request_id = short_id("cap")
     status = room_status(session)
     if status.state not in {"alive", "unknown"}:
         raise SystemExit(

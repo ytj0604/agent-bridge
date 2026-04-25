@@ -19,7 +19,7 @@ from typing import Any, Callable
 from bridge_identity import resolve_participant_endpoint
 from bridge_participants import active_participants, participant_record
 from bridge_paths import model_bin_dir, state_root
-from bridge_util import append_jsonl, locked_json, normalize_kind, public_record, read_json, run_tmux_capture, utc_now
+from bridge_util import append_jsonl, locked_json, normalize_kind, public_record, read_json, run_tmux_capture, short_id, utc_now
 
 
 PHYSICAL_AGENT_TYPES = {"claude", "codex"}
@@ -127,7 +127,7 @@ def make_message(
     if auto_return is None:
         auto_return = sender != "bridge" and target != "bridge" and kind_expects_response(kind)
     return {
-        "id": f"msg-{uuid.uuid4().hex}",
+        "id": short_id("msg"),
         "created_ts": utc_now(),
         "updated_ts": utc_now(),
         "from": sender,
@@ -135,7 +135,7 @@ def make_message(
         "kind": kind,
         "intent": intent,
         "body": str(body),
-        "causal_id": causal_id or f"causal-{uuid.uuid4().hex[:12]}",
+        "causal_id": causal_id or short_id("causal"),
         "hop_count": int(hop_count),
         "auto_return": bool(auto_return),
         "reply_to": reply_to,
@@ -315,7 +315,7 @@ class BridgeDaemon:
                 if target not in self.participants:
                     return {"ok": False, "error": f"target {target!r} is not an active participant"}
                 if not message.get("id"):
-                    message["id"] = f"msg-{uuid.uuid4().hex}"
+                    message["id"] = short_id("msg")
                 message["bridge_session"] = self.bridge_session
                 self.enqueue_ipc_message(message)
                 ids.append(message["id"])
@@ -1022,7 +1022,7 @@ class BridgeDaemon:
                     existing = self.watchdogs.get(wake_id_existing)
                     if existing and existing.get("ref_message_id") == message_id and not existing.get("is_alarm"):
                         self.watchdogs.pop(wake_id_existing, None)
-            wake_id = f"wake-{uuid.uuid4().hex[:12]}"
+            wake_id = short_id("wake")
             self.watchdogs[wake_id] = {
                 "sender": sender,
                 "deadline": deadline,
@@ -1055,7 +1055,7 @@ class BridgeDaemon:
         except (TypeError, ValueError):
             return None
         deadline = time.time() + delay
-        wake_id = f"wake-{uuid.uuid4().hex[:12]}"
+        wake_id = short_id("wake")
         with self.state_lock:
             self.watchdogs[wake_id] = {
                 "sender": sender,
@@ -1203,7 +1203,7 @@ class BridgeDaemon:
             return
         body = self.build_watchdog_fire_text(wd)
         synthetic = {
-            "id": f"msg-{uuid.uuid4().hex}",
+            "id": short_id("msg"),
             "created_ts": utc_now(),
             "updated_ts": utc_now(),
             "from": "bridge",
@@ -1211,7 +1211,7 @@ class BridgeDaemon:
             "kind": "notice",
             "intent": "watchdog_wake",
             "body": body,
-            "causal_id": wd.get("ref_causal_id") or f"causal-{uuid.uuid4().hex[:12]}",
+            "causal_id": wd.get("ref_causal_id") or short_id("causal"),
             "hop_count": 0,
             "auto_return": False,
             "reply_to": wd.get("ref_message_id"),
@@ -1375,7 +1375,7 @@ class BridgeDaemon:
             "deliver normally once the hold is released."
         )
         return {
-            "id": f"msg-{uuid.uuid4().hex}",
+            "id": short_id("msg"),
             "created_ts": utc_now(),
             "updated_ts": utc_now(),
             "from": "bridge",
@@ -1383,7 +1383,7 @@ class BridgeDaemon:
             "kind": "notice",
             "intent": "interrupt_notice",
             "body": body,
-            "causal_id": f"causal-{uuid.uuid4().hex[:12]}",
+            "causal_id": short_id("causal"),
             "hop_count": 0,
             "auto_return": False,
             "reply_to": active_context.get("id"),
@@ -1692,7 +1692,7 @@ class BridgeDaemon:
         requester = str(context.get("from") or "")
         expected = self.aggregate_expected_from_context(context)
         message_ids = self.aggregate_message_ids_from_context(context)
-        causal_id = str(context.get("causal_id") or f"causal-{uuid.uuid4().hex[:12]}")
+        causal_id = str(context.get("causal_id") or short_id("causal"))
         original_intent = str(context.get("intent") or "message")
         hop_count = int(context.get("hop_count") or 0)
         reply_to = str(context.get("id") or message_ids.get(sender) or "")
@@ -1808,7 +1808,7 @@ class BridgeDaemon:
         if not text.strip():
             return
 
-        causal_id = context.get("causal_id") or f"causal-{uuid.uuid4().hex[:12]}"
+        causal_id = context.get("causal_id") or short_id("causal")
         hop_count = int(context.get("hop_count") or 0)
         original_intent = context.get("intent") or "message"
         return_intent = f"{original_intent}_result"
@@ -2039,6 +2039,46 @@ class BridgeDaemon:
         self.queue.update(mutator)
         for msg_id in recovered:
             self.log("ingressing_recovered", message_id=msg_id)
+
+    def _recover_orphan_delivered_messages(self) -> None:
+        # Startup recovery: messages with status="delivered" depend on the
+        # daemon's in-memory current_prompt_by_agent ctx to terminal-cleanup
+        # (remove from queue) when the recipient's response_finished fires.
+        # Across a daemon restart that ctx is gone, so any pre-restart
+        # delivered item becomes an orphan: it stays in the queue forever
+        # AND blocks reserve_next from injecting newer messages to the same
+        # target (delivered counts as a delivery blocker).
+        #
+        # Recovery policy: drop these from the queue. The recipient's
+        # response_finished, if it arrives, will be treated as a
+        # user-context turn (no auto-route) per consume-once semantics;
+        # that loss of auto-route is part of I-03's accepted restart trade-
+        # off. Aggregate participants are also dropped — the aggregate's
+        # synthesized result message (if any) is in the queue separately
+        # and goes through its own recovery path.
+        recovered: list[dict] = []
+
+        def mutator(queue: list[dict]) -> list[dict]:
+            kept = []
+            for item in queue:
+                if item.get("status") == "delivered":
+                    recovered.append(dict(item))
+                    continue
+                kept.append(item)
+            queue[:] = kept
+            return recovered
+
+        self.queue.update(mutator)
+        for item in recovered:
+            self.log(
+                "delivered_orphan_recovered",
+                message_id=item.get("id"),
+                to=item.get("to"),
+                from_agent=item.get("from"),
+                kind=item.get("kind"),
+                aggregate_id=item.get("aggregate_id"),
+                reason="daemon_restart_lost_routing_ctx",
+            )
 
     # Maintenance constants for aged-ingressing promotion. The threshold
     # is generous enough to absorb normal daemon jitter (event read +
@@ -2286,6 +2326,7 @@ class BridgeDaemon:
                 # just promote them to "pending" and let delivery proceed.
                 with self.state_lock:
                     self._recover_ingressing_messages()
+                    self._recover_orphan_delivered_messages()
 
                 self.try_deliver()
 

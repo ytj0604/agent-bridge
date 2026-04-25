@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -1107,6 +1108,556 @@ def scenario_held_drain_skips_consume_once(label: str, tmpdir: Path) -> None:
     print(f"  PASS  {label}")
 
 
+# ---------- v1.5.x scenarios: multi-target send_peer ----------
+
+def _participants_state(aliases: list[str]) -> dict:
+    return {
+        "session": "test-session",
+        "participants": {a: {"alias": a, "agent_type": "codex", "pane": f"%{i+10}", "status": "active"} for i, a in enumerate(aliases)},
+    }
+
+
+def scenario_resolve_targets_single(label: str, tmpdir: Path) -> None:
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    sys.path.insert(0, str(libexec))
+    try:
+        import importlib
+        bp = importlib.import_module("bridge_participants")
+        state = _participants_state(["claude", "codex1", "codex2"])
+        assert_true(bp.resolve_targets(state, "claude", "codex1") == ["codex1"], f"{label}: single alias")
+    finally:
+        sys.path.remove(str(libexec))
+    print(f"  PASS  {label}")
+
+
+def scenario_resolve_targets_multi_basic(label: str, tmpdir: Path) -> None:
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    sys.path.insert(0, str(libexec))
+    try:
+        import importlib
+        bp = importlib.import_module("bridge_participants")
+        state = _participants_state(["claude", "codex1", "codex2", "codex3"])
+        out = bp.resolve_targets(state, "claude", "codex1,codex2")
+        assert_true(out == ["codex1", "codex2"], f"{label}: comma-separated multi: {out}")
+    finally:
+        sys.path.remove(str(libexec))
+    print(f"  PASS  {label}")
+
+
+def scenario_resolve_targets_order_preserved(label: str, tmpdir: Path) -> None:
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    sys.path.insert(0, str(libexec))
+    try:
+        import importlib
+        bp = importlib.import_module("bridge_participants")
+        state = _participants_state(["claude", "codex1", "codex2", "codex3"])
+        out = bp.resolve_targets(state, "claude", "codex3,codex1,codex2")
+        assert_true(out == ["codex3", "codex1", "codex2"], f"{label}: order preservation: {out}")
+    finally:
+        sys.path.remove(str(libexec))
+    print(f"  PASS  {label}")
+
+
+def scenario_resolve_targets_dedup(label: str, tmpdir: Path) -> None:
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    sys.path.insert(0, str(libexec))
+    try:
+        import importlib
+        bp = importlib.import_module("bridge_participants")
+        state = _participants_state(["claude", "codex1", "codex2"])
+        out = bp.resolve_targets(state, "claude", "codex1,codex1")
+        assert_true(out == ["codex1"], f"{label}: dedup to single: {out}")
+        out = bp.resolve_targets(state, "claude", "codex1,codex2,codex1")
+        assert_true(out == ["codex1", "codex2"], f"{label}: dedup preserves first occurrence: {out}")
+    finally:
+        sys.path.remove(str(libexec))
+    print(f"  PASS  {label}")
+
+
+def scenario_resolve_targets_strip_empties(label: str, tmpdir: Path) -> None:
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    sys.path.insert(0, str(libexec))
+    try:
+        import importlib
+        bp = importlib.import_module("bridge_participants")
+        state = _participants_state(["claude", "codex1", "codex2"])
+        out = bp.resolve_targets(state, "claude", "codex1, codex2")
+        assert_true(out == ["codex1", "codex2"], f"{label}: whitespace stripped: {out}")
+        out = bp.resolve_targets(state, "claude", "codex1,,codex2")
+        assert_true(out == ["codex1", "codex2"], f"{label}: empty token dropped: {out}")
+        out = bp.resolve_targets(state, "claude", "codex1,")
+        assert_true(out == ["codex1"], f"{label}: trailing comma trimmed: {out}")
+    finally:
+        sys.path.remove(str(libexec))
+    print(f"  PASS  {label}")
+
+
+def scenario_resolve_targets_reserved_alone(label: str, tmpdir: Path) -> None:
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    sys.path.insert(0, str(libexec))
+    try:
+        import importlib
+        bp = importlib.import_module("bridge_participants")
+        state = _participants_state(["claude", "codex1", "codex2", "codex3"])
+        out = bp.resolve_targets(state, "claude", "ALL")
+        assert_true(sorted(out) == ["codex1", "codex2", "codex3"], f"{label}: ALL expands: {out}")
+        out = bp.resolve_targets(state, "claude", "all")
+        assert_true(sorted(out) == ["codex1", "codex2", "codex3"], f"{label}: all expands: {out}")
+        out = bp.resolve_targets(state, "claude", "*")
+        assert_true(sorted(out) == ["codex1", "codex2", "codex3"], f"{label}: * expands: {out}")
+    finally:
+        sys.path.remove(str(libexec))
+    print(f"  PASS  {label}")
+
+
+def scenario_resolve_targets_reserved_mix_rejected(label: str, tmpdir: Path) -> None:
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    sys.path.insert(0, str(libexec))
+    try:
+        import importlib
+        bp = importlib.import_module("bridge_participants")
+        state = _participants_state(["claude", "codex1", "codex2"])
+        for raw in ("ALL,codex1", "codex1,all", "*,codex2", "ALL,all"):
+            try:
+                bp.resolve_targets(state, "claude", raw)
+            except ValueError:
+                continue
+            raise AssertionError(f"{label}: reserved mix {raw!r} should reject")
+    finally:
+        sys.path.remove(str(libexec))
+    print(f"  PASS  {label}")
+
+
+def scenario_resolve_targets_unknown_rejected(label: str, tmpdir: Path) -> None:
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    sys.path.insert(0, str(libexec))
+    try:
+        import importlib
+        bp = importlib.import_module("bridge_participants")
+        state = _participants_state(["claude", "codex1", "codex2"])
+        try:
+            bp.resolve_targets(state, "claude", "codex1,unknown")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{label}: unknown alias must be rejected")
+    finally:
+        sys.path.remove(str(libexec))
+    print(f"  PASS  {label}")
+
+
+def scenario_resolve_targets_sender_in_list_rejected(label: str, tmpdir: Path) -> None:
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    sys.path.insert(0, str(libexec))
+    try:
+        import importlib
+        bp = importlib.import_module("bridge_participants")
+        state = _participants_state(["claude", "codex1", "codex2"])
+        try:
+            bp.resolve_targets(state, "claude", "codex1,claude")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{label}: sender in list must be rejected")
+    finally:
+        sys.path.remove(str(libexec))
+    print(f"  PASS  {label}")
+
+
+def scenario_resolve_targets_empty_after_strip_rejected(label: str, tmpdir: Path) -> None:
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    sys.path.insert(0, str(libexec))
+    try:
+        import importlib
+        bp = importlib.import_module("bridge_participants")
+        state = _participants_state(["claude", "codex1", "codex2"])
+        for raw in (",", ",,", "  ,  ,  "):
+            try:
+                bp.resolve_targets(state, "claude", raw)
+            except ValueError:
+                continue
+            raise AssertionError(f"{label}: comma-only {raw!r} must be rejected")
+    finally:
+        sys.path.remove(str(libexec))
+    print(f"  PASS  {label}")
+
+
+def scenario_short_id_format(label: str, tmpdir: Path) -> None:
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    sys.path.insert(0, str(libexec))
+    try:
+        import importlib
+        bu = importlib.import_module("bridge_util")
+        ids = {bu.short_id("msg") for _ in range(100)}
+        assert_true(len(ids) == 100, f"{label}: 100 random ids must be unique")
+        for ident in ids:
+            assert_true(ident.startswith("msg-"), f"{label}: prefix preserved: {ident}")
+            assert_true(len(ident) == len("msg-") + 12, f"{label}: 12-hex suffix: {ident} (len={len(ident)})")
+            hex_part = ident.split("-", 1)[1]
+            int(hex_part, 16)  # raises if not hex
+        # Custom length still works
+        custom = bu.short_id("agg", length=16)
+        assert_true(len(custom) == len("agg-") + 16, f"{label}: custom length")
+    finally:
+        sys.path.remove(str(libexec))
+    print(f"  PASS  {label}")
+
+
+# ---------- v1.5.x scenarios: aggregate trigger guards (unit-style) ----------
+
+def _import_aggregate_helper():
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    if str(libexec) not in sys.path:
+        sys.path.insert(0, str(libexec))
+    import importlib
+    be = importlib.import_module("bridge_enqueue")
+    return be.should_create_aggregate
+
+
+def scenario_aggregate_trigger_request_multi(label: str, tmpdir: Path) -> None:
+    f = _import_aggregate_helper()
+    assert_true(f("request", "claude", False, ["codex1", "codex2"]), f"{label}: standard multi-target request must trigger aggregate")
+    print(f"  PASS  {label}")
+
+
+def scenario_aggregate_trigger_single_no(label: str, tmpdir: Path) -> None:
+    f = _import_aggregate_helper()
+    assert_true(not f("request", "claude", False, ["codex1"]), f"{label}: single target must NOT trigger aggregate")
+    print(f"  PASS  {label}")
+
+
+def scenario_aggregate_trigger_notice_no(label: str, tmpdir: Path) -> None:
+    f = _import_aggregate_helper()
+    assert_true(not f("notice", "claude", False, ["codex1", "codex2"]), f"{label}: notice multi-target must NOT trigger aggregate (no reply route)")
+    print(f"  PASS  {label}")
+
+
+def scenario_aggregate_trigger_bridge_sender_no(label: str, tmpdir: Path) -> None:
+    f = _import_aggregate_helper()
+    assert_true(not f("request", "bridge", False, ["codex1", "codex2"]), f"{label}: bridge synthetic multi-target must NOT trigger aggregate")
+    print(f"  PASS  {label}")
+
+
+def scenario_aggregate_trigger_no_auto_return_no(label: str, tmpdir: Path) -> None:
+    f = _import_aggregate_helper()
+    assert_true(not f("request", "claude", True, ["codex1", "codex2"]), f"{label}: --no-auto-return multi-target must NOT trigger aggregate")
+    print(f"  PASS  {label}")
+
+
+# ---------- v1.5.x scenarios: forgotten retention + restart guards ----------
+
+def _import_daemon_ctl():
+    libexec = Path("/root/agent-bridge/libexec/agent-bridge")
+    if str(libexec) not in sys.path:
+        sys.path.insert(0, str(libexec))
+    import importlib
+    return importlib.import_module("bridge_daemon_ctl")
+
+
+def _make_fake_archive(root: Path, name: str, mtime_offset: int = 0) -> Path:
+    archive = root / name
+    archive.mkdir(parents=True, exist_ok=True)
+    (archive / "events.raw.jsonl").write_text("{}\n", encoding="utf-8")
+    if mtime_offset:
+        ts = time.time() - mtime_offset
+        os.utime(archive, (ts, ts))
+    return archive
+
+
+def scenario_prune_keeps_recent_n(label: str, tmpdir: Path) -> None:
+    state_dir = tmpdir / "state"
+    state_dir.mkdir()
+    forgotten = state_dir / ".forgotten"
+    forgotten.mkdir()
+    # 12 archives, oldest first by mtime
+    for i in range(12):
+        _make_fake_archive(forgotten, f"sess-{i:02d}", mtime_offset=(12 - i) * 60)
+    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(state_dir)
+    try:
+        ctl = _import_daemon_ctl()
+        # importlib reload to pick up env if previously cached
+        import importlib
+        importlib.reload(ctl)
+        result = ctl.prune_forgotten_archives(retention_count=10)
+        assert_true(result["retention"] == 10, f"{label}: retention reported")
+        assert_true(len(result["removed"]) == 2, f"{label}: 2 removed, got {result['removed']}")
+        # Oldest two should be removed
+        assert_true(set(result["removed"]) == {"sess-00", "sess-01"}, f"{label}: removed oldest, got {result['removed']}")
+        remaining = sorted(p.name for p in forgotten.iterdir())
+        assert_true(len(remaining) == 10, f"{label}: 10 kept, got {len(remaining)}")
+    finally:
+        os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
+    print(f"  PASS  {label}")
+
+
+def scenario_prune_disabled_retention_zero(label: str, tmpdir: Path) -> None:
+    state_dir = tmpdir / "state"
+    state_dir.mkdir()
+    forgotten = state_dir / ".forgotten"
+    forgotten.mkdir()
+    for i in range(5):
+        _make_fake_archive(forgotten, f"sess-{i}", mtime_offset=(5 - i) * 60)
+    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(state_dir)
+    try:
+        ctl = _import_daemon_ctl()
+        import importlib
+        importlib.reload(ctl)
+        result = ctl.prune_forgotten_archives(retention_count=0)
+        assert_true(result["retention"] == 0, f"{label}: retention=0")
+        assert_true(result["removed"] == [], f"{label}: nothing removed when disabled")
+        remaining = list(forgotten.iterdir())
+        assert_true(len(remaining) == 5, f"{label}: all 5 still present")
+    finally:
+        os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
+    print(f"  PASS  {label}")
+
+
+def scenario_prune_below_retention(label: str, tmpdir: Path) -> None:
+    state_dir = tmpdir / "state"
+    state_dir.mkdir()
+    forgotten = state_dir / ".forgotten"
+    forgotten.mkdir()
+    for i in range(3):
+        _make_fake_archive(forgotten, f"sess-{i}", mtime_offset=(3 - i) * 60)
+    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(state_dir)
+    try:
+        ctl = _import_daemon_ctl()
+        import importlib
+        importlib.reload(ctl)
+        result = ctl.prune_forgotten_archives(retention_count=10)
+        assert_true(result["removed"] == [], f"{label}: none removed when below retention")
+        assert_true(result["kept"] == 3, f"{label}: kept reflects actual count")
+    finally:
+        os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
+    print(f"  PASS  {label}")
+
+
+def scenario_prune_missing_forgotten_dir_safe(label: str, tmpdir: Path) -> None:
+    state_dir = tmpdir / "state"
+    state_dir.mkdir()  # No .forgotten subdir
+    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(state_dir)
+    try:
+        ctl = _import_daemon_ctl()
+        import importlib
+        importlib.reload(ctl)
+        result = ctl.prune_forgotten_archives(retention_count=10)
+        assert_true(result["removed"] == [], f"{label}: no-op when .forgotten missing")
+    finally:
+        os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
+    print(f"  PASS  {label}")
+
+
+def scenario_resolve_forgotten_retention_invalid_env(label: str, tmpdir: Path) -> None:
+    ctl = _import_daemon_ctl()
+    saved = os.environ.get("AGENT_BRIDGE_FORGOTTEN_RETENTION_COUNT")
+    try:
+        os.environ["AGENT_BRIDGE_FORGOTTEN_RETENTION_COUNT"] = "not-a-number"
+        # Capture stderr to silence the warning during regression
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            assert_true(ctl._resolve_forgotten_retention() == ctl.DEFAULT_FORGOTTEN_RETENTION, f"{label}: invalid env falls back to default")
+        os.environ["AGENT_BRIDGE_FORGOTTEN_RETENTION_COUNT"] = "-5"
+        with contextlib.redirect_stderr(buf):
+            assert_true(ctl._resolve_forgotten_retention() == ctl.DEFAULT_FORGOTTEN_RETENTION, f"{label}: negative env falls back to default")
+        os.environ["AGENT_BRIDGE_FORGOTTEN_RETENTION_COUNT"] = "7"
+        assert_true(ctl._resolve_forgotten_retention() == 7, f"{label}: valid env honored")
+    finally:
+        if saved is None:
+            os.environ.pop("AGENT_BRIDGE_FORGOTTEN_RETENTION_COUNT", None)
+        else:
+            os.environ["AGENT_BRIDGE_FORGOTTEN_RETENTION_COUNT"] = saved
+    print(f"  PASS  {label}")
+
+
+def scenario_queue_status_counts(label: str, tmpdir: Path) -> None:
+    ctl = _import_daemon_ctl()
+    qfile = tmpdir / "pending.json"
+    qfile.write_text(json.dumps([
+        {"id": "msg-1", "status": "pending"},
+        {"id": "msg-2", "status": "pending"},
+        {"id": "msg-3", "status": "delivered"},
+        {"id": "msg-4", "status": "inflight"},
+        {"id": "msg-5"},  # no status
+    ]), encoding="utf-8")
+    counts = ctl._read_queue_status_counts(qfile)
+    assert_true(counts.get("pending") == 2, f"{label}: pending count")
+    assert_true(counts.get("delivered") == 1, f"{label}: delivered count")
+    assert_true(counts.get("inflight") == 1, f"{label}: inflight count")
+    print(f"  PASS  {label}")
+
+
+def scenario_queue_status_counts_missing_file(label: str, tmpdir: Path) -> None:
+    ctl = _import_daemon_ctl()
+    counts = ctl._read_queue_status_counts(tmpdir / "nonexistent.json")
+    assert_true(counts == {}, f"{label}: missing file → empty counts, got {counts}")
+    print(f"  PASS  {label}")
+
+
+def scenario_uninstall_helper_print_paths(label: str, tmpdir: Path) -> None:
+    helper = "/root/agent-bridge/libexec/agent-bridge/bridge_uninstall_state.py"
+    proc = subprocess.run([sys.executable, helper, "--print-paths"], capture_output=True, text=True, timeout=10)
+    assert_true(proc.returncode == 0, f"{label}: helper exit 0, got {proc.returncode}: {proc.stderr}")
+    payload = json.loads(proc.stdout)
+    for key in ("state", "run", "log"):
+        assert_true(key in payload, f"{label}: payload contains {key}")
+        assert_true(payload[key].endswith(key), f"{label}: {key} path looks like .../<{key}>")
+    print(f"  PASS  {label}")
+
+
+def scenario_uninstall_helper_refuses_dangerous_path(label: str, tmpdir: Path) -> None:
+    helper = "/root/agent-bridge/libexec/agent-bridge/bridge_uninstall_state.py"
+    env = dict(os.environ)
+    env["AGENT_BRIDGE_STATE_DIR"] = "/etc"  # dangerous
+    proc = subprocess.run([sys.executable, helper, "--dry-run"], env=env, capture_output=True, text=True, timeout=10)
+    assert_true(proc.returncode != 0, f"{label}: must refuse dangerous path, exit was {proc.returncode}")
+    assert_true("refuses" in proc.stderr.lower() or "dangerous" in proc.stderr.lower(), f"{label}: stderr explains refusal: {proc.stderr!r}")
+    print(f"  PASS  {label}")
+
+
+# ---------- v1.5.x P1 follow-up: dry-run safety + orphan delivered + concurrent prune ----------
+
+def scenario_restart_dry_run_no_side_effect(label: str, tmpdir: Path) -> None:
+    """restart --dry-run must not invoke start_under_lock (which has stop side
+    effects). Verify by patching daemon_command + start_under_lock to detect
+    any call."""
+    ctl = _import_daemon_ctl()
+    state_dir = tmpdir / "state"
+    sess_dir = state_dir / "test-session"
+    sess_dir.mkdir(parents=True)
+    (sess_dir / "session.json").write_text(json.dumps({
+        "session": "test-session",
+        "participants": {"claude": {"alias": "claude", "agent_type": "claude", "pane": "%4", "status": "active"}},
+        "queue_file": str(sess_dir / "pending.json"),
+        "state_file": str(sess_dir / "events.raw.jsonl"),
+        "events_file": str(sess_dir / "events.jsonl"),
+        "state_dir": str(sess_dir),
+    }), encoding="utf-8")
+    (sess_dir / "pending.json").write_text("[]", encoding="utf-8")
+    (sess_dir / "events.raw.jsonl").write_text("", encoding="utf-8")
+    (sess_dir / "events.jsonl").write_text("", encoding="utf-8")
+
+    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(state_dir)
+    os.environ["AGENT_BRIDGE_RUN_DIR"] = str(tmpdir / "run")
+    os.environ["AGENT_BRIDGE_LOG_DIR"] = str(tmpdir / "log")
+    try:
+        import importlib
+        importlib.reload(ctl)
+        # Track whether start_under_lock was called
+        original = ctl.start_under_lock
+        called = {"n": 0}
+
+        def trap(args, paths):
+            called["n"] += 1
+            return original(args, paths)
+
+        ctl.start_under_lock = trap
+        ns = argparse.Namespace(dry_run=True, force=False, json=False, health_delay=0.1, stop_timeout=1.0, max_hops=None, submit_delay=None, submit_timeout=None)
+        result = ctl.restart_one("test-session", ns)
+        assert_true(called["n"] == 0, f"{label}: start_under_lock must NOT be called for dry-run, was called {called['n']} times")
+        assert_true(result.get("dry_run") is True, f"{label}: result.dry_run=True")
+        assert_true(result.get("restart") is True, f"{label}: result.restart=True")
+        assert_true("command" in result and isinstance(result["command"], list), f"{label}: command list returned")
+    finally:
+        for k in ("AGENT_BRIDGE_STATE_DIR", "AGENT_BRIDGE_RUN_DIR", "AGENT_BRIDGE_LOG_DIR"):
+            os.environ.pop(k, None)
+    print(f"  PASS  {label}")
+
+
+def scenario_recover_orphan_delivered(label: str, tmpdir: Path) -> None:
+    """Daemon startup must sweep status=delivered items to unblock the queue
+    after a restart that lost the routing context."""
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    # Plant: one delivered (orphan), one pending (waiting)
+    msgs = [
+        {"id": "msg-orph-1", "created_ts": utc_now(), "updated_ts": utc_now(), "from": "codex", "to": "claude",
+         "kind": "result", "intent": "test", "body": "x", "causal_id": "c", "hop_count": 1,
+         "auto_return": False, "reply_to": None, "source": "test", "bridge_session": "test-session",
+         "status": "delivered", "delivered_ts": utc_now(), "nonce": "n1"},
+        {"id": "msg-orph-2", "created_ts": utc_now(), "updated_ts": utc_now(), "from": "codex", "to": "claude",
+         "kind": "result", "intent": "test", "body": "y", "causal_id": "c", "hop_count": 1,
+         "auto_return": False, "reply_to": None, "source": "test", "bridge_session": "test-session",
+         "status": "pending", "nonce": None},
+    ]
+    def add(q):
+        q.extend(msgs)
+        return None
+    d.queue.update(add)
+    d._recover_orphan_delivered_messages()
+    queue_after = list(d.queue.read())
+    ids = {m.get("id"): m.get("status") for m in queue_after}
+    assert_true("msg-orph-1" not in ids, f"{label}: orphan delivered must be removed, got {ids}")
+    assert_true(ids.get("msg-orph-2") == "pending", f"{label}: pending unaffected, got {ids}")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(any(e.get("event") == "delivered_orphan_recovered" for e in events), f"{label}: log emitted")
+    print(f"  PASS  {label}")
+
+
+def scenario_recover_orphan_delivered_aggregate_member(label: str, tmpdir: Path) -> None:
+    """Documents current restart-sweep policy for aggregate members:
+    sweeping a delivered aggregate member does NOT inject a synthetic
+    'interrupted' reply (unlike agent_interrupt_peer). The aggregate
+    therefore depends on its own watchdog to surface the stalled state.
+    This regression freezes that policy so any future change has to
+    update it consciously."""
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    aggregate_id = "agg-test-orph"
+    msg = {
+        "id": "msg-aggorph-1",
+        "created_ts": utc_now(), "updated_ts": utc_now(), "delivered_ts": utc_now(),
+        "from": "claude", "to": "codex",
+        "kind": "request", "intent": "test",
+        "body": "x", "causal_id": "c", "hop_count": 1, "auto_return": True,
+        "reply_to": None, "source": "test", "bridge_session": "test-session",
+        "status": "delivered", "nonce": "n-aggorph",
+        "aggregate_id": aggregate_id,
+        "aggregate_expected": ["codex"],
+        "aggregate_message_ids": {"codex": "msg-aggorph-1"},
+    }
+    def add(q):
+        q.append(msg)
+        return None
+    d.queue.update(add)
+    d._recover_orphan_delivered_messages()
+    queue_after = list(d.queue.read())
+    # Member removed
+    assert_true(not any(m.get("id") == "msg-aggorph-1" for m in queue_after), f"{label}: aggregate member removed from queue")
+    # No synthetic reply was injected for the aggregate
+    synthetic = [m for m in queue_after if m.get("aggregate_id") == aggregate_id]
+    assert_true(synthetic == [], f"{label}: NO synthetic reply injected for swept aggregate member, got {synthetic}")
+    print(f"  PASS  {label}")
+
+
+def scenario_prune_concurrent_stat_safe(label: str, tmpdir: Path) -> None:
+    """prune_forgotten_archives must tolerate FileNotFoundError during
+    stat() when a concurrent process removes an entry between iterdir and
+    sort."""
+    state_dir = tmpdir / "state"
+    state_dir.mkdir()
+    forgotten = state_dir / ".forgotten"
+    forgotten.mkdir()
+    for i in range(3):
+        _make_fake_archive(forgotten, f"sess-{i}", mtime_offset=(3 - i) * 60)
+    # Mimic the race: monkey-patch Path.stat on the second entry to raise FileNotFoundError once.
+    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(state_dir)
+    try:
+        ctl = _import_daemon_ctl()
+        import importlib
+        importlib.reload(ctl)
+        # Remove one entry RIGHT before the prune to simulate a concurrent prune
+        # finishing first. The sort path must not crash.
+        shutil.rmtree(forgotten / "sess-1")
+        result = ctl.prune_forgotten_archives(retention_count=10)
+        # 2 entries left, retention 10 → none removed, no error
+        assert_true(result["errors"] == {}, f"{label}: no errors on concurrent missing, got {result['errors']}")
+    finally:
+        os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
+    print(f"  PASS  {label}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--keep-tmp", action="store_true")
@@ -1158,6 +1709,35 @@ def main() -> int:
             ("nonce_missing_stops_enter_retry", scenario_nonce_missing_stops_enter_retry),
             ("hook_logger_anchored_regex", scenario_hook_logger_anchored_regex),
             ("turn_id_mismatch_preserves_ctx", scenario_turn_id_mismatch_preserves_ctx),
+            ("short_id_format", scenario_short_id_format),
+            ("resolve_targets_single", scenario_resolve_targets_single),
+            ("resolve_targets_multi_basic", scenario_resolve_targets_multi_basic),
+            ("resolve_targets_order_preserved", scenario_resolve_targets_order_preserved),
+            ("resolve_targets_dedup", scenario_resolve_targets_dedup),
+            ("resolve_targets_strip_empties", scenario_resolve_targets_strip_empties),
+            ("resolve_targets_reserved_alone", scenario_resolve_targets_reserved_alone),
+            ("resolve_targets_reserved_mix_rejected", scenario_resolve_targets_reserved_mix_rejected),
+            ("resolve_targets_unknown_rejected", scenario_resolve_targets_unknown_rejected),
+            ("resolve_targets_sender_in_list_rejected", scenario_resolve_targets_sender_in_list_rejected),
+            ("resolve_targets_empty_after_strip_rejected", scenario_resolve_targets_empty_after_strip_rejected),
+            ("aggregate_trigger_request_multi", scenario_aggregate_trigger_request_multi),
+            ("aggregate_trigger_single_no", scenario_aggregate_trigger_single_no),
+            ("aggregate_trigger_notice_no", scenario_aggregate_trigger_notice_no),
+            ("aggregate_trigger_bridge_sender_no", scenario_aggregate_trigger_bridge_sender_no),
+            ("aggregate_trigger_no_auto_return_no", scenario_aggregate_trigger_no_auto_return_no),
+            ("prune_keeps_recent_n", scenario_prune_keeps_recent_n),
+            ("prune_disabled_retention_zero", scenario_prune_disabled_retention_zero),
+            ("prune_below_retention", scenario_prune_below_retention),
+            ("prune_missing_forgotten_dir_safe", scenario_prune_missing_forgotten_dir_safe),
+            ("resolve_forgotten_retention_invalid_env", scenario_resolve_forgotten_retention_invalid_env),
+            ("queue_status_counts", scenario_queue_status_counts),
+            ("queue_status_counts_missing_file", scenario_queue_status_counts_missing_file),
+            ("uninstall_helper_print_paths", scenario_uninstall_helper_print_paths),
+            ("uninstall_helper_refuses_dangerous_path", scenario_uninstall_helper_refuses_dangerous_path),
+            ("restart_dry_run_no_side_effect", scenario_restart_dry_run_no_side_effect),
+            ("recover_orphan_delivered", scenario_recover_orphan_delivered),
+            ("recover_orphan_delivered_aggregate_member", scenario_recover_orphan_delivered_aggregate_member),
+            ("prune_concurrent_stat_safe", scenario_prune_concurrent_stat_safe),
         ]
         passes = 0
         fails = 0

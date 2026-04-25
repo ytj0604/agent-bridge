@@ -9,11 +9,20 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import uuid
 from typing import Any, Callable, Iterator
 
 
 MESSAGE_KINDS = {"request", "result", "notice"}
 DEFAULT_REDACT_FIELDS = {"prompt", "last_assistant_message", "body", "tool_input", "transcript_path"}
+
+# Default suffix length for hex-derived identifiers that show up in prompt
+# envelopes (msg-, causal-, agg-, wake-, cap-). 12 hex = 2^48 ≈ 2.8e14; the
+# birthday-collision threshold at 1% sits around 5M unique IDs, well above
+# any realistic per-session traffic. nonce/probe/snapshot use shorter
+# suffixes because they have additional disambiguators (timestamp / agent
+# alias / filename namespace).
+SHORT_ID_LEN = 12
 
 
 class TmuxCaptureError(RuntimeError):
@@ -22,6 +31,11 @@ class TmuxCaptureError(RuntimeError):
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def short_id(prefix: str, length: int = SHORT_ID_LEN) -> str:
+    """Generate a prefixed short hex identifier (e.g., 'msg-a1b2c3d4e5f6')."""
+    return f"{prefix}-{uuid.uuid4().hex[:length]}"
 
 
 def _default_copy(default: Any) -> Any:

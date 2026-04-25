@@ -71,7 +71,7 @@ def parse_body_and_target(args: argparse.Namespace, session: str) -> tuple[str |
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="agent_send_peer",
-        description="Send a message from the current attached agent pane to one peer or all peers.",
+        description="Send a message from the current attached agent pane to one peer, a comma-separated subset, or all peers.",
     )
     parser.add_argument("--session", dest="session")
     parser.add_argument("--from", dest="sender")

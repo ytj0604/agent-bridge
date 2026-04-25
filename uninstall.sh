@@ -95,8 +95,23 @@ if [[ "$remove_shims" == "1" ]]; then
 fi
 
 if [[ "$remove_state" == "1" ]]; then
-  echo "remove runtime state/log/run under $root"
-  run_or_print rm -rf "$root/state" "$root/run" "$root/log"
+  helper="$libexec_dir/bridge_uninstall_state.py"
+  helper_args=()
+  if [[ "$dry_run" == "1" ]]; then
+    helper_args+=("--dry-run")
+  fi
+  echo "remove bridge runtime state/run/log via $helper"
+  if ! python3 "$helper" "${helper_args[@]}"; then
+    echo "uninstall.sh: state cleanup helper failed; aborting" >&2
+    exit 1
+  fi
+  # Legacy install-root paths (only relevant for very old installs that
+  # wrote state under the repo dir). Still cleanup if present.
+  for legacy in "$root/state" "$root/run" "$root/log"; do
+    if [[ -d "$legacy" ]]; then
+      run_or_print rm -rf "$legacy"
+    fi
+  done
 fi
 
 if [[ "$remove_repo" == "1" ]]; then

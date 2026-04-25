@@ -12,13 +12,30 @@ from bridge_daemon_client import ensure_daemon_running
 from bridge_identity import resolve_caller_from_pane
 from bridge_participants import active_participants, load_session, resolve_targets, room_status
 from bridge_paths import run_root, state_root
-from bridge_util import MESSAGE_KINDS, append_jsonl, locked_json, normalize_kind, public_record, utc_now
+from bridge_util import MESSAGE_KINDS, append_jsonl, locked_json, normalize_kind, public_record, short_id, utc_now
 
 # v1.5: enforce request-only watchdog and provide a default delay for
 # requests. Default 5 minutes, override via env. The watchdog itself is
 # armed at delivery time inside the daemon (mark_message_delivered uses
 # the watchdog_delay_sec metadata).
 USER_SENDABLE_KINDS = sorted({"request", "notice"})
+
+
+def should_create_aggregate(kind: str, sender: str, no_auto_return: bool, targets: list[str]) -> bool:
+    """Return True iff this enqueue should generate a shared aggregate_id.
+
+    Aggregate is meaningful only when there are multiple recipients AND a
+    reply route exists. notice / sender=="bridge" / single-target /
+    --no-auto-return all skip aggregate. Whether the multi-target came
+    from --all or from --to a,b,c is irrelevant — both deserve the same
+    aggregate UX.
+    """
+    return (
+        kind == "request"
+        and sender != "bridge"
+        and not no_auto_return
+        and len(targets) > 1
+    )
 
 
 def _resolve_default_watchdog_seconds() -> float | None:
@@ -119,7 +136,7 @@ def main() -> int:
         "--watchdog",
         type=float,
         default=None,
-        help="seconds from now at which to wake the sender if the message has not been resolved",
+        help="seconds (counted from delivery, i.e. when the prompt is injected into the peer's pane) after which to wake the sender if no response_finished arrived. 0 disables.",
     )
     args = parser.parse_args()
 
@@ -186,10 +203,10 @@ def main() -> int:
         print(f"agent_send_peer: {exc}", file=sys.stderr)
         return 2
 
-    causal_id = args.causal_id or f"causal-{uuid.uuid4().hex[:12]}"
+    causal_id = args.causal_id or short_id("causal")
     aggregate_id = ""
-    if args.target_all and kind == "request" and args.sender != "bridge" and len(targets) > 1:
-        aggregate_id = f"agg-{uuid.uuid4().hex}"
+    if should_create_aggregate(kind, args.sender, args.no_auto_return, targets):
+        aggregate_id = short_id("agg")
 
     # v1.5 watchdog: enforce request-only at the enqueue boundary as well
     # (defense-in-depth; bridge_send_peer also rejects). Resolve the delay
@@ -218,7 +235,7 @@ def main() -> int:
     for target in targets:
         auto_return = not args.no_auto_return and kind == "request" and args.sender != "bridge" and target != "bridge"
         message = {
-            "id": f"msg-{uuid.uuid4().hex}",
+            "id": short_id("msg"),
             "created_ts": utc_now(),
             "updated_ts": utc_now(),
             "from": args.sender,

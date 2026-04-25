@@ -7,9 +7,10 @@ def model_cheat_sheet() -> list[str]:
         "Commands:",
         "- agent_list_peers : list aliases and show this cheat sheet.",
         "- agent_send_peer --to <alias> 'request' : ask one peer; keep working while the bridge auto-routes the peer's reply back to you as a [bridge:*] result.",
+        "- agent_send_peer --to <a>,<b>[,...] 'request' : partial broadcast to the listed peers; same aggregate UX as --all, one merged result returns once all listed peers reply.",
         "- agent_send_peer --all 'message' : broadcast one request to every other peer; one aggregated result returns after all peers reply. Do not put an alias before the body.",
         "- agent_send_peer --kind notice --to <alias> 'FYI' : send info without expecting a reply. The bridge does NOT route any peer reply back; if you want a safety wake set agent_alarm separately.",
-        "- agent_send_peer [--to <alias>|--all] --watchdog <sec> 'request' : add a watchdog that wakes you with a [bridge:watchdog] notice if the request has not been answered <sec> seconds after the prompt is delivered to the peer. Request only. --watchdog 0 disables the default. Default delay is set via env AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC (300).",
+        "- agent_send_peer [--to <alias>|--to <a>,<b>|--all] --watchdog <sec> 'request' : add a watchdog that wakes you with a [bridge:watchdog] notice if the request has not been answered <sec> seconds after the prompt is delivered to the peer. Request only. --watchdog 0 disables the default. Default delay is set via env AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC (300).",
         "- agent_alarm <sec> [--note 'text'] : schedule a self-addressed wake notice. The alarm is automatically cancelled when ANY incoming peer message (kind != result, from != you, from != bridge) arrives at you; that triggering message is prepended with a [bridge:alarm_cancelled] notice telling you to re-arm if it is not what you were waiting for.",
         "- agent_extend_wait <message_id> <sec> : after a watchdog wake, keep waiting on the SAME request for <sec> more seconds. Only the original sender can extend; aggregate broadcasts cannot be per-message extended.",
         "- agent_interrupt_peer <alias> : send ESC and CANCEL the active in-flight message (it is removed, not requeued). Pending messages stay queued. The peer enters held_interrupt state; new messages are NOT delivered until either the next response_finished arrives (auto-release) OR you run 'agent_interrupt_peer <alias> --clear-hold' (manual). If ESC injection fails (no pane / tmux error), the bridge fail-closes and changes no state.",
@@ -51,6 +52,7 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "\n"
         "Sending:\n"
         "  agent_send_peer --to <alias> 'body'                  - request (default). Peer's next reply auto-routes back as [bridge:*] result. End your turn after sending.\n"
+        "  agent_send_peer --to <a>,<b>[,...] 'body'            - partial broadcast to listed peers; one aggregated result after all listed peers reply.\n"
         "  agent_send_peer --kind notice --to <alias> 'body'    - fire-and-forget. Bridge will NOT route any reply back even if peer answers. Use request when you need an answer.\n"
         "  agent_send_peer --all 'body'                         - broadcast request; one aggregated result returns after all peers reply.\n"
         "\n"
