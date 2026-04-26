@@ -65,6 +65,15 @@ PANE_MODE_ENTER_DEFER_KEYS = (
 INTERRUPTED_TOMBSTONE_LIMIT_PER_AGENT = 16
 INTERRUPTED_TOMBSTONE_TTL_SECONDS = 600.0
 _STOP_SIGNAL: int | None = None
+PROMPT_BODY_CONTROL_TRANSLATION = {
+    codepoint: None
+    for codepoint in (
+        *range(0x00, 0x09),
+        *range(0x0B, 0x20),
+        0x7F,
+        *range(0x80, 0xA0),
+    )
+}
 
 
 def _request_stop(signum: int, _frame: object) -> None:
@@ -96,30 +105,83 @@ def one_line(text: str) -> str:
     return " ".join(str(text).split())
 
 
+def normalize_prompt_body_text(text: str) -> str:
+    raw = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    return raw.translate(PROMPT_BODY_CONTROL_TRANSLATION)
+
+
 def prompt_body(text: str) -> str:
-    raw = str(text)
+    raw = normalize_prompt_body_text(text)
     if len(raw) > MAX_PEER_BODY_CHARS:
         raw = raw[:MAX_PEER_BODY_CHARS] + "\n[bridge truncated peer body]"
-    return (
-        raw.replace("\\", "\\\\")
-        .replace("\r", "\\r")
-        .replace("\n", "\\n")
-        .replace("\t", "\\t")
-    )
+    return raw
 
 
 def kind_expects_response(kind: str) -> bool:
     return kind == "request"
 
 
-def run_tmux_send(target: str, prompt: str, submit_delay: float) -> None:
-    subprocess.run(["tmux", "send-keys", "-t", target, "-l", prompt], check=True)
-    time.sleep(submit_delay)
-    subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True)
+def _tmux_buffer_component(value: object, fallback: str) -> str:
+    raw = str(value or fallback)
+    safe = "".join(
+        ch if ("a" <= ch <= "z" or "A" <= ch <= "Z" or "0" <= ch <= "9" or ch in "._-") else "-"
+        for ch in raw
+    ).strip("._-")
+    if not safe:
+        safe = fallback
+    if len(safe) > 48:
+        digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:10]
+        safe = f"{safe[:37]}-{digest}"
+    return safe
 
 
-def run_tmux_send_literal(target: str, prompt: str) -> None:
-    subprocess.run(["tmux", "send-keys", "-t", target, "-l", prompt], check=True)
+def tmux_prompt_buffer_name(
+    bridge_session: str,
+    target_alias: str,
+    message_id: str,
+    nonce: str,
+) -> str:
+    components = [
+        _tmux_buffer_component(bridge_session, "session"),
+        _tmux_buffer_component(target_alias, "target"),
+        _tmux_buffer_component(message_id, "message"),
+        _tmux_buffer_component(nonce, "nonce"),
+        str(os.getpid()),
+        uuid.uuid4().hex[:12],
+    ]
+    return "bridge-" + "-".join(components)
+
+
+def run_tmux_send_literal(
+    target: str,
+    prompt: str,
+    *,
+    bridge_session: str = "",
+    target_alias: str = "",
+    message_id: str = "",
+    nonce: str = "",
+) -> None:
+    buffer_name = tmux_prompt_buffer_name(bridge_session, target_alias or target, message_id, nonce)
+    try:
+        subprocess.run(
+            ["tmux", "load-buffer", "-b", buffer_name, "-"],
+            input=prompt.encode("utf-8"),
+            check=True,
+        )
+        subprocess.run(
+            ["tmux", "paste-buffer", "-p", "-r", "-d", "-b", buffer_name, "-t", target],
+            check=True,
+        )
+    finally:
+        try:
+            subprocess.run(
+                ["tmux", "delete-buffer", "-b", buffer_name],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except Exception:
+            pass
 
 
 def run_tmux_enter(target: str) -> None:
@@ -820,7 +882,7 @@ class BridgeDaemon:
         """Pick the queue item that was just delivered to `agent`.
 
         Order of resolution:
-          1. reserved[agent]: in-memory pointer set when run_tmux_send was
+          1. reserved[agent]: in-memory pointer set when prompt delivery was
              called and not yet cleared by the prompt_submitted that
              confirms submission. Verified against queue (must still be
              status=inflight and to=agent).
@@ -1366,7 +1428,8 @@ class BridgeDaemon:
         self.reserved[target] = str(message["id"])
         self.remember_nonce(nonce, message)
         body_text = str(message.get("body") or "")
-        if len(body_text) > MAX_PEER_BODY_CHARS:
+        normalized_body_text = normalize_prompt_body_text(body_text)
+        if len(normalized_body_text) > MAX_PEER_BODY_CHARS:
             self.log(
                 "body_truncated",
                 message_id=message.get("id"),
@@ -1375,6 +1438,7 @@ class BridgeDaemon:
                 kind=message.get("kind"),
                 intent=message.get("intent"),
                 original_chars=len(body_text),
+                normalized_chars=len(normalized_body_text),
                 limit_chars=MAX_PEER_BODY_CHARS,
             )
         prompt = build_peer_prompt(message, nonce, self.max_hops)
@@ -1382,7 +1446,14 @@ class BridgeDaemon:
 
         try:
             if not self.dry_run:
-                run_tmux_send_literal(pane, prompt)
+                run_tmux_send_literal(
+                    pane,
+                    prompt,
+                    bridge_session=self.bridge_session,
+                    target_alias=target,
+                    message_id=str(message["id"]),
+                    nonce=nonce,
+                )
                 time.sleep(self.submit_delay)
                 enter_status = self.pane_mode_status(pane)
                 if enter_status.get("error"):

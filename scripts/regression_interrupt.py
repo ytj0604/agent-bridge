@@ -49,6 +49,7 @@ sys.path.insert(0, str(LIBEXEC))
 
 import bridge_daemon  # noqa: E402
 import bridge_attach  # noqa: E402
+import bridge_hook_logger  # noqa: E402
 import bridge_identity  # noqa: E402
 import bridge_join  # noqa: E402
 import bridge_pane_probe  # noqa: E402
@@ -1551,7 +1552,7 @@ def scenario_pre_enter_probe_failure_defers_enter(label: str, tmpdir: Path) -> N
     enter_calls: list[str] = []
     old_literal = bridge_daemon.run_tmux_send_literal
     old_enter = bridge_daemon.run_tmux_enter
-    bridge_daemon.run_tmux_send_literal = lambda pane, prompt: literal_calls.append(pane)  # type: ignore[assignment]
+    bridge_daemon.run_tmux_send_literal = lambda pane, prompt, **kwargs: literal_calls.append(pane)  # type: ignore[assignment]
     bridge_daemon.run_tmux_enter = lambda pane: enter_calls.append(pane)  # type: ignore[assignment]
     try:
         msg = test_message("msg-mode-pre-enter")
@@ -4694,7 +4695,7 @@ def scenario_daemon_undeliverable_request_returns_result(label: str, tmpdir: Pat
     d.resolve_endpoint_detail = lambda target, purpose="write": {"ok": False, "pane": "", "reason": "process_mismatch", "probe_status": "mismatch", "detail": "gone", "should_detach": True}  # type: ignore[method-assign]
     calls: list[str] = []
     old_literal = bridge_daemon.run_tmux_send_literal
-    bridge_daemon.run_tmux_send_literal = lambda pane, prompt: calls.append(pane)  # type: ignore[assignment]
+    bridge_daemon.run_tmux_send_literal = lambda pane, prompt, **kwargs: calls.append(pane)  # type: ignore[assignment]
     try:
         msg = test_message("msg-undeliverable", frm="alice", to="bob", status="pending")
         d.queue.update(lambda queue: queue.append(msg))
@@ -5306,6 +5307,131 @@ def scenario_alarm_cancel_preserves_at_limit_body(label: str, tmpdir: Path) -> N
     print(f"  PASS  {label}")
 
 
+def scenario_prompt_body_preserves_multiline_and_sanitizes(label: str, tmpdir: Path) -> None:
+    body = "alpha\r\nbeta\tgamma\rdelta\x00epsilon\x1b[31m\x85z"
+    formatted = bridge_daemon.prompt_body(body)
+    assert_true(formatted == "alpha\nbeta\tgamma\ndeltaepsilon[31mz", f"{label}: body formatting mismatch: {formatted!r}")
+    assert_true("\\n" not in formatted and "\\t" not in formatted, f"{label}: multiline body must not be backslash-escaped: {formatted!r}")
+
+    literal_backslashes = r"literal \n and \t stay"
+    assert_true(bridge_daemon.prompt_body(literal_backslashes) == literal_backslashes, f"{label}: literal slash sequences must pass through")
+
+    crlf_at_limit = ("x" * (MAX_PEER_BODY_CHARS - 1)) + "\r\n"
+    assert_true("[bridge truncated peer body]" not in bridge_daemon.prompt_body(crlf_at_limit), f"{label}: CRLF must normalize before truncation")
+
+    trailing_lf = "tail\n"
+    assert_true(bridge_daemon.prompt_body(trailing_lf) == trailing_lf, f"{label}: trailing LF should be preserved")
+
+    long_body = ("x" * MAX_PEER_BODY_CHARS) + "\nrest"
+    truncated = bridge_daemon.prompt_body(long_body)
+    assert_true(truncated == ("x" * MAX_PEER_BODY_CHARS) + "\n[bridge truncated peer body]", f"{label}: truncation marker should be on its own line")
+
+    msg = test_message("msg-multiline")
+    msg["body"] = "first\nsecond\tline"
+    prompt = bridge_daemon.build_peer_prompt(msg, "nonce-multiline", 4)
+    lines = prompt.splitlines()
+    assert_true(len(lines) == 2, f"{label}: prompt should contain exactly body newline: {prompt!r}")
+    assert_true(lines[0].startswith("[bridge:nonce-multiline] "), f"{label}: prefix must stay on the first line: {prompt!r}")
+    assert_true(lines[0].endswith("Request: first") and lines[1] == "second\tline", f"{label}: body lines should be literal: {prompt!r}")
+    assert_true(bridge_hook_logger.extract_nonce(prompt) == "nonce-multiline", f"{label}: nonce extraction must still match prompt start")
+    print(f"  PASS  {label}")
+
+
+def scenario_tmux_paste_buffer_delivery_sequence(label: str, tmpdir: Path) -> None:
+    prompt = "prefix line\nbody\tline\n"
+    old_run = bridge_daemon.subprocess.run
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_run(cmd, **kwargs):
+        cmd_list = list(cmd)
+        calls.append((cmd_list, dict(kwargs)))
+        if cmd_list[1] == "load-buffer":
+            assert_true(kwargs.get("input") == prompt.encode("utf-8"), f"{label}: load-buffer stdin should be prompt bytes")
+        return subprocess.CompletedProcess(cmd_list, 0)
+
+    bridge_daemon.subprocess.run = fake_run  # type: ignore[assignment]
+    try:
+        bridge_daemon.run_tmux_send_literal(
+            "%42",
+            prompt,
+            bridge_session="sess/a",
+            target_alias="codex.review",
+            message_id="msg-1",
+            nonce="nonce-1",
+        )
+        bridge_daemon.run_tmux_send_literal(
+            "%42",
+            prompt,
+            bridge_session="sess/a",
+            target_alias="codex.review",
+            message_id="msg-1",
+            nonce="nonce-1",
+        )
+    finally:
+        bridge_daemon.subprocess.run = old_run  # type: ignore[assignment]
+
+    first = calls[:3]
+    second = calls[3:6]
+    assert_true(len(first) == 3 and len(second) == 3, f"{label}: each delivery should load, paste, cleanup: {calls}")
+    load_cmd, load_kwargs = first[0]
+    paste_cmd, _ = first[1]
+    delete_cmd, delete_kwargs = first[2]
+    buffer_name = load_cmd[3]
+    assert_true(load_cmd == ["tmux", "load-buffer", "-b", buffer_name, "-"], f"{label}: load command mismatch: {load_cmd}")
+    assert_true(load_kwargs.get("check") is True, f"{label}: load-buffer should check")
+    assert_true(paste_cmd == ["tmux", "paste-buffer", "-p", "-r", "-d", "-b", buffer_name, "-t", "%42"], f"{label}: paste command mismatch: {paste_cmd}")
+    assert_true(delete_cmd == ["tmux", "delete-buffer", "-b", buffer_name], f"{label}: delete command mismatch: {delete_cmd}")
+    assert_true(delete_kwargs.get("check") is False, f"{label}: delete-buffer cleanup should tolerate not-found")
+    assert_true("sess-a" in buffer_name and "codex.review" in buffer_name and "msg-1" in buffer_name and "nonce-1" in buffer_name, f"{label}: buffer name should include session/target/message/nonce: {buffer_name}")
+    assert_true(str(os.getpid()) in buffer_name, f"{label}: buffer name should include daemon pid: {buffer_name}")
+    assert_true(buffer_name != second[0][0][3], f"{label}: repeated deliveries must use unique server-scoped buffer names")
+
+    calls.clear()
+
+    def fake_run_paste_fails(cmd, **kwargs):
+        cmd_list = list(cmd)
+        calls.append((cmd_list, dict(kwargs)))
+        if cmd_list[1] == "paste-buffer":
+            raise subprocess.CalledProcessError(2, cmd_list)
+        if cmd_list[1] == "delete-buffer":
+            return subprocess.CompletedProcess(cmd_list, 1, "", "no buffer")
+        return subprocess.CompletedProcess(cmd_list, 0)
+
+    bridge_daemon.subprocess.run = fake_run_paste_fails  # type: ignore[assignment]
+    try:
+        try:
+            bridge_daemon.run_tmux_send_literal("%42", prompt, bridge_session="sess", target_alias="bob", message_id="msg", nonce="nonce")
+            raise AssertionError(f"{label}: paste failure should propagate")
+        except subprocess.CalledProcessError:
+            pass
+    finally:
+        bridge_daemon.subprocess.run = old_run  # type: ignore[assignment]
+    assert_true([cmd[1] for cmd, _ in calls] == ["load-buffer", "paste-buffer", "delete-buffer"], f"{label}: paste failure should still cleanup: {calls}")
+
+    calls.clear()
+
+    def fake_run_load_fails(cmd, **kwargs):
+        cmd_list = list(cmd)
+        calls.append((cmd_list, dict(kwargs)))
+        if cmd_list[1] == "load-buffer":
+            raise subprocess.CalledProcessError(3, cmd_list)
+        if cmd_list[1] == "paste-buffer":
+            raise AssertionError(f"{label}: paste should not run after load failure")
+        return subprocess.CompletedProcess(cmd_list, 1, "", "no buffer")
+
+    bridge_daemon.subprocess.run = fake_run_load_fails  # type: ignore[assignment]
+    try:
+        try:
+            bridge_daemon.run_tmux_send_literal("%42", prompt, bridge_session="sess", target_alias="bob", message_id="msg", nonce="nonce")
+            raise AssertionError(f"{label}: load failure should propagate")
+        except subprocess.CalledProcessError:
+            pass
+    finally:
+        bridge_daemon.subprocess.run = old_run  # type: ignore[assignment]
+    assert_true("paste-buffer" not in [cmd[1] for cmd, _ in calls], f"{label}: load failure should not paste: {calls}")
+    print(f"  PASS  {label}")
+
+
 def scenario_daemon_logs_body_truncated_for_legacy_long_body(label: str, tmpdir: Path) -> None:
     participants = _participants_state(["alice", "bob"])["participants"]
     d = make_daemon(tmpdir, participants)
@@ -5868,6 +5994,8 @@ def main() -> int:
             ("enqueue_rejects_oversized_body_unchanged", scenario_enqueue_rejects_oversized_body_unchanged),
             ("enqueue_stdin_rejects_oversized_body_unchanged", scenario_enqueue_stdin_rejects_oversized_body_unchanged),
             ("alarm_cancel_preserves_at_limit_body", scenario_alarm_cancel_preserves_at_limit_body),
+            ("prompt_body_preserves_multiline_and_sanitizes", scenario_prompt_body_preserves_multiline_and_sanitizes),
+            ("tmux_paste_buffer_delivery_sequence", scenario_tmux_paste_buffer_delivery_sequence),
             ("daemon_logs_body_truncated_for_legacy_long_body", scenario_daemon_logs_body_truncated_for_legacy_long_body),
             ("response_send_guard_socket_cli_error_kind", scenario_response_send_guard_socket_cli_error_kind),
             ("response_send_guard_socket_error_kind_parse", scenario_response_send_guard_socket_error_kind_parse),
