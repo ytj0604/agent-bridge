@@ -4370,6 +4370,54 @@ def _run_fake_install(
     )
 
 
+def _run_bridge_install_hooks(
+    tmpdir: Path,
+    *,
+    claude_settings: Path | None = None,
+    codex_hooks: Path | None = None,
+    codex_config: Path | None = None,
+    skip_claude: bool = False,
+    skip_codex: bool = False,
+    dry_run: bool = False,
+) -> subprocess.CompletedProcess:
+    hook_command = tmpdir / "bridge-hook"
+    hook_command.parent.mkdir(parents=True, exist_ok=True)
+    hook_command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    os.chmod(hook_command, 0o755)
+    cmd = [
+        sys.executable,
+        str(ROOT / "libexec" / "agent-bridge" / "bridge_install_hooks.py"),
+        "--hook-command",
+        str(hook_command),
+        "--claude-settings",
+        str(claude_settings or (tmpdir / "settings.json")),
+        "--codex-hooks",
+        str(codex_hooks or (tmpdir / "hooks.json")),
+        "--codex-config",
+        str(codex_config or (tmpdir / "config.toml")),
+    ]
+    if skip_claude:
+        cmd.append("--skip-claude")
+    if skip_codex:
+        cmd.append("--skip-codex")
+    if dry_run:
+        cmd.append("--dry-run")
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=_fake_install_env(tmpdir),
+        timeout=10,
+    )
+
+
+def _assert_hook_config_unchanged(label: str, path: Path, before: bytes, proc: subprocess.CompletedProcess, *needles: str) -> None:
+    assert_true(proc.returncode != 0, f"{label}: hook installer should fail, got {proc.returncode}: stdout={proc.stdout!r} stderr={proc.stderr!r}")
+    for needle in needles:
+        assert_true(needle in proc.stderr, f"{label}: stderr should contain {needle!r}: {proc.stderr!r}")
+    assert_true(path.read_bytes() == before, f"{label}: invalid existing hook config must not be overwritten")
+
+
 def scenario_install_sh_chmods_target_or_fails(label: str, tmpdir: Path) -> None:
     positive_root = tmpdir / "install-positive"
     positive_root.mkdir()
@@ -4551,6 +4599,141 @@ def scenario_install_sh_skip_hooks_with_ignore_flag_is_noop(label: str, tmpdir: 
     assert_true(proc.returncode == 0, f"{label}: skip-hooks + ignore should remain a no-op success: {proc.stderr!r}")
     assert_true(not argv_file.exists(), f"{label}: --skip-hooks must not invoke hook installer")
     assert_true("hook config install failed" not in proc.stderr, f"{label}: no hook failure warning expected when hooks skipped: {proc.stderr!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_rejects_malformed_json_without_overwrite(label: str, tmpdir: Path) -> None:
+    settings = tmpdir / "claude-malformed" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_bytes(b'{"hooks": [')
+    before = settings.read_bytes()
+    proc = _run_bridge_install_hooks(tmpdir, claude_settings=settings, skip_codex=True)
+    _assert_hook_config_unchanged(
+        label,
+        settings,
+        before,
+        proc,
+        str(settings),
+        "invalid JSON",
+        "refusing to overwrite",
+        "Fix or move aside",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_rejects_non_object_json_without_overwrite(label: str, tmpdir: Path) -> None:
+    for suffix, content in (("array", b"[1, 2, 3]"), ("null", b"null")):
+        settings = tmpdir / f"claude-non-object-{suffix}" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_bytes(content)
+        before = settings.read_bytes()
+        proc = _run_bridge_install_hooks(tmpdir / suffix, claude_settings=settings, skip_codex=True)
+        _assert_hook_config_unchanged(
+            f"{label}:{suffix}",
+            settings,
+            before,
+            proc,
+            str(settings),
+            "must be a JSON object",
+            "refusing to overwrite",
+        )
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_dry_run_invalid_json_fails_without_overwrite(label: str, tmpdir: Path) -> None:
+    settings = tmpdir / "dry-run-invalid" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_bytes(b'{"hooks":')
+    before = settings.read_bytes()
+    before_entries = sorted(p.name for p in settings.parent.iterdir())
+    proc = _run_bridge_install_hooks(tmpdir, claude_settings=settings, skip_codex=True, dry_run=True)
+    _assert_hook_config_unchanged(
+        label,
+        settings,
+        before,
+        proc,
+        "invalid JSON",
+        "refusing to overwrite",
+    )
+    after_entries = sorted(p.name for p in settings.parent.iterdir())
+    assert_true(after_entries == before_entries, f"{label}: dry-run invalid config should not create files: {after_entries}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_missing_json_still_creates(label: str, tmpdir: Path) -> None:
+    settings = tmpdir / "new-claude" / "settings.json"
+    proc = _run_bridge_install_hooks(tmpdir, claude_settings=settings, skip_codex=True)
+    assert_true(proc.returncode == 0, f"{label}: missing config should be created, got {proc.returncode}: {proc.stderr!r}")
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    hooks = data.get("hooks") or {}
+    assert_true("SessionStart" in hooks and "Stop" in hooks, f"{label}: bridge hook events should be written: {data!r}")
+    stop_blocks = hooks.get("Stop") or []
+    assert_true(any("--agent claude" in ((block.get("hooks") or [{}])[0].get("command", "")) for block in stop_blocks if isinstance(block, dict)), f"{label}: claude hook command should be present: {data!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_invalid_utf8_fails_without_overwrite(label: str, tmpdir: Path) -> None:
+    settings = tmpdir / "invalid-utf8" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_bytes(b'{"hooks": "\xff"}')
+    before = settings.read_bytes()
+    proc = _run_bridge_install_hooks(tmpdir, claude_settings=settings, skip_codex=True)
+    _assert_hook_config_unchanged(
+        label,
+        settings,
+        before,
+        proc,
+        str(settings),
+        "invalid JSON",
+        "refusing to overwrite",
+        "Fix or move aside",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_existing_valid_json_object_merges_correctly(label: str, tmpdir: Path) -> None:
+    settings = tmpdir / "valid-claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(
+        json.dumps({
+            "custom": {"preserve": True},
+            "hooks": {
+                "Stop": [
+                    {
+                        "matcher": "user-custom",
+                        "hooks": [{"type": "command", "command": "echo user hook"}],
+                    }
+                ]
+            },
+        }),
+        encoding="utf-8",
+    )
+    proc = _run_bridge_install_hooks(tmpdir, claude_settings=settings, skip_codex=True)
+    assert_true(proc.returncode == 0, f"{label}: valid config should merge, got {proc.returncode}: {proc.stderr!r}")
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    assert_true(data.get("custom", {}).get("preserve") is True, f"{label}: user fields must be preserved: {data!r}")
+    stop_blocks = data.get("hooks", {}).get("Stop") or []
+    assert_true(any("echo user hook" in str(block) for block in stop_blocks), f"{label}: existing user hook should remain: {data!r}")
+    assert_true(any("--agent claude" in str(block) for block in stop_blocks), f"{label}: bridge Stop hook should be merged: {data!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_codex_hooks_rejects_malformed_json_without_overwrite(label: str, tmpdir: Path) -> None:
+    hooks = tmpdir / "codex-malformed" / "hooks.json"
+    hooks.parent.mkdir(parents=True)
+    hooks.write_bytes(b'{"hooks": [')
+    before = hooks.read_bytes()
+    proc = _run_bridge_install_hooks(tmpdir, codex_hooks=hooks, skip_claude=True)
+    _assert_hook_config_unchanged(
+        label,
+        hooks,
+        before,
+        proc,
+        str(hooks),
+        "invalid JSON",
+        "refusing to overwrite",
+        "Fix or move aside",
+    )
     print(f"  PASS  {label}")
 
 
@@ -8238,6 +8421,13 @@ def main() -> int:
             ("install_sh_hook_success_succeeds", scenario_install_sh_hook_success_succeeds),
             ("install_sh_shim_failure_still_hard_fails_under_override", scenario_install_sh_shim_failure_still_hard_fails_under_override),
             ("install_sh_skip_hooks_with_ignore_flag_is_noop", scenario_install_sh_skip_hooks_with_ignore_flag_is_noop),
+            ("bridge_install_hooks_rejects_malformed_json_without_overwrite", scenario_bridge_install_hooks_rejects_malformed_json_without_overwrite),
+            ("bridge_install_hooks_rejects_non_object_json_without_overwrite", scenario_bridge_install_hooks_rejects_non_object_json_without_overwrite),
+            ("bridge_install_hooks_dry_run_invalid_json_fails_without_overwrite", scenario_bridge_install_hooks_dry_run_invalid_json_fails_without_overwrite),
+            ("bridge_install_hooks_missing_json_still_creates", scenario_bridge_install_hooks_missing_json_still_creates),
+            ("bridge_install_hooks_invalid_utf8_fails_without_overwrite", scenario_bridge_install_hooks_invalid_utf8_fails_without_overwrite),
+            ("bridge_install_hooks_existing_valid_json_object_merges_correctly", scenario_bridge_install_hooks_existing_valid_json_object_merges_correctly),
+            ("bridge_install_hooks_codex_hooks_rejects_malformed_json_without_overwrite", scenario_bridge_install_hooks_codex_hooks_rejects_malformed_json_without_overwrite),
             ("restart_dry_run_no_side_effect", scenario_restart_dry_run_no_side_effect),
             ("recover_orphan_delivered", scenario_recover_orphan_delivered),
             ("recover_orphan_delivered_aggregate_member", scenario_recover_orphan_delivered_aggregate_member),

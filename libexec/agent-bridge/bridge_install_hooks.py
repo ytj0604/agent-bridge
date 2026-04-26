@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from pathlib import Path
 
-from bridge_util import read_json, write_json_atomic
+from bridge_util import write_json_atomic
 
 CLAUDE_EVENTS = {
     "SessionStart": None,
@@ -25,9 +26,29 @@ CODEX_EVENTS = {
 
 
 def load_json(path: Path) -> dict:
-    data = read_json(path, {})
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except PermissionError as exc:
+        raise SystemExit(f"{path}: permission denied while reading hook config ({exc})")
+    except UnicodeDecodeError as exc:
+        raise SystemExit(
+            f"{path}: invalid JSON hook config: cannot decode UTF-8 at byte {exc.start}; "
+            "refusing to overwrite existing file. Fix or move aside the file and rerun."
+        )
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"{path}: invalid JSON hook config at line {exc.lineno} column {exc.colno}: {exc.msg}; "
+            "refusing to overwrite existing file. Fix or move aside the file and rerun."
+        )
     if not isinstance(data, dict):
-        raise SystemExit(f"{path} is not a JSON object")
+        raise SystemExit(
+            f"{path}: hook config must be a JSON object, got {type(data).__name__}; "
+            "refusing to overwrite existing file. Fix or move aside the file and rerun."
+        )
     return data
 
 
