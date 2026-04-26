@@ -60,6 +60,8 @@ bridge_run
 
 - `AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC` — default request watchdog in seconds; `0` disables the default.
 - `AGENT_BRIDGE_PANE_MODE_GRACE_SEC` — how long the daemon leaves a target message pending while the target tmux pane is in copy/view mode before force-cancelling that mode. Default is `180`. Set `0` to disable force-cancel and wait indefinitely; negative values also disable it and log a warning.
+- `AGENT_BRIDGE_TURN_ID_MISMATCH_GRACE_SEC` — how long the daemon keeps a turn-id-mismatched active context before unblocking the target if the matching Stop hook never arrives. Default is `300`; `0` expires on the next maintenance sweep.
+- `AGENT_BRIDGE_TURN_ID_MISMATCH_POST_WATCHDOG_GRACE_SEC` — extra seconds after a matching request or aggregate watchdog deadline before turn-id-mismatch expiry may unblock the target. Default is `1`.
 
 If the daemon restarts while a target pane is in copy/view mode, avoid editing that pane's prompt buffer until the bridge submits or recovers the deferred message.
 

@@ -1852,6 +1852,65 @@ def _queue_item(d, message_id: str) -> dict | None:
     return next((item for item in d.queue.read() if item.get("id") == message_id), None)
 
 
+def _active_turn(
+    d,
+    *,
+    message_id: str,
+    frm: str = "codex",
+    to: str = "claude",
+    nonce: str = "n-active-turn",
+    turn_id: str = "active-turn",
+    auto_return: bool = True,
+    kind: str = "request",
+    aggregate_id: str | None = None,
+    aggregate_expected: list[str] | None = None,
+    aggregate_message_ids: dict[str, str] | None = None,
+) -> dict:
+    msg = _make_delivered_context(
+        d,
+        message_id,
+        frm=frm,
+        to=to,
+        nonce=nonce,
+        turn_id=turn_id,
+        auto_return=auto_return,
+        kind=kind,
+        aggregate_id=aggregate_id,
+        aggregate_expected=aggregate_expected,
+        aggregate_message_ids=aggregate_message_ids,
+    )
+    d.busy[to] = True
+    d.reserved[to] = None
+    d.last_enter_ts[message_id] = time.time()
+    d.remember_nonce(nonce, msg)
+    return msg
+
+
+def _plant_watchdog(
+    d,
+    wake_id: str,
+    *,
+    sender: str = "codex",
+    message_id: str | None = None,
+    aggregate_id: str | None = None,
+    to: str = "claude",
+    deadline: float | None = None,
+) -> str:
+    d.watchdogs[wake_id] = {
+        "sender": sender,
+        "deadline": time.time() if deadline is None else deadline,
+        "ref_message_id": message_id,
+        "ref_aggregate_id": aggregate_id,
+        "ref_to": to,
+        "ref_kind": "request",
+        "ref_intent": "test",
+        "ref_causal_id": "causal-watchdog",
+        "ref_aggregate_expected": ["w1", "w2"] if aggregate_id else [],
+        "is_alarm": False,
+    }
+    return wake_id
+
+
 def _auto_return_results(d, sender: str, target: str) -> list[dict]:
     return [
         item for item in d.queue.read()
@@ -2598,7 +2657,7 @@ def scenario_hook_logger_anchored_regex(label: str, tmpdir: Path) -> None:
 
 def scenario_turn_id_mismatch_preserves_ctx(label: str, tmpdir: Path) -> None:
     """A late Stop with mismatched turn_id must NOT pop ctx (consume-once
-    is for normal terminal path only — stale Stops are skipped earlier)."""
+    is for normal terminal path only; bounded expiry is a later maintenance step)."""
     participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
     d = make_daemon(tmpdir, participants)
     _make_inflight(d, "msg-tm-1", frm="codex", to="claude", nonce="n-tm-1")
@@ -2609,6 +2668,361 @@ def scenario_turn_id_mismatch_preserves_ctx(label: str, tmpdir: Path) -> None:
     d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "old-stale-turn", "last_assistant_message": "leftover"})
     ctx_after = d.current_prompt_by_agent.get("claude") or {}
     assert_true(ctx_after.get("id") == "msg-tm-1", f"{label}: turn_id_mismatch must NOT consume ctx")
+    assert_true(d.busy.get("claude") is True, f"{label}: turn_id_mismatch must keep busy until expiry")
+    assert_true((_queue_item(d, "msg-tm-1") or {}).get("status") == "delivered", f"{label}: delivered row must remain before expiry")
+    assert_true(isinstance(ctx_after.get("turn_id_mismatch_since_ts"), float), f"{label}: mismatch since_ts expected")
+    assert_true(isinstance(ctx_after.get("turn_id_mismatch_last_ts"), float), f"{label}: mismatch last_ts expected")
+    assert_true(ctx_after.get("turn_id_mismatch_response_turn_id") == "old-stale-turn", f"{label}: response turn_id must be recorded")
+    assert_true(int(ctx_after.get("turn_id_mismatch_count") or 0) >= 1, f"{label}: mismatch count expected")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(
+        sum(1 for e in events if e.get("event") == "response_skipped_stale" and e.get("reason") == "turn_id_mismatch") == 1,
+        f"{label}: one stale response log expected",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_turn_id_mismatch_annotation_is_idempotent(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    _active_turn(d, message_id="msg-tm-idem", nonce="n-tm-idem", turn_id="active-turn")
+
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "stale-1", "last_assistant_message": "old1"})
+    first = dict(d.current_prompt_by_agent.get("claude") or {})
+    since = first.get("turn_id_mismatch_since_ts")
+    last = first.get("turn_id_mismatch_last_ts")
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "stale-2", "last_assistant_message": "old2"})
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "stale-3", "last_assistant_message": "old3"})
+
+    ctx = d.current_prompt_by_agent.get("claude") or {}
+    assert_true(ctx.get("turn_id_mismatch_since_ts") == since, f"{label}: since_ts must stay pinned to first mismatch")
+    assert_true(float(ctx.get("turn_id_mismatch_last_ts") or 0) >= float(last or 0), f"{label}: last_ts must update")
+    assert_true(ctx.get("turn_id_mismatch_response_turn_id") == "stale-3", f"{label}: latest mismatched turn should be recorded")
+    assert_true(ctx.get("turn_id_mismatch_count") == 3, f"{label}: mismatch count must increment")
+    print(f"  PASS  {label}")
+
+
+def scenario_turn_id_mismatch_matching_stop_before_expiry_cleans_normally(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = _active_turn(d, message_id="msg-tm-match", nonce="n-tm-match", turn_id="active-turn")
+
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "stale-turn", "last_assistant_message": "old"})
+    assert_true((d.current_prompt_by_agent.get("claude") or {}).get("turn_id_mismatch_since_ts") is not None, f"{label}: mismatch must annotate ctx")
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "active-turn", "last_assistant_message": "real reply"})
+
+    assert_true(d.current_prompt_by_agent.get("claude") is None, f"{label}: matching Stop must pop ctx normally")
+    assert_true(d.busy.get("claude") is False, f"{label}: matching Stop must clear busy")
+    assert_true(_queue_item(d, "msg-tm-match") is None, f"{label}: matching Stop must remove delivered row")
+    results = _auto_return_results(d, "claude", "codex")
+    assert_true(len(results) == 1 and results[0].get("reply_to") == msg["id"], f"{label}: matching Stop must route normal result")
+    print(f"  PASS  {label}")
+
+
+def scenario_turn_id_mismatch_expiry_unblocks_target(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    d.turn_id_mismatch_grace_seconds = 0.0
+    d.turn_id_mismatch_post_watchdog_grace_seconds = 0.0
+    _active_turn(d, message_id="msg-tm-expire", nonce="n-tm-expire", turn_id="active-turn")
+    d.reserved["claude"] = "msg-tm-expire"
+    d.watchdogs["wake-tm-expire"] = {
+        "sender": "codex",
+        "deadline": time.time() - 1.0,
+        "ref_message_id": "msg-tm-expire",
+        "ref_aggregate_id": None,
+        "ref_to": "claude",
+        "ref_kind": "request",
+        "ref_intent": "test",
+        "is_alarm": False,
+    }
+    pending = test_message("msg-tm-next", frm="codex", to="claude", status="pending")
+    d.queue.update(lambda queue: (queue.append(pending), None)[1])
+
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "stale-turn", "last_assistant_message": "old"})
+    assert_true(d.cached_nonce("n-tm-expire") is not None, f"{label}: precondition nonce cached")
+    d.expire_turn_id_mismatch_contexts()
+
+    assert_true(d.busy.get("claude") is False, f"{label}: expiry must clear busy")
+    assert_true(d.reserved.get("claude") == "msg-tm-next", f"{label}: pending message should be reserved after expiry")
+    assert_true(d.current_prompt_by_agent.get("claude") is None, f"{label}: expiry must pop current ctx")
+    assert_true(_queue_item(d, "msg-tm-expire") is None, f"{label}: expiry must remove delivered row")
+    assert_true((_queue_item(d, "msg-tm-next") or {}).get("status") == "inflight", f"{label}: pending message should move to inflight")
+    assert_true(d.cached_nonce("n-tm-expire") is None, f"{label}: expiry must discard active nonce")
+    assert_true("msg-tm-expire" not in d.last_enter_ts, f"{label}: expiry must clear last_enter_ts")
+    assert_true("wake-tm-expire" not in d.watchdogs, f"{label}: expiry must cancel non-aggregate message watchdog")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(
+        any(e.get("event") == "watchdog_cancelled" and e.get("reason") == "turn_id_mismatch_expired" and e.get("ref_message_id") == "msg-tm-expire" for e in events),
+        f"{label}: watchdog cancellation log expected",
+    )
+    expired = [e for e in events if e.get("event") == "turn_id_mismatch_context_expired" and e.get("message_id") == "msg-tm-expire"]
+    assert_true(len(expired) == 1, f"{label}: exactly one expiry log expected")
+    assert_true(expired[0].get("removed_delivered") is True, f"{label}: expiry log must say delivered row removed")
+    assert_true(expired[0].get("mismatched_turn_id") == "stale-turn", f"{label}: expiry log must include mismatched turn")
+    print(f"  PASS  {label}")
+
+
+def scenario_turn_id_mismatch_expiry_waits_for_watchdog_deadline(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    d.turn_id_mismatch_grace_seconds = 0.0
+    d.turn_id_mismatch_post_watchdog_grace_seconds = 2.0
+    _active_turn(d, message_id="msg-tm-wd", nonce="n-tm-wd", turn_id="active-turn")
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "stale-turn", "last_assistant_message": "old"})
+    since = float((d.current_prompt_by_agent.get("claude") or {}).get("turn_id_mismatch_since_ts"))
+    d.watchdogs["wake-tm-wd"] = {
+        "sender": "codex",
+        "deadline": since + 100.0,
+        "ref_message_id": "msg-tm-wd",
+        "ref_aggregate_id": None,
+        "ref_to": "claude",
+        "ref_kind": "request",
+        "ref_intent": "test",
+        "is_alarm": False,
+    }
+
+    with d.state_lock:
+        expired = d._expire_turn_id_mismatch_contexts_locked(since + 101.0)
+    assert_true(expired == [], f"{label}: post-watchdog grace must defer expiry")
+    assert_true((d.current_prompt_by_agent.get("claude") or {}).get("id") == "msg-tm-wd", f"{label}: ctx must remain before deadline")
+    d.watchdogs["wake-tm-wd"]["deadline"] = since + 200.0
+    with d.state_lock:
+        expired = d._expire_turn_id_mismatch_contexts_locked(since + 201.0)
+    assert_true(expired == [], f"{label}: extended watchdog deadline must defer expiry")
+    with d.state_lock:
+        expired = d._expire_turn_id_mismatch_contexts_locked(since + 203.0)
+    assert_true(expired == ["claude"], f"{label}: expiry should happen after extended deadline plus post grace")
+    assert_true(d.current_prompt_by_agent.get("claude") is None, f"{label}: ctx should be expired after extended deadline")
+    print(f"  PASS  {label}")
+
+
+def scenario_turn_id_mismatch_watchdog_fire_preserves_post_grace(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    d.turn_id_mismatch_grace_seconds = 0.0
+    d.turn_id_mismatch_post_watchdog_grace_seconds = 10.0
+    _active_turn(d, message_id="msg-tm-fired", nonce="n-tm-fired", turn_id="active-turn")
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "stale-turn", "last_assistant_message": "old"})
+    deadline = time.time() - 1.0
+    _plant_watchdog(d, "wake-tm-fired", message_id="msg-tm-fired", deadline=deadline)
+
+    d.check_watchdogs()
+    d.expire_turn_id_mismatch_contexts()
+
+    ctx = d.current_prompt_by_agent.get("claude") or {}
+    assert_true(ctx.get("id") == "msg-tm-fired", f"{label}: ctx must survive same tick as watchdog fire")
+    assert_true("wake-tm-fired" not in d.watchdogs, f"{label}: watchdog should have fired and been popped")
+    unblock_ts = float(ctx.get("turn_id_mismatch_post_watchdog_unblock_ts") or 0.0)
+    assert_true(abs(unblock_ts - (deadline + 10.0)) < 0.001, f"{label}: post-watchdog unblock ts must be stamped, got {unblock_ts}")
+
+    with d.state_lock:
+        expired = d._expire_turn_id_mismatch_contexts_locked(unblock_ts - 0.1)
+    assert_true(expired == [], f"{label}: ctx must remain before stamped unblock ts")
+    with d.state_lock:
+        expired = d._expire_turn_id_mismatch_contexts_locked(unblock_ts)
+    assert_true(expired == ["claude"], f"{label}: ctx should expire at stamped unblock ts")
+    print(f"  PASS  {label}")
+
+
+def scenario_turn_id_mismatch_aggregate_watchdog_fire_preserves_post_grace(label: str, tmpdir: Path) -> None:
+    participants = {
+        "manager": {"alias": "manager", "agent_type": "claude", "pane": "%97"},
+        "w1": {"alias": "w1", "agent_type": "codex", "pane": "%96"},
+        "w2": {"alias": "w2", "agent_type": "codex", "pane": "%95"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.turn_id_mismatch_grace_seconds = 0.0
+    d.turn_id_mismatch_post_watchdog_grace_seconds = 10.0
+    agg_id = "agg-tm-fired"
+    _active_turn(
+        d,
+        message_id="msg-agg-fired-w1",
+        frm="manager",
+        to="w1",
+        nonce="n-agg-fired-w1",
+        turn_id="active-turn",
+        aggregate_id=agg_id,
+        aggregate_expected=["w1", "w2"],
+        aggregate_message_ids={"w1": "msg-agg-fired-w1", "w2": "msg-agg-fired-w2"},
+    )
+    d.handle_response_finished({"agent": "w1", "bridge_agent": "w1", "turn_id": "stale-turn", "last_assistant_message": "old"})
+    deadline = time.time() - 1.0
+    _plant_watchdog(d, "wake-agg-fired", sender="manager", message_id="msg-agg-fired-w1", aggregate_id=agg_id, to="w1", deadline=deadline)
+
+    d.check_watchdogs()
+    d.expire_turn_id_mismatch_contexts()
+
+    ctx = d.current_prompt_by_agent.get("w1") or {}
+    assert_true(ctx.get("id") == "msg-agg-fired-w1", f"{label}: aggregate leg ctx must survive same tick as watchdog fire")
+    assert_true("wake-agg-fired" not in d.watchdogs, f"{label}: aggregate watchdog should have fired and been popped")
+    unblock_ts = float(ctx.get("turn_id_mismatch_post_watchdog_unblock_ts") or 0.0)
+    assert_true(abs(unblock_ts - (deadline + 10.0)) < 0.001, f"{label}: aggregate post-watchdog unblock ts must be stamped")
+    with d.state_lock:
+        expired = d._expire_turn_id_mismatch_contexts_locked(unblock_ts)
+    assert_true(expired == ["w1"], f"{label}: aggregate leg should expire at stamped unblock ts")
+    print(f"  PASS  {label}")
+
+
+def scenario_turn_id_mismatch_post_watchdog_grace_zero_allows_same_tick_expiry(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    d.turn_id_mismatch_grace_seconds = 0.0
+    d.turn_id_mismatch_post_watchdog_grace_seconds = 0.0
+    _active_turn(d, message_id="msg-tm-zero", nonce="n-tm-zero", turn_id="active-turn")
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "stale-turn", "last_assistant_message": "old"})
+    _plant_watchdog(d, "wake-tm-zero", message_id="msg-tm-zero", deadline=time.time() - 1.0)
+
+    d.check_watchdogs()
+    d.expire_turn_id_mismatch_contexts()
+
+    assert_true(d.current_prompt_by_agent.get("claude") is None, f"{label}: post grace 0 allows same-tick expiry")
+    assert_true(_queue_item(d, "msg-tm-zero") is None, f"{label}: delivered row should be removed when post grace is zero")
+    print(f"  PASS  {label}")
+
+
+def scenario_turn_id_mismatch_extend_wait_before_fire_defers_without_stamp(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    d.turn_id_mismatch_grace_seconds = 0.0
+    d.turn_id_mismatch_post_watchdog_grace_seconds = 2.0
+    _active_turn(d, message_id="msg-tm-extend", nonce="n-tm-extend", turn_id="active-turn")
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "stale-turn", "last_assistant_message": "old"})
+    since = float((d.current_prompt_by_agent.get("claude") or {}).get("turn_id_mismatch_since_ts"))
+    _plant_watchdog(d, "wake-tm-extend", message_id="msg-tm-extend", deadline=since + 1.0)
+
+    ok, err, _deadline_iso = d.upsert_message_watchdog("codex", "msg-tm-extend", 200.0)
+    assert_true(ok, f"{label}: extend_wait should succeed before watchdog fires, got {err!r}")
+    ctx = d.current_prompt_by_agent.get("claude") or {}
+    assert_true(ctx.get("turn_id_mismatch_post_watchdog_unblock_ts") is None, f"{label}: no post-fire stamp should exist before watchdog fires")
+    active_wd = next(wd for wd in d.watchdogs.values() if wd.get("ref_message_id") == "msg-tm-extend")
+    extended_deadline = float(active_wd.get("deadline"))
+    with d.state_lock:
+        expired = d._expire_turn_id_mismatch_contexts_locked(extended_deadline + 1.0)
+    assert_true(expired == [], f"{label}: extended watchdog deadline should defer expiry before post grace elapses")
+    with d.state_lock:
+        expired = d._expire_turn_id_mismatch_contexts_locked(extended_deadline + 2.0)
+    assert_true(expired == ["claude"], f"{label}: expiry should happen at extended deadline plus post grace")
+    print(f"  PASS  {label}")
+
+
+def scenario_turn_id_mismatch_expiry_does_not_remove_non_delivered_queue_rows(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    for status in ("pending", "inflight", "submitted"):
+        case_dir = tmpdir / status
+        case_dir.mkdir()
+        d = make_daemon(case_dir, participants)
+        d.turn_id_mismatch_grace_seconds = 0.0
+        d.queue.update(lambda queue, status=status: (queue.append(test_message("msg-tm-nondelivered", frm="codex", to="claude", status=status)), None)[1])
+        d.current_prompt_by_agent["claude"] = {
+            "id": "msg-tm-nondelivered",
+            "nonce": "n-tm-nondelivered",
+            "from": "codex",
+            "auto_return": True,
+            "turn_id": "active-turn",
+            "turn_id_mismatch_since_ts": time.time() - 10.0,
+            "turn_id_mismatch_last_ts": time.time() - 10.0,
+            "turn_id_mismatch_response_turn_id": "stale-turn",
+        }
+        d.busy["claude"] = True
+        with d.state_lock:
+            expired = d._expire_turn_id_mismatch_contexts_locked(time.time())
+        item = _queue_item(d, "msg-tm-nondelivered")
+        assert_true(expired == ["claude"], f"{label}: ctx should expire for status {status}")
+        assert_true(item is not None and item.get("status") == status, f"{label}: {status} row must not be removed")
+    print(f"  PASS  {label}")
+
+
+def scenario_turn_id_mismatch_aggregate_leg_expiry_no_synthetic_reply(label: str, tmpdir: Path) -> None:
+    participants = {
+        "manager": {"alias": "manager", "agent_type": "claude", "pane": "%97"},
+        "w1": {"alias": "w1", "agent_type": "codex", "pane": "%96"},
+        "w2": {"alias": "w2", "agent_type": "codex", "pane": "%95"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.turn_id_mismatch_grace_seconds = 0.0
+    d.turn_id_mismatch_post_watchdog_grace_seconds = 1.0
+    agg_id = "agg-tm-expire"
+    _active_turn(
+        d,
+        message_id="msg-agg-w1",
+        frm="manager",
+        to="w1",
+        nonce="n-agg-w1",
+        turn_id="active-turn",
+        aggregate_id=agg_id,
+        aggregate_expected=["w1", "w2"],
+        aggregate_message_ids={"w1": "msg-agg-w1", "w2": "msg-agg-w2"},
+    )
+    d.handle_response_finished({"agent": "w1", "bridge_agent": "w1", "turn_id": "stale-turn", "last_assistant_message": "old"})
+    since = float((d.current_prompt_by_agent.get("w1") or {}).get("turn_id_mismatch_since_ts"))
+    d.watchdogs["wake-agg-tm"] = {
+        "sender": "manager",
+        "deadline": since + 50.0,
+        "ref_message_id": "msg-agg-w1",
+        "ref_aggregate_id": agg_id,
+        "ref_to": "w1",
+        "ref_kind": "request",
+        "ref_intent": "test",
+        "is_alarm": False,
+    }
+    with d.state_lock:
+        expired = d._expire_turn_id_mismatch_contexts_locked(since + 50.5)
+    assert_true(expired == [], f"{label}: aggregate watchdog post-grace must defer expiry")
+    with d.state_lock:
+        expired = d._expire_turn_id_mismatch_contexts_locked(since + 51.5)
+    assert_true(expired == ["w1"], f"{label}: aggregate leg should expire after aggregate watchdog deadline")
+    assert_true(_queue_item(d, "msg-agg-w1") is None, f"{label}: aggregate delivered leg should be removed")
+    assert_true("wake-agg-tm" in d.watchdogs, f"{label}: aggregate watchdog must not be cancelled by leg expiry")
+    queued = d.queue.read()
+    assert_true(not any(item.get("kind") == "result" and item.get("source") in {"auto_return", "aggregate_return"} for item in queued), f"{label}: expiry must not synthesize result")
+    aggregate_data = read_json(Path(d.aggregate_file), {"aggregates": {}})
+    replies = ((aggregate_data.get("aggregates") or {}).get(agg_id) or {}).get("replies") or {}
+    assert_true(replies == {}, f"{label}: expiry must not collect aggregate reply")
+    print(f"  PASS  {label}")
+
+
+def scenario_turn_id_mismatch_sweep_no_op_without_annotation(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    _active_turn(d, message_id="msg-tm-noann", nonce="n-tm-noann", turn_id="active-turn")
+    with d.state_lock:
+        expired = d._expire_turn_id_mismatch_contexts_locked(time.time() + 3600.0)
+    assert_true(expired == [], f"{label}: sweep should ignore ctx without annotation")
+    assert_true((d.current_prompt_by_agent.get("claude") or {}).get("id") == "msg-tm-noann", f"{label}: ctx must remain")
+    print(f"  PASS  {label}")
+
+
+def scenario_turn_id_mismatch_sweep_no_op_after_normal_pop(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    _active_turn(d, message_id="msg-tm-pop", nonce="n-tm-pop", turn_id="active-turn")
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "stale-turn", "last_assistant_message": "old"})
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "active-turn", "last_assistant_message": "real"})
+    with d.state_lock:
+        expired = d._expire_turn_id_mismatch_contexts_locked(time.time() + 3600.0)
+    assert_true(expired == [], f"{label}: sweep should no-op after normal terminal pop")
+    assert_true(d.current_prompt_by_agent.get("claude") is None, f"{label}: ctx remains gone")
+    print(f"  PASS  {label}")
+
+
+def scenario_turn_id_mismatch_notice_ctx_follows_same_expiry(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    d.turn_id_mismatch_grace_seconds = 0.0
+    _active_turn(
+        d,
+        message_id="msg-tm-notice",
+        nonce="n-tm-notice",
+        turn_id="active-turn",
+        auto_return=False,
+        kind="notice",
+    )
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "stale-turn", "last_assistant_message": ""})
+    d.expire_turn_id_mismatch_contexts()
+    assert_true(d.current_prompt_by_agent.get("claude") is None, f"{label}: notice ctx should expire")
+    assert_true(_queue_item(d, "msg-tm-notice") is None, f"{label}: notice delivered row should be removed")
+    assert_true(_auto_return_results(d, "claude", "codex") == [], f"{label}: notice expiry must not auto-route")
     print(f"  PASS  {label}")
 
 
@@ -6225,6 +6639,19 @@ def main() -> int:
             ("nonce_missing_stops_enter_retry", scenario_nonce_missing_stops_enter_retry),
             ("hook_logger_anchored_regex", scenario_hook_logger_anchored_regex),
             ("turn_id_mismatch_preserves_ctx", scenario_turn_id_mismatch_preserves_ctx),
+            ("turn_id_mismatch_annotation_is_idempotent", scenario_turn_id_mismatch_annotation_is_idempotent),
+            ("turn_id_mismatch_matching_stop_before_expiry_cleans_normally", scenario_turn_id_mismatch_matching_stop_before_expiry_cleans_normally),
+            ("turn_id_mismatch_expiry_unblocks_target", scenario_turn_id_mismatch_expiry_unblocks_target),
+            ("turn_id_mismatch_expiry_waits_for_watchdog_deadline", scenario_turn_id_mismatch_expiry_waits_for_watchdog_deadline),
+            ("turn_id_mismatch_watchdog_fire_preserves_post_grace", scenario_turn_id_mismatch_watchdog_fire_preserves_post_grace),
+            ("turn_id_mismatch_aggregate_watchdog_fire_preserves_post_grace", scenario_turn_id_mismatch_aggregate_watchdog_fire_preserves_post_grace),
+            ("turn_id_mismatch_post_watchdog_grace_zero_allows_same_tick_expiry", scenario_turn_id_mismatch_post_watchdog_grace_zero_allows_same_tick_expiry),
+            ("turn_id_mismatch_extend_wait_before_fire_defers_without_stamp", scenario_turn_id_mismatch_extend_wait_before_fire_defers_without_stamp),
+            ("turn_id_mismatch_expiry_does_not_remove_non_delivered_queue_rows", scenario_turn_id_mismatch_expiry_does_not_remove_non_delivered_queue_rows),
+            ("turn_id_mismatch_aggregate_leg_expiry_no_synthetic_reply", scenario_turn_id_mismatch_aggregate_leg_expiry_no_synthetic_reply),
+            ("turn_id_mismatch_sweep_no_op_without_annotation", scenario_turn_id_mismatch_sweep_no_op_without_annotation),
+            ("turn_id_mismatch_sweep_no_op_after_normal_pop", scenario_turn_id_mismatch_sweep_no_op_after_normal_pop),
+            ("turn_id_mismatch_notice_ctx_follows_same_expiry", scenario_turn_id_mismatch_notice_ctx_follows_same_expiry),
             ("short_id_format", scenario_short_id_format),
             ("resolve_targets_single", scenario_resolve_targets_single),
             ("resolve_targets_multi_basic", scenario_resolve_targets_multi_basic),

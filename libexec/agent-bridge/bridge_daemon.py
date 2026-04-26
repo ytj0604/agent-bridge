@@ -44,6 +44,8 @@ MAX_PROCESSED_CAPTURE_REQUESTS = 4096
 MAX_CAPTURE_REQUEST_AGE_SECONDS = 60
 CAPTURE_RESPONSE_TTL_SECONDS = 60 * 60
 PANE_MODE_GRACE_DEFAULT_SECONDS = 180.0
+TURN_ID_MISMATCH_GRACE_DEFAULT_SECONDS = 300.0
+TURN_ID_MISMATCH_POST_WATCHDOG_GRACE_DEFAULT_SECONDS = 1.0
 PANE_MODE_PROBE_TIMEOUT_SECONDS = 0.3
 PANE_MODE_FORCE_CANCEL_MODES = {"copy-mode", "copy-mode-vi", "view-mode"}
 PANE_MODE_METADATA_KEYS = (
@@ -235,6 +237,19 @@ def resolve_pane_mode_grace_seconds() -> tuple[float | None, str | None]:
     return value, None
 
 
+def resolve_non_negative_env_seconds(env_name: str, default: float) -> tuple[float, str | None]:
+    raw = os.environ.get(env_name)
+    if raw is None or str(raw).strip() == "":
+        return default, None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default, f"invalid {env_name}={raw!r}; using {default:g}"
+    if value < 0:
+        return default, f"{env_name}={raw!r} is negative; using {default:g}"
+    return value, None
+
+
 def pane_mode_block_since_ts(item: dict) -> float | None:
     raw_ts = item.get("pane_mode_blocked_since_ts")
     try:
@@ -338,6 +353,22 @@ class BridgeDaemon:
         self.submit_delay = args.submit_delay
         self.submit_timeout = args.submit_timeout
         self.pane_mode_grace_seconds, self.pane_mode_grace_warning = resolve_pane_mode_grace_seconds()
+        self.turn_id_mismatch_grace_seconds, turn_id_mismatch_grace_warning = resolve_non_negative_env_seconds(
+            "AGENT_BRIDGE_TURN_ID_MISMATCH_GRACE_SEC",
+            TURN_ID_MISMATCH_GRACE_DEFAULT_SECONDS,
+        )
+        (
+            self.turn_id_mismatch_post_watchdog_grace_seconds,
+            turn_id_mismatch_post_watchdog_grace_warning,
+        ) = resolve_non_negative_env_seconds(
+            "AGENT_BRIDGE_TURN_ID_MISMATCH_POST_WATCHDOG_GRACE_SEC",
+            TURN_ID_MISMATCH_POST_WATCHDOG_GRACE_DEFAULT_SECONDS,
+        )
+        self.turn_id_mismatch_grace_warnings = [
+            warning
+            for warning in (turn_id_mismatch_grace_warning, turn_id_mismatch_post_watchdog_grace_warning)
+            if warning
+        ]
         self.from_start = args.from_start
         self.dry_run = args.dry_run
         self.stdout_events = args.stdout_events
@@ -1892,6 +1923,30 @@ class BridgeDaemon:
             for wake_id, wd in due:
                 self.fire_watchdog(wake_id, wd)
 
+    def stamp_turn_id_mismatch_post_watchdog_unblock(self, wd: dict) -> None:
+        if wd.get("is_alarm"):
+            return
+        try:
+            deadline = float(wd.get("deadline"))
+        except (TypeError, ValueError):
+            return
+        unblock_ts = deadline + max(0.0, float(self.turn_id_mismatch_post_watchdog_grace_seconds))
+        message_id = str(wd.get("ref_message_id") or "")
+        aggregate_id = str(wd.get("ref_aggregate_id") or "")
+        for context in self.current_prompt_by_agent.values():
+            if not isinstance(context, dict) or context.get("turn_id_mismatch_since_ts") is None:
+                continue
+            matches_message = bool(message_id and context.get("id") == message_id)
+            matches_aggregate = bool(aggregate_id and context.get("aggregate_id") == aggregate_id)
+            if not matches_message and not matches_aggregate:
+                continue
+            try:
+                existing = float(context.get("turn_id_mismatch_post_watchdog_unblock_ts") or 0.0)
+            except (TypeError, ValueError):
+                existing = 0.0
+            if unblock_ts > existing:
+                context["turn_id_mismatch_post_watchdog_unblock_ts"] = unblock_ts
+
     def build_watchdog_fire_text(self, wd: dict) -> str:
         if wd.get("is_alarm"):
             custom = str(wd.get("alarm_body") or "").strip()
@@ -1980,10 +2035,10 @@ class BridgeDaemon:
         return text
 
     def fire_watchdog(self, wake_id: str, wd: dict) -> None:
-        self.watchdogs.pop(wake_id, None)
         sender = str(wd.get("sender") or "")
         self.reload_participants()
         if not sender or sender not in self.participants:
+            self.watchdogs.pop(wake_id, None)
             self.log(
                 "watchdog_fire_skipped",
                 wake_id=wake_id,
@@ -2000,6 +2055,7 @@ class BridgeDaemon:
             and wd.get("ref_message_id")
             and self._lookup_queue_item(str(wd.get("ref_message_id"))) is None
         ):
+            self.watchdogs.pop(wake_id, None)
             self.log(
                 "watchdog_skipped_stale",
                 wake_id=wake_id,
@@ -2007,6 +2063,8 @@ class BridgeDaemon:
                 ref_message_id=wd.get("ref_message_id"),
             )
             return
+        self.stamp_turn_id_mismatch_post_watchdog_unblock(wd)
+        self.watchdogs.pop(wake_id, None)
         body = self.build_watchdog_fire_text(wd)
         synthetic = {
             "id": short_id("msg"),
@@ -2487,6 +2545,109 @@ class BridgeDaemon:
             if wd and wd.get("ref_aggregate_id") == aggregate_id and not wd.get("is_alarm"):
                 self.watchdogs.pop(wake_id, None)
                 self.log("watchdog_cancelled", wake_id=wake_id, reason=reason, ref_aggregate_id=aggregate_id)
+
+    def turn_id_mismatch_expiry_deadline(self, context: dict) -> float | None:
+        try:
+            since_ts = float(context.get("turn_id_mismatch_since_ts"))
+        except (TypeError, ValueError):
+            return None
+        deadline = since_ts + max(0.0, float(self.turn_id_mismatch_grace_seconds))
+        try:
+            post_watchdog_unblock_ts = float(context.get("turn_id_mismatch_post_watchdog_unblock_ts"))
+        except (TypeError, ValueError):
+            post_watchdog_unblock_ts = None
+        if post_watchdog_unblock_ts is not None:
+            deadline = max(deadline, post_watchdog_unblock_ts)
+        message_id = str(context.get("id") or "")
+        aggregate_id = str(context.get("aggregate_id") or "")
+        post_watchdog_grace = max(0.0, float(self.turn_id_mismatch_post_watchdog_grace_seconds))
+        for wd in self.watchdogs.values():
+            if not wd or wd.get("is_alarm"):
+                continue
+            matches_message = bool(message_id and wd.get("ref_message_id") == message_id)
+            matches_aggregate = bool(aggregate_id and wd.get("ref_aggregate_id") == aggregate_id)
+            if not matches_message and not matches_aggregate:
+                continue
+            try:
+                wd_deadline = float(wd.get("deadline"))
+            except (TypeError, ValueError):
+                continue
+            deadline = max(deadline, wd_deadline + post_watchdog_grace)
+        return deadline
+
+    def expire_turn_id_mismatch_contexts(self) -> None:
+        now = time.time()
+        with self.state_lock:
+            expired_targets = self._expire_turn_id_mismatch_contexts_locked(now)
+        for target in expired_targets:
+            self.try_deliver(target)
+        if expired_targets:
+            self.try_deliver()
+
+    def _expire_turn_id_mismatch_contexts_locked(self, now: float) -> list[str]:
+        ready: list[tuple[str, dict]] = []
+        for target, context in list(self.current_prompt_by_agent.items()):
+            if not isinstance(context, dict) or context.get("turn_id_mismatch_since_ts") is None:
+                continue
+            deadline = self.turn_id_mismatch_expiry_deadline(context)
+            if deadline is None or now < deadline:
+                continue
+            ready.append((target, dict(context)))
+
+        expired_targets: list[str] = []
+        for target, context in ready:
+            active_context = self.current_prompt_by_agent.get(target) or {}
+            if (
+                str(active_context.get("id") or "") != str(context.get("id") or "")
+                or active_context.get("turn_id") != context.get("turn_id")
+                or active_context.get("turn_id_mismatch_since_ts") != context.get("turn_id_mismatch_since_ts")
+            ):
+                continue
+
+            message_id = str(context.get("id") or "")
+            aggregate_id = str(context.get("aggregate_id") or "")
+            removed_delivered = False
+            if message_id:
+                def mutator(queue: list[dict]) -> dict | None:
+                    found = None
+                    kept = []
+                    for item in queue:
+                        if (
+                            item.get("id") == message_id
+                            and item.get("to") == target
+                            and item.get("status") == "delivered"
+                        ):
+                            found = dict(item)
+                            continue
+                        kept.append(item)
+                    queue[:] = kept
+                    return found
+
+                removed_delivered = bool(self.queue.update(mutator))
+
+            nonce = context.get("nonce")
+            if nonce:
+                self.discard_nonce(str(nonce))
+            if message_id:
+                self.last_enter_ts.pop(message_id, None)
+                if not aggregate_id:
+                    self.cancel_watchdogs_for_message(message_id, reason="turn_id_mismatch_expired")
+            self.current_prompt_by_agent.pop(target, None)
+            self.busy[target] = False
+            self.reserved[target] = None
+            expired_targets.append(target)
+            since_ts = float(context.get("turn_id_mismatch_since_ts") or now)
+            self.log(
+                "turn_id_mismatch_context_expired",
+                target=target,
+                message_id=message_id,
+                active_turn_id=context.get("turn_id"),
+                mismatched_turn_id=context.get("turn_id_mismatch_response_turn_id"),
+                mismatch_age_sec=round(max(0.0, now - since_ts), 3),
+                removed_delivered=removed_delivered,
+                aggregate_id=aggregate_id,
+            )
+        return expired_targets
 
     def requeue_stale_inflight(self) -> None:
         now = time.time()
@@ -3061,9 +3222,16 @@ class BridgeDaemon:
 
             if turn_id_mismatch:
                 # A late Stop event for an old turn arrived while the peer
-                # is processing a new turn. Skip routing and DO NOT touch
-                # busy/reserved/current_prompt — those describe the new
-                # turn that is still in flight.
+                # is processing a new turn. Skip routing now; a maintenance
+                # sweep expires the active context later if the matching Stop
+                # never arrives. The first mismatch pins the grace clock so a
+                # stream of stale Stops cannot keep the target busy forever.
+                now_ts = time.time()
+                if context.get("turn_id_mismatch_since_ts") is None:
+                    context["turn_id_mismatch_since_ts"] = now_ts
+                context["turn_id_mismatch_last_ts"] = now_ts
+                context["turn_id_mismatch_response_turn_id"] = response_turn_id
+                context["turn_id_mismatch_count"] = int(context.get("turn_id_mismatch_count") or 0) + 1
                 if first_time:
                     self.log(
                         "response_skipped_stale",
@@ -3102,8 +3270,9 @@ class BridgeDaemon:
             # auto-routed reply. Subsequent response_finished events
             # without a fresh prompt_submitted (e.g., system reminders
             # that don't fire UPS hooks) must NOT re-route to the peer.
-            # Held-drain and turn_id_mismatch branches above intentionally
-            # skip this pop — those paths leave ctx untouched.
+            # Held-drain skips this pop. turn_id_mismatch keeps ctx only
+            # until its bounded maintenance expiry, unless the matching Stop
+            # arrives first and reaches this normal terminal path.
             self.current_prompt_by_agent.pop(sender, None)
         self.try_deliver(sender)
         self.try_deliver()
@@ -3480,9 +3649,13 @@ class BridgeDaemon:
                     dry_run=self.dry_run,
                     command_socket=str(self.command_socket) if self.command_socket else "",
                     pane_mode_grace_seconds=self.pane_mode_grace_seconds,
+                    turn_id_mismatch_grace_seconds=self.turn_id_mismatch_grace_seconds,
+                    turn_id_mismatch_post_watchdog_grace_seconds=self.turn_id_mismatch_post_watchdog_grace_seconds,
                 )
                 if self.pane_mode_grace_warning:
                     self.log("pane_mode_grace_config_warning", warning=self.pane_mode_grace_warning)
+                for warning in self.turn_id_mismatch_grace_warnings:
+                    self.log("turn_id_mismatch_grace_config_warning", warning=warning)
                 if self.startup_backfill_summary:
                     unknown = [
                         alias for alias, item in self.startup_backfill_summary.items()
@@ -3519,6 +3692,7 @@ class BridgeDaemon:
                     self.requeue_stale_inflight()
                     self.retry_enter_for_inflight()
                     self.check_watchdogs()
+                    self.expire_turn_id_mismatch_contexts()
                     self._promote_aged_ingressing()
                     # Periodic delivery wake (throttled): hold release,
                     # watchdog fires, requeues, etc. can leave pending
