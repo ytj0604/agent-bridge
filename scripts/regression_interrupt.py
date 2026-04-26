@@ -112,6 +112,24 @@ def assert_true(cond: bool, msg: str) -> None:
         raise AssertionError(msg)
 
 
+@contextmanager
+def patched_environ(**updates: str | None):
+    old = {key: os.environ.get(key) for key in updates}
+    try:
+        for key, value in updates.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def test_message(message_id: str, frm: str = "claude", to: str = "codex", status: str = "pending") -> dict:
     return {
         "id": message_id,
@@ -5159,6 +5177,131 @@ def scenario_send_peer_implicit_target_allows_stdin(label: str, tmpdir: Path) ->
     print(f"  PASS  {label}")
 
 
+def _write_send_peer_precheck_identity(state_root_path: Path, *, pane: str = "%20") -> list[Path]:
+    write_identity_fixture(state_root_path, alias="alice", agent="codex", session_id="sess-a", pane=pane)
+    live_record = {
+        "agent": "codex",
+        "session_id": "sess-a",
+        "pane": pane,
+        "target": "tmux:1.0",
+        "last_seen_at": utc_now(),
+    }
+    _write_json(
+        Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]),
+        {
+            "version": 1,
+            "panes": {pane: live_record},
+            "sessions": {bridge_identity.identity_key("codex", "sess-a"): live_record},
+        },
+    )
+    return [
+        Path(os.environ["AGENT_BRIDGE_ATTACH_REGISTRY"]),
+        Path(os.environ["AGENT_BRIDGE_PANE_LOCKS"]),
+        Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]),
+    ]
+
+
+def scenario_send_peer_implicit_target_resolves_session_from_pane(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    with isolated_identity_env(tmpdir) as state_root_path:
+        identity_files = _write_send_peer_precheck_identity(state_root_path, pane="%20")
+        before = {path: path.read_bytes() for path in identity_files}
+        with patched_environ(AGENT_BRIDGE_SESSION=None, AGENT_BRIDGE_AGENT=None, TMUX_PANE="%20"):
+            code, out, err, calls = _run_send_peer_with_fake_subprocess(
+                bs,
+                ["--kind", "notice", "bob", "hello world"],
+                stdin_isatty=True,
+            )
+        after = {path: path.read_bytes() for path in identity_files}
+    assert_true(before == after, f"{label}: precheck pane lookup must be read-only")
+    assert_true(code == 0 and len(calls) == 1, f"{label}: implicit target should succeed without env session: code={code} err={err!r}")
+    cmd, kwargs = calls[0]
+    assert_true(cmd[cmd.index("--to") + 1] == "bob", f"{label}: implicit target forwarded as --to bob: {cmd}")
+    assert_true(kwargs.get("input") == b"hello world", f"{label}: body forwarded via stdin bytes: {kwargs}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_implicit_target_stdin_resolves_session_from_pane(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    with isolated_identity_env(tmpdir) as state_root_path:
+        _write_send_peer_precheck_identity(state_root_path, pane="%21")
+        with patched_environ(AGENT_BRIDGE_SESSION=None, AGENT_BRIDGE_AGENT=None, TMUX_PANE="%21"):
+            code, out, err, calls = _run_send_peer_with_fake_subprocess(
+                bs,
+                ["bob", "--stdin"],
+                stdin_text="stdin body",
+                stdin_isatty=False,
+            )
+    assert_true(code == 0 and len(calls) == 1, f"{label}: implicit target + stdin should succeed without env session: code={code} err={err!r}")
+    cmd, kwargs = calls[0]
+    assert_true(cmd[cmd.index("--to") + 1] == "bob", f"{label}: implicit target forwarded as --to bob: {cmd}")
+    assert_true(kwargs.get("input") == b"stdin body", f"{label}: stdin body forwarded: {kwargs}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_precheck_fails_open_identity_errors_owned_by_validator(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    parser = bs.build_parser()
+    bs._precheck_lookup_session_for_pane = lambda pane: ""  # type: ignore[attr-defined]
+    split_error = bs.validate_send_peer_argv(["bob", "hello"], parser)
+    assert_true("multiple shell arguments" in split_error, f"{label}: unresolved implicit target should fail closed: {split_error!r}")
+
+    def identity_error(args, session, sender):
+        print("agent_send_peer: duplicate resume identity error", file=sys.stderr)
+        return None
+
+    bs.validate_caller_identity = identity_error
+    bs.load_session = lambda session: _participants_state(["alice", "bob"])
+    with patched_environ(AGENT_BRIDGE_SESSION=None, AGENT_BRIDGE_AGENT=None, TMUX_PANE="%99"):
+        code, out, err = _run_send_peer_main(bs, ["--to", "bob", "hello"], stdin_isatty=True)
+    assert_true(code == 2 and out == "", f"{label}: validator identity error should reject: code={code} out={out!r}")
+    assert_true("duplicate resume identity error" in err and "multiple shell arguments" not in err, f"{label}: identity error should be authoritative: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_allow_spoof_requires_explicit_destination_without_session(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    bs._precheck_lookup_session_for_pane = lambda pane: ""  # type: ignore[attr-defined]
+    with patched_environ(AGENT_BRIDGE_SESSION=None, AGENT_BRIDGE_AGENT=None, TMUX_PANE=None):
+        code, out, err, calls = _run_send_peer_with_fake_subprocess(
+            bs,
+            ["--allow-spoof", "bob", "hello world"],
+            stdin_isatty=True,
+        )
+    assert_true(code == 2 and not calls and out == "", f"{label}: allow-spoof shorthand without session should reject before enqueue")
+    assert_true("leading-alias shorthand" in err and "--to <alias>" in err and "multiple shell arguments" not in err, f"{label}: error should require explicit destination: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_rejects_allow_spoof_attached_value(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--allow-spoof=1", "--to", "bob", "hello world"],
+        stdin_isatty=True,
+    )
+    assert_true(code == 2 and not calls and out == "", f"{label}: attached value on flag must reject")
+    assert_true("unrecognized option" in err and "--allow-spoof=1" in err, f"{label}: stderr identifies bad flag form: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_all_rejects_leading_alias_body(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--all", "bob"],
+        stdin_isatty=True,
+    )
+    assert_true(code == 2 and not calls and out == "", f"{label}: --all with leading alias body must reject")
+    assert_true("remove leading alias" in err and "use --to bob" in err, f"{label}: stderr should explain --all alias confusion: {err!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_send_peer_rejects_stdin_with_positional_body(label: str, tmpdir: Path) -> None:
     bs = _import_send_peer_module()
     _patch_send_peer_for_unit(bs)
@@ -5987,6 +6130,12 @@ def main() -> int:
             ("send_peer_inline_body_accepts_empty_non_tty_stdin", scenario_send_peer_inline_body_accepts_empty_non_tty_stdin),
             ("send_peer_explicit_stdin_multibyte_body", scenario_send_peer_explicit_stdin_multibyte_body),
             ("send_peer_implicit_target_allows_stdin", scenario_send_peer_implicit_target_allows_stdin),
+            ("send_peer_implicit_target_resolves_session_from_pane", scenario_send_peer_implicit_target_resolves_session_from_pane),
+            ("send_peer_implicit_target_stdin_resolves_session_from_pane", scenario_send_peer_implicit_target_stdin_resolves_session_from_pane),
+            ("send_peer_precheck_fails_open_identity_errors_owned_by_validator", scenario_send_peer_precheck_fails_open_identity_errors_owned_by_validator),
+            ("send_peer_allow_spoof_requires_explicit_destination_without_session", scenario_send_peer_allow_spoof_requires_explicit_destination_without_session),
+            ("send_peer_rejects_allow_spoof_attached_value", scenario_send_peer_rejects_allow_spoof_attached_value),
+            ("send_peer_all_rejects_leading_alias_body", scenario_send_peer_all_rejects_leading_alias_body),
             ("send_peer_rejects_stdin_with_positional_body", scenario_send_peer_rejects_stdin_with_positional_body),
             ("send_peer_rejects_pipe_with_positional_body", scenario_send_peer_rejects_pipe_with_positional_body),
             ("send_peer_pipe_only_body_still_supported", scenario_send_peer_pipe_only_body_still_supported),

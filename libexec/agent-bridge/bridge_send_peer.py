@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 
-from bridge_identity import resolve_caller_from_pane
+from bridge_identity import read_attached_mapping, read_live_by_pane, read_pane_lock, resolve_caller_from_pane
 from bridge_participants import active_participants, load_session
 from bridge_paths import libexec_dir, python_exe
 from bridge_util import read_limited_text, validate_peer_body_size
@@ -81,6 +81,8 @@ def _classify_option_token(
         if base in value_options:
             return base, True, "=" in token
         if base in flag_options:
+            if "=" in token:
+                return token, False, False
             return base, False, False
         return token, False, False
     base = token[:2]
@@ -100,8 +102,40 @@ def _extract_session_arg(argv: list[str]) -> str:
     return os.environ.get("AGENT_BRIDGE_SESSION") or ""
 
 
-def _precheck_participants(argv: list[str]) -> set[str]:
+def _precheck_lookup_session_for_pane(pane: str | None) -> str:
+    """Best-effort, read-only room lookup for syntax precheck.
+
+    This deliberately does not call resolve_caller_from_pane(): authoritative
+    identity validation happens later and may repair/reconnect state. Precheck
+    only needs enough participant context to classify the leading-alias
+    shorthand, and must fail open without surfacing identity errors.
+    """
+    pane = pane or ""
+    if not pane:
+        return ""
+    try:
+        live = read_live_by_pane(pane)
+        if live:
+            agent_type = str(live.get("agent") or "")
+            session_id = str(live.get("session_id") or "")
+            mapping = read_attached_mapping(agent_type, session_id)
+            if mapping and str(mapping.get("bridge_session") or ""):
+                return str(mapping.get("bridge_session") or "")
+        lock = read_pane_lock(pane)
+        return str(lock.get("bridge_session") or "")
+    except Exception:
+        return ""
+
+
+def _precheck_session(argv: list[str]) -> str:
     session = _extract_session_arg(argv)
+    if not session:
+        session = _precheck_lookup_session_for_pane(os.environ.get("TMUX_PANE"))
+    return session
+
+
+def _precheck_participants(argv: list[str]) -> set[str]:
+    session = _precheck_session(argv)
     if not session:
         return set()
     try:
@@ -121,10 +155,12 @@ def validate_send_peer_argv(
     participants: set[str] | None = None,
 ) -> str:
     value_options, flag_options = option_kinds_from_parser(parser)
+    precheck_session = _precheck_session(argv) if participants is None else ""
     participants = participants if participants is not None else _precheck_participants(argv)
     destination_selected = False
     body_seen = False
     stdin_seen = False
+    allow_spoof_seen = False
     destination_count = 0
     index = 0
 
@@ -156,6 +192,8 @@ def validate_send_peer_argv(
                 )
             if opt_name == STDIN_OPTION:
                 stdin_seen = True
+            if opt_name == "--allow-spoof":
+                allow_spoof_seen = True
             if opt_name in DESTINATION_OPTIONS:
                 destination_count += 1
                 if destination_count > 1:
@@ -186,6 +224,18 @@ def validate_send_peer_argv(
 
         if stdin_seen and token not in participants and token not in RESERVED_IMPLICIT_TARGETS:
             return "cannot combine --stdin with a positional inline body"
+
+        if (
+            allow_spoof_seen
+            and not precheck_session
+            and token not in RESERVED_IMPLICIT_TARGETS
+            and _remaining_has_body_or_stdin(argv, index + 1)
+        ):
+            return (
+                "leading-alias shorthand cannot be validated under --allow-spoof "
+                "without an inferable bridge session. Use --to <alias>, and pass "
+                "--session <name> if this is an admin/test operation outside an attached pane."
+            )
 
         if (
             not body_seen

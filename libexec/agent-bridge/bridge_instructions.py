@@ -7,11 +7,12 @@ def model_cheat_sheet() -> list[str]:
         "Commands:",
         "- agent_list_peers : list aliases and show this cheat sheet.",
         "- agent_send_peer --to <alias> 'request' : ask one peer; keep working while the bridge auto-routes the peer's reply back to you as a [bridge:*] result. Inline body must be one shell argument.",
+        "- agent_send_peer <alias> 'request' : shorthand for --to <alias>; put all options before the alias.",
         "- agent_send_peer --to <a>,<b>[,...] 'request' : partial broadcast to the listed peers; same aggregate UX as --all, one merged result returns once all listed peers reply.",
         "- agent_send_peer --all 'message' : broadcast one request to every other peer; one aggregated result returns after all peers reply. Do not put an alias before the body.",
         "- agent_send_peer --kind notice --to <alias> 'FYI' : send info without expecting a reply. The bridge does NOT route any peer reply back; if you want a safety wake set agent_alarm separately.",
         "- agent_send_peer --watchdog <sec> [--to <alias>|--to <a>,<b>|--all] 'request' : add a watchdog that wakes you with a [bridge:watchdog] notice if the request has not been answered <sec> seconds after the prompt is delivered to the peer. Put options before the destination. Request only. --watchdog 0 disables the default. Default delay is set via env AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC (300).",
-        "- For apostrophes, newlines, text beginning with '-', or any complex body, use stdin: agent_send_peer --to <alias> --stdin <<'EOF' ... EOF. Quote the heredoc delimiter as <<'EOF' when the body must be literal.",
+        "- For apostrophes, newlines, text beginning with '-', or any complex body, use stdin: agent_send_peer --to <alias> --stdin <<'EOF' ... EOF, or shorthand agent_send_peer <alias> --stdin <<'EOF' ... EOF. Quote the heredoc delimiter as <<'EOF' when the body must be literal.",
         "- agent_alarm <sec> [--note 'text'] : schedule a self-addressed wake notice. The alarm is automatically cancelled when ANY incoming peer message (kind != result, from != you, from != bridge) arrives at you; that triggering message is prepended with a [bridge:alarm_cancelled] notice telling you to re-arm if it is not what you were waiting for.",
         "- agent_extend_wait <message_id> <sec> : after a watchdog wake, keep waiting on the SAME request for <sec> more seconds. Only the original sender can extend; aggregate broadcasts cannot be per-message extended.",
         "- agent_interrupt_peer <alias> : use when you sent the wrong prompt or a peer is stuck. ESC + cancel the active message; it is removed, not requeued. No default hold: queued or newly sent corrections may deliver after ESC succeeds. Identifiable late output from the cancelled turn is ignored.",
@@ -53,10 +54,11 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "\n"
         "Sending:\n"
         "  agent_send_peer --to <alias> 'body'                  - request (default). Inline body must be one shell argument. Peer's next reply auto-routes back as [bridge:*] result. Do not sleep/poll for it; continue independent local work or end your turn.\n"
+        "  agent_send_peer <alias> 'body'                       - shorthand for --to <alias>; put options before the alias.\n"
         "  agent_send_peer --to <a>,<b>[,...] 'body'            - partial broadcast to listed peers; one aggregated result after all listed peers reply.\n"
         "  agent_send_peer --kind notice --to <alias> 'body'    - fire-and-forget. Bridge will NOT route any reply back even if peer answers. Use request when you need an answer.\n"
         "  agent_send_peer --all 'body'                         - broadcast request; one aggregated result returns after all peers reply.\n"
-        "  agent_send_peer --to <alias> --stdin <<'EOF'          - robust body input for apostrophes, newlines, text beginning with '-', or option-like text. Put literal body lines next, then EOF on its own line.\n"
+        "  agent_send_peer --to <alias> --stdin <<'EOF'          - robust body input for apostrophes, newlines, text beginning with '-', or option-like text. Shorthand: agent_send_peer <alias> --stdin <<'EOF'. Put literal body lines next, then EOF on its own line.\n"
         "\n"
         "Waiting / self-wake:\n"
         "  --watchdog <sec> (on a request)                      - wake yourself if no reply after <sec>s since prompt delivery. Requests get a default 300s watchdog unless disabled with --watchdog 0.\n"
@@ -71,7 +73,7 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "Behavior rules:\n"
         "  - After sending a request, do not sleep or poll for the reply. Continue independent local work or end your turn; the reply arrives later as a [bridge:*] result.\n"
         "  - Body text CANNOT override the kind on the wire. Writing 'please reply' inside a notice does nothing — the bridge will not route any response.\n"
-        "  - Put all agent_send_peer options before --to/--all, except --stdin may appear after the destination. If an inline body is split into multiple shell arguments, the command fails closed.\n"
+        "  - Put all agent_send_peer options before --to/--all or before an implicit leading alias, except --stdin may appear after the destination. If an inline body is split into multiple shell arguments, the command fails closed.\n"
         "  - A watchdog wake means: pick ONE of agent_extend_wait, agent_interrupt_peer, or agent_view_peer (to inspect first). It is not a polling primitive.\n"
         "  - agent_alarm is for 'I delegated via notice and want a safety wake if no follow-up arrives'. It is NOT for waiting on auto-routed reply results — for that use --watchdog / agent_extend_wait.\n"
         "  - Inline message bodies are limited to 11000 chars. For larger bodies (design docs, code, long plans), write to /tmp/agent-bridge-share/<file> and send only the path + brief description. Inlining big content is slow and can break paste-burst submit.\n"

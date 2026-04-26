@@ -20,6 +20,7 @@ python3 scripts/regression_interrupt.py  # run daemon regression checks
 ```
 
 After installation, `bridge_run` attaches a room to tmux panes; `bridge_manage` inspects or stops active rooms.
+Model-facing sends support both `agent_send_peer --to <alias> 'message'` and shorthand `agent_send_peer <alias> 'message'`. Put options before `--to`/`--all` or before an implicit leading alias; only `--stdin` may appear after the destination.
 
 ## Coding Style & Naming Conventions
 Target Python 3.10+ and Bash 4+. Use 4-space Python indentation, `snake_case`, and type hints where useful. Keep shell scripts executable, with `#!/usr/bin/env bash` and `set -euo pipefail`. Preserve `bridge_*` for bridge internals and `agent_*` for model-facing commands. No project-wide formatter is configured.
