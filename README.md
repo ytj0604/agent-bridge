@@ -6,7 +6,7 @@ Local tmux-based bridge that lets Claude Code and Codex agents talk to each othe
 
 Multiple AI coding agents (Claude Code, Codex) running locally on the same machine can collaborate through a queued message bus:
 
-- **Ask a peer to do work** with `agent_send_peer --to <alias> '...'`. The sender ends its turn immediately; when the peer replies, the bridge auto-routes the result back as the sender's next prompt. Both agents work in parallel — the sender does not block.
+- **Ask a peer to do work** with `agent_send_peer --to <alias> '...'`. The inline body must be one shell argument; use `--stdin` with a quoted heredoc for apostrophes, newlines, or option-like text. The sender ends its turn immediately; when the peer replies, the bridge auto-routes the result back as the sender's next prompt. Both agents work in parallel — the sender does not block.
 - **Broadcast or partial-broadcast** with `--all` or `--to <a>,<b>`. One merged result returns after every addressed peer has replied.
 - **Time-bound a wait** with per-request watchdogs, self-scheduled alarms, and ESC-cancel interrupts.
 - **Read a peer's terminal** via `agent_view_peer` — paginated snapshots, since-last delta, search — so a model can inspect what its peer is doing without asking the human to copy/paste output.
@@ -44,6 +44,9 @@ bridge_run
 # 3. From inside any agent pane, the model can now use:
 #    agent_list_peers
 #    agent_send_peer --to <alias> 'request'
+#    agent_send_peer --to <alias> --stdin <<'EOF'
+#    request with apostrophes, newlines, or --option-like text
+#    EOF
 #    agent_view_peer <alias> --onboard
 ```
 

@@ -4631,16 +4631,25 @@ def _run_enqueue_main(be, argv: list[str], stdin_text: str = "") -> tuple[int, s
     return int(code), out.getvalue(), err.getvalue()
 
 
-def _run_send_peer_main(bs, argv: list[str], stdin_text: str = "") -> tuple[int, str, str]:
+def _run_send_peer_main(bs, argv: list[str], stdin_text: str = "", stdin_isatty: bool | None = None) -> tuple[int, str, str]:
     import contextlib
     import io
+
+    class FakeStdin(io.StringIO):
+        def __init__(self, text: str, is_tty: bool):
+            super().__init__(text)
+            self._is_tty = is_tty
+
+        def isatty(self) -> bool:
+            return self._is_tty
+
     old_argv = sys.argv[:]
     old_stdin = sys.stdin
     out = io.StringIO()
     err = io.StringIO()
     try:
         sys.argv = ["agent_send_peer", *argv]
-        sys.stdin = io.StringIO(stdin_text)
+        sys.stdin = FakeStdin(stdin_text, stdin_text == "" if stdin_isatty is None else stdin_isatty)
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = bs.main()
     finally:
@@ -4700,6 +4709,275 @@ def scenario_send_peer_rejects_oversized_body_before_subprocess(label: str, tmpd
     assert_true(out == "", f"{label}: rejection has no stdout: {out!r}")
     assert_true(not called["subprocess"], f"{label}: enqueue subprocess was not spawned")
     assert_true(str(MAX_INLINE_SEND_BODY_CHARS) in err and "/tmp/agent-bridge-share" in err, f"{label}: stderr explains limit: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def _patch_send_peer_for_unit(bs) -> None:
+    bs.validate_caller_identity = lambda args, session, sender: (session or "test-session", sender or "alice")
+    bs.load_session = lambda session: _participants_state(["alice", "bob", "carol"])
+
+
+def _run_send_peer_with_fake_subprocess(
+    bs,
+    argv: list[str],
+    *,
+    stdin_text: str = "",
+    stdin_isatty: bool | None = None,
+    stdout_text: str = "",
+    returncode: int = 0,
+):
+    calls: list[tuple[list[str], dict]] = []
+    old_run = bs.subprocess.run
+
+    def fake_run(cmd, **kwargs):
+        calls.append((list(cmd), dict(kwargs)))
+        if stdout_text:
+            print(stdout_text, end="")
+        return argparse.Namespace(returncode=returncode)
+
+    try:
+        bs.subprocess.run = fake_run
+        code, out, err = _run_send_peer_main(bs, argv, stdin_text=stdin_text, stdin_isatty=stdin_isatty)
+    finally:
+        bs.subprocess.run = old_run
+    return code, out, err, calls
+
+
+def scenario_send_peer_rejects_split_inline_body(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--to", "bob", "hello", "world"],
+        stdin_isatty=True,
+    )
+    assert_true(code == 2 and not calls and out == "", f"{label}: split explicit body must reject before enqueue")
+    assert_true("multiple shell arguments" in err and "--stdin" in err, f"{label}: stderr must explain heredoc path: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_rejects_implicit_split_inline_body(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "bob", "hello", "world"],
+        stdin_isatty=True,
+    )
+    assert_true(code == 2 and not calls and out == "", f"{label}: split implicit-target body must reject")
+    assert_true("multiple shell arguments" in err and "--stdin" in err, f"{label}: stderr must explain stdin: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_rejects_option_after_destination(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--to", "bob", "--kind", "notice", "hello"],
+        stdin_isatty=True,
+    )
+    assert_true(code == 2 and not calls and out == "", f"{label}: option leakage after --to must reject")
+    assert_true("after the destination" in err and "--kind" in err, f"{label}: stderr identifies leaked option: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_rejects_option_after_implicit_target(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "bob", "--kind", "notice", "hello"],
+        stdin_isatty=True,
+    )
+    assert_true(code == 2 and not calls and out == "", f"{label}: option leakage after implicit target must reject")
+    assert_true("after the destination" in err and "--kind" in err, f"{label}: stderr identifies leaked option: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_rejects_option_after_inline_body(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--to", "bob", "hello", "--kind", "notice"],
+        stdin_isatty=True,
+    )
+    assert_true(code == 2 and not calls and out == "", f"{label}: option after body must reject")
+    assert_true("after the inline body" in err or "after the destination" in err, f"{label}: stderr explains option position: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_single_inline_body_uses_stdin_handoff(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--to", "bob", "hello world"],
+        stdin_isatty=True,
+    )
+    assert_true(code == 0 and len(calls) == 1, f"{label}: single argv body should enqueue once: code={code} err={err!r}")
+    cmd, kwargs = calls[0]
+    assert_true("--stdin" in cmd and "--body" not in cmd, f"{label}: wrapper must hand body to enqueue via stdin: {cmd}")
+    assert_true(cmd[cmd.index("--to") + 1] == "bob", f"{label}: target preserved: {cmd}")
+    assert_true(kwargs.get("input") == b"hello world", f"{label}: body encoded as utf-8 bytes: {kwargs}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_request_success_prints_anti_wait_hint(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--to", "bob", "hello world"],
+        stdin_isatty=True,
+        stdout_text="msg-test123\n",
+    )
+    assert_true(code == 0 and len(calls) == 1, f"{label}: request should succeed: code={code} err={err!r}")
+    assert_true(out == "msg-test123\n", f"{label}: enqueue stdout must be preserved exactly: {out!r}")
+    assert_true("Waiting for a bridge follow-up?" in err, f"{label}: common hint missing: {err!r}")
+    assert_true("notice sent" not in err, f"{label}: request must not print notice alarm hint: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_notice_success_prints_alarm_and_anti_wait_hints(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--to", "bob", "hello world"],
+        stdin_isatty=True,
+        stdout_text="msg-notice123\n",
+    )
+    assert_true(code == 0 and len(calls) == 1, f"{label}: notice should succeed: code={code} err={err!r}")
+    assert_true(out == "msg-notice123\n", f"{label}: enqueue stdout must be preserved exactly: {out!r}")
+    assert_true("notice sent" in err and "agent_alarm" in err, f"{label}: notice alarm hint missing: {err!r}")
+    assert_true("Waiting for a bridge follow-up?" in err, f"{label}: common hint missing: {err!r}")
+    assert_true(err.index("notice sent") < err.index("Waiting for a bridge follow-up?"), f"{label}: notice-specific hint should come first: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_subprocess_failure_prints_no_success_hint(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--to", "bob", "hello world"],
+        stdin_isatty=True,
+        stdout_text="enqueue failed details\n",
+        returncode=1,
+    )
+    assert_true(code == 1 and len(calls) == 1, f"{label}: subprocess failure should propagate: code={code}")
+    assert_true(out == "enqueue failed details\n", f"{label}: failure stdout still comes from subprocess: {out!r}")
+    assert_true("notice sent" not in err and "Waiting for a bridge follow-up?" not in err, f"{label}: success hints must not print on failure: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_inline_body_accepts_empty_non_tty_stdin(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--to", "bob", "hello world"],
+        stdin_text="",
+        stdin_isatty=False,
+    )
+    assert_true(code == 0 and len(calls) == 1, f"{label}: empty non-tty stdin must not look like a pipe collision: code={code} err={err!r}")
+    cmd, kwargs = calls[0]
+    assert_true("--stdin" in cmd and "--body" not in cmd, f"{label}: enqueue still uses --stdin: {cmd}")
+    assert_true(kwargs.get("input") == b"hello world", f"{label}: inline body preserved: {kwargs}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_explicit_stdin_multibyte_body(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    body = "한글 can't --kind request `x`"
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--to", "bob", "--stdin"],
+        stdin_text=body,
+        stdin_isatty=False,
+    )
+    assert_true(code == 0 and len(calls) == 1, f"{label}: explicit stdin should enqueue once: code={code} err={err!r}")
+    cmd, kwargs = calls[0]
+    assert_true("--stdin" in cmd and "--body" not in cmd, f"{label}: enqueue subprocess uses --stdin: {cmd}")
+    assert_true(kwargs.get("input") == body.encode("utf-8"), f"{label}: multibyte body must be utf-8 bytes: {kwargs}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_implicit_target_allows_stdin(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "bob", "--stdin"],
+        stdin_text="stdin body",
+        stdin_isatty=False,
+    )
+    assert_true(code == 0 and len(calls) == 1, f"{label}: implicit target + --stdin should work: code={code} err={err!r}")
+    cmd, kwargs = calls[0]
+    assert_true(cmd[cmd.index("--to") + 1] == "bob", f"{label}: implicit target passed to enqueue: {cmd}")
+    assert_true(kwargs.get("input") == b"stdin body", f"{label}: stdin body forwarded: {kwargs}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_rejects_stdin_with_positional_body(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--to", "bob", "--stdin", "body"],
+        stdin_text="stdin body",
+        stdin_isatty=False,
+    )
+    assert_true(code == 2 and not calls and out == "", f"{label}: --stdin + positional body must reject")
+    assert_true("cannot combine --stdin" in err, f"{label}: stderr explains collision: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_rejects_pipe_with_positional_body(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--to", "bob", "body"],
+        stdin_text="pipe body",
+        stdin_isatty=False,
+    )
+    assert_true(code == 2 and not calls and out == "", f"{label}: pipe + positional body must reject")
+    assert_true("piped stdin" in err, f"{label}: stderr explains pipe collision: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_pipe_only_body_still_supported(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--to", "bob"],
+        stdin_text="pipe body",
+        stdin_isatty=False,
+    )
+    assert_true(code == 0 and len(calls) == 1, f"{label}: pipe-only body remains supported: code={code} err={err!r}")
+    cmd, kwargs = calls[0]
+    assert_true("--stdin" in cmd and kwargs.get("input") == b"pipe body", f"{label}: pipe body forwarded via stdin: {cmd} {kwargs}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_precheck_option_table_matches_parser(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    parser = bs.build_parser()
+    value_options, flag_options = bs.option_kinds_from_parser(parser)
+    covered = value_options | flag_options
+    parser_options = {
+        opt
+        for action in parser._actions
+        for opt in (getattr(action, "option_strings", []) or [])
+        if opt not in {"-h", "--help"}
+    }
+    assert_true(parser_options <= covered, f"{label}: precheck option table missing {sorted(parser_options - covered)}")
+    assert_true("--stdin" in flag_options and "--to" in value_options and "-t" in value_options, f"{label}: expected key options classified")
     print(f"  PASS  {label}")
 
 
@@ -5325,6 +5603,22 @@ def main() -> int:
             ("daemon_startup_backfill_summary_logs_repair_hint", scenario_daemon_startup_backfill_summary_logs_repair_hint),
             ("peer_body_size_helper_boundaries", scenario_peer_body_size_helper_boundaries),
             ("send_peer_rejects_oversized_body_before_subprocess", scenario_send_peer_rejects_oversized_body_before_subprocess),
+            ("send_peer_rejects_split_inline_body", scenario_send_peer_rejects_split_inline_body),
+            ("send_peer_rejects_implicit_split_inline_body", scenario_send_peer_rejects_implicit_split_inline_body),
+            ("send_peer_rejects_option_after_destination", scenario_send_peer_rejects_option_after_destination),
+            ("send_peer_rejects_option_after_implicit_target", scenario_send_peer_rejects_option_after_implicit_target),
+            ("send_peer_rejects_option_after_inline_body", scenario_send_peer_rejects_option_after_inline_body),
+            ("send_peer_single_inline_body_uses_stdin_handoff", scenario_send_peer_single_inline_body_uses_stdin_handoff),
+            ("send_peer_request_success_prints_anti_wait_hint", scenario_send_peer_request_success_prints_anti_wait_hint),
+            ("send_peer_notice_success_prints_alarm_and_anti_wait_hints", scenario_send_peer_notice_success_prints_alarm_and_anti_wait_hints),
+            ("send_peer_subprocess_failure_prints_no_success_hint", scenario_send_peer_subprocess_failure_prints_no_success_hint),
+            ("send_peer_inline_body_accepts_empty_non_tty_stdin", scenario_send_peer_inline_body_accepts_empty_non_tty_stdin),
+            ("send_peer_explicit_stdin_multibyte_body", scenario_send_peer_explicit_stdin_multibyte_body),
+            ("send_peer_implicit_target_allows_stdin", scenario_send_peer_implicit_target_allows_stdin),
+            ("send_peer_rejects_stdin_with_positional_body", scenario_send_peer_rejects_stdin_with_positional_body),
+            ("send_peer_rejects_pipe_with_positional_body", scenario_send_peer_rejects_pipe_with_positional_body),
+            ("send_peer_pipe_only_body_still_supported", scenario_send_peer_pipe_only_body_still_supported),
+            ("send_peer_precheck_option_table_matches_parser", scenario_send_peer_precheck_option_table_matches_parser),
             ("enqueue_rejects_oversized_body_unchanged", scenario_enqueue_rejects_oversized_body_unchanged),
             ("enqueue_stdin_rejects_oversized_body_unchanged", scenario_enqueue_stdin_rejects_oversized_body_unchanged),
             ("alarm_cancel_preserves_at_limit_body", scenario_alarm_cancel_preserves_at_limit_body),
