@@ -5921,6 +5921,56 @@ def scenario_view_peer_allows_page_in_live_onboard_older_and_snapshot_in_older_s
     print(f"  PASS  {label}")
 
 
+def scenario_view_peer_rejects_empty_search_before_session_lookup(label: str, tmpdir: Path) -> None:
+    bv = _import_view_peer()
+    cases = [
+        ["codex1", "--search", ""],
+        ["codex1", "--search", "   "],
+        ["codex1", "--search", "\t\n"],
+    ]
+    for idx, argv in enumerate(cases):
+        msg, reached_validation = _run_view_peer_main_with_sentinels(bv, argv)
+        assert_true("--search query must be non-empty" in msg, f"{label}:{idx}: targeted empty-search error expected for {argv!r}: {msg!r}")
+        assert_true(not reached_validation, f"{label}:{idx}: validation/session lookup must not run for empty-search argv {argv!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_view_peer_empty_search_counts_as_search_for_mode_errors(label: str, tmpdir: Path) -> None:
+    bv = _import_view_peer()
+    cases = [
+        (["codex1", "--onboard", "--search", ""], "choose only one of --onboard, --older, --since-last, or --search"),
+        (["codex1", "--live"], "--live is only valid with --search"),
+        (["codex1", "--live", "--search", ""], "--search query must be non-empty"),
+        (["codex1", "--search", "", "--page", "0"], "--search query must be non-empty"),
+    ]
+    for idx, (argv, expected) in enumerate(cases):
+        msg, reached_validation = _run_view_peer_main_with_sentinels(bv, argv)
+        assert_true(expected in msg, f"{label}:{idx}: expected {expected!r} for {argv!r}, got {msg!r}")
+        assert_true(not reached_validation, f"{label}:{idx}: validation/session lookup must not run for invalid search-shape argv {argv!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_view_peer_nonempty_search_still_reaches_validation(label: str, tmpdir: Path) -> None:
+    bv = _import_view_peer()
+    msg, reached_validation = _run_view_peer_main_with_sentinels(bv, ["codex1", "--search", " needle "])
+    assert_true(msg == "validate_caller reached", f"{label}: non-empty query with surrounding spaces should reach validation sentinel, got {msg!r}")
+    assert_true(reached_validation, f"{label}: validation sentinel should be reached for non-empty query")
+    print(f"  PASS  {label}")
+
+
+def scenario_view_peer_search_with_page_after_a19_reports_page_error(label: str, tmpdir: Path) -> None:
+    bv = _import_view_peer()
+    cases = [
+        ["codex1", "--search", " needle ", "--page", "0"],
+        ["codex1", "--search", "needle", "--page", "0"],
+    ]
+    for idx, argv in enumerate(cases):
+        msg, reached_validation = _run_view_peer_main_with_sentinels(bv, argv)
+        assert_true("--page is only valid with live view, --onboard, or --older" in msg, f"{label}:{idx}: non-empty search with page should report A18 page error for {argv!r}: {msg!r}")
+        assert_true(not reached_validation, f"{label}:{idx}: validation/session lookup must not run for invalid search+page argv {argv!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_view_peer_render_output_model_safe(label: str, tmpdir: Path) -> None:
     bv = _import_view_peer()
     import contextlib
@@ -9292,6 +9342,10 @@ def main() -> int:
             ("view_peer_rejects_snapshot_without_snapshot_mode", scenario_view_peer_rejects_snapshot_without_snapshot_mode),
             ("view_peer_rejects_page_with_since_last_or_search", scenario_view_peer_rejects_page_with_since_last_or_search),
             ("view_peer_allows_page_in_live_onboard_older_and_snapshot_in_older_search", scenario_view_peer_allows_page_in_live_onboard_older_and_snapshot_in_older_search),
+            ("view_peer_rejects_empty_search_before_session_lookup", scenario_view_peer_rejects_empty_search_before_session_lookup),
+            ("view_peer_empty_search_counts_as_search_for_mode_errors", scenario_view_peer_empty_search_counts_as_search_for_mode_errors),
+            ("view_peer_nonempty_search_still_reaches_validation", scenario_view_peer_nonempty_search_still_reaches_validation),
+            ("view_peer_search_with_page_after_a19_reports_page_error", scenario_view_peer_search_with_page_after_a19_reports_page_error),
             ("view_peer_render_output_model_safe", scenario_view_peer_render_output_model_safe),
             ("view_peer_search_explicit_snapshot_uses_safe_ref", scenario_view_peer_search_explicit_snapshot_uses_safe_ref),
             ("view_peer_snapshot_ref_collision_unique", scenario_view_peer_snapshot_ref_collision_unique),

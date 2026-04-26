@@ -1289,18 +1289,23 @@ def main() -> int:
     parser.add_argument("--capture-file", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    modes = sum(bool(value) for value in (args.onboard, args.older, args.since_last, args.search))
+    # argparse preserves explicit empty values (`--search ""`), so mode checks
+    # must test flag presence rather than query truthiness.
+    search_requested = args.search is not None
+    modes = sum(bool(value) for value in (args.onboard, args.older, args.since_last, search_requested))
     if modes > 1:
         raise SystemExit("agent_view_peer: choose only one of --onboard, --older, --since-last, or --search")
-    if args.live and not args.search:
+    if args.live and not search_requested:
         raise SystemExit("agent_view_peer: --live is only valid with --search")
     if args.live and args.snapshot:
         raise SystemExit("agent_view_peer: --live and --snapshot cannot be used together")
     if args.page is not None and args.page < 0:
         raise SystemExit("agent_view_peer: --page must be >= 0")
-    if args.snapshot is not None and not (args.older or args.search):
+    if search_requested and not str(args.search).strip():
+        raise SystemExit("agent_view_peer: --search query must be non-empty")
+    if args.snapshot is not None and not (args.older or search_requested):
         raise SystemExit("agent_view_peer: --snapshot is only valid with --older or --search")
-    if args.page is not None and (args.since_last or args.search):
+    if args.page is not None and (args.since_last or search_requested):
         raise SystemExit("agent_view_peer: --page is only valid with live view, --onboard, or --older")
     if args.tail is not None and args.lines is not None:
         raise SystemExit("agent_view_peer: use either --tail or --lines, not both")
@@ -1327,7 +1332,7 @@ def main() -> int:
             handle_older(args, session, caller, target, record, lines_count, max_chars, cache_writable)
         elif args.since_last:
             handle_since_last(args, session, caller, target, state, record, lines_count, max_chars, cache_writable)
-        elif args.search:
+        elif search_requested:
             handle_search(args, session, caller, target, state, record, lines_count, max_chars)
         else:
             handle_live(args, session, caller, target, state, record, lines_count, max_chars, cache_writable)
