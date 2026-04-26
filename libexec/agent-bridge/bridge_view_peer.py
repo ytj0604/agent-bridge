@@ -1298,6 +1298,10 @@ def main() -> int:
         raise SystemExit("agent_view_peer: --live and --snapshot cannot be used together")
     if args.page is not None and args.page < 0:
         raise SystemExit("agent_view_peer: --page must be >= 0")
+    if args.snapshot is not None and not (args.older or args.search):
+        raise SystemExit("agent_view_peer: --snapshot is only valid with --older or --search")
+    if args.page is not None and (args.since_last or args.search):
+        raise SystemExit("agent_view_peer: --page is only valid with live view, --onboard, or --older")
     if args.tail is not None and args.lines is not None:
         raise SystemExit("agent_view_peer: use either --tail or --lines, not both")
 

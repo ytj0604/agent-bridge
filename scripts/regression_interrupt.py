@@ -5830,6 +5830,97 @@ def _import_view_peer():
     return importlib.reload(bv)
 
 
+class ViewPeerValidationSentinel(RuntimeError):
+    pass
+
+
+def _run_view_peer_main_with_sentinels(bv, argv: list[str]) -> tuple[str, bool]:
+    old_argv = sys.argv[:]
+    old_validate_caller = bv.validate_caller
+    old_handlers = {
+        "handle_live": bv.handle_live,
+        "handle_onboard": bv.handle_onboard,
+        "handle_older": bv.handle_older,
+        "handle_since_last": bv.handle_since_last,
+        "handle_search": bv.handle_search,
+    }
+    reached_validation = False
+
+    def sentinel_validate(_args):
+        nonlocal reached_validation
+        reached_validation = True
+        raise ViewPeerValidationSentinel("validate_caller reached")
+
+    def handler_sentinel(*_args, **_kwargs):
+        raise ViewPeerValidationSentinel("handler reached")
+
+    try:
+        sys.argv = ["agent_view_peer", *argv]
+        bv.validate_caller = sentinel_validate
+        for name in old_handlers:
+            setattr(bv, name, handler_sentinel)
+        try:
+            bv.main()
+        except SystemExit as exc:
+            return str(exc), reached_validation
+        except ViewPeerValidationSentinel as exc:
+            return str(exc), reached_validation
+        raise AssertionError(f"agent_view_peer main returned normally for argv {argv!r}")
+    finally:
+        sys.argv = old_argv
+        bv.validate_caller = old_validate_caller
+        for name, value in old_handlers.items():
+            setattr(bv, name, value)
+
+
+def scenario_view_peer_rejects_snapshot_without_snapshot_mode(label: str, tmpdir: Path) -> None:
+    bv = _import_view_peer()
+    cases = [
+        ["codex1", "--snapshot", "snap-X"],
+        ["codex1", "--onboard", "--snapshot", "snap-X"],
+        ["codex1", "--since-last", "--snapshot", "snap-X"],
+        ["codex1", "--snapshot", ""],
+        ["codex1", "--since-last", "--snapshot", "snap-X", "--page", "1"],
+    ]
+    for idx, argv in enumerate(cases):
+        msg, reached_validation = _run_view_peer_main_with_sentinels(bv, argv)
+        assert_true("--snapshot is only valid with --older or --search" in msg, f"{label}:{idx}: targeted snapshot error expected for {argv!r}: {msg!r}")
+        assert_true(not reached_validation, f"{label}:{idx}: validation/session lookup must not run for invalid snapshot argv {argv!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_view_peer_rejects_page_with_since_last_or_search(label: str, tmpdir: Path) -> None:
+    bv = _import_view_peer()
+    cases = [
+        ["codex1", "--since-last", "--page", "0"],
+        ["codex1", "--since-last", "--page", "1"],
+        ["codex1", "--search", "needle", "--page", "0"],
+        ["codex1", "--search", "needle", "--page", "1"],
+        ["codex1", "--search", "needle", "--snapshot", "snap-X", "--page", "1"],
+    ]
+    for idx, argv in enumerate(cases):
+        msg, reached_validation = _run_view_peer_main_with_sentinels(bv, argv)
+        assert_true("--page is only valid with live view, --onboard, or --older" in msg, f"{label}:{idx}: targeted page error expected for {argv!r}: {msg!r}")
+        assert_true(not reached_validation, f"{label}:{idx}: validation/session lookup must not run for invalid page argv {argv!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_view_peer_allows_page_in_live_onboard_older_and_snapshot_in_older_search(label: str, tmpdir: Path) -> None:
+    bv = _import_view_peer()
+    cases = [
+        ["codex1", "--page", "1"],
+        ["codex1", "--onboard", "--page", "1"],
+        ["codex1", "--older", "--page", "1"],
+        ["codex1", "--older", "--snapshot", "snap-X"],
+        ["codex1", "--search", "needle", "--snapshot", "snap-X"],
+    ]
+    for idx, argv in enumerate(cases):
+        msg, reached_validation = _run_view_peer_main_with_sentinels(bv, argv)
+        assert_true(msg == "validate_caller reached", f"{label}:{idx}: valid flag shape should reach validation sentinel for {argv!r}, got {msg!r}")
+        assert_true(reached_validation, f"{label}:{idx}: validation sentinel should be reached for valid flag shape {argv!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_view_peer_render_output_model_safe(label: str, tmpdir: Path) -> None:
     bv = _import_view_peer()
     import contextlib
@@ -9198,6 +9289,9 @@ def main() -> int:
             ("model_safe_participants_strips_endpoints", scenario_model_safe_participants_strips_endpoints),
             ("model_safe_participants_uses_active_only", scenario_model_safe_participants_uses_active_only),
             ("list_peers_json_daemon_status_strips_pid", scenario_list_peers_json_daemon_status_strips_pid),
+            ("view_peer_rejects_snapshot_without_snapshot_mode", scenario_view_peer_rejects_snapshot_without_snapshot_mode),
+            ("view_peer_rejects_page_with_since_last_or_search", scenario_view_peer_rejects_page_with_since_last_or_search),
+            ("view_peer_allows_page_in_live_onboard_older_and_snapshot_in_older_search", scenario_view_peer_allows_page_in_live_onboard_older_and_snapshot_in_older_search),
             ("view_peer_render_output_model_safe", scenario_view_peer_render_output_model_safe),
             ("view_peer_search_explicit_snapshot_uses_safe_ref", scenario_view_peer_search_explicit_snapshot_uses_safe_ref),
             ("view_peer_snapshot_ref_collision_unique", scenario_view_peer_snapshot_ref_collision_unique),
