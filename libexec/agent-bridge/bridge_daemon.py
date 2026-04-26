@@ -3119,10 +3119,11 @@ class BridgeDaemon:
             # residue cannot survive an early tombstone return:
             # - no marker: normal path
             # - marker + no active ctx id: legacy held-drain
-            # - marker prior_id == active id and turn ids match (including
-            #   both absent): legacy held-drain
-            # - marker prior_id == active id but turn ids differ: stale
-            #   residue; pop it and let turn_id_mismatch handling run
+            # - marker prior_id == active id and no active turn-id conflict:
+            #   legacy held-drain. A matching id is enough when the active ctx
+            #   has no turn_id; otherwise the Stop turn must match.
+            # - marker prior_id == active id but active turn-id conflicts:
+            #   stale residue; pop it and let turn_id_mismatch handling run
             # - marker prior_id absent/different from active id: stale
             #   residue; pop it and continue with normal stale/terminal rules
             if held_info is not None:
@@ -3133,12 +3134,12 @@ class BridgeDaemon:
                     and held_prior_message_id
                     and held_prior_message_id == active_message_id
                 )
-                held_turns_match = response_turn_id == context_turn_id
-                legacy_held_drain = not active_message_id or (held_matches_active and held_turns_match)
+                held_turns_conflict = context_turn_id is not None and response_turn_id != context_turn_id
+                legacy_held_drain = not active_message_id or (held_matches_active and not held_turns_conflict)
                 if not legacy_held_drain:
                     stale_info = self.held_interrupt.pop(sender, None) or held_info
                     held_info = None
-                    held_stale_turn_mismatch = bool(active_message_id and response_turn_id != context_turn_id)
+                    held_stale_turn_mismatch = bool(active_message_id and held_turns_conflict)
                     hold_duration_ms = None
                     since_ts = stale_info.get("since_ts")
                     if isinstance(since_ts, (int, float)):
@@ -3204,9 +3205,22 @@ class BridgeDaemon:
                 # (possibly partial) text. If a new prompt_submitted
                 # arrived while held, a late Stop for the old turn must
                 # release the hold without clobbering the new active ctx.
+                active_message_id = str(context.get("id") or "")
+                held_prior_message_id = str(held_info.get("prior_message_id") or "")
+                message_id_matches = bool(
+                    active_message_id
+                    and held_prior_message_id
+                    and active_message_id == held_prior_message_id
+                )
+                turn_id_matches = bool(response_turn_id and context_turn_id and response_turn_id == context_turn_id)
+                has_active_context = bool(context)
+                # An empty ctx is not a real active prompt in normal daemon
+                # state; preserve that legacy manual-recovery drain, but
+                # require a concrete id or turn-id match for any present ctx.
                 held_drain_matches_current = (
-                    response_turn_id == context_turn_id
-                    or (not context.get("id") and not context_turn_id)
+                    not has_active_context
+                    or message_id_matches
+                    or turn_id_matches
                 )
                 if first_time:
                     if held_drain_matches_current:

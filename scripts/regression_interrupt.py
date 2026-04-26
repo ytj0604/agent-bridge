@@ -2531,6 +2531,80 @@ def scenario_held_drain_stale_stop_preserves_new_ctx(label: str, tmpdir: Path) -
     print(f"  PASS  {label}")
 
 
+def scenario_held_drain_missing_identity_does_not_clear_active_ctx(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    d.held_interrupt["claude"] = {
+        "since": utc_now(),
+        "since_ts": time.time(),
+        "prior_message_id": "msg-old-held",
+        "prior_sender": "codex",
+        "reason": "legacy",
+    }
+    active_ctx = {
+        "id": None,
+        "nonce": "n-present-no-id",
+        "causal_id": "causal-present-no-id",
+        "hop_count": 1,
+        "from": "codex",
+        "kind": "request",
+        "intent": "test",
+        "source": "test",
+        "auto_return": True,
+        "turn_id": None,
+    }
+    d.current_prompt_by_agent["claude"] = dict(active_ctx)
+    d.busy["claude"] = True
+    pending = test_message("msg-pending-missing-identity", frm="codex", to="claude", status="pending")
+    d.queue.update(lambda queue: queue.append(pending))
+
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "stale-turn", "last_assistant_message": "stale"})
+
+    assert_true("claude" not in d.held_interrupt, f"{label}: stale hold marker should be popped")
+    assert_true(d.current_prompt_by_agent.get("claude") == active_ctx, f"{label}: unidentified active ctx must remain")
+    assert_true(d.busy.get("claude") is True, f"{label}: busy must stay true for unidentified active ctx")
+    item = _queue_item(d, "msg-pending-missing-identity")
+    assert_true(item is not None and item.get("status") == "pending", f"{label}: pending message must not deliver")
+    assert_true(_auto_return_results(d, "claude", "codex") == [], f"{label}: stale held drain must not auto-route")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(any(e.get("event") == "hold_released" and e.get("target") == "claude" for e in events), f"{label}: hold_released log expected")
+    stale = next((e for e in events if e.get("event") == "held_drain_stale_stop"), None)
+    assert_true(stale is not None, f"{label}: held_drain_stale_stop log expected")
+    assert_true(stale.get("active_message_id") is None, f"{label}: stale log active_message_id expected")
+    assert_true(stale.get("active_turn_id") is None, f"{label}: stale log active_turn_id expected")
+    assert_true(stale.get("response_turn_id") == "stale-turn", f"{label}: stale log response_turn_id expected")
+    assert_true(stale.get("prior_message_id") == "msg-old-held", f"{label}: stale log prior_message_id expected")
+    print(f"  PASS  {label}")
+
+
+def scenario_held_drain_matching_prior_id_without_turn_still_clears_ctx(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    d.current_prompt_by_agent["claude"] = {
+        "id": "msg-held-id-only",
+        "from": "codex",
+        "kind": "request",
+        "intent": "test",
+        "auto_return": True,
+        "turn_id": None,
+    }
+    d.busy["claude"] = True
+    d.held_interrupt["claude"] = {
+        "since": utc_now(),
+        "since_ts": time.time(),
+        "prior_message_id": "msg-held-id-only",
+        "prior_sender": "codex",
+    }
+
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "unrelated-turn", "last_assistant_message": "drain"})
+
+    assert_true("claude" not in d.held_interrupt, f"{label}: id-only matching drain must release hold")
+    assert_true(d.current_prompt_by_agent.get("claude") is None, f"{label}: id-only matching drain must clear ctx")
+    assert_true(d.busy.get("claude") is False, f"{label}: id-only matching drain must clear busy")
+    assert_true(_auto_return_results(d, "claude", "codex") == [], f"{label}: held drain must not auto-route")
+    print(f"  PASS  {label}")
+
+
 def scenario_stale_hold_ignored_active_context_routes_normally(label: str, tmpdir: Path) -> None:
     participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
     d = make_daemon(tmpdir, participants)
@@ -7809,6 +7883,8 @@ def main() -> int:
             ("prompt_intercept_aggregate_completes", scenario_prompt_intercept_aggregate_completes),
             ("prompt_intercept_held_drain_noop", scenario_prompt_intercept_held_drain_noop),
             ("held_drain_stale_stop_preserves_new_ctx", scenario_held_drain_stale_stop_preserves_new_ctx),
+            ("held_drain_missing_identity_does_not_clear_active_ctx", scenario_held_drain_missing_identity_does_not_clear_active_ctx),
+            ("held_drain_matching_prior_id_without_turn_still_clears_ctx", scenario_held_drain_matching_prior_id_without_turn_still_clears_ctx),
             ("stale_hold_ignored_active_context_routes_normally", scenario_stale_hold_ignored_active_context_routes_normally),
             ("stale_hold_old_stop_with_active_ctx_applies_a4_mismatch", scenario_stale_hold_old_stop_with_active_ctx_applies_a4_mismatch),
             ("held_no_prior_id_with_active_ctx_classified_stale", scenario_held_no_prior_id_with_active_ctx_classified_stale),
