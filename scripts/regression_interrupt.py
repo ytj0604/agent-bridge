@@ -677,7 +677,7 @@ def scenario_aggregate_late_real_stop_after_interrupt_does_not_overwrite(label: 
 def scenario_watchdog_cancel_on_empty_response(label: str, tmpdir: Path) -> None:
     # v1.5: watchdog arms at delivery, not enqueue. The cancel-on-empty
     # invariant from v1 is preserved: even an empty/no-text response must
-    # still cancel the watchdog at terminal handle_response_finished.
+    # still cancel the watchdog and auto-route an explicit sentinel result.
     participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
     d = make_daemon(tmpdir, participants)
     msg = {
@@ -699,8 +699,24 @@ def scenario_watchdog_cancel_on_empty_response(label: str, tmpdir: Path) -> None
     d.queue.update(assign)
     d.handle_prompt_submitted({"agent": "codex", "bridge_agent": "codex", "nonce": "wd-nonce", "turn_id": "t-wd", "prompt": ""})
     assert_true(any(wd.get("ref_message_id") == "msg-wd-1" for wd in d.watchdogs.values()), f"{label}: watchdog must be registered after delivery (prompt_submitted)")
+    ctx = dict(d.current_prompt_by_agent.get("codex") or {})
     d.handle_response_finished({"agent": "codex", "bridge_agent": "codex", "turn_id": "t-wd", "last_assistant_message": ""})
     assert_true(not any(wd.get("ref_message_id") == "msg-wd-1" for wd in d.watchdogs.values()), f"{label}: watchdog must be cancelled even when response text is empty")
+    routed = _auto_return_results(d, "codex", "claude")
+    assert_true(len(routed) == 1, f"{label}: empty response should auto-route one sentinel result, got {routed}")
+    _assert_auto_return_result_shape(
+        label,
+        routed[0],
+        sender="codex",
+        target="claude",
+        reply_to="msg-wd-1",
+        causal_id=str(ctx.get("causal_id") or ""),
+        hop_count=int(ctx.get("hop_count") or 0),
+        body="Result from codex:\n(empty response)",
+    )
+    events = read_events(tmpdir / "events.raw.jsonl")
+    cancellations = [e for e in events if e.get("event") == "watchdog_cancelled" and e.get("ref_message_id") == "msg-wd-1"]
+    assert_true(len(cancellations) == 1 and cancellations[0].get("reason") == "reply_received", f"{label}: empty reply watchdog cancel should use reply_received: {cancellations}")
     print(f"  PASS  {label}")
 
 
@@ -1836,6 +1852,38 @@ def _queue_item(d, message_id: str) -> dict | None:
     return next((item for item in d.queue.read() if item.get("id") == message_id), None)
 
 
+def _auto_return_results(d, sender: str, target: str) -> list[dict]:
+    return [
+        item for item in d.queue.read()
+        if item.get("from") == sender
+        and item.get("to") == target
+        and item.get("kind") == "result"
+        and item.get("source") == "auto_return"
+    ]
+
+
+def _assert_auto_return_result_shape(
+    label: str,
+    result: dict,
+    *,
+    sender: str,
+    target: str,
+    reply_to: str,
+    causal_id: str,
+    hop_count: int,
+    body: str,
+) -> None:
+    assert_true(result.get("from") == sender, f"{label}: result sender mismatch: {result}")
+    assert_true(result.get("to") == target, f"{label}: result target mismatch: {result}")
+    assert_true(result.get("kind") == "result", f"{label}: result kind mismatch: {result}")
+    assert_true(result.get("source") == "auto_return", f"{label}: result source mismatch: {result}")
+    assert_true(result.get("auto_return") is False, f"{label}: result must not auto-return: {result}")
+    assert_true(result.get("reply_to") == reply_to, f"{label}: reply_to mismatch: {result}")
+    assert_true(result.get("causal_id") == causal_id, f"{label}: causal_id mismatch: {result}")
+    assert_true(int(result.get("hop_count") or 0) == hop_count, f"{label}: hop_count mismatch: {result}")
+    assert_true(result.get("body") == body, f"{label}: body mismatch: {result.get('body')!r}")
+
+
 def scenario_orphan_nonce_in_user_prompt(label: str, tmpdir: Path) -> None:
     """User prompt that quotes a stale [bridge:nonce] must NOT be treated as a delivery."""
     participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
@@ -2157,18 +2205,120 @@ def scenario_consume_once_basic(label: str, tmpdir: Path) -> None:
 
 
 def scenario_consume_once_empty_response(label: str, tmpdir: Path) -> None:
-    """Empty terminal response also consumes ctx — subsequent Stop must not route."""
+    """Empty terminal response routes a sentinel once and consumes ctx."""
     participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
     d = make_daemon(tmpdir, participants)
     _make_inflight(d, "msg-empty-1", frm="codex", to="claude", nonce="n-empty-1")
     d.handle_prompt_submitted({"agent": "claude", "bridge_agent": "claude", "nonce": "n-empty-1", "turn_id": "t-e-1", "prompt": "[bridge:n-empty-1] x"})
-    # Empty Stop: maybe_return_response will skip routing on empty, but ctx must still be consumed
+    ctx = dict(d.current_prompt_by_agent.get("claude") or {})
     d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "t-e-1", "last_assistant_message": ""})
     assert_true(d.current_prompt_by_agent.get("claude") is None, f"{label}: empty Stop must still consume ctx")
+    routed_first = _auto_return_results(d, "claude", "codex")
+    assert_true(len(routed_first) == 1, f"{label}: empty Stop should auto-route exactly one sentinel result, got {routed_first}")
+    _assert_auto_return_result_shape(
+        label,
+        routed_first[0],
+        sender="claude",
+        target="codex",
+        reply_to="msg-empty-1",
+        causal_id=str(ctx.get("causal_id") or ""),
+        hop_count=int(ctx.get("hop_count") or 0),
+        body="Result from claude:\n(empty response)",
+    )
     # Next Stop has no ctx to route through
     d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "t-e-2", "last_assistant_message": "later unrelated reply"})
-    routed = [it for it in d.queue.read() if it.get("from") == "claude" and it.get("to") == "codex" and it.get("kind") == "result"]
-    assert_true(len(routed) == 0, f"{label}: no auto-route should occur after empty Stop consumed ctx")
+    routed_total = _auto_return_results(d, "claude", "codex")
+    assert_true(len(routed_total) == 1, f"{label}: later Stop must not route after empty Stop consumed ctx, got {routed_total}")
+    print(f"  PASS  {label}")
+
+
+def scenario_empty_response_whitespace_only_routes_sentinel(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = _make_delivered_context(d, "msg-empty-ws", "codex", "claude", "n-empty-ws", turn_id="t-empty-ws")
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "t-empty-ws", "last_assistant_message": "   \n\t  \n"})
+    routed = _auto_return_results(d, "claude", "codex")
+    assert_true(len(routed) == 1, f"{label}: whitespace-only response should route sentinel, got {routed}")
+    _assert_auto_return_result_shape(
+        label,
+        routed[0],
+        sender="claude",
+        target="codex",
+        reply_to="msg-empty-ws",
+        causal_id=str(msg.get("causal_id") or ""),
+        hop_count=int(msg.get("hop_count") or 0),
+        body="Result from claude:\n(empty response)",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_empty_response_preserves_nonempty_with_surrounding_whitespace(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = _make_delivered_context(d, "msg-nonempty-ws", "codex", "claude", "n-nonempty-ws", turn_id="t-nonempty-ws")
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "t-nonempty-ws", "last_assistant_message": "\nhello\n"})
+    routed = _auto_return_results(d, "claude", "codex")
+    assert_true(len(routed) == 1, f"{label}: non-empty response should route once, got {routed}")
+    _assert_auto_return_result_shape(
+        label,
+        routed[0],
+        sender="claude",
+        target="codex",
+        reply_to="msg-nonempty-ws",
+        causal_id=str(msg.get("causal_id") or ""),
+        hop_count=int(msg.get("hop_count") or 0),
+        body="Result from claude:\n\nhello\n",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_empty_response_self_return_still_skipped(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}}
+    d = make_daemon(tmpdir, participants)
+    _make_delivered_context(d, "msg-self-empty", "claude", "claude", "n-self-empty", turn_id="t-self-empty")
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "t-self-empty", "last_assistant_message": ""})
+    routed = _auto_return_results(d, "claude", "claude")
+    assert_true(routed == [], f"{label}: self-return empty response must not route: {routed}")
+    print(f"  PASS  {label}")
+
+
+def scenario_empty_response_auto_return_false_still_skipped(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    _make_delivered_context(d, "msg-noauto-empty", "codex", "claude", "n-noauto-empty", auto_return=False, turn_id="t-noauto-empty")
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "t-noauto-empty", "last_assistant_message": ""})
+    routed = _auto_return_results(d, "claude", "codex")
+    assert_true(routed == [], f"{label}: auto_return=False empty response must not route: {routed}")
+    print(f"  PASS  {label}")
+
+
+def scenario_empty_response_inactive_requester_still_skipped(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}}
+    d = make_daemon(tmpdir, participants)
+    _make_delivered_context(d, "msg-inactive-empty", "missing", "claude", "n-inactive-empty", turn_id="t-inactive-empty")
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "t-inactive-empty", "last_assistant_message": ""})
+    routed = _auto_return_results(d, "claude", "missing")
+    assert_true(routed == [], f"{label}: inactive requester empty response must not route: {routed}")
+    print(f"  PASS  {label}")
+
+
+def scenario_empty_response_unicode_whitespace_routes_sentinel(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = _make_delivered_context(d, "msg-empty-unicode-ws", "codex", "claude", "n-empty-unicode-ws", turn_id="t-empty-unicode-ws")
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "t-empty-unicode-ws", "last_assistant_message": "\u00a0\u2028"})
+    routed = _auto_return_results(d, "claude", "codex")
+    assert_true(len(routed) == 1, f"{label}: unicode whitespace-only response should route sentinel, got {routed}")
+    _assert_auto_return_result_shape(
+        label,
+        routed[0],
+        sender="claude",
+        target="codex",
+        reply_to="msg-empty-unicode-ws",
+        causal_id=str(msg.get("causal_id") or ""),
+        hop_count=int(msg.get("hop_count") or 0),
+        body="Result from claude:\n(empty response)",
+    )
     print(f"  PASS  {label}")
 
 
@@ -2338,6 +2488,63 @@ def scenario_aggregate_consume_once_no_overwrite(label: str, tmpdir: Path) -> No
     # auto-routed reply.
     assert_true(d.current_prompt_by_agent.get("codex") is None, f"{label}: ctx should remain cleared after duplicate Stop")
     assert_true(len(routed_to_claude) <= 1, f"{label}: aggregate must not collect a duplicate reply, got {len(routed_to_claude)}")
+    print(f"  PASS  {label}")
+
+
+def scenario_empty_response_in_aggregate_path_unchanged(label: str, tmpdir: Path) -> None:
+    participants = {
+        "manager": {"alias": "manager", "agent_type": "claude", "pane": "%97"},
+        "w1": {"alias": "w1", "agent_type": "codex", "pane": "%96"},
+        "w2": {"alias": "w2", "agent_type": "codex", "pane": "%95"},
+    }
+    d = make_daemon(tmpdir, participants)
+    agg_id = f"agg-empty-{uuid.uuid4().hex[:8]}"
+    expected = ["w1", "w2"]
+    message_ids = {"w1": "msg-agg-empty-w1", "w2": "msg-agg-empty-w2"}
+    _make_delivered_context(
+        d,
+        "msg-agg-empty-w1",
+        "manager",
+        "w1",
+        "n-agg-empty-w1",
+        turn_id="t-agg-empty-w1",
+        aggregate_id=agg_id,
+        aggregate_expected=expected,
+        aggregate_message_ids=message_ids,
+    )
+    _make_delivered_context(
+        d,
+        "msg-agg-empty-w2",
+        "manager",
+        "w2",
+        "n-agg-empty-w2",
+        turn_id="t-agg-empty-w2",
+        aggregate_id=agg_id,
+        aggregate_expected=expected,
+        aggregate_message_ids=message_ids,
+    )
+    d.handle_response_finished({"agent": "w1", "bridge_agent": "w1", "turn_id": "t-agg-empty-w1", "last_assistant_message": ""})
+    d.handle_response_finished({"agent": "w2", "bridge_agent": "w2", "turn_id": "t-agg-empty-w2", "last_assistant_message": "w2 ok"})
+
+    aggregate_data = read_json(d.aggregate_file, {"aggregates": {}})
+    aggregate = (aggregate_data.get("aggregates") or {}).get(agg_id) or {}
+    replies = aggregate.get("replies") or {}
+    assert_true(str((replies.get("w1") or {}).get("body") or "") == "", f"{label}: aggregate should store raw empty body for w1: {replies}")
+    assert_true(str((replies.get("w2") or {}).get("body") or "") == "w2 ok", f"{label}: aggregate should store raw non-empty body for w2: {replies}")
+
+    aggregate_results = [
+        item for item in d.queue.read()
+        if item.get("from") == "bridge"
+        and item.get("to") == "manager"
+        and item.get("kind") == "result"
+        and item.get("source") == "aggregate_return"
+        and item.get("aggregate_id") == agg_id
+    ]
+    assert_true(len(aggregate_results) == 1, f"{label}: aggregate should queue one result, got {aggregate_results}")
+    body = str(aggregate_results[0].get("body") or "")
+    assert_true("--- w1 in_reply_to=msg-agg-empty-w1 ---\n(empty response)" in body, f"{label}: aggregate empty leg should render sentinel without per-leg result prefix: {body!r}")
+    assert_true("w2 ok" in body, f"{label}: aggregate non-empty leg should remain: {body!r}")
+    assert_true("Result from w1:" not in body and "Result from w2:" not in body, f"{label}: aggregate body must not use single-request result prefixes: {body!r}")
     print(f"  PASS  {label}")
 
 
@@ -5999,6 +6206,12 @@ def main() -> int:
             ("prompt_intercept_inflight_only_requeues", scenario_prompt_intercept_inflight_only_requeues),
             ("consume_once_basic", scenario_consume_once_basic),
             ("consume_once_empty_response", scenario_consume_once_empty_response),
+            ("empty_response_whitespace_only_routes_sentinel", scenario_empty_response_whitespace_only_routes_sentinel),
+            ("empty_response_preserves_nonempty_with_surrounding_whitespace", scenario_empty_response_preserves_nonempty_with_surrounding_whitespace),
+            ("empty_response_self_return_still_skipped", scenario_empty_response_self_return_still_skipped),
+            ("empty_response_auto_return_false_still_skipped", scenario_empty_response_auto_return_false_still_skipped),
+            ("empty_response_inactive_requester_still_skipped", scenario_empty_response_inactive_requester_still_skipped),
+            ("empty_response_unicode_whitespace_routes_sentinel", scenario_empty_response_unicode_whitespace_routes_sentinel),
             ("nonce_mismatch_fail_closed", scenario_nonce_mismatch_fail_closed),
             ("no_observed_nonce_with_candidate_fail_closed", scenario_no_observed_nonce_with_candidate_fail_closed),
             ("daemon_restart_queue_scan", scenario_daemon_restart_queue_scan),
@@ -6007,6 +6220,7 @@ def main() -> int:
             ("held_drain_skips_consume_once", scenario_held_drain_skips_consume_once),
             ("matching_nonce_contaminated_body_residual", scenario_matching_nonce_contaminated_body_documents_residual),
             ("aggregate_consume_once_no_overwrite", scenario_aggregate_consume_once_no_overwrite),
+            ("empty_response_in_aggregate_path_unchanged", scenario_empty_response_in_aggregate_path_unchanged),
             ("nonce_mismatch_stops_enter_retry", scenario_nonce_mismatch_stops_enter_retry),
             ("nonce_missing_stops_enter_retry", scenario_nonce_missing_stops_enter_retry),
             ("hook_logger_anchored_regex", scenario_hook_logger_anchored_regex),

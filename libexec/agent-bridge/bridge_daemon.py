@@ -64,6 +64,7 @@ PANE_MODE_ENTER_DEFER_KEYS = (
 )
 INTERRUPTED_TOMBSTONE_LIMIT_PER_AGENT = 16
 INTERRUPTED_TOMBSTONE_TTL_SECONDS = 600.0
+EMPTY_RESPONSE_BODY = "(empty response)"
 _STOP_SIGNAL: int | None = None
 PROMPT_BODY_CONTROL_TRANSLATION = {
     codepoint: None
@@ -2915,16 +2916,14 @@ class BridgeDaemon:
             self.collect_aggregate_response(sender, text, context)
             return
 
-        if not text.strip():
-            return
-
         causal_id = context.get("causal_id") or short_id("causal")
         hop_count = int(context.get("hop_count") or 0)
         original_intent = context.get("intent") or "message"
         return_intent = f"{original_intent}_result"
+        response_text = text if text.strip() else EMPTY_RESPONSE_BODY
         body = (
             f"Result from {sender}:\n"
-            f"{text}"
+            f"{response_text}"
         )
         message = make_message(
             sender=sender,
