@@ -4737,6 +4737,165 @@ def scenario_bridge_install_hooks_codex_hooks_rejects_malformed_json_without_ove
     print(f"  PASS  {label}")
 
 
+def scenario_bridge_install_hooks_codex_config_ignores_nested_codex_hooks(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-nested-hooks.toml"
+    nested_block = '[codex_hooks]\nkind = "keep"\n'
+    config.write_text(nested_block, encoding="utf-8")
+    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
+    text = config.read_text(encoding="utf-8")
+    assert_true(nested_block in text, f"{label}: [codex_hooks] table content must be preserved: {text!r}")
+    assert_true("[features]\ncodex_hooks = true\n" in text, f"{label}: [features].codex_hooks should be added: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_codex_config_ignores_nested_disable_paste_burst(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-nested-disable.toml"
+    config.write_text("[profile]\ndisable_paste_burst = true\n", encoding="utf-8")
+    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
+    text = config.read_text(encoding="utf-8")
+    assert_true(text.startswith("disable_paste_burst = true\n[profile]\n"), f"{label}: top-level disable_paste_burst should be inserted before first table: {text!r}")
+    assert_true("[profile]\ndisable_paste_burst = true\n" in text, f"{label}: nested disable_paste_burst should remain unchanged: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_codex_config_updates_only_scoped_keys(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-scoped-update.toml"
+    config.write_text(
+        "disable_paste_burst = false  # was off\n"
+        "\n"
+        "[features]\n"
+        "  codex_hooks = false  # was off\n"
+        "\n"
+        "[profile]\n"
+        "disable_paste_burst = false  # profile scoped\n"
+        "codex_hooks = false  # profile scoped\n",
+        encoding="utf-8",
+    )
+    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
+    text = config.read_text(encoding="utf-8")
+    assert_true("disable_paste_burst = true  # was off\n" in text, f"{label}: top-level disable line/comment should update: {text!r}")
+    assert_true("  codex_hooks = true  # was off\n" in text, f"{label}: [features] line indentation/comment should update: {text!r}")
+    assert_true("disable_paste_burst = false  # profile scoped\n" in text, f"{label}: profile disable must stay false: {text!r}")
+    assert_true("codex_hooks = false  # profile scoped\n" in text, f"{label}: profile codex_hooks must stay false: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_codex_config_inserts_features_key_before_next_table(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-features-insert.toml"
+    config.write_text(
+        "[features]\n"
+        "experimental = true\n"
+        "\n"
+        "[profile]\n"
+        "codex_hooks = false\n",
+        encoding="utf-8",
+    )
+    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
+    text = config.read_text(encoding="utf-8")
+    features_index = text.index("[features]")
+    inserted_index = text.index("codex_hooks = true")
+    profile_index = text.index("[profile]")
+    assert_true(features_index < inserted_index < profile_index, f"{label}: codex_hooks=true should land inside [features]: {text!r}")
+    assert_true("[profile]\ncodex_hooks = false\n" in text, f"{label}: profile codex_hooks must remain unchanged: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_codex_config_dry_run_no_write(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-dry-run.toml"
+    config.write_text("[features]\ncodex_hooks = false\n[profile]\ndisable_paste_burst = true\n", encoding="utf-8")
+    before = config.read_bytes()
+    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True, dry_run=True)
+    assert_true(proc.returncode == 0, f"{label}: dry-run should succeed: {proc.stderr!r}")
+    assert_true("codex_hooks enabled" in proc.stdout and "disable_paste_burst enabled" in proc.stdout, f"{label}: dry-run stdout should report computed actions: {proc.stdout!r}")
+    assert_true(config.read_bytes() == before, f"{label}: dry-run must not alter config bytes")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_codex_config_empty_features_section_inserts(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-empty-features.toml"
+    config.write_text("[features]\n[profile]\nname = \"p\"\n", encoding="utf-8")
+    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
+    text = config.read_text(encoding="utf-8")
+    assert_true("[features]\ncodex_hooks = true\n[profile]\n" in text, f"{label}: empty features section should receive key before next table: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_codex_config_first_table_is_array_table(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-array-first.toml"
+    config.write_text("[[features_array]]\nname = \"first\"\n", encoding="utf-8")
+    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
+    text = config.read_text(encoding="utf-8")
+    assert_true(text.startswith("disable_paste_burst = true\n[[features_array]]\n"), f"{label}: top-level disable should be inserted before first array table: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_codex_config_table_header_with_trailing_comment(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-header-comment.toml"
+    config.write_text("[features]  # primary features section\nother = true\n", encoding="utf-8")
+    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
+    text = config.read_text(encoding="utf-8")
+    assert_true("[features]  # primary features section\nother = true\ncodex_hooks = true\n" in text, f"{label}: [features] with trailing comment should be recognized: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_codex_config_commented_out_assignments_ignored(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-comments.toml"
+    config.write_text(
+        "# disable_paste_burst = true\n"
+        "# codex_hooks = true\n"
+        "[features]\n"
+        "# codex_hooks = true\n",
+        encoding="utf-8",
+    )
+    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
+    text = config.read_text(encoding="utf-8")
+    assert_true("# disable_paste_burst = true\n" in text and "# codex_hooks = true\n" in text, f"{label}: commented assignments should remain comments: {text!r}")
+    live_disable_index = text.index("disable_paste_burst = true\n")
+    features_index = text.index("[features]")
+    assert_true(live_disable_index < features_index, f"{label}: live top-level disable should be inserted before first table: {text!r}")
+    assert_true("[features]\n# codex_hooks = true\ncodex_hooks = true\n" in text, f"{label}: live features codex_hooks should be inserted despite comment: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_codex_config_no_trailing_newline_handled(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-no-newline.toml"
+    config.write_text("[features]\nother = true", encoding="utf-8")
+    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
+    text = config.read_text(encoding="utf-8")
+    assert_true("other = true\ncodex_hooks = true\n" in text, f"{label}: no-newline config should not concatenate inserted key: {text!r}")
+    assert_true(text.startswith("disable_paste_burst = true\n[features]\n"), f"{label}: top-level disable should still be inserted cleanly: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_install_hooks_codex_config_already_enabled_is_byte_unchanged(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-already.toml"
+    config.write_text(
+        "disable_paste_burst = true\n"
+        "\n"
+        "[features]\n"
+        "codex_hooks = true\n"
+        "\n"
+        "[profile]\n"
+        "codex_hooks = false\n",
+        encoding="utf-8",
+    )
+    before = config.read_bytes()
+    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
+    assert_true("codex_hooks already enabled" in proc.stdout and "disable_paste_burst already enabled" in proc.stdout, f"{label}: stdout should report already-enabled actions: {proc.stdout!r}")
+    assert_true(config.read_bytes() == before, f"{label}: already-enabled scoped config must remain byte-identical")
+    print(f"  PASS  {label}")
+
+
 # ---------- v1.5.x P1 follow-up: dry-run safety + orphan delivered + concurrent prune ----------
 
 def scenario_restart_dry_run_no_side_effect(label: str, tmpdir: Path) -> None:
@@ -8428,6 +8587,17 @@ def main() -> int:
             ("bridge_install_hooks_invalid_utf8_fails_without_overwrite", scenario_bridge_install_hooks_invalid_utf8_fails_without_overwrite),
             ("bridge_install_hooks_existing_valid_json_object_merges_correctly", scenario_bridge_install_hooks_existing_valid_json_object_merges_correctly),
             ("bridge_install_hooks_codex_hooks_rejects_malformed_json_without_overwrite", scenario_bridge_install_hooks_codex_hooks_rejects_malformed_json_without_overwrite),
+            ("bridge_install_hooks_codex_config_ignores_nested_codex_hooks", scenario_bridge_install_hooks_codex_config_ignores_nested_codex_hooks),
+            ("bridge_install_hooks_codex_config_ignores_nested_disable_paste_burst", scenario_bridge_install_hooks_codex_config_ignores_nested_disable_paste_burst),
+            ("bridge_install_hooks_codex_config_updates_only_scoped_keys", scenario_bridge_install_hooks_codex_config_updates_only_scoped_keys),
+            ("bridge_install_hooks_codex_config_inserts_features_key_before_next_table", scenario_bridge_install_hooks_codex_config_inserts_features_key_before_next_table),
+            ("bridge_install_hooks_codex_config_dry_run_no_write", scenario_bridge_install_hooks_codex_config_dry_run_no_write),
+            ("bridge_install_hooks_codex_config_empty_features_section_inserts", scenario_bridge_install_hooks_codex_config_empty_features_section_inserts),
+            ("bridge_install_hooks_codex_config_first_table_is_array_table", scenario_bridge_install_hooks_codex_config_first_table_is_array_table),
+            ("bridge_install_hooks_codex_config_table_header_with_trailing_comment", scenario_bridge_install_hooks_codex_config_table_header_with_trailing_comment),
+            ("bridge_install_hooks_codex_config_commented_out_assignments_ignored", scenario_bridge_install_hooks_codex_config_commented_out_assignments_ignored),
+            ("bridge_install_hooks_codex_config_no_trailing_newline_handled", scenario_bridge_install_hooks_codex_config_no_trailing_newline_handled),
+            ("bridge_install_hooks_codex_config_already_enabled_is_byte_unchanged", scenario_bridge_install_hooks_codex_config_already_enabled_is_byte_unchanged),
             ("restart_dry_run_no_side_effect", scenario_restart_dry_run_no_side_effect),
             ("recover_orphan_delivered", scenario_recover_orphan_delivered),
             ("recover_orphan_delivered_aggregate_member", scenario_recover_orphan_delivered_aggregate_member),
