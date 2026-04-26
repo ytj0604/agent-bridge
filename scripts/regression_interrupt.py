@@ -3964,19 +3964,64 @@ def _write_fake_install_tree(root: Path, *, omit: Path | None = None) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         os.chmod(target, 0o644)
+    hook = root / "hooks" / "bridge-hook"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    os.chmod(hook, 0o755)
 
 
-def _run_fake_install(root: Path, bin_dir: Path, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+def _write_fake_hook_installer(root: Path, *, exit_code: int = 0, argv_file: Path | None = None) -> Path:
+    path = root / "libexec" / "agent-bridge" / "bridge_install_hooks.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    argv_literal = repr(str(argv_file)) if argv_file else "''"
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib\n"
+        "import sys\n"
+        f"argv_file = {argv_literal}\n"
+        "if argv_file:\n"
+        "    pathlib.Path(argv_file).parent.mkdir(parents=True, exist_ok=True)\n"
+        "    pathlib.Path(argv_file).write_text('\\n'.join(sys.argv[1:]) + '\\n', encoding='utf-8')\n"
+        f"raise SystemExit({int(exit_code)})\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _fake_install_env(tmpdir: Path, *, path_prefix: Path | None = None) -> dict[str, str]:
+    env = dict(os.environ)
+    env["HOME"] = str(tmpdir / "home")
+    env["XDG_BIN_HOME"] = str(tmpdir / "xdg-bin")
+    env["XDG_CONFIG_HOME"] = str(tmpdir / "xdg-config")
+    env["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
+    env["AGENT_BRIDGE_RUN_DIR"] = str(tmpdir / "run")
+    env["AGENT_BRIDGE_LOG_DIR"] = str(tmpdir / "log")
+    if path_prefix is not None:
+        env["PATH"] = f"{path_prefix}:{env.get('PATH', '')}"
+    return env
+
+
+def _run_fake_install(
+    root: Path,
+    bin_dir: Path,
+    *,
+    env: dict[str, str] | None = None,
+    skip_hooks: bool = True,
+    extra_args: list[str] | None = None,
+) -> subprocess.CompletedProcess:
+    cmd = [
+        "bash",
+        str(root / "install.sh"),
+        "--yes",
+        "--bin-dir",
+        str(bin_dir),
+    ]
+    if skip_hooks:
+        cmd.append("--skip-hooks")
+    cmd.append("--no-shell-rc")
+    cmd.extend(extra_args or [])
     return subprocess.run(
-        [
-            "bash",
-            str(root / "install.sh"),
-            "--yes",
-            "--bin-dir",
-            str(bin_dir),
-            "--skip-hooks",
-            "--no-shell-rc",
-        ],
+        cmd,
         capture_output=True,
         text=True,
         env=env,
@@ -4023,6 +4068,148 @@ def scenario_install_sh_chmods_target_or_fails(label: str, tmpdir: Path) -> None
     assert_true(proc.returncode != 0, f"{label}: chmod failure must hard fail")
     assert_true("cannot make shim target executable for agent_alarm" in proc.stderr, f"{label}: chmod failure stderr should name shim: {proc.stderr!r}")
     assert_true(not os.access(failing_root / "model-bin" / "agent_alarm", os.X_OK), f"{label}: failed chmod target should remain non-executable")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_hook_failure_hard_fails(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "hook-hard-fail"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    argv_file = tmpdir / "hook-hard-fail.argv"
+    _write_fake_hook_installer(root, exit_code=42, argv_file=argv_file)
+    proc = _run_fake_install(root, tmpdir / "shims-hook-hard-fail", skip_hooks=False, env=_fake_install_env(tmpdir))
+    assert_true(proc.returncode == 42, f"{label}: hook installer status must pass through, got {proc.returncode}: {proc.stderr!r}")
+    assert_true("install.sh: hook config install failed" in proc.stderr, f"{label}: hard-fail stderr should name hook failure: {proc.stderr!r}")
+    assert_true("shims may have been written" in proc.stderr, f"{label}: hard-fail stderr should mention partial shims: {proc.stderr!r}")
+    assert_true("Agent Bridge will not receive hook events until fixed" in proc.stderr, f"{label}: hard-fail stderr should explain hook impact: {proc.stderr!r}")
+    assert_true("bridge_healthcheck" in proc.stderr, f"{label}: hard-fail stderr should recommend healthcheck: {proc.stderr!r}")
+    assert_true("--ignore-hook-failure" in proc.stderr, f"{label}: hard-fail stderr should mention explicit escape hatch: {proc.stderr!r}")
+    assert_true("run: " not in proc.stdout, f"{label}: hard-fail stdout must not show final success hint: {proc.stdout!r}")
+    assert_true("tmux not found" not in proc.stderr, f"{label}: hard-fail must stop before tmux warning: {proc.stderr!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_hook_failure_ignore_flag_allows_success(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "hook-ignore"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    _write_fake_hook_installer(root, exit_code=42, argv_file=tmpdir / "hook-ignore.argv")
+    bin_dir = tmpdir / "shims-hook-ignore"
+    proc = _run_fake_install(
+        root,
+        bin_dir,
+        skip_hooks=False,
+        env=_fake_install_env(tmpdir),
+        extra_args=["--ignore-hook-failure"],
+    )
+    assert_true(proc.returncode == 0, f"{label}: ignore flag should allow success, got {proc.returncode}: {proc.stderr!r}")
+    assert_true("override was used" in proc.stderr, f"{label}: warning must say override was used: {proc.stderr!r}")
+    assert_true("shims were installed but hook events will not work until fixed" in proc.stderr, f"{label}: warning must explain broken hook events: {proc.stderr!r}")
+    assert_true("bridge_healthcheck" in proc.stderr, f"{label}: warning should recommend healthcheck: {proc.stderr!r}")
+    assert_true(f"run: {bin_dir}/bridge_healthcheck" in proc.stdout, f"{label}: success hint should remain after override: {proc.stdout!r}")
+    assert_true(os.access(bin_dir / "agent_alarm", os.X_OK), f"{label}: shims should be installed under override")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_hook_dry_run_failure_hard_fails(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "hook-dry-run-fail"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    argv_file = tmpdir / "hook-dry-run-fail.argv"
+    _write_fake_hook_installer(root, exit_code=42, argv_file=argv_file)
+    proc = _run_fake_install(
+        root,
+        tmpdir / "shims-hook-dry-run-fail",
+        skip_hooks=False,
+        env=_fake_install_env(tmpdir),
+        extra_args=["--dry-run"],
+    )
+    argv_text = argv_file.read_text(encoding="utf-8")
+    assert_true(proc.returncode == 42, f"{label}: dry-run hook failure must hard-fail, got {proc.returncode}: {proc.stderr!r}")
+    assert_true("--dry-run" in argv_text, f"{label}: install.sh must forward --dry-run to hook installer: {argv_text!r}")
+    assert_true("install.sh: hook config install failed" in proc.stderr, f"{label}: dry-run hard-fail should use targeted error: {proc.stderr!r}")
+    assert_true("run: " not in proc.stdout, f"{label}: dry-run hard-fail must not show final success hint: {proc.stdout!r}")
+
+    argv_override = tmpdir / "hook-dry-run-override.argv"
+    _write_fake_hook_installer(root, exit_code=42, argv_file=argv_override)
+    proc_override = _run_fake_install(
+        root,
+        tmpdir / "shims-hook-dry-run-override",
+        skip_hooks=False,
+        env=_fake_install_env(tmpdir),
+        extra_args=["--dry-run", "--ignore-hook-failure"],
+    )
+    assert_true(proc_override.returncode == 0, f"{label}: dry-run override should continue, got {proc_override.returncode}: {proc_override.stderr!r}")
+    assert_true("override was used" in proc_override.stderr, f"{label}: dry-run override warning expected: {proc_override.stderr!r}")
+    assert_true("--dry-run" in argv_override.read_text(encoding="utf-8"), f"{label}: dry-run override must still forward --dry-run")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_hook_success_succeeds(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "hook-success"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    argv_file = tmpdir / "hook-success.argv"
+    _write_fake_hook_installer(root, exit_code=0, argv_file=argv_file)
+    bin_dir = tmpdir / "shims-hook-success"
+    proc = _run_fake_install(root, bin_dir, skip_hooks=False, env=_fake_install_env(tmpdir))
+    argv_lines = argv_file.read_text(encoding="utf-8").splitlines()
+    assert_true(proc.returncode == 0, f"{label}: hook success should keep install success, got {proc.returncode}: {proc.stderr!r}")
+    assert_true("--hook-command" in argv_lines, f"{label}: hook installer should receive --hook-command: {argv_lines}")
+    assert_true(argv_lines[argv_lines.index("--hook-command") + 1] == str(root / "hooks" / "bridge-hook"), f"{label}: hook command path incorrect: {argv_lines}")
+    assert_true("--dry-run" not in argv_lines, f"{label}: non-dry-run install should not pass --dry-run: {argv_lines}")
+    assert_true(os.access(bin_dir / "agent_send_peer", os.X_OK), f"{label}: shims should be installed on hook success")
+
+    argv_dry = tmpdir / "hook-success-dry.argv"
+    _write_fake_hook_installer(root, exit_code=0, argv_file=argv_dry)
+    proc_dry = _run_fake_install(
+        root,
+        tmpdir / "shims-hook-success-dry",
+        skip_hooks=False,
+        env=_fake_install_env(tmpdir),
+        extra_args=["--dry-run"],
+    )
+    assert_true(proc_dry.returncode == 0, f"{label}: hook dry-run success should pass: {proc_dry.stderr!r}")
+    assert_true("--dry-run" in argv_dry.read_text(encoding="utf-8").splitlines(), f"{label}: dry-run should reach hook installer")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_shim_failure_still_hard_fails_under_override(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "shim-fail-override"
+    root.mkdir()
+    _write_fake_install_tree(root, omit=Path("model-bin/agent_alarm"))
+    argv_file = tmpdir / "shim-fail-override.argv"
+    _write_fake_hook_installer(root, exit_code=0, argv_file=argv_file)
+    proc = _run_fake_install(
+        root,
+        tmpdir / "shims-shim-fail-override",
+        skip_hooks=False,
+        env=_fake_install_env(tmpdir),
+        extra_args=["--ignore-hook-failure"],
+    )
+    assert_true(proc.returncode != 0, f"{label}: override must not suppress shim target failures")
+    assert_true("missing shim target for agent_alarm" in proc.stderr, f"{label}: missing shim error expected: {proc.stderr!r}")
+    assert_true("override was used" not in proc.stderr, f"{label}: hook override warning must not fire for shim failure: {proc.stderr!r}")
+    assert_true(not argv_file.exists(), f"{label}: hook installer should not run after shim failure")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_skip_hooks_with_ignore_flag_is_noop(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "skip-hooks-ignore"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    argv_file = tmpdir / "skip-hooks-ignore.argv"
+    _write_fake_hook_installer(root, exit_code=42, argv_file=argv_file)
+    proc = _run_fake_install(
+        root,
+        tmpdir / "shims-skip-hooks-ignore",
+        skip_hooks=True,
+        env=_fake_install_env(tmpdir),
+        extra_args=["--ignore-hook-failure"],
+    )
+    assert_true(proc.returncode == 0, f"{label}: skip-hooks + ignore should remain a no-op success: {proc.stderr!r}")
+    assert_true(not argv_file.exists(), f"{label}: --skip-hooks must not invoke hook installer")
+    assert_true("hook config install failed" not in proc.stderr, f"{label}: no hook failure warning expected when hooks skipped: {proc.stderr!r}")
     print(f"  PASS  {label}")
 
 
@@ -7155,6 +7342,12 @@ def main() -> int:
             ("direct_exec_targets_executable", scenario_direct_exec_targets_executable),
             ("healthcheck_executable_helper_distinguishes_states", scenario_healthcheck_executable_helper_distinguishes_states),
             ("install_sh_chmods_target_or_fails", scenario_install_sh_chmods_target_or_fails),
+            ("install_sh_hook_failure_hard_fails", scenario_install_sh_hook_failure_hard_fails),
+            ("install_sh_hook_failure_ignore_flag_allows_success", scenario_install_sh_hook_failure_ignore_flag_allows_success),
+            ("install_sh_hook_dry_run_failure_hard_fails", scenario_install_sh_hook_dry_run_failure_hard_fails),
+            ("install_sh_hook_success_succeeds", scenario_install_sh_hook_success_succeeds),
+            ("install_sh_shim_failure_still_hard_fails_under_override", scenario_install_sh_shim_failure_still_hard_fails_under_override),
+            ("install_sh_skip_hooks_with_ignore_flag_is_noop", scenario_install_sh_skip_hooks_with_ignore_flag_is_noop),
             ("restart_dry_run_no_side_effect", scenario_restart_dry_run_no_side_effect),
             ("recover_orphan_delivered", scenario_recover_orphan_delivered),
             ("recover_orphan_delivered_aggregate_member", scenario_recover_orphan_delivered_aggregate_member),

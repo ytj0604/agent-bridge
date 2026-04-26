@@ -25,6 +25,8 @@ Each room is a background daemon attached to existing tmux panes (the bridge doe
 ./install.sh --yes   # non-interactive, auto-append PATH
 ```
 
+Hook config install failure is fatal by default. Use `--skip-hooks` for a shim-only install that should not touch hooks. Use `--ignore-hook-failure` only as an explicit diagnostic escape hatch when you want shims installed even though hook events will not work until fixed; it has no effect with `--skip-hooks`.
+
 After install:
 
 1. **Reload your shell** (`source ~/.bashrc`) or open a new terminal so the new shims are on `PATH`.

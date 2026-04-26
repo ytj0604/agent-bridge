@@ -7,12 +7,16 @@ bin_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"
 yes="0"
 dry_run="0"
 install_hooks="1"
+ignore_hook_failure="0"
 update_shell_rc="ask"
 
 usage() {
   local code="${1:-2}"
   cat >&2 <<'EOF'
-usage: install.sh [--yes] [--dry-run] [--bin-dir DIR] [--skip-hooks] [--no-shell-rc]
+usage: install.sh [--yes] [--dry-run] [--bin-dir DIR] [--skip-hooks] [--ignore-hook-failure] [--no-shell-rc]
+
+  --skip-hooks            do not run hook config installation
+  --ignore-hook-failure   explicit shim-only/diagnostic escape hatch; only applies when hook installation runs
 EOF
   exit "$code"
 }
@@ -33,6 +37,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-hooks)
       install_hooks="0"
+      shift
+      ;;
+    --ignore-hook-failure)
+      ignore_hook_failure="1"
       shift
       ;;
     --no-shell-rc)
@@ -123,8 +131,25 @@ if [[ "$install_hooks" == "1" ]]; then
     args+=(--dry-run)
   fi
   echo "install hooks via $hook_command"
-  if ! python3 "${args[@]}"; then
-    echo "warning: hook config install failed; shims were installed, run bridge_healthcheck for details" >&2
+  if python3 "${args[@]}"; then
+    :
+  else
+    status="$?"
+    if [[ "$ignore_hook_failure" == "1" ]]; then
+      {
+        echo "WARNING: install.sh: hook config install failed, but --ignore-hook-failure override was used."
+        echo "WARNING: shims were installed but hook events will not work until fixed."
+        echo "WARNING: run $bin_dir/bridge_healthcheck or bridge_healthcheck for details."
+      } >&2
+    else
+      {
+        echo "install.sh: hook config install failed (exit $status)."
+        echo "install.sh: shims may have been written, but Agent Bridge will not receive hook events until fixed."
+        echo "install.sh: run $bin_dir/bridge_healthcheck or bridge_healthcheck for details."
+        echo "install.sh: pass --ignore-hook-failure only for an explicit shim-only/diagnostic install."
+      } >&2
+      exit "$status"
+    fi
   fi
 fi
 
