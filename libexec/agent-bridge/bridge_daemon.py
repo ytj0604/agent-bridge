@@ -3096,6 +3096,27 @@ class BridgeDaemon:
         )
         self.cancel_watchdogs_for_message(context.get("id"), reason="reply_received")
 
+    def _cleanup_terminal_context_locked(self, sender: str, context: dict, *, watchdog_reason: str) -> None:
+        msg_id = context.get("id")
+        if msg_id:
+            self.remove_delivered_message(sender, msg_id)
+            self.last_enter_ts.pop(str(msg_id), None)
+            # Aggregate watchdogs are cancelled inside collect_aggregate_response
+            # when the aggregate completes; only cancel the per-message
+            # watchdog here for non-aggregate messages.
+            if not context.get("aggregate_id"):
+                self.cancel_watchdogs_for_message(str(msg_id), reason=watchdog_reason)
+        ctx_nonce = context.get("nonce")
+        if ctx_nonce:
+            self.discard_nonce(str(ctx_nonce))
+        self.busy[sender] = False
+        self.reserved[sender] = None
+        # v1.5.2 consume-once: a peer request gets exactly one terminal
+        # response path. Held-drain skips this helper. turn_id_mismatch keeps
+        # ctx only until bounded maintenance expiry, unless the matching Stop
+        # arrives first and reaches terminal cleanup.
+        self.current_prompt_by_agent.pop(sender, None)
+
     def handle_response_finished(self, record: dict) -> None:
         self.reload_participants()
         sender = self.participant_alias(record)
@@ -3107,6 +3128,7 @@ class BridgeDaemon:
         # nor trigger try_deliver against an unrelated active turn — doing
         # so could cause the bridge to inject a fresh prompt on top of a
         # peer that is still mid-turn.
+        run_delivery_after_lock = False
         with self.state_lock:
             text = record.get("last_assistant_message") or ""
             context = self.current_prompt_by_agent.get(sender) or {}
@@ -3171,6 +3193,11 @@ class BridgeDaemon:
                 has_current_context=bool(context),
             )
             if interrupted_tombstone:
+                active_id = str(context.get("id") or "")
+                tombstone_message_id = str(interrupted_tombstone.get("message_id") or "")
+                id_match = bool(active_id and tombstone_message_id and active_id == tombstone_message_id)
+                turn_match = bool(response_turn_id and context_turn_id and response_turn_id == context_turn_id)
+                is_concrete_current = id_match or turn_match
                 self._pop_interrupted_tombstone(sender, interrupted_tombstone)
                 if first_time:
                     self.log(
@@ -3184,8 +3211,16 @@ class BridgeDaemon:
                         interrupted_turn_id=interrupted_tombstone.get("turn_id"),
                         interrupted_nonce=interrupted_tombstone.get("nonce"),
                     )
-                return
-            if interrupted_reason and first_time:
+                if is_concrete_current:
+                    self._cleanup_terminal_context_locked(
+                        sender,
+                        context,
+                        watchdog_reason="interrupted_tombstone_terminal",
+                    )
+                    run_delivery_after_lock = True
+                else:
+                    return
+            if not run_delivery_after_lock and interrupted_reason and first_time:
                 self.log(
                     "interrupted_response_ambiguous",
                     agent=sender,
@@ -3198,7 +3233,7 @@ class BridgeDaemon:
                     ],
                 )
 
-            if in_held:
+            if not run_delivery_after_lock and in_held:
                 # The held-target interrupt is being drained: this Stop
                 # event confirms the peer aborted the interrupted turn
                 # and is now idle. Release hold but do NOT route the
@@ -3261,7 +3296,7 @@ class BridgeDaemon:
                 self.try_deliver()
                 return
 
-            if turn_id_mismatch:
+            if not run_delivery_after_lock and turn_id_mismatch:
                 # A late Stop event for an old turn arrived while the peer
                 # is processing a new turn. Skip routing now; a maintenance
                 # sweep expires the active context later if the matching Stop
@@ -3284,37 +3319,17 @@ class BridgeDaemon:
                     )
                 return
 
-            # Normal terminal path: route (if applicable) and remove the
-            # delivered message from queue regardless of whether routing
-            # actually delivered text (notices, empty responses, inactive
-            # requesters all still terminate the message). Watchdog cancel
-            # also happens here, decoupled from routing success — otherwise
-            # a request whose response was empty / had no active requester
-            # would leave its watchdog alive and fire a bogus wake later.
-            if first_time:
-                self.maybe_return_response(sender, text, context)
-            msg_id = context.get("id")
-            if msg_id:
-                self.remove_delivered_message(sender, msg_id)
-                self.last_enter_ts.pop(str(msg_id), None)
-                # Aggregate watchdogs are cancelled inside collect_aggregate_response
-                # when the aggregate completes; only cancel the per-message
-                # watchdog here for non-aggregate messages.
-                if not context.get("aggregate_id"):
-                    self.cancel_watchdogs_for_message(str(msg_id), reason="terminal_response")
-            ctx_nonce = context.get("nonce")
-            if ctx_nonce:
-                self.discard_nonce(str(ctx_nonce))
-            self.busy[sender] = False
-            self.reserved[sender] = None
-            # v1.5.2 consume-once: a peer request gets exactly one
-            # auto-routed reply. Subsequent response_finished events
-            # without a fresh prompt_submitted (e.g., system reminders
-            # that don't fire UPS hooks) must NOT re-route to the peer.
-            # Held-drain skips this pop. turn_id_mismatch keeps ctx only
-            # until its bounded maintenance expiry, unless the matching Stop
-            # arrives first and reaches this normal terminal path.
-            self.current_prompt_by_agent.pop(sender, None)
+            if not run_delivery_after_lock:
+                # Normal terminal path: route (if applicable) and remove the
+                # delivered message from queue regardless of whether routing
+                # actually delivered text (notices, empty responses, inactive
+                # requesters all still terminate the message). Watchdog cancel
+                # also happens here, decoupled from routing success — otherwise
+                # a request whose response was empty / had no active requester
+                # would leave its watchdog alive and fire a bogus wake later.
+                if first_time:
+                    self.maybe_return_response(sender, text, context)
+                self._cleanup_terminal_context_locked(sender, context, watchdog_reason="terminal_response")
         self.try_deliver(sender)
         self.try_deliver()
 

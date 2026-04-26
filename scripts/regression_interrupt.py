@@ -698,6 +698,153 @@ def scenario_interrupted_empty_values_do_not_match_tombstone(label: str, tmpdir:
     print(f"  PASS  {label}")
 
 
+def scenario_interrupted_tombstone_current_ctx_id_match_cleans(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _active_turn(d, message_id="msg-current-id", frm="alice", to="bob", nonce="n-current-id", turn_id="turn-current")
+    _plant_watchdog(d, "wake-current-id", sender="alice", message_id="msg-current-id", to="bob")
+    d.interrupted_turns["bob"] = [{
+        "message_id": "msg-current-id",
+        "turn_id": "",
+        "nonce": "n-current-id",
+        "prior_sender": "alice",
+        "by_sender": "alice",
+        "cancelled_message_ids": ["msg-current-id"],
+        "interrupted_ts": time.time(),
+        "prompt_submitted_seen": True,
+        "superseded_by_prompt": False,
+    }]
+
+    d.handle_response_finished({"agent": "bob", "bridge_agent": "bob", "turn_id": None, "last_assistant_message": "suppressed"})
+
+    assert_true("bob" not in d.interrupted_turns, f"{label}: tombstone should be popped")
+    assert_true(_queue_item(d, "msg-current-id") is None, f"{label}: delivered row should be removed")
+    assert_true("wake-current-id" not in d.watchdogs, f"{label}: per-message watchdog should be cancelled")
+    assert_true(d.current_prompt_by_agent.get("bob") is None, f"{label}: current ctx should be cleared")
+    assert_true(d.busy.get("bob") is False, f"{label}: busy should clear")
+    assert_true("msg-current-id" not in d.last_enter_ts, f"{label}: last_enter_ts should clear")
+    assert_true("n-current-id" not in d.injected_by_nonce, f"{label}: nonce cache should clear")
+    assert_true(_auto_return_results(d, "bob", "alice") == [], f"{label}: tombstone terminal must suppress text")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    cancellations = [e for e in events if e.get("event") == "watchdog_cancelled" and e.get("ref_message_id") == "msg-current-id"]
+    assert_true(len(cancellations) == 1 and cancellations[0].get("reason") == "interrupted_tombstone_terminal", f"{label}: cancel reason expected: {cancellations}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupted_tombstone_current_ctx_turn_match_cleans(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _active_turn(d, message_id="msg-current-turn", frm="alice", to="bob", nonce="n-current-turn", turn_id="turn-current")
+    _plant_watchdog(d, "wake-current-turn", sender="alice", message_id="msg-current-turn", to="bob")
+    d.interrupted_turns["bob"] = [{
+        "message_id": "msg-other",
+        "turn_id": "turn-current",
+        "nonce": "n-other",
+        "prior_sender": "alice",
+        "by_sender": "alice",
+        "cancelled_message_ids": ["msg-other"],
+        "interrupted_ts": time.time(),
+        "prompt_submitted_seen": True,
+        "superseded_by_prompt": False,
+    }]
+
+    d.handle_response_finished({"agent": "bob", "bridge_agent": "bob", "turn_id": "turn-current", "last_assistant_message": "suppressed"})
+
+    assert_true("bob" not in d.interrupted_turns, f"{label}: tombstone should be popped")
+    assert_true(_queue_item(d, "msg-current-turn") is None, f"{label}: delivered row should be removed")
+    assert_true("wake-current-turn" not in d.watchdogs, f"{label}: turn-matched watchdog should be cancelled")
+    assert_true(d.current_prompt_by_agent.get("bob") is None, f"{label}: turn-matched ctx should be cleared")
+    assert_true(d.busy.get("bob") is False, f"{label}: busy should clear")
+    assert_true(_auto_return_results(d, "bob", "alice") == [], f"{label}: tombstone terminal must suppress text")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupted_tombstone_stale_stop_preserves_replacement_watchdog(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _active_turn(d, message_id="msg-new", frm="alice", to="bob", nonce="n-new", turn_id="turn-new")
+    _plant_watchdog(d, "wake-new", sender="alice", message_id="msg-new", to="bob")
+    d.interrupted_turns["bob"] = [{
+        "message_id": "msg-old",
+        "turn_id": "turn-old",
+        "nonce": "n-old",
+        "prior_sender": "alice",
+        "by_sender": "alice",
+        "cancelled_message_ids": ["msg-old"],
+        "interrupted_ts": time.time(),
+        "prompt_submitted_seen": True,
+        "superseded_by_prompt": False,
+    }]
+
+    d.handle_response_finished({"agent": "bob", "bridge_agent": "bob", "turn_id": "turn-old", "last_assistant_message": "late old"})
+
+    assert_true("bob" not in d.interrupted_turns, f"{label}: stale tombstone should be consumed")
+    ctx = d.current_prompt_by_agent.get("bob") or {}
+    assert_true(ctx.get("id") == "msg-new", f"{label}: replacement ctx must remain")
+    assert_true((_queue_item(d, "msg-new") or {}).get("status") == "delivered", f"{label}: replacement row must remain delivered")
+    assert_true("wake-new" in d.watchdogs, f"{label}: replacement watchdog must remain")
+    assert_true(d.busy.get("bob") is True, f"{label}: replacement busy state must remain")
+    assert_true(_auto_return_results(d, "bob", "alice") == [], f"{label}: stale tombstone must not auto-route")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupted_tombstone_aggregate_ctx_does_not_cancel_aggregate_watchdog(label: str, tmpdir: Path) -> None:
+    participants = {
+        "manager": {"alias": "manager", "agent_type": "claude", "pane": "%97"},
+        "w1": {"alias": "w1", "agent_type": "codex", "pane": "%96"},
+        "w2": {"alias": "w2", "agent_type": "codex", "pane": "%95"},
+    }
+    d = make_daemon(tmpdir, participants)
+    agg_id = "agg-tombstone-terminal"
+    _active_turn(
+        d,
+        message_id="msg-agg-w1",
+        frm="manager",
+        to="w1",
+        nonce="n-agg-w1",
+        turn_id="turn-agg-w1",
+        aggregate_id=agg_id,
+        aggregate_expected=["w1", "w2"],
+        aggregate_message_ids={"w1": "msg-agg-w1", "w2": "msg-agg-w2"},
+    )
+    _plant_watchdog(d, "wake-agg-terminal", sender="manager", message_id="msg-agg-w1", aggregate_id=agg_id, to="w1")
+    d.interrupted_turns["w1"] = [{
+        "message_id": "msg-agg-w1",
+        "turn_id": "turn-agg-w1",
+        "nonce": "n-agg-w1",
+        "prior_sender": "manager",
+        "by_sender": "manager",
+        "cancelled_message_ids": ["msg-agg-w1"],
+        "interrupted_ts": time.time(),
+        "prompt_submitted_seen": True,
+        "superseded_by_prompt": False,
+    }]
+
+    d.handle_response_finished({"agent": "w1", "bridge_agent": "w1", "turn_id": "turn-agg-w1", "last_assistant_message": "must not collect"})
+
+    assert_true(_queue_item(d, "msg-agg-w1") is None, f"{label}: aggregate leg row should be removed")
+    assert_true(d.current_prompt_by_agent.get("w1") is None, f"{label}: aggregate local ctx should clear")
+    assert_true(d.busy.get("w1") is False, f"{label}: aggregate local busy should clear")
+    assert_true("n-agg-w1" not in d.injected_by_nonce, f"{label}: aggregate nonce should clear")
+    assert_true("msg-agg-w1" not in d.last_enter_ts, f"{label}: aggregate last_enter should clear")
+    assert_true("wake-agg-terminal" in d.watchdogs, f"{label}: aggregate watchdog must remain")
+    aggregate_data = read_json(Path(d.aggregate_file), {"aggregates": {}})
+    replies = ((aggregate_data.get("aggregates") or {}).get(agg_id) or {}).get("replies") or {}
+    assert_true(replies == {}, f"{label}: tombstone text must not collect aggregate reply")
+    queued = d.queue.read()
+    assert_true(not any(item.get("kind") == "result" and item.get("source") in {"auto_return", "aggregate_return"} for item in queued), f"{label}: tombstone terminal must not synthesize result")
+    print(f"  PASS  {label}")
+
+
 def scenario_aggregate_late_real_stop_after_interrupt_does_not_overwrite(label: str, tmpdir: Path) -> None:
     participants = {
         "manager": {"alias": "manager", "agent_type": "claude", "pane": "%97"},
@@ -7799,6 +7946,10 @@ def main() -> int:
             ("interrupted_no_turn_race_routes_replacement_then_suppresses_old", scenario_interrupted_no_turn_race_routes_replacement_then_suppresses_old),
             ("interrupted_inflight_tombstone_retains_on_unrelated_stop", scenario_interrupted_inflight_tombstone_retains_on_unrelated_stop),
             ("interrupted_empty_values_do_not_match_tombstone", scenario_interrupted_empty_values_do_not_match_tombstone),
+            ("interrupted_tombstone_current_ctx_id_match_cleans", scenario_interrupted_tombstone_current_ctx_id_match_cleans),
+            ("interrupted_tombstone_current_ctx_turn_match_cleans", scenario_interrupted_tombstone_current_ctx_turn_match_cleans),
+            ("interrupted_tombstone_stale_stop_preserves_replacement_watchdog", scenario_interrupted_tombstone_stale_stop_preserves_replacement_watchdog),
+            ("interrupted_tombstone_aggregate_ctx_does_not_cancel_aggregate_watchdog", scenario_interrupted_tombstone_aggregate_ctx_does_not_cancel_aggregate_watchdog),
             ("aggregate_late_real_stop_after_interrupt_does_not_overwrite", scenario_aggregate_late_real_stop_after_interrupt_does_not_overwrite),
             ("watchdog_cancel_on_empty_response", scenario_watchdog_cancel_on_empty_response),
             ("alarm_cancelled_by_qualifying_request", scenario_alarm_cancelled_by_qualifying_request),
