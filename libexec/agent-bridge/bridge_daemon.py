@@ -266,7 +266,7 @@ def pane_mode_block_since_ts(item: dict) -> float | None:
         return None
 
 
-def build_peer_prompt(message: dict, nonce: str, max_hops: int) -> str:
+def build_peer_prompt(message: dict, nonce: str) -> str:
     sender = str(message["from"])
     kind = normalize_kind(message.get("kind"), "request")
     details = [f"from={sender}", f"kind={kind}"]
@@ -350,7 +350,6 @@ class BridgeDaemon:
         self.participants: dict[str, dict] = {}
         self.panes: dict[str, str] = {}
         self.session_mtime_ns: int | None = None
-        self.max_hops = args.max_hops
         self.submit_delay = args.submit_delay
         self.submit_timeout = args.submit_timeout
         self.pane_mode_grace_seconds, self.pane_mode_grace_warning = resolve_pane_mode_grace_seconds()
@@ -1467,7 +1466,7 @@ class BridgeDaemon:
                 normalized_chars=len(normalized_body_text),
                 limit_chars=MAX_PEER_BODY_CHARS,
             )
-        prompt = build_peer_prompt(message, nonce, self.max_hops)
+        prompt = build_peer_prompt(message, nonce)
         enter_deferred = False
 
         try:
@@ -3701,7 +3700,6 @@ class BridgeDaemon:
                     participants=sorted(self.participants),
                     panes=self.panes,
                     bridge_session=self.bridge_session,
-                    max_hops=self.max_hops,
                     dry_run=self.dry_run,
                     command_socket=str(self.command_socket) if self.command_socket else "",
                     pane_mode_grace_seconds=self.pane_mode_grace_seconds,
@@ -3787,7 +3785,6 @@ def main() -> int:
     parser.add_argument("--state-file", default=str(state_root() / "events.jsonl"))
     parser.add_argument("--public-state-file")
     parser.add_argument("--queue-file", default=str(state_root() / "pending.json"))
-    parser.add_argument("--max-hops", type=int, default=4)
     parser.add_argument("--submit-delay", type=float, default=1.0)
     parser.add_argument("--submit-timeout", type=float, default=20.0)
     parser.add_argument("--from-start", action="store_true")

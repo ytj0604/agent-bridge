@@ -97,8 +97,6 @@ def daemon_command(args: argparse.Namespace) -> list[str]:
         cmd += ["--claude-pane", args.claude_pane]
     if args.codex_pane:
         cmd += ["--codex-pane", args.codex_pane]
-    if args.max_hops is not None:
-        cmd += ["--max-hops", str(args.max_hops)]
     if args.submit_delay is not None:
         cmd += ["--submit-delay", str(args.submit_delay)]
     if args.submit_timeout is not None:
@@ -449,7 +447,6 @@ def ensure_args_from_state(session: str, state: dict, args: argparse.Namespace) 
         dry_run=args.dry_run,
         health_delay=args.health_delay,
         stop_timeout=args.stop_timeout,
-        max_hops=args.max_hops,
         submit_delay=args.submit_delay,
         submit_timeout=args.submit_timeout,
     )
@@ -800,7 +797,6 @@ def main() -> int:
     p_start.add_argument("--from-start", action="store_true")
     p_start.add_argument("--health-delay", type=float, default=0.35)
     p_start.add_argument("--stop-timeout", type=float, default=5.0)
-    p_start.add_argument("--max-hops", type=int)
     p_start.add_argument("--submit-delay", type=float)
     p_start.add_argument("--submit-timeout", type=float)
 
@@ -818,7 +814,6 @@ def main() -> int:
     p_ensure.add_argument("--dry-run", action="store_true")
     p_ensure.add_argument("--health-delay", type=float, default=0.35)
     p_ensure.add_argument("--stop-timeout", type=float, default=5.0)
-    p_ensure.add_argument("--max-hops", type=int)
     p_ensure.add_argument("--submit-delay", type=float)
     p_ensure.add_argument("--submit-timeout", type=float)
 
@@ -844,7 +839,6 @@ def main() -> int:
     )
     p_restart.add_argument("--health-delay", type=float, default=0.35)
     p_restart.add_argument("--stop-timeout", type=float, default=5.0)
-    p_restart.add_argument("--max-hops", type=int)
     p_restart.add_argument("--submit-delay", type=float)
     p_restart.add_argument("--submit-timeout", type=float)
     p_restart.add_argument("--dry-run", action="store_true")

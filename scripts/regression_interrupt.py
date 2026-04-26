@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import errno
+import inspect
 import json
 import os
 import shutil
@@ -77,7 +78,6 @@ def make_daemon(tmpdir: Path, participants: dict[str, dict]) -> bridge_daemon.Br
         state_file=str(state_file),
         public_state_file=str(public_state_file),
         queue_file=str(queue_file),
-        max_hops=4,
         submit_delay=0.0,
         submit_timeout=5.0,
         from_start=False,
@@ -2079,7 +2079,6 @@ def scenario_daemon_command_forwards_from_start(label: str, tmpdir: Path) -> Non
         queue_file=str(tmpdir / "pending.json"),
         claude_pane="",
         codex_pane="",
-        max_hops=None,
         submit_delay=None,
         submit_timeout=None,
         from_start=True,
@@ -2089,6 +2088,111 @@ def scenario_daemon_command_forwards_from_start(label: str, tmpdir: Path) -> Non
     args.from_start = False
     cmd_without = ctl.daemon_command(args)
     assert_true("--from-start" not in cmd_without, f"{label}: daemon_command must omit from_start=False: {cmd_without}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_command_ignores_legacy_max_hops(label: str, tmpdir: Path) -> None:
+    ctl = _import_daemon_ctl()
+    args = argparse.Namespace(
+        session="test-session",
+        state_file=str(tmpdir / "events.raw.jsonl"),
+        public_state_file=str(tmpdir / "events.jsonl"),
+        queue_file=str(tmpdir / "pending.json"),
+        claude_pane="",
+        codex_pane="",
+        submit_delay=None,
+        submit_timeout=None,
+        from_start=False,
+        max_hops=9,
+    )
+    cmd = ctl.daemon_command(args)
+    assert_true("--max-hops" not in cmd, f"{label}: daemon_command must ignore stale max_hops attr: {cmd}")
+    print(f"  PASS  {label}")
+
+
+def _run_daemon_ctl_main_isolated(tmpdir: Path, argv: list[str]) -> tuple[int, str, str]:
+    import contextlib
+    import importlib
+    import io
+
+    ctl = _import_daemon_ctl()
+    old_argv = sys.argv[:]
+    old_env = {key: os.environ.get(key) for key in ("AGENT_BRIDGE_STATE_DIR", "AGENT_BRIDGE_RUN_DIR", "AGENT_BRIDGE_LOG_DIR")}
+    out = io.StringIO()
+    err = io.StringIO()
+    try:
+        os.environ["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
+        os.environ["AGENT_BRIDGE_RUN_DIR"] = str(tmpdir / "run")
+        os.environ["AGENT_BRIDGE_LOG_DIR"] = str(tmpdir / "log")
+        importlib.reload(ctl)
+        sys.argv = ["bridge_daemon_ctl.py", *argv]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = ctl.main()
+            except SystemExit as exc:
+                code = int(exc.code or 0) if isinstance(exc.code, int) else 1
+    finally:
+        sys.argv = old_argv
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        importlib.reload(ctl)
+    return code, out.getvalue(), err.getvalue()
+
+
+def scenario_bridge_daemon_ctl_subcommands_reject_max_hops(label: str, tmpdir: Path) -> None:
+    base_start = [
+        "start",
+        "-s", "test-session",
+        "--state-file", str(tmpdir / "events.raw.jsonl"),
+        "--public-state-file", str(tmpdir / "events.jsonl"),
+        "--queue-file", str(tmpdir / "pending.json"),
+        "--dry-run",
+        "--json",
+    ]
+    cases = [
+        ("start", [*base_start, "--max-hops", "9"]),
+        ("ensure", ["ensure", "-s", "test-session", "--dry-run", "--json", "--max-hops", "9"]),
+        ("restart", ["restart", "-s", "test-session", "--dry-run", "--json", "--max-hops", "9"]),
+    ]
+    for subcommand, argv in cases:
+        code, out, err = _run_daemon_ctl_main_isolated(tmpdir / subcommand, argv)
+        assert_true(code == 2, f"{label}: {subcommand} should reject --max-hops with exit 2, got {code}, out={out!r}, err={err!r}")
+        assert_true("--max-hops" in err, f"{label}: {subcommand} stderr should mention --max-hops: {err!r}")
+        assert_true("unrecognized arguments" in err, f"{label}: {subcommand} stderr should be argparse-owned: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_daemon_rejects_max_hops_cli(label: str, tmpdir: Path) -> None:
+    state_file = tmpdir / "events.raw.jsonl"
+    public_state_file = tmpdir / "events.jsonl"
+    queue_file = tmpdir / "pending.json"
+    session_file = tmpdir / "session.json"
+    state_file.touch()
+    public_state_file.touch()
+    queue_file.write_text("[]", encoding="utf-8")
+    session_file.write_text(json.dumps({"session": "test-session", "participants": {}}, ensure_ascii=True), encoding="utf-8")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(LIBEXEC / "bridge_daemon.py"),
+            "--state-file", str(state_file),
+            "--public-state-file", str(public_state_file),
+            "--queue-file", str(queue_file),
+            "--session-file", str(session_file),
+            "--bridge-session", "test-session",
+            "--once",
+            "--dry-run",
+            "--max-hops", "9",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert_true(proc.returncode == 2, f"{label}: daemon CLI should reject --max-hops with exit 2, got {proc.returncode}")
+    assert_true("--max-hops" in proc.stderr and "unrecognized arguments" in proc.stderr, f"{label}: stderr should be argparse-owned: {proc.stderr!r}")
     print(f"  PASS  {label}")
 
 
@@ -2115,7 +2219,6 @@ def scenario_bridge_daemon_ctl_start_argv_includes_from_start_end_to_end(label: 
             replace=True,
             dry_run=True,
             stop_timeout=1.0,
-            max_hops=None,
             submit_delay=None,
             submit_timeout=None,
             from_start=True,
@@ -2201,9 +2304,11 @@ def scenario_daemon_follow_from_start_handles_self_daemon_started_safely(label: 
     d.follow()
     after_queue = d.queue.read()
     events = read_events(d.state_file)
+    daemon_started = next((e for e in events if e.get("event") == "daemon_started"), None)
     assert_true(d.participants == before_participants, f"{label}: daemon_started self-record must not mutate participants")
     assert_true(after_queue == before_queue, f"{label}: daemon_started self-record must not mutate queue: {after_queue}")
-    assert_true(any(e.get("event") == "daemon_started" for e in events), f"{label}: daemon_started should be logged")
+    assert_true(daemon_started is not None, f"{label}: daemon_started should be logged")
+    assert_true("max_hops" not in daemon_started, f"{label}: daemon_started must not report removed max_hops option: {daemon_started}")
     assert_true(not any(e.get("event") == "record_handler_failed" for e in events), f"{label}: daemon_started replay must not fail handler: {events}")
     print(f"  PASS  {label}")
 
@@ -4486,7 +4591,7 @@ def scenario_restart_dry_run_no_side_effect(label: str, tmpdir: Path) -> None:
             return original(args, paths)
 
         ctl.start_under_lock = trap
-        ns = argparse.Namespace(dry_run=True, force=False, json=False, health_delay=0.1, stop_timeout=1.0, max_hops=None, submit_delay=None, submit_timeout=None)
+        ns = argparse.Namespace(dry_run=True, force=False, json=False, health_delay=0.1, stop_timeout=1.0, submit_delay=None, submit_timeout=None)
         result = ctl.restart_one("test-session", ns)
         assert_true(called["n"] == 0, f"{label}: start_under_lock must NOT be called for dry-run, was called {called['n']} times")
         assert_true(result.get("dry_run") is True, f"{label}: result.dry_run=True")
@@ -7444,7 +7549,7 @@ def scenario_alarm_cancel_preserves_at_limit_body(label: str, tmpdir: Path) -> N
     assert_true(visible_body.startswith("[bridge:alarm_cancelled]"), f"{label}: recipient-visible body must include cancellation signal")
     assert_true(original in visible_body, f"{label}: alarm notice must not truncate or displace at-limit user body")
     assert_true(len(visible_body) <= MAX_PEER_BODY_CHARS, f"{label}: visible body must stay within daemon prompt guard")
-    prompt = bridge_daemon.build_peer_prompt(queued, "nonce-test", 4)
+    prompt = bridge_daemon.build_peer_prompt(queued, "nonce-test")
     assert_true("[bridge:alarm_cancelled]" in prompt and "[bridge truncated peer body]" not in prompt, f"{label}: in-band prompt carries clean alarm signal without truncation")
     events = read_events(tmpdir / "events.raw.jsonl")
     alarm_events = [e for e in events if e.get("event") == "alarm_cancelled_by_message"]
@@ -7473,12 +7578,29 @@ def scenario_prompt_body_preserves_multiline_and_sanitizes(label: str, tmpdir: P
 
     msg = test_message("msg-multiline")
     msg["body"] = "first\nsecond\tline"
-    prompt = bridge_daemon.build_peer_prompt(msg, "nonce-multiline", 4)
+    prompt = bridge_daemon.build_peer_prompt(msg, "nonce-multiline")
     lines = prompt.splitlines()
     assert_true(len(lines) == 2, f"{label}: prompt should contain exactly body newline: {prompt!r}")
     assert_true(lines[0].startswith("[bridge:nonce-multiline] "), f"{label}: prefix must stay on the first line: {prompt!r}")
     assert_true(lines[0].endswith("Request: first") and lines[1] == "second\tline", f"{label}: body lines should be literal: {prompt!r}")
     assert_true(bridge_hook_logger.extract_nonce(prompt) == "nonce-multiline", f"{label}: nonce extraction must still match prompt start")
+    print(f"  PASS  {label}")
+
+
+def scenario_build_peer_prompt_signature_drops_max_hops(label: str, tmpdir: Path) -> None:
+    params = inspect.signature(bridge_daemon.build_peer_prompt).parameters
+    assert_true(set(params.keys()) == {"message", "nonce"}, f"{label}: build_peer_prompt params should be message+nonce only, got {list(params)}")
+    msg = test_message("msg-prompt-signature", frm="alice", to="bob")
+    msg["body"] = "hello"
+    msg["kind"] = "request"
+    prompt = bridge_daemon.build_peer_prompt(msg, "nonce-sig")
+    expected = (
+        "[bridge:nonce-sig] from=alice kind=request "
+        f"causal_id={msg['causal_id']}. "
+        "Reply normally; do not call agent_send_peer; bridge auto-returns your reply. "
+        "Request: hello"
+    )
+    assert_true(prompt == expected, f"{label}: prompt output changed: {prompt!r} != {expected!r}")
     print(f"  PASS  {label}")
 
 
@@ -7582,7 +7704,7 @@ def scenario_daemon_logs_body_truncated_for_legacy_long_body(label: str, tmpdir:
     d = make_daemon(tmpdir, participants)
     legacy = test_message("msg-legacy-long", frm="alice", to="bob")
     legacy["body"] = "x" * (MAX_PEER_BODY_CHARS + 1)
-    prompt = bridge_daemon.build_peer_prompt(legacy, "nonce-test", 4)
+    prompt = bridge_daemon.build_peer_prompt(legacy, "nonce-test")
     assert_true("[bridge truncated peer body]" in prompt, f"{label}: direct prompt build includes truncation marker")
     assert_true(prompt.count("x") == MAX_PEER_BODY_CHARS, f"{label}: direct prompt build keeps exactly prompt limit chars")
 
@@ -8020,6 +8142,9 @@ def main() -> int:
             ("bridge_attach_start_daemon_argv_includes_from_start", scenario_bridge_attach_start_daemon_argv_includes_from_start),
             ("bridge_daemon_ctl_start_subparser_accepts_from_start", scenario_bridge_daemon_ctl_start_subparser_accepts_from_start),
             ("daemon_command_forwards_from_start", scenario_daemon_command_forwards_from_start),
+            ("daemon_command_ignores_legacy_max_hops", scenario_daemon_command_ignores_legacy_max_hops),
+            ("bridge_daemon_ctl_subcommands_reject_max_hops", scenario_bridge_daemon_ctl_subcommands_reject_max_hops),
+            ("bridge_daemon_rejects_max_hops_cli", scenario_bridge_daemon_rejects_max_hops_cli),
             ("bridge_daemon_ctl_start_argv_includes_from_start_end_to_end", scenario_bridge_daemon_ctl_start_argv_includes_from_start_end_to_end),
             ("daemon_follow_from_start_replays_prompt_submitted", scenario_daemon_follow_from_start_replays_prompt_submitted),
             ("daemon_follow_from_start_false_skips_pre_existing_record", scenario_daemon_follow_from_start_false_skips_pre_existing_record),
@@ -8229,6 +8354,7 @@ def main() -> int:
             ("enqueue_stdin_rejects_oversized_body_unchanged", scenario_enqueue_stdin_rejects_oversized_body_unchanged),
             ("alarm_cancel_preserves_at_limit_body", scenario_alarm_cancel_preserves_at_limit_body),
             ("prompt_body_preserves_multiline_and_sanitizes", scenario_prompt_body_preserves_multiline_and_sanitizes),
+            ("build_peer_prompt_signature_drops_max_hops", scenario_build_peer_prompt_signature_drops_max_hops),
             ("tmux_paste_buffer_delivery_sequence", scenario_tmux_paste_buffer_delivery_sequence),
             ("daemon_logs_body_truncated_for_legacy_long_body", scenario_daemon_logs_body_truncated_for_legacy_long_body),
             ("response_send_guard_socket_cli_error_kind", scenario_response_send_guard_socket_cli_error_kind),
