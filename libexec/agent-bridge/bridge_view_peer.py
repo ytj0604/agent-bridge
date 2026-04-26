@@ -5,6 +5,7 @@ import argparse
 from contextlib import contextmanager
 import errno
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,13 +28,64 @@ SNAPSHOT_CAPTURE_LINES = 100000
 SNAPSHOT_MAX_BYTES_PER_ROOM = 100 * 1024 * 1024
 SINCE_SCAN_LINES = 100000
 SINCE_TAIL_LINES = 30
-MIN_OVERLAP_LINES = 10
+SINCE_CURSOR_VERSION = 2
+SINCE_ANCHOR_LIMIT = 16
+SINCE_ANCHOR_SCAN_RAW_LINES = 300
+SINCE_ANCHOR_SCAN_STABLE_LINES = 200
+SINCE_ANCHOR_PRIMARY_LINES = 4
+SINCE_ANCHOR_FALLBACK_LINES = 3
+SINCE_ANCHOR_MIN_LINE_INFO_CHARS = 20
+SINCE_ANCHOR_MIN_WINDOW_CHARS = {4: 80, 3: 90}
+SINCE_CONSUMED_TAIL_MAX_LINES = 30
+SINCE_CONSUMED_TAIL_MAX_CHARS = 2000
 SEARCH_CONTEXT = 8
 MAX_MATCHES = 5
 MAX_LINE_CHARS = 1000
 SNAPSHOT_REF_CHARS = 6
 WRITE_FAILURE_ERRNOS = {errno.EROFS, errno.EACCES, errno.EPERM}
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
+USEFUL_ANCHOR_TOKEN_RE = re.compile(
+    r"(?:\bmsg-[A-Za-z0-9]+\b|\bcausal-[A-Za-z0-9]+\b|\bwake-[A-Za-z0-9]+\b|"
+    r"\bcap-[A-Za-z0-9]+\b|\bagg-[A-Za-z0-9]+\b|/[A-Za-z0-9_./-]{3,}|"
+    r"\b[A-Za-z0-9_.-]+\.(?:py|sh|md|json|toml|txt|yaml|yml)\b|"
+    r"\b(?:agent_send_peer|agent_view_peer|agent_alarm|agent_interrupt_peer|bridge|python3|pytest|rg|git)\b)"
+)
+DURATION_COUNTER_RE = re.compile(
+    r"\b\d+\s*(?:ms|s|sec|secs|seconds?|m|min|mins|minutes?|h|hr|hrs|hours?)\b|"
+    r"\b\d+m\s+\d+s\b|\b\d+\s+tokens?\b|[0-9]+(?:\.[0-9]+)?[kKmM]?\s+tokens?",
+    re.IGNORECASE,
+)
+STATUS_DURATION_RE = re.compile(
+    r"(?:<n>|\b\d+m\s+\d+s\b|\b\d+\s*(?:ms|s|sec|secs|seconds?|m|min|mins|minutes?|h|hr|hrs|hours?)\b)",
+    re.IGNORECASE,
+)
+STRICT_ACTIVE_RARE_GLYPH_MARKER_RE = re.compile(
+    r"(?:[\u2191\u2193]\s*(?:<n>|\d+(?:\.\d+)?[kKmM]?)\s+tokens?|\b(?:<n>|\d+(?:\.\d+)?[kKmM]?)\s+tokens?|thought\s+for|thinking\s+with\s+high\s+effort|"
+    r"still\s+thinking|almost\s+done\s+thinking|running\s+stop\s+hook)",
+    re.IGNORECASE,
+)
+ACTIVE_ARROW_TOKEN_COUNTER_RE = re.compile(r"[\u2191\u2193]\s*(?:<n>|\d+(?:\.\d+)?[kKmM]?)\s+tokens?", re.IGNORECASE)
+ACTIVE_THOUGHT_DURATION_RE = re.compile(rf"thought\s+for\s+{STATUS_DURATION_RE.pattern}", re.IGNORECASE)
+ACTIVE_EFFORT_MARKER_RE = re.compile(
+    r"(?:thinking\s+with\s+high\s+effort|still\s+thinking|almost\s+done\s+thinking)",
+    re.IGNORECASE,
+)
+ACTIVE_TUI_DURATION_PREFIX_RE = re.compile(rf"^\s*{STATUS_DURATION_RE.pattern}\s*(?:\u00b7|$)", re.IGNORECASE)
+ACTIVE_RUNNING_STOP_HOOK_TUI_RE = re.compile(
+    rf"(?:^|\u00b7\s*)running\s+stop\s+hook(?:\s*$|\s*\u00b7\s*(?:{STATUS_DURATION_RE.pattern}|[\u2191\u2193]\s*(?:<n>|\d+(?:\.\d+)?[kKmM]?)\s+tokens?))",
+    re.IGNORECASE,
+)
+MODEL_FOOTER_RE = re.compile(r"^\s*(?:gpt|claude)[A-Za-z0-9_.-]*(?:\s+\w+)?\s+\u00b7\s+")
+CODEX_PROMPT_PLACEHOLDER_RE = re.compile(
+    r"^\u203a\s+(?:Improve documentation in @filename|Message Codex|Ask Codex|Type a message)\s*$",
+    re.IGNORECASE,
+)
+CLAUDE_RARE_PARTIAL_STATUS_RE = re.compile(
+    r"(?P<glyph>[\u273b\u273d])\s+[A-Z][A-Za-z-]*(?:\u2026|\.{3})(?:\s*\((?P<payload>[^)]*)\))?"
+)
+CLAUDE_DOT_PARTIAL_STATUS_RE = re.compile(
+    r"\u00b7\s+(?P<verb>[A-Z][A-Za-z-]*ing)(?:\u2026|\.{3})(?:\s*\((?P<payload>[^)]*)\))?"
+)
 
 
 def clamp(value: int, minimum: int, maximum: int) -> int:
@@ -474,64 +526,524 @@ def save_cursor(session: str, caller: str, target: str, cursor: dict, *, cache_w
     write_json_atomic(cursor_path(session, caller, target), {**cursor, "updated_at": utc_now()})
 
 
+def normalize_since_text(line: str) -> str:
+    text = str(line or "").replace("\xa0", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def mostly_separator_line(text: str) -> bool:
+    stripped = re.sub(r"\s+", "", text)
+    if len(stripped) < 8:
+        return False
+    separator_chars = set("-_=*.\u2500\u2501\u2502\u2503\u2504\u2505\u2508\u2509\u2550")
+    return all(char in separator_chars for char in stripped)
+
+
+def strip_since_frame_edges(text: str) -> str:
+    return re.sub(r"^[\s\u2502\u2551\u2503\u2506\u2507\u250a\u250b]+|[\s\u2502\u2551\u2503\u2506\u2507\u250a\u250b]+$", "", text)
+
+
+def has_strict_active_status_marker(payload: str, glyph: str) -> bool:
+    payload = payload or ""
+    if glyph in {"\u273b", "\u273d"}:
+        return bool(STRICT_ACTIVE_RARE_GLYPH_MARKER_RE.search(payload))
+    if ACTIVE_ARROW_TOKEN_COUNTER_RE.search(payload):
+        return True
+    if ACTIVE_THOUGHT_DURATION_RE.search(payload):
+        return True
+    if ACTIVE_RUNNING_STOP_HOOK_TUI_RE.search(payload):
+        return True
+    if ACTIVE_EFFORT_MARKER_RE.search(payload) and ACTIVE_TUI_DURATION_PREFIX_RE.search(payload):
+        return True
+    return False
+
+
+def is_claude_rare_partial_status_line(stripped: str) -> bool:
+    partial = CLAUDE_RARE_PARTIAL_STATUS_RE.fullmatch(stripped)
+    if not partial:
+        return False
+    payload = partial.group("payload")
+    if payload is None:
+        return True
+    return has_strict_active_status_marker(payload, partial.group("glyph") or "")
+
+
+def is_claude_dot_partial_status_line(stripped: str) -> bool:
+    partial = CLAUDE_DOT_PARTIAL_STATUS_RE.fullmatch(stripped)
+    if not partial:
+        return False
+    payload = partial.group("payload")
+    return payload is not None and has_strict_active_status_marker(payload, "")
+
+
+def is_claude_status_line(text: str) -> bool:
+    stripped = strip_since_frame_edges(text)
+    duration = STATUS_DURATION_RE.pattern
+    if re.fullmatch(r"(?:\u2022\s+)?Running Stop hook", stripped, re.IGNORECASE):
+        return True
+    if re.fullmatch(rf"[\u2500\u2501]+\s*[A-Z][A-Za-z-]*\s+for\s+{duration}\s*[\u2500\u2501]+", stripped):
+        return True
+    if re.fullmatch(rf"[\u273b\u273d]\s+[A-Z][^\s()]*\s+for\s+{duration}(?:\s+\u00b7\s+.*)?", stripped):
+        return True
+    if is_claude_rare_partial_status_line(stripped) or is_claude_dot_partial_status_line(stripped):
+        return True
+    active = re.fullmatch(r"(?P<glyph>[\u273b\u273d]|\*)?\s*(?P<verb>[A-Z][^\s()]*ing)(?:\u2026|\.{3})\s*\((?P<payload>[^)]*)\)", stripped)
+    if active and has_strict_active_status_marker(active.group("payload"), active.group("glyph") or ""):
+        return True
+    return False
+
+
+def is_model_footer_line(line: str) -> bool:
+    return bool(MODEL_FOOTER_RE.search(strip_since_frame_edges(normalize_since_text(line))))
+
+
+def is_codex_bridge_prompt_line(line: str) -> bool:
+    return strip_since_frame_edges(normalize_since_text(line)).startswith("\u203a [bridge:")
+
+
+def is_codex_prompt_candidate_line(line: str) -> bool:
+    stripped = strip_since_frame_edges(normalize_since_text(line))
+    return bool(CODEX_PROMPT_PLACEHOLDER_RE.fullmatch(stripped)) and not stripped.startswith("\u203a [bridge:")
+
+
+def is_stored_codex_prompt_placeholder_line(line: str) -> bool:
+    stripped = strip_since_frame_edges(normalize_since_text(line))
+    if stripped.startswith("\u203a [bridge:"):
+        return False
+    return bool(CODEX_PROMPT_PLACEHOLDER_RE.fullmatch(stripped))
+
+
+def is_since_volatile_line(line: str, *, context_volatile: bool = False) -> bool:
+    if context_volatile:
+        return True
+    text = normalize_since_text(line)
+    if not text:
+        return True
+    stripped = strip_since_frame_edges(text)
+    lowered = stripped.lower()
+    text_lowered = text.lower()
+    if mostly_separator_line(text):
+        return True
+    if re.fullmatch(r"[\u276f>]+", stripped):
+        return True
+    if "bypass permissions" in text_lowered or "shift+tab" in text_lowered or "esc to interrupt" in text_lowered:
+        return True
+    if "remote control active" in lowered and len(stripped) <= 40:
+        return True
+    if is_model_footer_line(text):
+        return True
+    if is_claude_status_line(text):
+        return True
+    return False
+
+
+def has_semantic_after(lines: list[str], start: int, base_volatile: list[bool], context_volatile: set[int] | None = None) -> bool:
+    context_volatile = context_volatile or set()
+    for idx in range(start + 1, len(lines)):
+        if not normalize_since_text(lines[idx]):
+            continue
+        if is_since_volatile_line(lines[idx], context_volatile=idx in context_volatile or base_volatile[idx]):
+            continue
+        return True
+    return False
+
+
+def has_model_footer_after(lines: list[str], start: int, base_volatile: list[bool], context_volatile: set[int] | None = None) -> bool:
+    context_volatile = context_volatile or set()
+    for idx in range(start + 1, len(lines)):
+        if not normalize_since_text(lines[idx]):
+            continue
+        if is_model_footer_line(lines[idx]):
+            return True
+        if is_since_volatile_line(lines[idx], context_volatile=idx in context_volatile or base_volatile[idx]):
+            continue
+        return False
+    return False
+
+
+def trailing_tui_start(lines: list[str], base_volatile: list[bool]) -> int:
+    start = len(lines)
+    for idx in range(len(lines) - 1, -1, -1):
+        line = lines[idx]
+        if not normalize_since_text(line) or base_volatile[idx] or is_codex_prompt_candidate_line(line):
+            start = idx
+            continue
+        stripped = strip_since_frame_edges(normalize_since_text(line))
+        if CLAUDE_DOT_PARTIAL_STATUS_RE.fullmatch(stripped):
+            start = idx
+            continue
+        break
+    return start
+
+
+def has_adjacent_tui_evidence(lines: list[str], idx: int, base_volatile: list[bool], context_volatile: set[int]) -> bool:
+    for step in (-2, -1, 1, 2):
+        other = idx + step
+        if other < 0 or other >= len(lines) or not normalize_since_text(lines[other]):
+            continue
+        if base_volatile[other] or other in context_volatile or is_model_footer_line(lines[other]):
+            return True
+    return False
+
+
+def since_context_volatile_indexes(lines: list[str]) -> set[int]:
+    base_volatile = [is_since_volatile_line(line) for line in lines]
+    context_volatile: set[int] = set()
+    trailing_start = trailing_tui_start(lines, base_volatile)
+
+    for idx, line in enumerate(lines):
+        if not is_codex_prompt_candidate_line(line) or idx < trailing_start:
+            continue
+        if has_model_footer_after(lines, idx, base_volatile, context_volatile) or not has_semantic_after(lines, idx, base_volatile, context_volatile):
+            context_volatile.add(idx)
+
+    for idx, line in enumerate(lines):
+        stripped = strip_since_frame_edges(normalize_since_text(line))
+        partial = CLAUDE_DOT_PARTIAL_STATUS_RE.fullmatch(stripped)
+        if not partial or idx in context_volatile:
+            continue
+        payload = partial.group("payload")
+        if payload and has_strict_active_status_marker(payload, ""):
+            context_volatile.add(idx)
+        elif idx >= trailing_start and has_adjacent_tui_evidence(lines, idx, base_volatile, context_volatile):
+            context_volatile.add(idx)
+
+    return context_volatile
+
+
+def normalize_since_anchor_line(line: str, *, context_volatile: bool = False) -> str:
+    text = normalize_since_text(line)
+    if not text or is_since_volatile_line(text, context_volatile=context_volatile):
+        return ""
+    text = DURATION_COUNTER_RE.sub("<n>", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    info = re.sub(r"[\W_]+", "", text)
+    if len(info) < SINCE_ANCHOR_MIN_LINE_INFO_CHARS and not USEFUL_ANCHOR_TOKEN_RE.search(text):
+        return ""
+    return text
+
+
+def stable_since_projection(
+    lines: list[str],
+    *,
+    max_raw_lines: int | None = SINCE_ANCHOR_SCAN_RAW_LINES,
+    max_stable_lines: int | None = SINCE_ANCHOR_SCAN_STABLE_LINES,
+) -> list[dict]:
+    projection = []
+    raw_min = max(0, len(lines) - max_raw_lines) if max_raw_lines and max_raw_lines > 0 else 0
+    context_volatile = since_context_volatile_indexes(lines)
+    for idx, line in enumerate(lines):
+        if idx < raw_min:
+            continue
+        norm = normalize_since_anchor_line(line, context_volatile=idx in context_volatile)
+        if norm:
+            projection.append({"raw_index": idx, "norm": norm})
+    if max_stable_lines and max_stable_lines > 0:
+        return projection[-max_stable_lines:]
+    return projection
+
+
+def find_all_subsequences(values: list[str], needle: list[str]) -> list[int]:
+    if not needle:
+        return []
+    limit = len(values) - len(needle)
+    if limit < 0:
+        return []
+    matches = []
+    for idx in range(0, limit + 1):
+        if values[idx : idx + len(needle)] == needle:
+            matches.append(idx)
+    return matches
+
+
+def anchor_window_valid(window: list[dict], projection_norms: list[str]) -> bool:
+    norms = [str(item.get("norm") or "") for item in window]
+    if not anchor_lines_quality_valid(norms):
+        return False
+    return len(find_all_subsequences(projection_norms, norms)) == 1
+
+
+def anchor_lines_quality_valid(norms: list[str]) -> bool:
+    if len(norms) not in SINCE_ANCHOR_MIN_WINDOW_CHARS:
+        return False
+    if len(set(norms)) != len(norms):
+        return False
+    combined_info = sum(len(re.sub(r"[\W_]+", "", norm)) for norm in norms)
+    if combined_info < SINCE_ANCHOR_MIN_WINDOW_CHARS[len(norms)]:
+        return False
+    return True
+
+
+def build_since_anchors(lines: list[str]) -> list[dict]:
+    projection = stable_since_projection(lines)
+    projection_norms = [str(item["norm"]) for item in projection]
+    anchors = []
+    seen: set[tuple[str, ...]] = set()
+    for end in range(len(projection), 0, -1):
+        for size in (SINCE_ANCHOR_PRIMARY_LINES, SINCE_ANCHOR_FALLBACK_LINES):
+            start = end - size
+            if start < 0:
+                continue
+            window = projection[start : start + size]
+            norms = tuple(str(item["norm"]) for item in window)
+            if norms in seen or not anchor_window_valid(window, projection_norms):
+                continue
+            anchors.append(
+                {
+                    "lines": list(norms),
+                    "raw_start": int(window[0]["raw_index"]),
+                    "raw_end": int(window[-1]["raw_index"]),
+                    "stable_count": size,
+                }
+            )
+            seen.add(norms)
+            break
+        if len(anchors) >= SINCE_ANCHOR_LIMIT:
+            break
+    return anchors
+
+
+def since_anchor_identity(lines: list[str]) -> str:
+    body = "\n".join(str(line) for line in lines)
+    digest = hashlib.sha256(body.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"sha256:{digest}"
+
+
 def update_since_cursor(session: str, caller: str, target: str, lines: list[str], extra: dict | None = None, *, cache_writable: bool = True) -> None:
     if not cache_writable:
         return
     tail = lines[-SINCE_TAIL_LINES:]
+    anchors = build_since_anchors(lines)
     cursor = load_cursor(session, caller, target)
     cursor.update({
+        "cursor_version": SINCE_CURSOR_VERSION,
         "caller": caller,
         "target": target,
         "last_line_count": len(lines),
         "last_tail_lines": tail,
+        "since_anchors": anchors,
     })
     if extra:
         cursor.update(extra)
+    consumed_tail = cursor.get("since_consumed_tail")
+    anchor_identities = {since_anchor_identity([str(line) for line in anchor.get("lines") or []]) for anchor in anchors if isinstance(anchor, dict)}
+    if not extra or "since_consumed_tail" not in extra:
+        cursor["since_consumed_tail"] = build_since_consumed_tail_for_anchors(lines, anchors)
+    elif not isinstance(consumed_tail, dict) or consumed_tail.get("anchor_identity") not in anchor_identities:
+        cursor["since_consumed_tail"] = {}
     save_cursor(session, caller, target, cursor)
 
 
-def find_subsequence(lines: list[str], needle: list[str], start: int = 0) -> int:
-    if not needle:
-        return -1
-    limit = len(lines) - len(needle)
-    if limit < start:
-        return -1
-    for idx in range(max(0, start), limit + 1):
-        if lines[idx : idx + len(needle)] == needle:
-            return idx
-    return -1
+def cursor_anchors(previous: dict) -> tuple[list[dict], str]:
+    raw_anchors = previous.get("since_anchors")
+    if isinstance(raw_anchors, list):
+        anchors = []
+        for anchor in raw_anchors:
+            if not isinstance(anchor, dict):
+                continue
+            lines = []
+            for line in anchor.get("lines") or []:
+                if is_stored_codex_prompt_placeholder_line(str(line)):
+                    continue
+                norm = normalize_since_anchor_line(str(line))
+                if norm:
+                    lines.append(norm)
+            if not anchor_lines_quality_valid(lines):
+                continue
+            anchors.append({**anchor, "lines": lines})
+        return anchors, "stored"
+
+    old_tail = previous.get("last_tail_lines") or []
+    if isinstance(old_tail, list) and old_tail:
+        return build_since_anchors([str(line) for line in old_tail]), "legacy"
+    return [], "none"
 
 
-def find_last_subsequence(lines: list[str], needle: list[str]) -> int:
-    if not needle:
-        return -1
-    limit = len(lines) - len(needle)
-    for idx in range(limit, -1, -1):
-        if lines[idx : idx + len(needle)] == needle:
-            return idx
-    return -1
+def trim_since_delta(lines: list[str]) -> tuple[list[str], str]:
+    if not lines:
+        return [], "no meaningful new output since last view"
+    context_volatile = since_context_volatile_indexes(lines)
+    end = len(lines)
+    trimmed_volatile = False
+    while end > 0 and is_since_volatile_line(lines[end - 1], context_volatile=(end - 1) in context_volatile):
+        trimmed_volatile = True
+        end -= 1
+    while end > 0 and not normalize_since_text(lines[end - 1]):
+        end -= 1
+    display = lines[:end]
+    meaningful = [
+        line
+        for idx, line in enumerate(display)
+        if normalize_since_text(line) and not is_since_volatile_line(line, context_volatile=idx in context_volatile)
+    ]
+    if not meaningful:
+        if any(is_since_volatile_line(line, context_volatile=idx in context_volatile) for idx, line in enumerate(lines)):
+            return [], "only volatile TUI status changed; peer may still be working"
+        return [], "no meaningful new output since last view"
+    if trimmed_volatile:
+        return display, "trimmed volatile TUI status suffix"
+    return display, ""
+
+
+def consumed_tail_entries(lines: list[str]) -> list[dict]:
+    context_volatile = since_context_volatile_indexes(lines)
+    entries = []
+    for idx, line in enumerate(lines):
+        norm = normalize_since_text(line)
+        if not norm or is_since_volatile_line(line, context_volatile=idx in context_volatile):
+            continue
+        entries.append({"raw_index": idx, "norm": norm})
+    return entries
+
+
+def build_since_consumed_tail(anchor_identity: str, raw_delta: list[str]) -> dict:
+    if not anchor_identity:
+        return {}
+    entries = consumed_tail_entries(raw_delta)
+    kept = []
+    used = 0
+    truncated = False
+    for entry in entries:
+        norm = str(entry.get("norm") or "")
+        add = len(norm) + 1
+        if len(kept) >= SINCE_CONSUMED_TAIL_MAX_LINES or (kept and used + add > SINCE_CONSUMED_TAIL_MAX_CHARS):
+            truncated = True
+            break
+        if not kept and add > SINCE_CONSUMED_TAIL_MAX_CHARS:
+            truncated = True
+            break
+        kept.append(norm)
+        used += add
+    if len(kept) < len(entries):
+        truncated = True
+    if not kept:
+        return {}
+    return {"anchor_identity": anchor_identity, "lines": kept, "truncated": truncated}
+
+
+def build_since_consumed_tail_for_anchors(lines: list[str], anchors: list[dict]) -> dict:
+    if not anchors:
+        return {}
+    anchor = anchors[0]
+    anchor_lines = [str(line) for line in anchor.get("lines") or [] if str(line)]
+    if not anchor_lines:
+        return {}
+    try:
+        raw_end = int(anchor.get("raw_end"))
+    except (TypeError, ValueError):
+        return {}
+    return build_since_consumed_tail(since_anchor_identity(anchor_lines), lines[raw_end + 1 :])
+
+
+def apply_consumed_tail(previous: dict, anchor_identity: str, raw_delta: list[str]) -> tuple[list[str], str]:
+    memo = previous.get("since_consumed_tail")
+    if not isinstance(memo, dict) or not memo:
+        return raw_delta, "none"
+    if not anchor_identity or memo.get("anchor_identity") != anchor_identity:
+        return raw_delta, "cleared"
+    stored = [str(line) for line in memo.get("lines") or [] if str(line)]
+    if not stored:
+        return raw_delta, "cleared"
+    entries = consumed_tail_entries(raw_delta)
+    if len(entries) < len(stored):
+        return raw_delta, "cleared"
+    current_prefix = [str(entry.get("norm") or "") for entry in entries[: len(stored)]]
+    if current_prefix != stored:
+        return raw_delta, "cleared"
+    skip_to = int(entries[len(stored) - 1]["raw_index"]) + 1
+    return raw_delta[skip_to:], "skipped"
+
+
+def compute_since_delta_detail(previous: dict, lines: list[str]) -> dict:
+    if not previous:
+        return {
+            "delta": lines[-DEFAULT_LINES:],
+            "confidence": "new",
+            "note": "no previous cursor; showing latest lines",
+            "matched_anchor_identity": "",
+            "consumed_raw_delta": [],
+        }
+
+    anchors, anchor_source = cursor_anchors(previous)
+    if not anchors:
+        if "since_anchors" not in previous:
+            return {
+                "delta": lines[-DEFAULT_LINES:],
+                "confidence": "upgrade_reset",
+                "note": "no usable legacy since-last anchor; cursor reset from current capture",
+                "matched_anchor_identity": "",
+                "consumed_raw_delta": [],
+            }
+        return {
+            "delta": lines[-DEFAULT_LINES:],
+            "confidence": "new",
+            "note": "no usable since-last anchor; cursor reset from current capture",
+            "matched_anchor_identity": "",
+            "consumed_raw_delta": [],
+        }
+
+    projection = stable_since_projection(lines, max_raw_lines=None, max_stable_lines=None)
+    current_norms = [str(item["norm"]) for item in projection]
+    ambiguous = 0
+    absent = 0
+    for anchor_index, anchor in enumerate(anchors):
+        needle = [str(line) for line in anchor.get("lines") or [] if str(line)]
+        if len(needle) < SINCE_ANCHOR_FALLBACK_LINES:
+            absent += 1
+            continue
+        matches = find_all_subsequences(current_norms, needle)
+        if not matches:
+            absent += 1
+            continue
+        if len(matches) > 1:
+            ambiguous += 1
+            continue
+        match_end = matches[0] + len(needle) - 1
+        raw_end = int(projection[match_end]["raw_index"])
+        raw_delta = lines[raw_end + 1 :]
+        anchor_identity = since_anchor_identity(needle)
+        display_raw_delta, consumed_action = apply_consumed_tail(previous, anchor_identity, raw_delta)
+        delta, delta_note = trim_since_delta(display_raw_delta)
+        confidence = "high" if len(needle) >= SINCE_ANCHOR_PRIMARY_LINES else "medium"
+        note = f"matched {len(needle)} stable {anchor_source} anchor lines"
+        if anchor_index:
+            note = f"{note} after skipping {anchor_index} newer anchor(s)"
+        if consumed_action == "skipped":
+            note = f"{note}; skipped previously consumed short output"
+        elif consumed_action == "cleared":
+            note = f"{note}; reset stale consumed-tail memo"
+        if delta_note:
+            note = f"{note}; {delta_note}"
+        return {
+            "delta": delta,
+            "confidence": confidence,
+            "note": note,
+            "matched_anchor_identity": anchor_identity,
+            "consumed_raw_delta": raw_delta,
+        }
+
+    detail = []
+    if absent:
+        detail.append(f"{absent} absent")
+    if ambiguous:
+        detail.append(f"{ambiguous} ambiguous")
+    reason = ", ".join(detail) if detail else "no usable anchors"
+    return {
+        "delta": lines[-DEFAULT_LINES:],
+        "confidence": "uncertain",
+        "note": f"cursor anchor not found ({reason}); showing latest lines only; cursor not advanced; run agent_view_peer <target> --onboard to reset",
+        "matched_anchor_identity": "",
+        "consumed_raw_delta": [],
+    }
 
 
 def compute_since_delta(previous: dict, lines: list[str]) -> tuple[list[str], str, str]:
-    old_tail = previous.get("last_tail_lines") or []
-    old_count = int(previous.get("last_line_count") or 0)
-    if not old_tail:
-        return lines[-DEFAULT_LINES:], "new", "no previous cursor; showing latest lines"
+    detail = compute_since_delta_detail(previous, lines)
+    return list(detail["delta"]), str(detail["confidence"]), str(detail["note"])
 
-    if len(lines) >= old_count and old_count >= len(old_tail):
-        expected = old_count - len(old_tail)
-        if lines[expected:old_count] == old_tail:
-            return lines[old_count:], "high", "matched previous line count and tail"
 
-    for overlap in range(min(len(old_tail), SINCE_TAIL_LINES), MIN_OVERLAP_LINES - 1, -1):
-        needle = old_tail[-overlap:]
-        idx = find_last_subsequence(lines, needle)
-        if idx >= 0:
-            confidence = "medium" if overlap >= 20 else "low"
-            note = f"matched {overlap} cursor tail lines"
-            return lines[idx + overlap :], confidence, note
-
-    return lines[-DEFAULT_LINES:], "uncertain", "cursor tail not found; showing latest lines instead of guessing delta"
+def since_confidence_advances_cursor(confidence: str) -> bool:
+    return confidence in {"high", "medium", "new", "upgrade_reset"}
 
 
 def render_output(
@@ -648,14 +1160,27 @@ def handle_since_last(args: argparse.Namespace, session: str, caller: str, targe
     text = capture_text(args, session=session, caller=caller, target=target, state=state, pane=str(record["pane"]), start=-SINCE_SCAN_LINES, end=None, raw=args.raw)
     lines = clean_lines(text, raw=args.raw)
     previous = load_cursor(session, caller, target)
-    delta, confidence, note = compute_since_delta(previous, lines)
+    detail = compute_since_delta_detail(previous, lines)
+    delta = list(detail["delta"])
+    confidence = str(detail["confidence"])
+    note = str(detail["note"])
     shown_delta = delta[-lines_count:] if len(delta) > lines_count else delta
+    advance_cursor = since_confidence_advances_cursor(confidence)
     if len(delta) > lines_count:
         omitted = len(delta) - lines_count
-        note = f"{note}; {omitted} older delta lines omitted; cursor advanced to latest"
+        action = "cursor advanced to latest" if advance_cursor and cache_writable else "cursor not advanced"
+        note = f"{note}; {omitted} older delta lines omitted; {action}"
     if not cache_writable:
         note = f"{note}; capture cache is read-only, cursor not advanced"
-    update_since_cursor(session, caller, target, lines, {"last_since_confidence": confidence}, cache_writable=cache_writable)
+    if advance_cursor:
+        update_since_cursor(
+            session,
+            caller,
+            target,
+            lines,
+            {"last_since_confidence": confidence},
+            cache_writable=cache_writable,
+        )
     render_output(
         room=session,
         caller=caller,
