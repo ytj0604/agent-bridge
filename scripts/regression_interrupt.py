@@ -52,6 +52,7 @@ import bridge_daemon  # noqa: E402
 import bridge_attach  # noqa: E402
 import bridge_hook_logger  # noqa: E402
 import bridge_identity  # noqa: E402
+import bridge_instructions  # noqa: E402
 import bridge_join  # noqa: E402
 import bridge_pane_probe  # noqa: E402
 import bridge_response_guard  # noqa: E402
@@ -5971,6 +5972,33 @@ def scenario_view_peer_search_with_page_after_a19_reports_page_error(label: str,
     print(f"  PASS  {label}")
 
 
+def scenario_view_peer_doc_surfaces_disclose_search_semantics(label: str, tmpdir: Path) -> None:
+    phrase = "case-insensitive literal substring (no regex)"
+    search_shape = "agent_view_peer <alias> --search 'text' [--live]"
+
+    search_lines = [line for line in bridge_instructions.model_cheat_sheet() if search_shape in line]
+    assert_true(len(search_lines) == 1, f"{label}: expected one cheat-sheet search line, got {search_lines!r}")
+    assert_true(phrase in search_lines[0], f"{label}: cheat-sheet search line must disclose search semantics: {search_lines[0]!r}")
+
+    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
+    assert_true(search_shape in probe, f"{label}: probe prompt must keep the search command shape")
+    assert_true(phrase in probe, f"{label}: probe prompt must disclose search semantics")
+
+    help_result = subprocess.run(
+        [sys.executable, str(LIBEXEC / "bridge_view_peer.py"), "--help"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    help_text = help_result.stdout + help_result.stderr
+    normalized_help = " ".join(help_text.split())
+    assert_true(help_result.returncode == 0, f"{label}: agent_view_peer --help should exit 0, got {help_result.returncode}: {help_text!r}")
+    assert_true("--search" in help_text, f"{label}: --help output must include --search")
+    assert_true(phrase in normalized_help, f"{label}: --help output must disclose search semantics: {help_text!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_view_peer_render_output_model_safe(label: str, tmpdir: Path) -> None:
     bv = _import_view_peer()
     import contextlib
@@ -9346,6 +9374,7 @@ def main() -> int:
             ("view_peer_empty_search_counts_as_search_for_mode_errors", scenario_view_peer_empty_search_counts_as_search_for_mode_errors),
             ("view_peer_nonempty_search_still_reaches_validation", scenario_view_peer_nonempty_search_still_reaches_validation),
             ("view_peer_search_with_page_after_a19_reports_page_error", scenario_view_peer_search_with_page_after_a19_reports_page_error),
+            ("view_peer_doc_surfaces_disclose_search_semantics", scenario_view_peer_doc_surfaces_disclose_search_semantics),
             ("view_peer_render_output_model_safe", scenario_view_peer_render_output_model_safe),
             ("view_peer_search_explicit_snapshot_uses_safe_ref", scenario_view_peer_search_explicit_snapshot_uses_safe_ref),
             ("view_peer_snapshot_ref_collision_unique", scenario_view_peer_snapshot_ref_collision_unique),

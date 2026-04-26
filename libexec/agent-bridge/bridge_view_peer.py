@@ -1274,7 +1274,7 @@ def main() -> int:
     parser.add_argument("--onboard", action="store_true", help="create a stable snapshot and show the latest page")
     parser.add_argument("--older", action="store_true", help="show the next older page from the current snapshot")
     parser.add_argument("--since-last", action="store_true", help="show screen output added since this caller last viewed the target")
-    parser.add_argument("--search", help="search current snapshot, or live scrollback if no snapshot cursor exists")
+    parser.add_argument("--search", help="search current snapshot, or live scrollback if no snapshot cursor exists; case-insensitive literal substring (no regex)")
     parser.add_argument("--live", action="store_true", help="with --search, ignore saved snapshot and search current live scrollback")
     parser.add_argument("--snapshot", help="snapshot id to read for --older or --search")
     parser.add_argument("--page", type=int, help="latest-based page number; 0 is newest")

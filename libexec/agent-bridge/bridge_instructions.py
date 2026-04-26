@@ -21,7 +21,7 @@ def model_cheat_sheet() -> list[str]:
         "- agent_view_peer <alias> --onboard [--tail N] : capture a stable screen/history snapshot.",
         "- agent_view_peer <alias> --older : page older lines from that snapshot.",
         "- agent_view_peer <alias> --since-last : view latest changes since your last view.",
-        "- agent_view_peer <alias> --search 'text' [--live] : search saved snapshot, or current live screen with --live.",
+        "- agent_view_peer <alias> --search 'text' [--live] : search saved snapshot, or current live screen with --live; query is a case-insensitive literal substring (no regex).",
         "Kinds and routing contract:",
         "- request: the bridge auto-routes the peer's next response back to you as a [bridge:*] result. Sender stays woken up by that reply arrival. Default kind. Watchdog applies. Only request and notice can be sent by agents — 'result' kind is system-only (set by the bridge for auto-returns).",
         "- notice: the bridge does NOT route any reply back. Even if the peer writes a response, it stays in the peer's pane — observe via agent_view_peer. If you need an answer, use request, not notice. The kind on the wire beats any 'please reply' hint in the body.",
@@ -67,6 +67,7 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "\n"
         "Inspecting / interrupting:\n"
         "  agent_view_peer <alias> --onboard                    - snapshot peer's pane (debug only — do NOT poll for progress).\n"
+        "  agent_view_peer <alias> --search 'text' [--live]     - search snapshot/live screen; case-insensitive literal substring (no regex).\n"
         "  agent_interrupt_peer <alias>                         - use for a wrong prompt or stuck peer; ESC + cancel active message, then queued/new corrections may deliver without a hold.\n"
         "  agent_interrupt_peer [<alias>] --status              - show busy/held/queue state for one or all peers.\n"
         "\n"
