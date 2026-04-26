@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bridge_participants import active_participants, load_session, session_state_exists
-from bridge_identity import resolve_participant_endpoint
+from bridge_identity import resolve_participant_endpoint_detail
 from bridge_paths import ensure_runtime_writable, install_root, libexec_dir, log_root, python_exe, run_root, state_root
 from bridge_util import locked_json, read_json, utc_now, write_json_atomic as write_json
 
@@ -321,8 +321,10 @@ def send_room_closed_notices(session: str) -> dict:
     sent = 0
     errors = []
     for alias, record in active_participants(state).items():
-        pane = resolve_participant_endpoint(session, alias, record)
+        detail = resolve_participant_endpoint_detail(session, alias, record, purpose="write")
+        pane = str(detail.get("pane") or "") if detail.get("ok") else ""
         if not pane:
+            errors.append(f"{alias}: suppressed: {detail.get('reason') or 'no_verified_live_endpoint'}")
             continue
         try:
             tmux_send_literal(pane, notice)

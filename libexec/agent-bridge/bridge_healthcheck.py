@@ -7,6 +7,8 @@ import os
 import shutil
 from pathlib import Path
 
+from bridge_identity import backfill_session_process_identities
+from bridge_participants import load_session
 from bridge_paths import bin_dir, hook_dir, install_root, libexec_dir, log_root, model_bin_dir, run_root, runtime_config_file, state_root
 
 
@@ -58,7 +60,39 @@ def hook_command_status(path: Path, agent: str) -> tuple[bool, str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check Agent Bridge installation.")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--backfill-endpoints", action="store_true", help="repair live endpoint process fingerprints for active rooms")
+    parser.add_argument("--session", help="with --backfill-endpoints, limit repair to one bridge room")
     args = parser.parse_args()
+
+    if args.backfill_endpoints:
+        root = state_root()
+        if args.session:
+            sessions = [args.session]
+        elif root.exists():
+            sessions = sorted(path.name for path in root.iterdir() if path.is_dir() and (path / "session.json").exists())
+        else:
+            sessions = []
+        results = []
+        for session in sessions:
+            state = load_session(session)
+            summary = backfill_session_process_identities(session, state)
+            results.append({"session": session, "aliases": summary})
+        if args.json:
+            print(json.dumps(results, ensure_ascii=True, indent=2))
+        else:
+            for item in results:
+                print(f"endpoint backfill: {item['session']}")
+                aliases = item.get("aliases") or {}
+                if not aliases:
+                    print("  (no active participants)")
+                for alias, status in aliases.items():
+                    print(f"  {alias}: {status.get('status')} {status.get('reason') or ''}".rstrip())
+                print("  note: endpoint backfill only refreshes endpoints with prior live hook evidence; reattach/join with normal probing if no verified prior exists.")
+        return 1 if any(
+            status.get("status") != "verified"
+            for item in results
+            for status in (item.get("aliases") or {}).values()
+        ) else 0
 
     checks = []
 

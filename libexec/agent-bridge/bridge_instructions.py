@@ -30,7 +30,7 @@ def model_cheat_sheet() -> list[str]:
         "- agent_alarm is for 'I delegated work via notice and want a safety wake if no follow-up arrives'. It is NOT for waiting on auto-routed reply results — for that use --watchdog / agent_extend_wait.",
         "- Do not poll with agent_view_peer or schedule a wakeup to check progress; use agent_view_peer only when you suspect the peer is stuck or need to debug the bridge.",
         "- Never read bridge state files directly. Replies arrive as [bridge:*] prompts; use the bridge commands above for everything else.",
-        "- Large payloads (design docs, code, long plans): write to a shared path under /tmp/agent-bridge-share/ and send only the path + brief description. Peers Read the file directly. Inlining big bodies is slow and can break paste-burst submit.",
+        "- Large payloads (design docs, code, long plans): inline agent_send_peer bodies are limited to 11000 chars. Write larger content to a shared path under /tmp/agent-bridge-share/ and send only the path + brief description. Peers read the file directly. Inlining big bodies is slow and can break paste-burst submit.",
     ]
 
 
@@ -71,7 +71,7 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "  - Body text CANNOT override the kind on the wire. Writing 'please reply' inside a notice does nothing — the bridge will not route any response.\n"
         "  - A watchdog wake means: pick ONE of agent_extend_wait, agent_interrupt_peer, or agent_view_peer (to inspect first). It is not a polling primitive.\n"
         "  - agent_alarm is for 'I delegated via notice and want a safety wake if no follow-up arrives'. It is NOT for waiting on auto-routed reply results — for that use --watchdog / agent_extend_wait.\n"
-        "  - For large bodies (design docs, code, long plans), write to /tmp/agent-bridge-share/<file> and send only the path + brief description. Inlining big content is slow and can break paste-burst submit.\n"
+        "  - Inline message bodies are limited to 11000 chars. For larger bodies (design docs, code, long plans), write to /tmp/agent-bridge-share/<file> and send only the path + brief description. Inlining big content is slow and can break paste-burst submit.\n"
         "  - Never read bridge state files directly; use the commands above.\n"
         "\n"
         "If unsure about syntax or semantics, run agent_list_peers FIRST and read the full cheat sheet. Do NOT guess bridge commands — bluffing here breaks routing in subtle ways.\n"

@@ -9,7 +9,7 @@ import sys
 from bridge_identity import resolve_caller_from_pane
 from bridge_participants import active_participants, load_session
 from bridge_paths import libexec_dir, python_exe
-from bridge_util import MESSAGE_KINDS
+from bridge_util import MESSAGE_KINDS, read_limited_text, validate_peer_body_size
 
 # Agents may only originate "request" or "notice"; "result" is system-only
 # (set by the daemon when auto-returning a single reply or when an aggregate
@@ -60,7 +60,7 @@ def parse_body_and_target(args: argparse.Namespace, session: str) -> tuple[str |
     if words:
         body = " ".join(words)
     elif not sys.stdin.isatty():
-        body = sys.stdin.read()
+        body = read_limited_text(sys.stdin)
     else:
         body = ""
 
@@ -119,6 +119,10 @@ def main() -> int:
         return 2
     if not body.strip():
         print("agent_send_peer: message body is required", file=sys.stderr)
+        return 2
+    ok, size_error = validate_peer_body_size(body)
+    if not ok:
+        print(size_error, file=sys.stderr)
         return 2
 
     # --watchdog only makes sense for kind=request. Notices have no return

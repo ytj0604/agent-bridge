@@ -13,7 +13,7 @@ import sys
 import time
 import uuid
 
-from bridge_identity import resolve_caller_from_pane
+from bridge_identity import resolve_caller_from_pane, resolve_participant_endpoint_detail
 from bridge_participants import active_participants, load_session, normalize_alias, room_status
 from bridge_paths import state_root
 from bridge_util import TmuxCaptureError, append_jsonl, read_json, run_tmux_capture, short_id, utc_now, write_json_atomic
@@ -185,8 +185,24 @@ def capture_text(
 ) -> str:
     if args.capture_file:
         return Path(args.capture_file).read_text(encoding="utf-8", errors="replace")
+    participant = active_participants(state).get(target) or {"pane": pane}
+    endpoint_detail = resolve_participant_endpoint_detail(session, target, participant, purpose="read")
+    endpoint = str(endpoint_detail.get("pane") or "") if endpoint_detail.get("ok") else ""
+    if not endpoint:
+        return capture_via_daemon(
+            args,
+            session=session,
+            caller=caller,
+            target=target,
+            state=state,
+            pane=pane,
+            start=start,
+            end=end,
+            raw=raw,
+            direct_error=f"no verified live endpoint: {endpoint_detail.get('reason') or 'unknown'}",
+        )
     try:
-        return run_tmux_capture(pane, start, end, raw=raw)
+        return run_tmux_capture(endpoint, start, end, raw=raw)
     except TmuxCaptureError as exc:
         return capture_via_daemon(
             args,

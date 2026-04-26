@@ -17,7 +17,18 @@ from bridge_response_guard import (
     format_response_send_violation,
     response_send_violation,
 )
-from bridge_util import MESSAGE_KINDS, append_jsonl, locked_json, locked_json_read, normalize_kind, public_record, short_id, utc_now
+from bridge_util import (
+    MESSAGE_KINDS,
+    append_jsonl,
+    locked_json,
+    locked_json_read,
+    normalize_kind,
+    public_record,
+    read_limited_text,
+    short_id,
+    utc_now,
+    validate_peer_body_size,
+)
 
 # v1.5: enforce request-only watchdog and provide a default delay for
 # requests. Default 5 minutes, override via env. The watchdog itself is
@@ -195,9 +206,13 @@ def main() -> int:
         public_state_file = str(default_public_state_file)
     queue_file = Path(args.queue_file or os.environ.get("AGENT_BRIDGE_QUEUE") or default_queue_file)
 
-    body = sys.stdin.read() if args.stdin else args.body
+    body = read_limited_text(sys.stdin) if args.stdin else args.body
     if not body or not body.strip():
         print("agent_send_peer: --body or --stdin content is required", file=sys.stderr)
+        return 2
+    ok, size_error = validate_peer_body_size(body)
+    if not ok:
+        print(size_error, file=sys.stderr)
         return 2
     if args.target and args.target_all:
         print("agent_send_peer: use either --to <alias> or --all, not both", file=sys.stderr)

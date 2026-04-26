@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from bridge_identity import resolve_participant_endpoint
+from bridge_identity import backfill_session_process_identities, resolve_participant_endpoint_detail
 from bridge_participants import active_participants, participant_record
 from bridge_paths import model_bin_dir, state_root
 from bridge_response_guard import (
@@ -24,11 +24,20 @@ from bridge_response_guard import (
     format_response_send_violation,
     response_send_violation,
 )
-from bridge_util import append_jsonl, locked_json, normalize_kind, public_record, read_json, run_tmux_capture, short_id, utc_now
+from bridge_util import (
+    MAX_PEER_BODY_CHARS,
+    append_jsonl,
+    locked_json,
+    normalize_kind,
+    public_record,
+    read_json,
+    run_tmux_capture,
+    short_id,
+    utc_now,
+)
 
 
 PHYSICAL_AGENT_TYPES = {"claude", "codex"}
-MAX_BODY_CHARS = 12000
 MAX_PROCESSED_RETURNS = 4096
 MAX_NONCE_CACHE = 1024
 MAX_PROCESSED_CAPTURE_REQUESTS = 4096
@@ -87,8 +96,8 @@ def one_line(text: str) -> str:
 
 def prompt_body(text: str) -> str:
     raw = str(text)
-    if len(raw) > MAX_BODY_CHARS:
-        raw = raw[:MAX_BODY_CHARS] + "\n[bridge truncated peer body]"
+    if len(raw) > MAX_PEER_BODY_CHARS:
+        raw = raw[:MAX_PEER_BODY_CHARS] + "\n[bridge truncated peer body]"
     return (
         raw.replace("\\", "\\\\")
         .replace("\r", "\\r")
@@ -302,7 +311,14 @@ class BridgeDaemon:
         # process outside the mutator.
         self.state_lock = threading.RLock()
         self.last_delivery_tick = 0.0
+        self.startup_backfill_summary: dict[str, dict] = {}
         self.reload_participants()
+        if self.bridge_session and not self.dry_run:
+            try:
+                self.startup_backfill_summary = backfill_session_process_identities(self.bridge_session, self.session_state)
+                self.reload_participants()
+            except Exception as exc:
+                self.startup_backfill_summary = {"_error": {"status": "unknown", "reason": str(exc)}}
 
     def start_command_server(self) -> None:
         if not self.command_socket:
@@ -674,9 +690,28 @@ class BridgeDaemon:
         )
         if len(notice_text) > self._ALARM_NOTICE_TOTAL_CHARS:
             notice_text = notice_text[: self._ALARM_NOTICE_TOTAL_CHARS - 1] + "…"
+        compact_notice_text = f"[bridge:alarm_cancelled] {len(cancelled)} alarm(s) cancelled by this message."
         original_body = str(message.get("body") or "")
-        # Prepend so truncation in build_peer_prompt cannot hide the notice.
-        message["body"] = f"{notice_text}\n\n{original_body}" if original_body else notice_text
+        notice_truncated = False
+        notice_omitted = False
+        notice_compacted = False
+        if original_body:
+            # Normal external sends reserve headroom below this guard. Legacy
+            # queue items and internal synthetic bodies may still be near the
+            # guard, so compact or omit the notice instead of emitting garbage.
+            max_notice_chars = MAX_PEER_BODY_CHARS - len(original_body) - 2
+            if max_notice_chars <= 0:
+                notice_text = ""
+                notice_omitted = True
+            elif len(notice_text) + 2 + len(original_body) > MAX_PEER_BODY_CHARS:
+                if len(compact_notice_text) <= max_notice_chars:
+                    notice_text = compact_notice_text
+                    notice_compacted = True
+                else:
+                    notice_text = ""
+                    notice_omitted = True
+                notice_truncated = notice_omitted or notice_compacted
+        message["body"] = f"{notice_text}\n\n{original_body}" if notice_text and original_body else (notice_text or original_body)
         self.log(
             "alarm_cancelled_by_message",
             target=target,
@@ -685,6 +720,10 @@ class BridgeDaemon:
             trigger_kind=kind,
             cancelled_count=len(cancelled),
             cancelled_wake_ids=[wid for wid, _ in cancelled],
+            notice_truncated=notice_truncated,
+            notice_omitted=notice_omitted,
+            notice_compacted=notice_compacted,
+            original_body_chars=len(original_body),
         )
 
     def fallback_session_state(self) -> dict:
@@ -856,12 +895,33 @@ class BridgeDaemon:
             return True, ""
         return cancel_tmux_pane_mode(pane)
 
-    def resolve_target_pane(self, target: str) -> str:
+    def resolve_endpoint_detail(self, target: str, *, purpose: str = "write") -> dict:
         participant = self.participants.get(target)
-        endpoint = resolve_participant_endpoint(self.bridge_session or "", target, participant or {}) if participant else ""
-        if endpoint:
-            self.panes[target] = endpoint
-        return self.panes.get(target) or ""
+        if not participant:
+            self.panes.pop(target, None)
+            return {"ok": False, "pane": "", "reason": "unknown_target", "probe_status": "", "detail": "", "should_detach": False}
+        detail = resolve_participant_endpoint_detail(self.bridge_session or "", target, participant, purpose=purpose)
+        if detail.get("ok"):
+            self.panes[target] = str(detail.get("pane") or "")
+            if detail.get("reconnected"):
+                self.session_mtime_ns = None
+                self.reload_participants()
+                self.panes[target] = str(detail.get("pane") or "")
+            return detail
+        # Unit-style dry-run scenarios historically omit hook identities. Keep
+        # that test fixture convenience, but real tmux writes never take this
+        # path because dry_run=False in production.
+        if self.dry_run and not participant.get("hook_session_id"):
+            pane = str(participant.get("pane") or "")
+            if pane:
+                self.panes[target] = pane
+                return {"ok": True, "pane": pane, "reason": "dry_run_unverified", "probe_status": "", "detail": "", "should_detach": False}
+        self.panes.pop(target, None)
+        return detail
+
+    def resolve_target_pane(self, target: str) -> str:
+        detail = self.resolve_endpoint_detail(target, purpose="write")
+        return str(detail.get("pane") or "") if detail.get("ok") else ""
 
     def next_pending_candidate(self, target: str) -> dict | None:
         if target in self.held_interrupt:
@@ -1262,15 +1322,11 @@ class BridgeDaemon:
     def deliver_reserved(self, message: dict) -> None:
         target = str(message["to"])
         nonce = str(message["nonce"])
-        participant = self.participants.get(target)
-        endpoint = resolve_participant_endpoint(self.bridge_session or "", target, participant or {}) if participant else ""
-        if endpoint:
-            self.panes[target] = endpoint
-        if target not in self.panes or not self.panes.get(target):
-            self.mark_message_pending(str(message["id"]), "unknown_target")
-            self.log("message_delivery_failed", message_id=message["id"], to=target, nonce=nonce, error="unknown_target")
+        endpoint_detail = self.resolve_endpoint_detail(target, purpose="write")
+        if not endpoint_detail.get("ok"):
+            self.finalize_undeliverable_message(message, endpoint_detail, phase="pre_send")
             return
-        pane = self.panes[target]
+        pane = str(endpoint_detail.get("pane") or "")
         mode_status = self.pane_mode_status(pane)
         if mode_status.get("error"):
             deferred = self.defer_inflight_for_pane_mode_probe_failed(message, str(mode_status.get("error") or ""))
@@ -1303,6 +1359,18 @@ class BridgeDaemon:
 
         self.reserved[target] = str(message["id"])
         self.remember_nonce(nonce, message)
+        body_text = str(message.get("body") or "")
+        if len(body_text) > MAX_PEER_BODY_CHARS:
+            self.log(
+                "body_truncated",
+                message_id=message.get("id"),
+                from_agent=message.get("from"),
+                to=target,
+                kind=message.get("kind"),
+                intent=message.get("intent"),
+                original_chars=len(body_text),
+                limit_chars=MAX_PEER_BODY_CHARS,
+            )
         prompt = build_peer_prompt(message, nonce, self.max_hops)
         enter_deferred = False
 
@@ -1505,6 +1573,78 @@ class BridgeDaemon:
 
         return self.queue.update(mutator)
 
+    def finalize_undeliverable_message(self, message: dict, endpoint_detail: dict, *, phase: str) -> dict | None:
+        message_id = str(message.get("id") or "")
+        target = str(message.get("to") or "")
+        if not message_id:
+            return None
+
+        def mutator(queue: list[dict]) -> dict | None:
+            found = None
+            kept = []
+            for item in queue:
+                if item.get("id") == message_id:
+                    found = dict(item)
+                    continue
+                kept.append(item)
+            queue[:] = kept
+            return found
+
+        removed = self.queue.update(mutator) or dict(message)
+        nonce = str(removed.get("nonce") or message.get("nonce") or "")
+        if nonce:
+            self.discard_nonce(nonce)
+        if self.reserved.get(target) == message_id:
+            self.reserved[target] = None
+        self.last_enter_ts.pop(message_id, None)
+        active = self.current_prompt_by_agent.get(target) or {}
+        if str(active.get("id") or "") == message_id:
+            self.current_prompt_by_agent.pop(target, None)
+            self.busy[target] = False
+        self.cancel_watchdogs_for_message(message_id, reason="endpoint_lost")
+
+        reason = str(endpoint_detail.get("reason") or "endpoint_lost")
+        probe_status = str(endpoint_detail.get("probe_status") or "")
+        self.log(
+            "message_undeliverable",
+            message_id=message_id,
+            from_agent=removed.get("from"),
+            to=target,
+            kind=removed.get("kind"),
+            aggregate_id=removed.get("aggregate_id"),
+            reason=reason,
+            probe_status=probe_status,
+            detail=endpoint_detail.get("detail"),
+            phase=phase,
+        )
+
+        if removed.get("aggregate_id"):
+            self._record_aggregate_interrupted_reply(removed, by_sender="bridge", reason="endpoint_lost")
+            return removed
+
+        kind = normalize_kind(removed.get("kind"), "request")
+        requester = str(removed.get("from") or "")
+        if kind == "request" and bool(removed.get("auto_return")) and requester and requester != "bridge" and requester in self.participants:
+            body = (
+                f"[bridge:undeliverable] Message {message_id} to {target} could not be delivered because "
+                f"the target has no verified live endpoint ({reason}). The target may have exited, been killed, "
+                "or the tmux pane may have been reused. Ask the human to reattach/join the target, or remove it from the room."
+            )
+            result = make_message(
+                sender="bridge",
+                target=requester,
+                intent="undeliverable_result",
+                body=body,
+                causal_id=str(removed.get("causal_id") or short_id("causal")),
+                hop_count=int(removed.get("hop_count") or 0),
+                auto_return=False,
+                kind="result",
+                reply_to=message_id,
+                source="endpoint_lost",
+            )
+            self.queue_message(result)
+        return removed
+
     def retry_enter_for_inflight(self) -> None:
         now = time.time()
         with self.state_lock:
@@ -1521,9 +1661,12 @@ class BridgeDaemon:
                 if last is not None and now - last < 1.0:
                     continue
                 target = str(item.get("to") or "")
-                pane = self.panes.get(target)
-                if not pane:
+                endpoint_detail = self.resolve_endpoint_detail(target, purpose="write")
+                if not endpoint_detail.get("ok"):
+                    self.finalize_undeliverable_message(item, endpoint_detail, phase="enter_retry")
+                    self.last_enter_ts.pop(msg_id, None)
                     continue
+                pane = str(endpoint_detail.get("pane") or "")
                 mode_status = self.pane_mode_status(pane)
                 if mode_status.get("error"):
                     error = str(mode_status.get("error") or "")
@@ -1923,14 +2066,33 @@ class BridgeDaemon:
         # ordering comment in __init__.
         self.reload_participants()
         with self.state_lock:
-            participant = self.participants.get(target)
-            endpoint = resolve_participant_endpoint(self.bridge_session or "", target, participant or {}) if participant else ""
-            if endpoint:
-                self.panes[target] = endpoint
-            pane = self.panes.get(target)
+            endpoint_detail = self.resolve_endpoint_detail(target, purpose="write")
+            pane = str(endpoint_detail.get("pane") or "") if endpoint_detail.get("ok") else ""
             if not pane:
-                self.log("esc_failed", target=target, by_sender=sender, error="no_pane")
-                return {"esc_sent": False, "esc_error": "no_pane", "held": False, "cancelled_message_ids": []}
+                reason = str(endpoint_detail.get("reason") or "no_pane")
+                finalized: list[dict] = []
+                if endpoint_detail.get("should_detach") or endpoint_detail.get("probe_status") == "mismatch":
+                    for item in list(self.queue.read()):
+                        if item.get("to") == target and item.get("status") in {"delivered", "inflight", "submitted"}:
+                            removed = self.finalize_undeliverable_message(item, endpoint_detail, phase="interrupt_endpoint_lost")
+                            if removed:
+                                finalized.append(removed)
+                    self.busy[target] = False
+                    self.reserved[target] = None
+                self.log(
+                    "esc_failed",
+                    target=target,
+                    by_sender=sender,
+                    error=reason,
+                    probe_status=endpoint_detail.get("probe_status"),
+                    finalized_message_ids=[item.get("id") for item in finalized],
+                )
+                return {
+                    "esc_sent": False,
+                    "esc_error": reason,
+                    "held": False,
+                    "cancelled_message_ids": [item.get("id") for item in finalized],
+                }
             if not self.dry_run:
                 try:
                     subprocess.run(["tmux", "send-keys", "-t", pane, "Escape"], check=True)
@@ -2049,6 +2211,10 @@ class BridgeDaemon:
         if reason == "prompt_intercepted":
             synthetic_text = (
                 "[intercepted by user prompt: peer accepted a new prompt before this aggregate request finished]"
+            )
+        elif reason == "endpoint_lost":
+            synthetic_text = (
+                "[bridge:undeliverable] peer endpoint was lost before this aggregate request could complete"
             )
         else:
             synthetic_text = (
@@ -2944,9 +3110,10 @@ class BridgeDaemon:
         if not participant:
             fail(f"target {target!r} is not an active participant")
             return
-        endpoint = resolve_participant_endpoint(self.bridge_session or "", target, participant)
+        endpoint_detail = self.resolve_endpoint_detail(target, purpose="read")
+        endpoint = str(endpoint_detail.get("pane") or "") if endpoint_detail.get("ok") else ""
         if not endpoint:
-            fail(f"target {target!r} has no verified live pane")
+            fail(f"target {target!r} has no verified live pane ({endpoint_detail.get('reason')})")
             return
 
         try:
@@ -3045,6 +3212,24 @@ class BridgeDaemon:
                 )
                 if self.pane_mode_grace_warning:
                     self.log("pane_mode_grace_config_warning", warning=self.pane_mode_grace_warning)
+                if self.startup_backfill_summary:
+                    unknown = [
+                        alias for alias, item in self.startup_backfill_summary.items()
+                        if isinstance(item, dict) and item.get("status") == "unknown"
+                    ]
+                    mismatch = [
+                        alias for alias, item in self.startup_backfill_summary.items()
+                        if isinstance(item, dict) and item.get("status") == "mismatch"
+                    ]
+                    self.log(
+                        "endpoint_backfill_summary",
+                        statuses=self.startup_backfill_summary,
+                        repair_hint=(
+                            "run bin/bridge_healthcheck.sh --backfill-endpoints from a host tmux shell with /proc access; "
+                            "reattach/join with normal probing if no verified prior live endpoint exists"
+                            if unknown or mismatch else ""
+                        ),
+                    )
 
                 # Recover any messages left in the transient "ingressing"
                 # state by a previous daemon crash or by file-fallback

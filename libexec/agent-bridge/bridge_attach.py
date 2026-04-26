@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bridge_participants import ALIAS_RE
-from bridge_identity import detach_stale_pane_lock
+from bridge_identity import backfill_session_process_identities, detach_stale_pane_lock, verify_existing_live_process_identity
 from bridge_instructions import probe_prompt
 from bridge_paths import install_root, libexec_dir, model_bin_dir, pin_runtime_roots, run_root, state_root
 from bridge_ui import read_key, terminal_cells, terminal_width, truncate_to_cells
@@ -901,6 +901,25 @@ def peer_names(participants: list[dict], alias: str) -> str:
     return ", ".join(peers) or "(none)"
 
 
+def verify_no_probe_participant_processes(participants: list[dict]) -> None:
+    failures = []
+    for item in participants:
+        pane = item.get("pane") or {}
+        pane_id = str(pane.get("pane_id") or "")
+        probe = verify_existing_live_process_identity(str(item.get("agent") or ""), str(item.get("session_id") or ""), pane_id)
+        if probe.get("status") != "verified":
+            failures.append(
+                f"{item.get('alias')}:{pane_id}:{probe.get('status')}:{probe.get('reason')}"
+            )
+    if failures:
+        raise SystemExit(
+            "--no-probe could not verify participant pane processes: "
+            + ", ".join(failures)
+            + ". --no-probe is expert-only: host-side probing verifies the pane process, "
+            "but cannot prove the supplied hook_session_id is correct. Use normal probing unless you know the session ids."
+        )
+
+
 def stop_existing_daemon_for_reattach(session: str) -> None:
     pid_file = run_root() / f"{session}.pid"
     if not pid_file.exists():
@@ -1103,6 +1122,7 @@ def main() -> int:
             if not item.get("session_id"):
                 raise SystemExit(f"--no-probe requires hook session id for {item['alias']}; pass --participant-session {item['alias']}=SESSION_ID or alias:type:pane@SESSION_ID")
             probe_records[item["alias"]] = {"session_id": item["session_id"]}
+        verify_no_probe_participant_processes(participants)
     else:
         probes = []
         for item in participants:
@@ -1127,9 +1147,6 @@ def main() -> int:
             except AttachProbeTimeout as exc:
                 raise SystemExit(str(exc)) from exc
 
-    stop_existing_daemon_for_reattach(args.session)
-    archived_state = prepare_room_state_files(args.session, state_dir, events_file, bus_file, queue_file)
-
     mappings = []
     for item in participants:
         agent = item["agent"]
@@ -1150,6 +1167,12 @@ def main() -> int:
                 "attached_at": utc_now(),
             }
         )
+
+    if args.no_probe:
+        verify_no_probe_participant_processes(participants)
+
+    stop_existing_daemon_for_reattach(args.session)
+    archived_state = prepare_room_state_files(args.session, state_dir, events_file, bus_file, queue_file)
 
     update_registry(mappings, args.session)
     update_pane_locks(mappings, args.session, args.replace_locks)
@@ -1182,6 +1205,10 @@ def main() -> int:
     }
     if archived_state:
         state["archived_state"] = archived_state
+
+    write_state(state)
+    backfill_summary = backfill_session_process_identities(args.session, state, allow_create_from_hook=not args.no_probe)
+    state["endpoint_backfill"] = backfill_summary
 
     if args.no_daemon:
         state["daemon"] = {

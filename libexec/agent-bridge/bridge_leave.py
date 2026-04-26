@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from bridge_attach import pane_locks_file, registry_file
-from bridge_identity import resolve_participant_endpoint
+from bridge_identity import resolve_participant_endpoint_detail
 from bridge_participants import active_participants, format_peer_summary, load_session, save_session_state, session_state_exists
 from bridge_paths import ensure_runtime_writable, libexec_dir, state_root
 from bridge_util import locked_json
@@ -73,9 +73,11 @@ def tmux_send_literal(pane: str, text: str, submit_delay: float = 0.05) -> None:
 
 
 def send_leave_notice(session: str, alias: str, record: dict) -> dict:
-    pane = resolve_participant_endpoint(session, alias, record)
+    detail = resolve_participant_endpoint_detail(session, alias, record, purpose="write")
+    pane = str(detail.get("pane") or "") if detail.get("ok") else ""
     if not pane:
-        return {"sent": 0, "pane": "", "error": "no verified live endpoint"}
+        reason = str(detail.get("reason") or "no_verified_live_endpoint")
+        return {"sent": 0, "pane": "", "error": reason}
     body = (
         f"[bridge:membership] You were removed from bridge room {session} as {alias}. "
         "Peer routing for this alias has stopped. Do not use agent_send_peer for this room unless the human rejoins you."
@@ -159,6 +161,8 @@ def main() -> int:
     else:
         print(f"Left {args.alias} from {args.session}")
         print(f"Participants: {', '.join(result['participants']) or '(none)'}")
+        if leave_notice.get("error") and leave_notice.get("sent") == 0 and not args.no_notify:
+            print(f"Leave notice suppressed for {args.alias}: {leave_notice['error']}", file=sys.stderr)
         if removed_messages:
             print(f"Removed pending messages: {removed_messages}")
     return 0

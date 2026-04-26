@@ -15,6 +15,11 @@ from typing import Any, Callable, Iterator
 
 MESSAGE_KINDS = {"request", "result", "notice"}
 DEFAULT_REDACT_FIELDS = {"prompt", "last_assistant_message", "body", "tool_input", "transcript_path"}
+MAX_PEER_BODY_CHARS = 12000
+# External sends leave headroom under the daemon prompt guard for bridge-added
+# notices such as alarm-cancel prefixes.
+MAX_INLINE_SEND_BODY_CHARS = 11000
+SHARED_PAYLOAD_ROOT = "/tmp/agent-bridge-share"
 
 # Default suffix length for hex-derived identifiers that show up in prompt
 # envelopes (msg-, causal-, agg-, wake-, cap-). 12 hex = 2^48 ≈ 2.8e14; the
@@ -36,6 +41,28 @@ def utc_now() -> str:
 def short_id(prefix: str, length: int = SHORT_ID_LEN) -> str:
     """Generate a prefixed short hex identifier (e.g., 'msg-a1b2c3d4e5f6')."""
     return f"{prefix}-{uuid.uuid4().hex[:length]}"
+
+
+def validate_peer_body_size(body: str, tool_name: str = "agent_send_peer") -> tuple[bool, str]:
+    """Validate external inline peer body size using a character-count limit."""
+    actual = len(str(body))
+    if actual <= MAX_INLINE_SEND_BODY_CHARS:
+        return True, ""
+    return (
+        False,
+        (
+            f"{tool_name}: message body is {actual} chars, exceeding the inline limit "
+            f"of {MAX_INLINE_SEND_BODY_CHARS} chars. Write large content to "
+            f"{SHARED_PAYLOAD_ROOT}/<file> and send the path instead. Splitting into "
+            f"multiple {tool_name} calls is possible only if separate requests and "
+            "separate replies are acceptable."
+        ),
+    )
+
+
+def read_limited_text(stream, limit: int = MAX_INLINE_SEND_BODY_CHARS) -> str:
+    """Read enough text to validate size without consuming an unbounded stdin."""
+    return stream.read(max(0, int(limit)) + 1)
 
 
 def _default_copy(default: Any) -> Any:

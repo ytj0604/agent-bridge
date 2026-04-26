@@ -298,3 +298,78 @@ Two ways this hole can be reached:
 In both cases the daemon marks the candidate `delivered` and binds
 ctx, so the next `response_finished` will auto-route. A
 prompt-body-hash cross-check would close this; deferred to v1.6.
+
+---
+
+## I-05: oversized peer bodies silently truncated at delivery (fixed)
+
+**Status**: fixed after v1.5.2.
+
+### Symptom
+
+`agent_send_peer` accepted inline bodies larger than the daemon's
+delivery guard. The sender saw a successful message id, but the peer
+received only the first 12000 characters plus `[bridge truncated peer body]`.
+
+### Root cause
+
+`bridge_daemon.prompt_body()` defensively caps prompt injection at
+12000 characters to keep `tmux send-keys` and model TUI paste handling
+stable. `agent_send_peer` and `bridge_enqueue.py` did not enforce the
+same limit before queueing.
+
+### Fix
+
+- `bridge_send_peer.py` rejects oversized bodies before spawning
+  `bridge_enqueue.py`, avoiding argv/ARG_MAX failures for stdin input.
+- `bridge_enqueue.py` enforces the same limit for direct/fallback use.
+- External inline sends are capped at 11000 characters, leaving headroom
+  for bridge-added notices under the daemon's 12000-character prompt
+  guard. The shared limits live in `bridge_util.py`.
+- The daemon still keeps the delivery-time truncation guard for legacy
+  queued items and internal synthetic messages, but logs `body_truncated`
+  when it fires.
+- Alarm-cancel notices now shrink or omit their prepended notice rather
+  than displacing an at-limit user body.
+
+---
+
+## I-06: stale pane endpoints can receive bridge input after agent exit (fixed)
+
+**Status**: fixed after v1.5.2.
+
+### Symptom
+
+If an attached agent exited or was killed, its tmux pane could later be
+reused by a shell or a different agent. Bridge operations such as
+`bridge_leave`, room close, peer delivery, retry-Enter, or interrupt
+could still type into that pane using stale room state.
+
+### Root cause
+
+Write-side endpoint resolution trusted `pane-locks.json` when no live
+hook record was present, and the daemon could fall back to an old
+`self.panes[target]` cache after fresh resolution failed. Direct
+membership notices also bypassed the daemon queue and wrote to tmux
+directly.
+
+### Fix
+
+- Endpoint writes and live reads now require a verified live hook/backfill
+  record plus a current process fingerprint (`pid`, `/proc` start time,
+  and boot id when available).
+- Probe results are tri-state: `verified`, `mismatch`, or `unknown`.
+  `unknown` fails closed but does not mutate membership or pane locks.
+- Positive mismatches clear stale pane locks and mark the participant
+  `endpoint_lost` while keeping the alias visible for operator cleanup.
+- Daemon delivery, interrupt, retry-Enter, pane-mode cancel, room-close
+  notices, leave notices, daemon capture, and `agent_view_peer` live
+  capture use the strict endpoint path.
+- Undeliverable auto-return requests complete with a bridge
+  `[bridge:undeliverable]` result; aggregate members get a synthetic
+  undeliverable aggregate reply instead of hanging forever.
+- Daemon startup and `bridge_healthcheck.sh --backfill-endpoints` only
+  refresh endpoints that already have prior verified live evidence.
+  Fresh normal attach/join hook probes may create the initial
+  fingerprint; `--no-probe` requires an existing verified live endpoint
+  before it publishes room state.

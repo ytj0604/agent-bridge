@@ -16,6 +16,7 @@ Exits non-zero if any scenario fails.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import errno
 import json
 import os
@@ -47,8 +48,10 @@ INSTALL_SHIM_TARGETS = DIRECT_EXECUTABLE_TARGETS[:-1]
 sys.path.insert(0, str(LIBEXEC))
 
 import bridge_daemon  # noqa: E402
+import bridge_identity  # noqa: E402
+import bridge_pane_probe  # noqa: E402
 import bridge_response_guard  # noqa: E402
-from bridge_util import utc_now  # noqa: E402
+from bridge_util import MAX_INLINE_SEND_BODY_CHARS, MAX_PEER_BODY_CHARS, read_json, read_limited_text, validate_peer_body_size, utc_now, write_json_atomic  # noqa: E402
 
 
 def make_daemon(tmpdir: Path, participants: dict[str, dict]) -> bridge_daemon.BridgeDaemon:
@@ -126,6 +129,129 @@ def test_message(message_id: str, frm: str = "claude", to: str = "codex", status
         "nonce": None,
         "delivery_attempts": 0,
     }
+
+
+@contextmanager
+def isolated_identity_env(tmpdir: Path):
+    keys = [
+        "AGENT_BRIDGE_RUNTIME_DIR",
+        "AGENT_BRIDGE_ATTACH_REGISTRY",
+        "AGENT_BRIDGE_PANE_LOCKS",
+        "AGENT_BRIDGE_LIVE_SESSIONS",
+        "AGENT_BRIDGE_NO_RESUME_FROM_UNKNOWN",
+    ]
+    old = {key: os.environ.get(key) for key in keys}
+    runtime = tmpdir / "identity-runtime"
+    os.environ["AGENT_BRIDGE_RUNTIME_DIR"] = str(runtime)
+    os.environ["AGENT_BRIDGE_ATTACH_REGISTRY"] = str(tmpdir / "attached-sessions.json")
+    os.environ["AGENT_BRIDGE_PANE_LOCKS"] = str(tmpdir / "pane-locks.json")
+    os.environ["AGENT_BRIDGE_LIVE_SESSIONS"] = str(tmpdir / "live-sessions.json")
+    try:
+        yield runtime / "state"
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def write_identity_fixture(state_root_path: Path, *, alias: str = "codex", agent: str = "codex", session_id: str = "sess-a", pane: str = "%20") -> dict:
+    state_dir = state_root_path / "test-session"
+    participant = {
+        "alias": alias,
+        "agent_type": agent,
+        "pane": pane,
+        "target": "tmux:1.0",
+        "hook_session_id": session_id,
+        "status": "active",
+    }
+    state = {"session": "test-session", "participants": {alias: participant}, "panes": {alias: pane}, "targets": {alias: "tmux:1.0"}}
+    write_json_atomic(state_dir / "session.json", state)
+    write_json_atomic(
+        Path(os.environ["AGENT_BRIDGE_ATTACH_REGISTRY"]),
+        {
+            "version": 1,
+            "sessions": {
+                f"{agent}:{session_id}": {
+                    "agent": agent,
+                    "alias": alias,
+                    "session_id": session_id,
+                    "bridge_session": "test-session",
+                    "pane": pane,
+                    "target": "tmux:1.0",
+                }
+            },
+        },
+    )
+    write_json_atomic(
+        Path(os.environ["AGENT_BRIDGE_PANE_LOCKS"]),
+        {
+            "version": 1,
+            "panes": {
+                pane: {
+                    "bridge_session": "test-session",
+                    "agent": agent,
+                    "alias": alias,
+                    "target": "tmux:1.0",
+                    "hook_session_id": session_id,
+                }
+            },
+        },
+    )
+    write_json_atomic(Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]), {"version": 1, "panes": {}, "sessions": {}})
+    return participant
+
+
+def verified_identity(agent: str = "codex", pane: str = "%20", pid: int = 1234, start_time: str = "55") -> dict:
+    return {
+        "status": "verified",
+        "reason": "ok",
+        "pane": pane,
+        "target": "tmux:1.0",
+        "agent": agent,
+        "pane_pid": "100",
+        "boot_id": "boot-a",
+        "processes": [{"pid": pid, "start_time": start_time, "score": 99, "args_hint": agent}],
+    }
+
+
+def identity_live_record(
+    *,
+    agent: str = "codex",
+    session_id: str = "sess-a",
+    pane: str = "%20",
+    alias: str = "codex",
+    pid: int = 1234,
+    start_time: str = "55",
+    last_seen_at: str | None = None,
+    process_identity: dict | None = None,
+) -> dict:
+    return {
+        "agent": agent,
+        "session_id": session_id,
+        "pane": pane,
+        "target": "tmux:1.0",
+        "bridge_session": "test-session",
+        "alias": alias,
+        "last_seen_at": last_seen_at or utc_now(),
+        "process_identity": process_identity or verified_identity(agent, pane, pid=pid, start_time=start_time),
+    }
+
+
+def read_raw_events(state_root_path: Path) -> list[dict]:
+    path = state_root_path / "test-session" / "events.raw.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def write_live_identity_records(*records: dict, index_record: dict | None = None) -> None:
+    panes = {str(record.get("pane") or ""): record for record in records if record.get("pane")}
+    sessions: dict[str, dict] = {}
+    if index_record:
+        sessions[f"{index_record.get('agent')}:{index_record.get('session_id')}"] = index_record
+    write_json_atomic(Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]), {"version": 1, "panes": panes, "sessions": sessions})
 
 
 def scenario_lifecycle(label: str, tmpdir: Path) -> None:
@@ -1176,6 +1302,7 @@ def scenario_pre_enter_probe_failure_defers_enter(label: str, tmpdir: Path) -> N
     participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
     d = make_daemon(tmpdir, participants)
     d.dry_run = False
+    d.resolve_endpoint_detail = lambda target, purpose="write": {"ok": True, "pane": participants[target]["pane"], "reason": "test_verified"}  # type: ignore[method-assign]
     status_calls = [
         {"in_mode": False, "mode": "", "error": ""},
         {"in_mode": False, "mode": "", "error": ""},
@@ -2998,24 +3125,749 @@ def scenario_view_peer_snapshot_not_found_hides_full_id(label: str, tmpdir: Path
     print(f"  PASS  {label}")
 
 
+def scenario_endpoint_rejects_stale_pane_lock_without_live(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        participant = write_identity_fixture(state_root_path)
+        detail = bridge_identity.resolve_participant_endpoint_detail("test-session", "codex", participant)
+        assert_true(not detail.get("ok"), f"{label}: stale pane lock must not authorize endpoint")
+        assert_true(detail.get("reason") == "live_record_missing", f"{label}: expected live_record_missing, got {detail}")
+        locks = read_json(Path(os.environ["AGENT_BRIDGE_PANE_LOCKS"]), {"panes": {}})
+        assert_true("%20" in (locks.get("panes") or {}), f"{label}: unknown/stale lock should remain diagnostic-only")
+    print(f"  PASS  {label}")
+
+
+def scenario_endpoint_rejects_same_pane_new_live_identity(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        participant = write_identity_fixture(state_root_path, alias="codexA", session_id="sess-a", pane="%21")
+        write_json_atomic(
+            Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]),
+            {
+                "version": 1,
+                "panes": {
+                    "%21": {
+                        "agent": "codex",
+                        "session_id": "sess-b",
+                        "pane": "%21",
+                        "target": "tmux:1.0",
+                        "bridge_session": "test-session",
+                        "alias": "codexB",
+                        "last_seen_at": utc_now(),
+                        "process_identity": verified_identity("codex", "%21", pid=2000, start_time="99"),
+                    }
+                },
+                "sessions": {},
+            },
+        )
+        detail = bridge_identity.resolve_participant_endpoint_detail("test-session", "codexA", participant)
+        assert_true(not detail.get("ok") and detail.get("reason") == "live_record_mismatch", f"{label}: expected live mismatch, got {detail}")
+        locks = read_json(Path(os.environ["AGENT_BRIDGE_PANE_LOCKS"]), {"panes": {}})
+        assert_true("%21" not in (locks.get("panes") or {}), f"{label}: positive mismatch should clear pane lock")
+        state = read_json(state_root_path / "test-session" / "session.json", {})
+        record = ((state.get("participants") or {}).get("codexA") or {})
+        assert_true(record.get("endpoint_status") == "endpoint_lost", f"{label}: participant remains visible but endpoint_lost")
+    print(f"  PASS  {label}")
+
+
+def scenario_endpoint_probe_unknown_does_not_mutate(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        participant = write_identity_fixture(state_root_path, pane="%22")
+        live = {
+            "agent": "codex",
+            "session_id": "sess-a",
+            "pane": "%22",
+            "target": "tmux:1.0",
+            "bridge_session": "test-session",
+            "alias": "codex",
+            "last_seen_at": utc_now(),
+            "process_identity": verified_identity("codex", "%22"),
+        }
+        write_json_atomic(Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]), {"version": 1, "panes": {"%22": live}, "sessions": {"codex:sess-a": live}})
+        old_probe = bridge_identity.probe_agent_process
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: {"status": "unknown", "reason": "ps_unavailable", "processes": []}  # type: ignore[assignment]
+        try:
+            detail = bridge_identity.resolve_participant_endpoint_detail("test-session", "codex", participant)
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+        assert_true(not detail.get("ok") and detail.get("reason") == "probe_unknown", f"{label}: expected probe_unknown, got {detail}")
+        locks = read_json(Path(os.environ["AGENT_BRIDGE_PANE_LOCKS"]), {"panes": {}})
+        assert_true("%22" in (locks.get("panes") or {}), f"{label}: probe_unknown must not clear pane lock")
+        state = read_json(state_root_path / "test-session" / "session.json", {})
+        record = ((state.get("participants") or {}).get("codex") or {})
+        assert_true(record.get("endpoint_status") != "endpoint_lost", f"{label}: probe_unknown must not mark endpoint lost")
+    print(f"  PASS  {label}")
+
+
+def scenario_endpoint_accepts_matching_process_fingerprint(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        participant = write_identity_fixture(state_root_path, pane="%23")
+        identity = verified_identity("codex", "%23", pid=3000, start_time="101")
+        live = {
+            "agent": "codex",
+            "session_id": "sess-a",
+            "pane": "%23",
+            "target": "tmux:1.0",
+            "bridge_session": "test-session",
+            "alias": "codex",
+            "last_seen_at": utc_now(),
+            "process_identity": identity,
+        }
+        write_json_atomic(Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]), {"version": 1, "panes": {"%23": live}, "sessions": {"codex:sess-a": live}})
+        old_probe = bridge_identity.probe_agent_process
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: dict(identity)  # type: ignore[assignment]
+        try:
+            detail = bridge_identity.resolve_participant_endpoint_detail("test-session", "codex", participant)
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+        assert_true(detail.get("ok") and detail.get("pane") == "%23", f"{label}: matching fingerprint should resolve, got {detail}")
+    print(f"  PASS  {label}")
+
+
+def scenario_backfill_refuses_to_mint_without_live_record(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        participant = write_identity_fixture(state_root_path, pane="%24")
+        old_probe = bridge_identity.probe_agent_process
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: verified_identity(agent, pane, pid=4000, start_time="201")  # type: ignore[assignment]
+        try:
+            summary = bridge_identity.backfill_session_process_identities("test-session", {"session": "test-session", "participants": {"codex": participant}})
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+        assert_true(summary.get("codex", {}).get("reason") == "live_record_missing", f"{label}: backfill must refuse to mint without live hook proof: {summary}")
+        live = read_json(Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]), {"panes": {}, "sessions": {}})
+        assert_true((live.get("panes") or {}) == {} and (live.get("sessions") or {}) == {}, f"{label}: live records must remain empty: {live}")
+        detail = bridge_identity.resolve_participant_endpoint_detail("test-session", "codex", participant)
+        assert_true(not detail.get("ok") and detail.get("reason") == "live_record_missing", f"{label}: resolver must still fail closed: {detail}")
+    print(f"  PASS  {label}")
+
+
+def scenario_backfill_refuses_other_live_identity(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        participant = write_identity_fixture(state_root_path, alias="codexA", session_id="sess-a", pane="%25")
+        other = {
+            "agent": "codex",
+            "session_id": "sess-b",
+            "pane": "%25",
+            "target": "tmux:1.0",
+            "bridge_session": "test-session",
+            "alias": "codexB",
+            "last_seen_at": utc_now(),
+            "process_identity": verified_identity("codex", "%25", pid=5000, start_time="301"),
+        }
+        write_json_atomic(Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]), {"version": 1, "panes": {"%25": other}, "sessions": {"codex:sess-b": other}})
+        old_probe = bridge_identity.probe_agent_process
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: verified_identity(agent, pane, pid=5001, start_time="302")  # type: ignore[assignment]
+        try:
+            summary = bridge_identity.backfill_session_process_identities("test-session", {"session": "test-session", "participants": {"codexA": participant}})
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+        assert_true(summary.get("codexA", {}).get("reason") == "live_record_mismatch", f"{label}: backfill must refuse other live identity: {summary}")
+        live = read_json(Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]), {"panes": {}})
+        assert_true(((live.get("panes") or {}).get("%25") or {}).get("session_id") == "sess-b", f"{label}: other live record must not be overwritten: {live}")
+    print(f"  PASS  {label}")
+
+
+def scenario_backfill_rejects_changed_process_fingerprint(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        participant = write_identity_fixture(state_root_path, pane="%26")
+        original_identity = verified_identity("codex", "%26", pid=6000, start_time="401")
+        live = {
+            "agent": "codex",
+            "session_id": "sess-a",
+            "pane": "%26",
+            "target": "tmux:1.0",
+            "bridge_session": "test-session",
+            "alias": "codex",
+            "last_seen_at": utc_now(),
+            "process_identity": original_identity,
+        }
+        write_json_atomic(Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]), {"version": 1, "panes": {"%26": live}, "sessions": {"codex:sess-a": live}})
+        mismatch = verified_identity("codex", "%26", pid=6001, start_time="402")
+        mismatch["status"] = "mismatch"
+        mismatch["reason"] = "process_fingerprint_mismatch"
+        old_probe = bridge_identity.probe_agent_process
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: dict(mismatch)  # type: ignore[assignment]
+        try:
+            summary = bridge_identity.backfill_session_process_identities("test-session", {"session": "test-session", "participants": {"codex": participant}})
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+        assert_true(summary.get("codex", {}).get("status") == "mismatch", f"{label}: changed process must not be refreshed: {summary}")
+        live_after = read_json(Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]), {"panes": {}})
+        proc = (((live_after.get("panes") or {}).get("%26") or {}).get("process_identity") or {}).get("processes", [{}])[0]
+        assert_true(proc.get("pid") == 6000, f"{label}: original fingerprint must remain: {live_after}")
+    print(f"  PASS  {label}")
+
+
+def scenario_backfill_allows_fresh_hook_proof_create(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        participant = write_identity_fixture(state_root_path, pane="%27")
+        identity = verified_identity("codex", "%27", pid=7000, start_time="501")
+        old_probe = bridge_identity.probe_agent_process
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: dict(identity)  # type: ignore[assignment]
+        try:
+            summary = bridge_identity.backfill_session_process_identities(
+                "test-session",
+                {"session": "test-session", "participants": {"codex": participant}},
+                allow_create_from_hook=True,
+            )
+            detail = bridge_identity.resolve_participant_endpoint_detail("test-session", "codex", participant)
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+        assert_true(summary.get("codex", {}).get("status") == "verified", f"{label}: fresh hook proof may create fingerprint: {summary}")
+        assert_true(detail.get("ok") and detail.get("pane") == "%27", f"{label}: created live fingerprint should resolve: {detail}")
+    print(f"  PASS  {label}")
+
+
+def scenario_hook_unknown_preserves_verified_process_identity(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        write_identity_fixture(state_root_path, pane="%28")
+        original_identity = verified_identity("codex", "%28", pid=8000, start_time="601")
+        live = {
+            "agent": "codex",
+            "session_id": "sess-a",
+            "pane": "%28",
+            "target": "tmux:1.0",
+            "bridge_session": "test-session",
+            "alias": "codex",
+            "last_seen_at": utc_now(),
+            "process_identity": original_identity,
+        }
+        write_json_atomic(Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]), {"version": 1, "panes": {"%28": live}, "sessions": {"codex:sess-a": live}})
+        old_probe = bridge_identity.probe_agent_process
+        old_target = bridge_identity.tmux_target_for_pane
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: {"status": "unknown", "reason": "ps_unavailable", "pane": pane, "agent": agent, "processes": []}  # type: ignore[assignment]
+        bridge_identity.tmux_target_for_pane = lambda pane: "tmux:1.0"  # type: ignore[assignment]
+        try:
+            bridge_identity.update_live_session(agent_type="codex", session_id="sess-a", pane="%28", bridge_session="test-session", alias="codex", event="prompt_submitted")
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+            bridge_identity.tmux_target_for_pane = old_target  # type: ignore[assignment]
+        live_after = read_json(Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]), {"panes": {}})
+        record = (live_after.get("panes") or {}).get("%28") or {}
+        proc = ((record.get("process_identity") or {}).get("processes") or [{}])[0]
+        assert_true(proc.get("pid") == 8000, f"{label}: verified fingerprint must be preserved: {record}")
+        assert_true((record.get("process_identity_diagnostics") or {}).get("reason") == "ps_unavailable", f"{label}: unknown probe diagnostics retained: {record}")
+    print(f"  PASS  {label}")
+
+
+def scenario_probe_tmux_access_failure_unknown(label: str, tmpdir: Path) -> None:
+    old_run = bridge_pane_probe.run
+    try:
+        bridge_pane_probe.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1, "", "no server running on /tmp/tmux-0/default")  # type: ignore[assignment]
+        unknown = bridge_pane_probe.probe_agent_process("%29", "codex")
+        bridge_pane_probe.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1, "", "can't find pane: %29")  # type: ignore[assignment]
+        missing = bridge_pane_probe.probe_agent_process("%29", "codex")
+    finally:
+        bridge_pane_probe.run = old_run  # type: ignore[assignment]
+    assert_true(unknown.get("status") == "unknown" and unknown.get("reason") == "tmux_access_failed", f"{label}: tmux access failure must be unknown: {unknown}")
+    assert_true(missing.get("status") == "mismatch" and missing.get("reason") == "pane_unavailable", f"{label}: positive missing pane remains mismatch: {missing}")
+    print(f"  PASS  {label}")
+
+
+def scenario_endpoint_read_mismatch_does_not_mutate(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        participant = write_identity_fixture(state_root_path, alias="codexA", session_id="sess-a", pane="%30")
+        other = {
+            "agent": "codex",
+            "session_id": "sess-b",
+            "pane": "%30",
+            "target": "tmux:1.0",
+            "bridge_session": "test-session",
+            "alias": "codexB",
+            "last_seen_at": utc_now(),
+            "process_identity": verified_identity("codex", "%30", pid=9000, start_time="701"),
+        }
+        write_json_atomic(Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]), {"version": 1, "panes": {"%30": other}, "sessions": {"codex:sess-b": other}})
+        detail = bridge_identity.resolve_participant_endpoint_detail("test-session", "codexA", participant, purpose="read")
+        assert_true(not detail.get("ok") and not detail.get("should_detach"), f"{label}: read mismatch should fail without detach directive: {detail}")
+        locks = read_json(Path(os.environ["AGENT_BRIDGE_PANE_LOCKS"]), {"panes": {}})
+        assert_true("%30" in (locks.get("panes") or {}), f"{label}: read path must not clear pane lock")
+        state = read_json(state_root_path / "test-session" / "session.json", {})
+        record = ((state.get("participants") or {}).get("codexA") or {})
+        assert_true(record.get("endpoint_status") != "endpoint_lost", f"{label}: read path must not mark endpoint lost")
+    print(f"  PASS  {label}")
+
+
+def scenario_verified_candidate_ordering_prefers_pane_then_newest(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir):
+        write_identity_fixture(tmpdir / "identity-runtime" / "state", pane="%40")
+        older = identity_live_record(pane="%40", pid=9400, start_time="901", last_seen_at="2026-01-01T00:00:00Z")
+        newer = identity_live_record(pane="%41", pid=9401, start_time="902", last_seen_at="2026-01-02T00:00:00Z")
+        write_live_identity_records(older, newer, index_record=older)
+        calls: list[str] = []
+        old_probe = bridge_identity.probe_agent_process
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: (calls.append(pane) or dict(stored_identity or verified_identity(agent, pane)))  # type: ignore[assignment]
+        try:
+            preferred = bridge_identity.find_verified_live_record_for_identity("codex", "sess-a", prefer_pane="%40")
+            calls.clear()
+            newest = bridge_identity.find_verified_live_record_for_identity("codex", "sess-a")
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+        assert_true(preferred.get("pane") == "%40", f"{label}: prefer_pane must win before timestamp: {preferred}")
+        assert_true(newest.get("pane") == "%41", f"{label}: without prefer_pane newest verified candidate must win: {newest}")
+        assert_true(calls == ["%41"], f"{label}: verified helper should short-circuit on first newest candidate: {calls}")
+    print(f"  PASS  {label}")
+
+
+def scenario_resume_new_pane_reconnects_unknown_old_and_logs(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        write_identity_fixture(state_root_path, pane="%42")
+        old_probe = bridge_identity.probe_agent_process
+        old_target = bridge_identity.tmux_target_for_pane
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: verified_identity(agent, pane, pid=9500, start_time="1001")  # type: ignore[assignment]
+        bridge_identity.tmux_target_for_pane = lambda pane: "tmux:1.0"  # type: ignore[assignment]
+        try:
+            mapping = bridge_identity.update_live_session(
+                agent_type="codex",
+                session_id="sess-a",
+                pane="%43",
+                bridge_session="test-session",
+                alias="codex",
+                event="prompt_submitted",
+            )
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+            bridge_identity.tmux_target_for_pane = old_target  # type: ignore[assignment]
+        assert_true(mapping and mapping.get("pane") == "%43", f"{label}: hook should reconnect to new verified pane: {mapping}")
+        registry = read_json(Path(os.environ["AGENT_BRIDGE_ATTACH_REGISTRY"]), {"sessions": {}})
+        attached = (registry.get("sessions") or {}).get("codex:sess-a") or {}
+        assert_true(attached.get("pane") == "%43", f"{label}: attached mapping not updated: {attached}")
+        state = read_json(state_root_path / "test-session" / "session.json", {})
+        participant = ((state.get("participants") or {}).get("codex") or {})
+        assert_true(participant.get("pane") == "%43", f"{label}: participant pane not refreshed: {participant}")
+        locks = read_json(Path(os.environ["AGENT_BRIDGE_PANE_LOCKS"]), {"panes": {}})
+        assert_true("%42" in (locks.get("panes") or {}) and "%43" in (locks.get("panes") or {}), f"{label}: unknown-old reconnect must not clear old diagnostic lock: {locks}")
+        events = read_raw_events(state_root_path)
+        reconnects = [event for event in events if event.get("event") == "endpoint_auto_reconnected"]
+        assert_true(reconnects and reconnects[-1].get("reason") == "mapped_endpoint_unknown", f"{label}: reconnect log missing/incorrect: {events}")
+        assert_true(reconnects[-1].get("old_status") == "unknown", f"{label}: old_status should be unknown: {reconnects[-1]}")
+    print(f"  PASS  {label}")
+
+
+def scenario_resume_unknown_old_opt_out_blocks_switch(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        write_identity_fixture(state_root_path, pane="%44")
+        os.environ["AGENT_BRIDGE_NO_RESUME_FROM_UNKNOWN"] = "1"
+        old_probe = bridge_identity.probe_agent_process
+        old_target = bridge_identity.tmux_target_for_pane
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: verified_identity(agent, pane, pid=9501, start_time="1002")  # type: ignore[assignment]
+        bridge_identity.tmux_target_for_pane = lambda pane: "tmux:1.0"  # type: ignore[assignment]
+        try:
+            mapping = bridge_identity.update_live_session(
+                agent_type="codex",
+                session_id="sess-a",
+                pane="%45",
+                bridge_session="test-session",
+                alias="codex",
+                event="prompt_submitted",
+            )
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+            bridge_identity.tmux_target_for_pane = old_target  # type: ignore[assignment]
+        registry = read_json(Path(os.environ["AGENT_BRIDGE_ATTACH_REGISTRY"]), {"sessions": {}})
+        attached = (registry.get("sessions") or {}).get("codex:sess-a") or {}
+        assert_true(mapping is None, f"{label}: opt-out should suppress unknown-old reconnect return: {mapping}")
+        assert_true(attached.get("pane") == "%44", f"{label}: opt-out should keep original mapping: {attached}")
+        assert_true(not read_raw_events(state_root_path), f"{label}: blocked reconnect should not log success")
+    print(f"  PASS  {label}")
+
+
+def scenario_hook_cached_prior_unknown_does_not_reconnect(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        write_identity_fixture(state_root_path, pane="%58")
+        prior = identity_live_record(pane="%59", pid=9510, start_time="1011")
+        write_live_identity_records(prior, index_record=prior)
+        old_probe = bridge_identity.probe_agent_process
+        old_target = bridge_identity.tmux_target_for_pane
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: {"status": "unknown", "reason": "ps_unavailable", "pane": pane, "agent": agent, "processes": []}  # type: ignore[assignment]
+        bridge_identity.tmux_target_for_pane = lambda pane: "tmux:1.0"  # type: ignore[assignment]
+        try:
+            mapping = bridge_identity.update_live_session(
+                agent_type="codex",
+                session_id="sess-a",
+                pane="%59",
+                bridge_session="test-session",
+                alias="codex",
+                event="prompt_submitted",
+            )
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+            bridge_identity.tmux_target_for_pane = old_target  # type: ignore[assignment]
+        registry = read_json(Path(os.environ["AGENT_BRIDGE_ATTACH_REGISTRY"]), {"sessions": {}})
+        attached = (registry.get("sessions") or {}).get("codex:sess-a") or {}
+        live = read_json(Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]), {"panes": {}})
+        candidate = ((live.get("panes") or {}).get("%59") or {})
+        assert_true(mapping is None, f"{label}: cached prior plus fresh unknown must not reconnect: {mapping}")
+        assert_true(attached.get("pane") == "%58", f"{label}: attached mapping must stay on old pane: {attached}")
+        assert_true((candidate.get("process_identity_diagnostics") or {}).get("reason") == "ps_unavailable", f"{label}: unknown diagnostics should be retained: {candidate}")
+        assert_true(not read_raw_events(state_root_path), f"{label}: blocked reconnect should not log success")
+    print(f"  PASS  {label}")
+
+
+def scenario_resolver_reconnects_to_alternate_verified_live_record(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        participant = write_identity_fixture(state_root_path, pane="%46")
+        new_live = identity_live_record(pane="%47", pid=9502, start_time="1003", last_seen_at="2026-01-03T00:00:00Z")
+        write_live_identity_records(new_live, index_record=new_live)
+        old_probe = bridge_identity.probe_agent_process
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: dict(stored_identity or verified_identity(agent, pane))  # type: ignore[assignment]
+        try:
+            detail = bridge_identity.resolve_participant_endpoint_detail("test-session", "codex", participant)
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+        assert_true(detail.get("ok") and detail.get("pane") == "%47", f"{label}: resolver should recover to alternate verified pane: {detail}")
+        registry = read_json(Path(os.environ["AGENT_BRIDGE_ATTACH_REGISTRY"]), {"sessions": {}})
+        assert_true(((registry.get("sessions") or {}).get("codex:sess-a") or {}).get("pane") == "%47", f"{label}: registry not migrated: {registry}")
+        state = read_json(state_root_path / "test-session" / "session.json", {})
+        assert_true((((state.get("participants") or {}).get("codex") or {}).get("pane")) == "%47", f"{label}: participant pane not refreshed: {state}")
+    print(f"  PASS  {label}")
+
+
+def scenario_resolver_candidate_unknown_on_final_probe_does_not_reconnect(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        participant = write_identity_fixture(state_root_path, pane="%60")
+        candidate = identity_live_record(pane="%61", pid=9511, start_time="1012", last_seen_at="2026-01-08T00:00:00Z")
+        write_live_identity_records(candidate, index_record=candidate)
+        calls: dict[str, int] = {"%61": 0}
+        old_probe = bridge_identity.probe_agent_process
+
+        def probe(pane, agent, stored_identity=None):
+            if pane == "%61":
+                calls["%61"] += 1
+                if calls["%61"] == 1:
+                    return dict(stored_identity or verified_identity(agent, pane))
+                return {"status": "unknown", "reason": "ps_unavailable", "pane": pane, "agent": agent, "processes": []}
+            return {"status": "unknown", "reason": "ps_unavailable", "pane": pane, "agent": agent, "processes": []}
+
+        bridge_identity.probe_agent_process = probe  # type: ignore[assignment]
+        try:
+            detail = bridge_identity.resolve_participant_endpoint_detail("test-session", "codex", participant)
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+        registry = read_json(Path(os.environ["AGENT_BRIDGE_ATTACH_REGISTRY"]), {"sessions": {}})
+        attached = (registry.get("sessions") or {}).get("codex:sess-a") or {}
+        assert_true(not detail.get("ok") and detail.get("reason") == "live_record_missing", f"{label}: final unknown probe should block reconnect: {detail}")
+        assert_true(calls["%61"] >= 2, f"{label}: candidate should be re-probed before write: {calls}")
+        assert_true(attached.get("pane") == "%60", f"{label}: attached mapping must stay on original pane: {attached}")
+        assert_true(not read_raw_events(state_root_path), f"{label}: blocked reconnect should not log success")
+    print(f"  PASS  {label}")
+
+
+def scenario_resolver_read_reconnect_logs_distinct_reason(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        participant = write_identity_fixture(state_root_path, pane="%48")
+        new_live = identity_live_record(pane="%49", pid=9503, start_time="1004", last_seen_at="2026-01-04T00:00:00Z")
+        write_live_identity_records(new_live, index_record=new_live)
+        old_probe = bridge_identity.probe_agent_process
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: dict(stored_identity or verified_identity(agent, pane))  # type: ignore[assignment]
+        try:
+            detail = bridge_identity.resolve_participant_endpoint_detail("test-session", "codex", participant, purpose="read")
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+        assert_true(detail.get("ok") and detail.get("pane") == "%49", f"{label}: read resolver should recover to alternate verified pane: {detail}")
+        locks = read_json(Path(os.environ["AGENT_BRIDGE_PANE_LOCKS"]), {"panes": {}})
+        assert_true("%48" in (locks.get("panes") or {}), f"{label}: read reconnect must not clear old lock: {locks}")
+        reconnects = [event for event in read_raw_events(state_root_path) if event.get("event") == "endpoint_auto_reconnected"]
+        assert_true(reconnects and reconnects[-1].get("reason") == "endpoint_auto_reconnected_via_read", f"{label}: read reconnect reason not distinct: {reconnects}")
+    print(f"  PASS  {label}")
+
+
+def scenario_session_end_replacement_uses_verified_candidate(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        write_identity_fixture(state_root_path, pane="%50")
+        ended = identity_live_record(pane="%50", pid=9504, start_time="1005", last_seen_at="2026-01-05T00:00:00Z")
+        stale_newer = identity_live_record(pane="%51", pid=9505, start_time="1006", last_seen_at="2026-01-07T00:00:00Z")
+        verified_older = identity_live_record(pane="%52", pid=9506, start_time="1007", last_seen_at="2026-01-06T00:00:00Z")
+        write_live_identity_records(ended, stale_newer, verified_older, index_record=ended)
+        old_probe = bridge_identity.probe_agent_process
+        def probe(pane, agent, stored_identity=None):
+            if pane == "%51":
+                result = dict(stored_identity or verified_identity(agent, pane))
+                result["status"] = "mismatch"
+                result["reason"] = "process_fingerprint_mismatch"
+                return result
+            return dict(stored_identity or verified_identity(agent, pane))
+        bridge_identity.probe_agent_process = probe  # type: ignore[assignment]
+        try:
+            bridge_identity.update_live_session(agent_type="codex", session_id="sess-a", pane="%50", event="session_ended")
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+        registry = read_json(Path(os.environ["AGENT_BRIDGE_ATTACH_REGISTRY"]), {"sessions": {}})
+        attached = (registry.get("sessions") or {}).get("codex:sess-a") or {}
+        live = read_json(Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]), {"sessions": {}})
+        assert_true(attached.get("pane") == "%52", f"{label}: SessionEnd should not choose newer unverified stale pane: {attached}")
+        assert_true(((live.get("sessions") or {}).get("codex:sess-a") or {}).get("pane") == "%52", f"{label}: live index should choose verified replacement: {live}")
+    print(f"  PASS  {label}")
+
+
+def scenario_reconnect_rereads_mapping_before_write(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        write_identity_fixture(state_root_path, pane="%53")
+        stale_mapping = bridge_identity.read_attached_mapping("codex", "sess-a") or {}
+        candidate = identity_live_record(pane="%54", pid=9507, start_time="1008")
+        newer = identity_live_record(pane="%55", pid=9508, start_time="1009")
+        write_live_identity_records(candidate, newer, index_record=newer)
+        bridge_identity.update_attached_endpoint(stale_mapping, "%55", "tmux:1.0")
+        old_probe = bridge_identity.probe_agent_process
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: dict(stored_identity or verified_identity(agent, pane))  # type: ignore[assignment]
+        try:
+            result = bridge_identity.auto_reconnect_attached_endpoint(
+                stale_mapping,
+                candidate,
+                "mapped_endpoint_mismatch",
+                old_pane="%53",
+                old_status="mismatch",
+            )
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+        registry = read_json(Path(os.environ["AGENT_BRIDGE_ATTACH_REGISTRY"]), {"sessions": {}})
+        attached = (registry.get("sessions") or {}).get("codex:sess-a") or {}
+        assert_true(attached.get("pane") == "%55", f"{label}: stale reconnect must not overwrite newer mapping: {attached}")
+        assert_true(result.get("pane") == "%55", f"{label}: helper should return current verified mapping: {result}")
+    print(f"  PASS  {label}")
+
+
+def scenario_caller_reconnects_from_resumed_pane(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        write_identity_fixture(state_root_path, pane="%56")
+        new_live = identity_live_record(pane="%57", pid=9509, start_time="1010")
+        write_live_identity_records(new_live, index_record=new_live)
+        old_probe = bridge_identity.probe_agent_process
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: dict(stored_identity or verified_identity(agent, pane))  # type: ignore[assignment]
+        try:
+            resolution = bridge_identity.resolve_caller_from_pane(pane="%57", tool_name="agent_send_peer")
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+        assert_true(resolution.ok and resolution.alias == "codex", f"{label}: caller should reconnect resumed pane: {resolution}")
+        registry = read_json(Path(os.environ["AGENT_BRIDGE_ATTACH_REGISTRY"]), {"sessions": {}})
+        assert_true(((registry.get("sessions") or {}).get("codex:sess-a") or {}).get("pane") == "%57", f"{label}: caller reconnect did not persist mapping: {registry}")
+    print(f"  PASS  {label}")
+
+
+def scenario_no_probe_requires_verified_live_identity(label: str, tmpdir: Path) -> None:
+    with isolated_identity_env(tmpdir) as state_root_path:
+        write_identity_fixture(state_root_path, pane="%31")
+        missing = bridge_identity.verify_existing_live_process_identity("codex", "sess-a", "%31")
+        identity = verified_identity("codex", "%31", pid=9100, start_time="801")
+        live = {
+            "agent": "codex",
+            "session_id": "sess-a",
+            "pane": "%31",
+            "target": "tmux:1.0",
+            "bridge_session": "test-session",
+            "alias": "codex",
+            "last_seen_at": utc_now(),
+            "process_identity": identity,
+        }
+        write_json_atomic(Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]), {"version": 1, "panes": {"%31": live}, "sessions": {"codex:sess-a": live}})
+        old_probe = bridge_identity.probe_agent_process
+        bridge_identity.probe_agent_process = lambda pane, agent, stored_identity=None: dict(identity)  # type: ignore[assignment]
+        try:
+            verified = bridge_identity.verify_existing_live_process_identity("codex", "sess-a", "%31")
+        finally:
+            bridge_identity.probe_agent_process = old_probe  # type: ignore[assignment]
+        assert_true(missing.get("reason") == "live_record_missing", f"{label}: no-probe must require live hook record before publish: {missing}")
+        assert_true(verified.get("status") == "verified", f"{label}: verified live identity accepted: {verified}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_undeliverable_request_returns_result(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%1", "hook_session_id": "sess-alice"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%2", "hook_session_id": "sess-bob"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.dry_run = False
+    d.held_interrupt["alice"] = {"reason": "test_hold"}
+    d.resolve_endpoint_detail = lambda target, purpose="write": {"ok": False, "pane": "", "reason": "process_mismatch", "probe_status": "mismatch", "detail": "gone", "should_detach": True}  # type: ignore[method-assign]
+    calls: list[str] = []
+    old_literal = bridge_daemon.run_tmux_send_literal
+    bridge_daemon.run_tmux_send_literal = lambda pane, prompt: calls.append(pane)  # type: ignore[assignment]
+    try:
+        msg = test_message("msg-undeliverable", frm="alice", to="bob", status="pending")
+        d.queue.update(lambda queue: queue.append(msg))
+        d.try_deliver("bob")
+    finally:
+        bridge_daemon.run_tmux_send_literal = old_literal  # type: ignore[assignment]
+    queue = d.queue.read()
+    assert_true(calls == [], f"{label}: must not paste into stale pane")
+    assert_true(not any(item.get("id") == "msg-undeliverable" for item in queue), f"{label}: original removed")
+    result = next((item for item in queue if item.get("to") == "alice" and item.get("kind") == "result"), None)
+    assert_true(result is not None and "[bridge:undeliverable]" in str(result.get("body") or ""), f"{label}: sender gets undeliverable result")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_endpoint_lost_finalizes_delivered_non_aggregate(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%1", "hook_session_id": "sess-alice"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%2", "hook_session_id": "sess-bob"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.dry_run = False
+    d.held_interrupt["alice"] = {"reason": "test_hold"}
+    d.resolve_endpoint_detail = lambda target, purpose="write": {"ok": False, "pane": "", "reason": "process_mismatch", "probe_status": "mismatch", "detail": "gone", "should_detach": True}  # type: ignore[method-assign]
+    msg = test_message("msg-delivered-lost", frm="alice", to="bob", status="delivered")
+    d.queue.update(lambda queue: queue.append(msg))
+    d.current_prompt_by_agent["bob"] = {"id": "msg-delivered-lost", "from": "alice", "auto_return": True}
+    result = d.handle_interrupt(sender="alice", target="bob")
+    queue = d.queue.read()
+    assert_true(not result.get("held"), f"{label}: endpoint loss should not enter hold")
+    assert_true(not any(item.get("id") == "msg-delivered-lost" for item in queue), f"{label}: delivered original removed")
+    assert_true(any(item.get("kind") == "result" and item.get("to") == "alice" for item in queue), f"{label}: non-aggregate sender gets result")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_endpoint_lost_finalizes_delivered_aggregate(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%1", "hook_session_id": "sess-alice"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%2", "hook_session_id": "sess-bob"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.dry_run = False
+    d.held_interrupt["alice"] = {"reason": "test_hold"}
+    d.resolve_endpoint_detail = lambda target, purpose="write": {"ok": False, "pane": "", "reason": "process_mismatch", "probe_status": "mismatch", "detail": "gone", "should_detach": True}  # type: ignore[method-assign]
+    msg = test_message("msg-agg-lost", frm="alice", to="bob", status="delivered")
+    msg["aggregate_id"] = "agg-lost"
+    msg["aggregate_expected"] = ["bob"]
+    msg["aggregate_message_ids"] = {"bob": "msg-agg-lost"}
+    d.queue.update(lambda queue: queue.append(msg))
+    d.current_prompt_by_agent["bob"] = {"id": "msg-agg-lost", "from": "alice", "auto_return": True, "aggregate_id": "agg-lost"}
+    d.handle_interrupt(sender="alice", target="bob")
+    aggregate = (read_json(d.aggregate_file, {"aggregates": {}}).get("aggregates") or {}).get("agg-lost") or {}
+    reply = ((aggregate.get("replies") or {}).get("bob") or {}).get("body") or ""
+    assert_true("[bridge:undeliverable]" in reply, f"{label}: aggregate gets synthetic undeliverable reply")
+    print(f"  PASS  {label}")
+
+
+def scenario_retry_enter_endpoint_lost_does_not_press_enter(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%1", "hook_session_id": "sess-alice"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%2", "hook_session_id": "sess-bob"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.dry_run = False
+    d.resolve_endpoint_detail = lambda target, purpose="write": {"ok": False, "pane": "", "reason": "process_mismatch", "probe_status": "mismatch", "detail": "gone", "should_detach": True}  # type: ignore[method-assign]
+    msg = test_message("msg-enter-lost", frm="alice", to="bob", status="inflight")
+    d.queue.update(lambda queue: queue.append(msg))
+    d.last_enter_ts["msg-enter-lost"] = time.time() - 2.0
+    enter_calls: list[str] = []
+    old_enter = bridge_daemon.run_tmux_enter
+    bridge_daemon.run_tmux_enter = lambda pane: enter_calls.append(pane)  # type: ignore[assignment]
+    try:
+        d.retry_enter_for_inflight()
+    finally:
+        bridge_daemon.run_tmux_enter = old_enter  # type: ignore[assignment]
+    assert_true(enter_calls == [], f"{label}: retry must not press Enter into stale pane")
+    assert_true(not any(item.get("id") == "msg-enter-lost" for item in d.queue.read()), f"{label}: inflight removed as undeliverable")
+    print(f"  PASS  {label}")
+
+
+def scenario_direct_notices_suppress_unverified_endpoint(label: str, tmpdir: Path) -> None:
+    import bridge_daemon_ctl
+    import bridge_leave
+
+    record = {"alias": "bob", "agent_type": "codex", "pane": "%2", "hook_session_id": "sess-bob"}
+    calls: list[tuple[str, str]] = []
+    old_leave_resolve = bridge_leave.resolve_participant_endpoint_detail
+    old_leave_send = bridge_leave.tmux_send_literal
+    old_ctl_resolve = bridge_daemon_ctl.resolve_participant_endpoint_detail
+    old_ctl_send = bridge_daemon_ctl.tmux_send_literal
+    bridge_leave.resolve_participant_endpoint_detail = lambda *args, **kwargs: {"ok": False, "reason": "process_mismatch"}  # type: ignore[assignment]
+    bridge_leave.tmux_send_literal = lambda pane, text: calls.append(("leave", pane))  # type: ignore[assignment]
+    bridge_daemon_ctl.resolve_participant_endpoint_detail = lambda *args, **kwargs: {"ok": False, "reason": "process_mismatch"}  # type: ignore[assignment]
+    bridge_daemon_ctl.tmux_send_literal = lambda pane, text: calls.append(("close", pane))  # type: ignore[assignment]
+    try:
+        leave_result = bridge_leave.send_leave_notice("test-session", "bob", record)
+        with isolated_identity_env(tmpdir) as state_root_path:
+            write_identity_fixture(state_root_path, alias="bob", pane="%2", session_id="sess-bob")
+            close_result = bridge_daemon_ctl.send_room_closed_notices("test-session")
+    finally:
+        bridge_leave.resolve_participant_endpoint_detail = old_leave_resolve  # type: ignore[assignment]
+        bridge_leave.tmux_send_literal = old_leave_send  # type: ignore[assignment]
+        bridge_daemon_ctl.resolve_participant_endpoint_detail = old_ctl_resolve  # type: ignore[assignment]
+        bridge_daemon_ctl.tmux_send_literal = old_ctl_send  # type: ignore[assignment]
+    assert_true(leave_result.get("sent") == 0 and close_result.get("sent") == 0, f"{label}: notices suppressed")
+    assert_true(calls == [], f"{label}: no direct tmux send for unverified endpoint")
+    print(f"  PASS  {label}")
+
+
+def scenario_view_peer_unverified_endpoint_uses_daemon_not_local_capture(label: str, tmpdir: Path) -> None:
+    import bridge_view_peer as bv
+
+    state = {"participants": {"bob": {"alias": "bob", "agent_type": "codex", "pane": "%2", "hook_session_id": "sess-bob", "status": "active"}}}
+    args = argparse.Namespace(capture_file=None, capture_timeout=0.1)
+    calls: list[str] = []
+    old_resolve = bv.resolve_participant_endpoint_detail
+    old_capture = bv.run_tmux_capture
+    old_daemon = bv.capture_via_daemon
+    bv.resolve_participant_endpoint_detail = lambda *args, **kwargs: {"ok": False, "reason": "process_mismatch"}  # type: ignore[assignment]
+    bv.run_tmux_capture = lambda *args, **kwargs: calls.append("local") or ""  # type: ignore[assignment]
+    bv.capture_via_daemon = lambda *args, **kwargs: "daemon-capture"  # type: ignore[assignment]
+    try:
+        text = bv.capture_text(args, session="test-session", caller="alice", target="bob", state=state, pane="%2", start=-10)
+    finally:
+        bv.resolve_participant_endpoint_detail = old_resolve  # type: ignore[assignment]
+        bv.run_tmux_capture = old_capture  # type: ignore[assignment]
+        bv.capture_via_daemon = old_daemon  # type: ignore[assignment]
+    assert_true(text == "daemon-capture" and calls == [], f"{label}: unverified endpoint must not use local capture")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_startup_backfill_summary_logs_repair_hint(label: str, tmpdir: Path) -> None:
+    participants = {"alice": {"alias": "alice", "pane": "%1"}, "bob": {"alias": "bob", "pane": "%2"}}
+    d = make_daemon(tmpdir, participants)
+    d.startup_backfill_summary = {"alice": {"status": "unknown", "reason": "ps_unavailable"}}
+    d.follow()
+    events = read_events(tmpdir / "events.raw.jsonl")
+    event = next((item for item in events if item.get("event") == "endpoint_backfill_summary"), None)
+    assert_true(event is not None, f"{label}: startup backfill summary event missing")
+    assert_true("bridge_healthcheck.sh --backfill-endpoints" in str(event.get("repair_hint") or ""), f"{label}: repair hint missing")
+    print(f"  PASS  {label}")
+
+
 def _import_enqueue_module():
     import importlib
     be = importlib.import_module("bridge_enqueue")
     return importlib.reload(be)
 
 
-def _run_enqueue_main(be, argv: list[str]) -> tuple[int, str, str]:
+def _import_send_peer_module():
+    import importlib
+    bs = importlib.import_module("bridge_send_peer")
+    return importlib.reload(bs)
+
+
+def _run_enqueue_main(be, argv: list[str], stdin_text: str = "") -> tuple[int, str, str]:
     import contextlib
     import io
     old_argv = sys.argv[:]
+    old_stdin = sys.stdin
     out = io.StringIO()
     err = io.StringIO()
     try:
         sys.argv = ["bridge_enqueue.py", *argv]
+        sys.stdin = io.StringIO(stdin_text)
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = be.main()
     finally:
         sys.argv = old_argv
+        sys.stdin = old_stdin
+    return int(code), out.getvalue(), err.getvalue()
+
+
+def _run_send_peer_main(bs, argv: list[str], stdin_text: str = "") -> tuple[int, str, str]:
+    import contextlib
+    import io
+    old_argv = sys.argv[:]
+    old_stdin = sys.stdin
+    out = io.StringIO()
+    err = io.StringIO()
+    try:
+        sys.argv = ["agent_send_peer", *argv]
+        sys.stdin = io.StringIO(stdin_text)
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = bs.main()
+    finally:
+        sys.argv = old_argv
+        sys.stdin = old_stdin
     return int(code), out.getvalue(), err.getvalue()
 
 
@@ -3030,6 +3882,159 @@ def _patch_enqueue_for_unit(be, state: dict, *, socket_error: str = "") -> None:
 def _write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+
+
+def scenario_peer_body_size_helper_boundaries(label: str, tmpdir: Path) -> None:
+    import io
+    ok, err = validate_peer_body_size("x" * MAX_INLINE_SEND_BODY_CHARS)
+    assert_true(ok and err == "", f"{label}: exactly limit chars should be accepted")
+    ok2, err2 = validate_peer_body_size("x" * (MAX_INLINE_SEND_BODY_CHARS + 1))
+    assert_true(not ok2, f"{label}: over-limit chars should be rejected")
+    assert_true(str(MAX_INLINE_SEND_BODY_CHARS) in err2 and "/tmp/agent-bridge-share" in err2, f"{label}: error explains limit and shared path: {err2!r}")
+    ok3, err3 = validate_peer_body_size("한" * MAX_INLINE_SEND_BODY_CHARS)
+    assert_true(ok3 and err3 == "", f"{label}: limit is explicit char-count, not byte-count")
+    limited = read_limited_text(io.StringIO("x" * (MAX_INLINE_SEND_BODY_CHARS + 100)))
+    assert_true(len(limited) == MAX_INLINE_SEND_BODY_CHARS + 1, f"{label}: stdin read is bounded to limit+1 chars")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_rejects_oversized_body_before_subprocess(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    bs.validate_caller_identity = lambda args, session, sender: (session or "test-session", sender or "alice")
+    bs.load_session = lambda session: _participants_state(["alice", "bob"])
+    called = {"subprocess": False}
+    old_run = bs.subprocess.run
+
+    def fail_subprocess(_cmd):
+        called["subprocess"] = True
+        raise AssertionError("bridge_enqueue subprocess must not be spawned for oversized body")
+
+    try:
+        bs.subprocess.run = fail_subprocess
+        code, out, err = _run_send_peer_main(
+            bs,
+            ["--session", "test-session", "--from", "alice", "--to", "bob"],
+            stdin_text="x" * (MAX_INLINE_SEND_BODY_CHARS + 1),
+        )
+    finally:
+        bs.subprocess.run = old_run
+    assert_true(code == 2, f"{label}: wrapper rejects oversized body, got {code}")
+    assert_true(out == "", f"{label}: rejection has no stdout: {out!r}")
+    assert_true(not called["subprocess"], f"{label}: enqueue subprocess was not spawned")
+    assert_true(str(MAX_INLINE_SEND_BODY_CHARS) in err and "/tmp/agent-bridge-share" in err, f"{label}: stderr explains limit: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_rejects_oversized_body_unchanged(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    queue_file = tmpdir / "pending.json"
+    state_file = tmpdir / "events.raw.jsonl"
+    public_file = tmpdir / "events.jsonl"
+    queue_file.write_text("[]", encoding="utf-8")
+    state_file.write_text(json.dumps({"event": "initial_raw"}) + "\n", encoding="utf-8")
+    public_file.write_text(json.dumps({"event": "initial_public"}) + "\n", encoding="utf-8")
+    before = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
+    be.enqueue_via_daemon_socket = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("socket enqueue must not run"))
+
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "alice",
+            "--to", "bob",
+            "--body", "x" * (MAX_INLINE_SEND_BODY_CHARS + 1),
+            "--queue-file", str(queue_file),
+            "--state-file", str(state_file),
+            "--public-state-file", str(public_file),
+        ],
+    )
+    assert_true(code == 2, f"{label}: enqueue rejects oversized body, got {code}")
+    assert_true(out == "", f"{label}: rejection has no stdout: {out!r}")
+    assert_true(str(MAX_INLINE_SEND_BODY_CHARS) in err and "/tmp/agent-bridge-share" in err, f"{label}: stderr explains limit: {err!r}")
+    after = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
+    assert_true(before == after, f"{label}: rejection must not mutate queue or events")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_stdin_rejects_oversized_body_unchanged(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    queue_file = tmpdir / "pending.json"
+    state_file = tmpdir / "events.raw.jsonl"
+    public_file = tmpdir / "events.jsonl"
+    queue_file.write_text("[]", encoding="utf-8")
+    state_file.write_text(json.dumps({"event": "initial_raw"}) + "\n", encoding="utf-8")
+    public_file.write_text(json.dumps({"event": "initial_public"}) + "\n", encoding="utf-8")
+    before = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
+    be.enqueue_via_daemon_socket = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("socket enqueue must not run"))
+
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "alice",
+            "--to", "bob",
+            "--stdin",
+            "--queue-file", str(queue_file),
+            "--state-file", str(state_file),
+            "--public-state-file", str(public_file),
+        ],
+        stdin_text="x" * (MAX_INLINE_SEND_BODY_CHARS + 100),
+    )
+    assert_true(code == 2, f"{label}: enqueue --stdin rejects oversized body, got {code}")
+    assert_true(out == "", f"{label}: rejection has no stdout: {out!r}")
+    assert_true(str(MAX_INLINE_SEND_BODY_CHARS) in err and "/tmp/agent-bridge-share" in err, f"{label}: stderr explains limit: {err!r}")
+    after = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
+    assert_true(before == after, f"{label}: rejection must not mutate queue or events")
+    print(f"  PASS  {label}")
+
+
+def scenario_alarm_cancel_preserves_at_limit_body(label: str, tmpdir: Path) -> None:
+    participants = _participants_state(["alice", "bob"])["participants"]
+    d = make_daemon(tmpdir, participants)
+    _enqueue_alarm(d, "bob", "long body alarm")
+    original = "x" * MAX_INLINE_SEND_BODY_CHARS
+    msg = _qualifying_message("alice", "bob", kind="request", body=original)
+    msg["id"] = "msg-at-limit-alarm"
+    d.enqueue_ipc_message(msg)
+    queued = next((it for it in d.queue.read() if it.get("id") == "msg-at-limit-alarm"), None)
+    assert_true(queued is not None, f"{label}: message queued")
+    visible_body = str(queued.get("body") or "")
+    assert_true(visible_body.startswith("[bridge:alarm_cancelled]"), f"{label}: recipient-visible body must include cancellation signal")
+    assert_true(original in visible_body, f"{label}: alarm notice must not truncate or displace at-limit user body")
+    assert_true(len(visible_body) <= MAX_PEER_BODY_CHARS, f"{label}: visible body must stay within daemon prompt guard")
+    prompt = bridge_daemon.build_peer_prompt(queued, "nonce-test", 4)
+    assert_true("[bridge:alarm_cancelled]" in prompt and "[bridge truncated peer body]" not in prompt, f"{label}: in-band prompt carries clean alarm signal without truncation")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    alarm_events = [e for e in events if e.get("event") == "alarm_cancelled_by_message"]
+    assert_true(alarm_events and alarm_events[-1].get("notice_omitted") is False, f"{label}: at external limit should retain alarm notice: {alarm_events}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_logs_body_truncated_for_legacy_long_body(label: str, tmpdir: Path) -> None:
+    participants = _participants_state(["alice", "bob"])["participants"]
+    d = make_daemon(tmpdir, participants)
+    legacy = test_message("msg-legacy-long", frm="alice", to="bob")
+    legacy["body"] = "x" * (MAX_PEER_BODY_CHARS + 1)
+    prompt = bridge_daemon.build_peer_prompt(legacy, "nonce-test", 4)
+    assert_true("[bridge truncated peer body]" in prompt, f"{label}: direct prompt build includes truncation marker")
+    assert_true(prompt.count("x") == MAX_PEER_BODY_CHARS, f"{label}: direct prompt build keeps exactly prompt limit chars")
+
+    def add(queue):
+        queue.append(legacy)
+        return None
+
+    d.queue.update(add)
+    d.try_deliver("bob")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    truncated = [e for e in events if e.get("event") == "body_truncated"]
+    assert_true(truncated, f"{label}: body_truncated event expected")
+    assert_true(truncated[-1].get("message_id") == "msg-legacy-long", f"{label}: truncation log names message: {truncated[-1]}")
+    assert_true(truncated[-1].get("original_chars") == MAX_PEER_BODY_CHARS + 1, f"{label}: truncation log records original chars: {truncated[-1]}")
+    print(f"  PASS  {label}")
 
 
 def scenario_response_send_guard_socket_cli_error_kind(label: str, tmpdir: Path) -> None:
@@ -3478,6 +4483,41 @@ def main() -> int:
             ("view_peer_snapshot_ref_collision_unique", scenario_view_peer_snapshot_ref_collision_unique),
             ("view_peer_capture_errors_sanitized", scenario_view_peer_capture_errors_sanitized),
             ("view_peer_snapshot_not_found_hides_full_id", scenario_view_peer_snapshot_not_found_hides_full_id),
+            ("endpoint_rejects_stale_pane_lock_without_live", scenario_endpoint_rejects_stale_pane_lock_without_live),
+            ("endpoint_rejects_same_pane_new_live_identity", scenario_endpoint_rejects_same_pane_new_live_identity),
+            ("endpoint_probe_unknown_does_not_mutate", scenario_endpoint_probe_unknown_does_not_mutate),
+            ("endpoint_accepts_matching_process_fingerprint", scenario_endpoint_accepts_matching_process_fingerprint),
+            ("backfill_refuses_to_mint_without_live_record", scenario_backfill_refuses_to_mint_without_live_record),
+            ("backfill_refuses_other_live_identity", scenario_backfill_refuses_other_live_identity),
+            ("backfill_rejects_changed_process_fingerprint", scenario_backfill_rejects_changed_process_fingerprint),
+            ("backfill_allows_fresh_hook_proof_create", scenario_backfill_allows_fresh_hook_proof_create),
+            ("hook_unknown_preserves_verified_process_identity", scenario_hook_unknown_preserves_verified_process_identity),
+            ("probe_tmux_access_failure_unknown", scenario_probe_tmux_access_failure_unknown),
+            ("endpoint_read_mismatch_does_not_mutate", scenario_endpoint_read_mismatch_does_not_mutate),
+            ("verified_candidate_ordering_prefers_pane_then_newest", scenario_verified_candidate_ordering_prefers_pane_then_newest),
+            ("resume_new_pane_reconnects_unknown_old_and_logs", scenario_resume_new_pane_reconnects_unknown_old_and_logs),
+            ("resume_unknown_old_opt_out_blocks_switch", scenario_resume_unknown_old_opt_out_blocks_switch),
+            ("hook_cached_prior_unknown_does_not_reconnect", scenario_hook_cached_prior_unknown_does_not_reconnect),
+            ("resolver_reconnects_to_alternate_verified_live_record", scenario_resolver_reconnects_to_alternate_verified_live_record),
+            ("resolver_candidate_unknown_on_final_probe_does_not_reconnect", scenario_resolver_candidate_unknown_on_final_probe_does_not_reconnect),
+            ("resolver_read_reconnect_logs_distinct_reason", scenario_resolver_read_reconnect_logs_distinct_reason),
+            ("session_end_replacement_uses_verified_candidate", scenario_session_end_replacement_uses_verified_candidate),
+            ("reconnect_rereads_mapping_before_write", scenario_reconnect_rereads_mapping_before_write),
+            ("caller_reconnects_from_resumed_pane", scenario_caller_reconnects_from_resumed_pane),
+            ("no_probe_requires_verified_live_identity", scenario_no_probe_requires_verified_live_identity),
+            ("daemon_undeliverable_request_returns_result", scenario_daemon_undeliverable_request_returns_result),
+            ("interrupt_endpoint_lost_finalizes_delivered_non_aggregate", scenario_interrupt_endpoint_lost_finalizes_delivered_non_aggregate),
+            ("interrupt_endpoint_lost_finalizes_delivered_aggregate", scenario_interrupt_endpoint_lost_finalizes_delivered_aggregate),
+            ("retry_enter_endpoint_lost_does_not_press_enter", scenario_retry_enter_endpoint_lost_does_not_press_enter),
+            ("direct_notices_suppress_unverified_endpoint", scenario_direct_notices_suppress_unverified_endpoint),
+            ("view_peer_unverified_endpoint_uses_daemon_not_local_capture", scenario_view_peer_unverified_endpoint_uses_daemon_not_local_capture),
+            ("daemon_startup_backfill_summary_logs_repair_hint", scenario_daemon_startup_backfill_summary_logs_repair_hint),
+            ("peer_body_size_helper_boundaries", scenario_peer_body_size_helper_boundaries),
+            ("send_peer_rejects_oversized_body_before_subprocess", scenario_send_peer_rejects_oversized_body_before_subprocess),
+            ("enqueue_rejects_oversized_body_unchanged", scenario_enqueue_rejects_oversized_body_unchanged),
+            ("enqueue_stdin_rejects_oversized_body_unchanged", scenario_enqueue_stdin_rejects_oversized_body_unchanged),
+            ("alarm_cancel_preserves_at_limit_body", scenario_alarm_cancel_preserves_at_limit_body),
+            ("daemon_logs_body_truncated_for_legacy_long_body", scenario_daemon_logs_body_truncated_for_legacy_long_body),
             ("response_send_guard_socket_cli_error_kind", scenario_response_send_guard_socket_cli_error_kind),
             ("response_send_guard_socket_error_kind_parse", scenario_response_send_guard_socket_error_kind_parse),
             ("enqueue_fallback_success_silent_with_raw_diagnostic", scenario_enqueue_fallback_success_silent_with_raw_diagnostic),

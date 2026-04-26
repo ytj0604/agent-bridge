@@ -22,6 +22,7 @@ from bridge_attach import (
     send_prompt,
     wait_for_probe,
 )
+from bridge_identity import backfill_session_process_identities, verify_existing_live_process_identity
 from bridge_participants import active_participants, format_peer_summary, load_session, normalize_agent_type, participant_record, save_session_state, session_state_exists
 from bridge_instructions import probe_prompt
 from bridge_paths import ensure_runtime_writable, libexec_dir, state_root
@@ -196,6 +197,13 @@ def main() -> int:
             raise SystemExit("--no-probe requires --session-id")
         probe_record = {"session_id": args.session_id}
         hook_session_id = args.session_id
+        probe = verify_existing_live_process_identity(agent_type, hook_session_id, str(pane.get("pane_id") or ""))
+        if probe.get("status") != "verified":
+            raise SystemExit(
+                f"--no-probe could not verify {alias} pane process: {probe.get('status')}:{probe.get('reason')}. "
+                "--no-probe is expert-only: host-side probing verifies the pane process, "
+                "but cannot prove the supplied hook_session_id is correct. Use normal probing unless you know the session id."
+            )
     else:
         discovery_file().parent.mkdir(parents=True, exist_ok=True)
         discovery_file().touch(exist_ok=True)
@@ -220,6 +228,9 @@ def main() -> int:
     state.setdefault("panes", {})
     state.setdefault("targets", {})
     state.setdefault("hook_session_ids", {})
+    endpoint_summary = {}
+    if args.no_probe:
+        endpoint_summary = dict(probe)
     state["participants"][alias] = participant_record(
         alias=alias,
         agent_type=agent_type,
@@ -229,6 +240,8 @@ def main() -> int:
         cwd=probe_record.get("cwd") or pane.get("cwd") or "",
         model=probe_record.get("model") or "",
     )
+    if endpoint_summary:
+        state["participants"][alias]["endpoint_backfill"] = endpoint_summary
     state["panes"][alias] = pane["pane_id"]
     state["targets"][alias] = pane["target"]
     state["hook_session_ids"][alias] = hook_session_id
@@ -248,6 +261,10 @@ def main() -> int:
     }
     update_registry(mapping)
     update_pane_lock(mapping)
+    if not args.no_probe:
+        backfill_summary = backfill_session_process_identities(args.session, state, aliases=[alias], allow_create_from_hook=True)
+        state["participants"][alias]["endpoint_backfill"] = backfill_summary.get(alias, {})
+        save_session_state(state)
 
     if not args.no_notify:
         body = (

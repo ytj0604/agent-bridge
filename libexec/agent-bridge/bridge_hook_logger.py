@@ -189,6 +189,8 @@ def main() -> int:
         record["bridge_session"] = live_mapping.get("bridge_session")
         record["bridge_agent"] = live_mapping.get("alias") or args.agent
         record["pane"] = live_mapping.get("pane") or record.get("pane")
+        if live_mapping.get("_endpoint_auto_reconnected"):
+            record["endpoint_auto_reconnected"] = live_mapping.get("_endpoint_auto_reconnected")
 
     should_log_unscoped = os.environ.get("AGENT_BRIDGE_LOG_UNSCOPED") == "1"
 
