@@ -2,6 +2,7 @@
 import argparse
 import errno
 import json
+import math
 import os
 import socket
 import sys
@@ -62,9 +63,15 @@ def _resolve_default_watchdog_seconds() -> float | None:
         val = float(raw)
     except (TypeError, ValueError):
         return 300.0
+    if not math.isfinite(val):
+        return 300.0
     if val <= 0:
         return None
     return val
+
+
+def format_numeric_value(value: float) -> str:
+    return format(float(value), "g")
 
 
 WRITE_FAILURE_ERRNOS = {errno.EROFS, errno.EACCES, errno.EPERM}
@@ -245,18 +252,24 @@ def main() -> int:
     # (defense-in-depth; bridge_send_peer also rejects). Resolve the delay
     # in seconds: explicit --watchdog overrides; if unset for kind=request,
     # apply the env-driven default. --watchdog 0 disables.
-    if args.watchdog is not None and kind != "request":
-        print(
-            f"agent_send_peer: --watchdog only applies to --kind request (got {kind!r}). For notice, use agent_alarm.",
-            file=sys.stderr,
-        )
-        return 2
     watchdog_delay_sec: float | None = None
     if args.watchdog is not None:
         try:
             val = float(args.watchdog)
         except (TypeError, ValueError):
             print(f"agent_send_peer: invalid --watchdog value {args.watchdog!r}", file=sys.stderr)
+            return 2
+        if not math.isfinite(val) or val < 0:
+            print(
+                f"agent_send_peer: --watchdog must be a finite non-negative number, got {format_numeric_value(val)}",
+                file=sys.stderr,
+            )
+            return 2
+        if kind != "request":
+            print(
+                f"agent_send_peer: --watchdog only applies to --kind request (got {kind!r}). For notice, use agent_alarm.",
+                file=sys.stderr,
+            )
             return 2
         if val > 0:
             watchdog_delay_sec = val

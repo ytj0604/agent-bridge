@@ -112,6 +112,21 @@ def assert_true(cond: bool, msg: str) -> None:
         raise AssertionError(msg)
 
 
+class FakeCommandConn:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+        self.used = False
+
+    def recv(self, _size: int) -> bytes:
+        if self.used:
+            return b""
+        self.used = True
+        return self.payload
+
+    def getsockopt(self, *_args) -> bytes:
+        raise OSError("no peer credentials in test")
+
+
 @contextmanager
 def patched_environ(**updates: str | None):
     old = {key: os.environ.get(key) for key in updates}
@@ -6132,6 +6147,18 @@ def _import_send_peer_module():
     return importlib.reload(bs)
 
 
+def _import_extend_wait_module():
+    import importlib
+    bew = importlib.import_module("bridge_extend_wait")
+    return importlib.reload(bew)
+
+
+def _import_alarm_module():
+    import importlib
+    ba = importlib.import_module("bridge_alarm")
+    return importlib.reload(ba)
+
+
 def _run_enqueue_main(be, argv: list[str], stdin_text: str = "") -> tuple[int, str, str]:
     import contextlib
     import io
@@ -6143,10 +6170,49 @@ def _run_enqueue_main(be, argv: list[str], stdin_text: str = "") -> tuple[int, s
         sys.argv = ["bridge_enqueue.py", *argv]
         sys.stdin = io.StringIO(stdin_text)
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = be.main()
+            try:
+                code = be.main()
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
     finally:
         sys.argv = old_argv
         sys.stdin = old_stdin
+    return int(code), out.getvalue(), err.getvalue()
+
+
+def _run_extend_wait_main(bew, argv: list[str]) -> tuple[int, str, str]:
+    import contextlib
+    import io
+    old_argv = sys.argv[:]
+    out = io.StringIO()
+    err = io.StringIO()
+    try:
+        sys.argv = ["agent_extend_wait", *argv]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = bew.main()
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
+    finally:
+        sys.argv = old_argv
+    return int(code), out.getvalue(), err.getvalue()
+
+
+def _run_alarm_main(ba, argv: list[str]) -> tuple[int, str, str]:
+    import contextlib
+    import io
+    old_argv = sys.argv[:]
+    out = io.StringIO()
+    err = io.StringIO()
+    try:
+        sys.argv = ["agent_alarm", *argv]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = ba.main()
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
+    finally:
+        sys.argv = old_argv
     return int(code), out.getvalue(), err.getvalue()
 
 
@@ -6170,7 +6236,10 @@ def _run_send_peer_main(bs, argv: list[str], stdin_text: str = "", stdin_isatty:
         sys.argv = ["agent_send_peer", *argv]
         sys.stdin = FakeStdin(stdin_text, stdin_text == "" if stdin_isatty is None else stdin_isatty)
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = bs.main()
+            try:
+                code = bs.main()
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
     finally:
         sys.argv = old_argv
         sys.stdin = old_stdin
@@ -6188,6 +6257,257 @@ def _patch_enqueue_for_unit(be, state: dict, *, socket_error: str = "") -> None:
 def _write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+
+
+def _enqueue_watchdog_argv(tmpdir: Path, *extra: str, kind: str = "request") -> list[str]:
+    return [
+        "--session", "test-session",
+        "--from", "alice",
+        "--to", "bob",
+        "--kind", kind,
+        "--body", "hello",
+        "--queue-file", str(tmpdir / "pending.json"),
+        "--state-file", str(tmpdir / "events.raw.jsonl"),
+        "--public-state-file", str(tmpdir / "events.jsonl"),
+        *extra,
+    ]
+
+
+def _assert_send_peer_watchdog_rejected(label: str, tmpdir: Path, raw: str, expected_value: str) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    watchdog_args = (f"--watchdog={raw}",) if raw.startswith("-") else ("--watchdog", raw)
+    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, *watchdog_args))
+    assert_true(code == 2, f"{label}: invalid watchdog {raw!r} exits 2, got {code}, err={err!r}")
+    assert_true(out == "", f"{label}: invalid watchdog has no stdout: {out!r}")
+    assert_true("finite non-negative" in err and f"got {expected_value}" in err, f"{label}: error should explain rule and value: {err!r}")
+    assert_true(not (tmpdir / "pending.json").exists(), f"{label}: invalid watchdog must not enqueue")
+
+
+def scenario_send_peer_watchdog_negative_one_rejected(label: str, tmpdir: Path) -> None:
+    _assert_send_peer_watchdog_rejected(label, tmpdir, "-1", "-1")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_watchdog_nan_rejected(label: str, tmpdir: Path) -> None:
+    _assert_send_peer_watchdog_rejected(label, tmpdir, "nan", "nan")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_watchdog_inf_rejected(label: str, tmpdir: Path) -> None:
+    _assert_send_peer_watchdog_rejected(label, tmpdir, "inf", "inf")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_watchdog_minus_inf_rejected(label: str, tmpdir: Path) -> None:
+    _assert_send_peer_watchdog_rejected(label, tmpdir, "-inf", "-inf")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_watchdog_zero_disables_for_request(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--watchdog", "0"))
+    assert_true(code == 0, f"{label}: watchdog 0 should succeed, got {code}, err={err!r}")
+    assert_true(out.strip().startswith("msg-"), f"{label}: stdout should contain queued id: {out!r}")
+    queue = json.loads((tmpdir / "pending.json").read_text(encoding="utf-8"))
+    assert_true("watchdog_delay_sec" not in queue[0], f"{label}: watchdog 0 should disable metadata: {queue}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_watchdog_finite_positive_succeeds(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--watchdog", "1.5"))
+    assert_true(code == 0, f"{label}: finite watchdog should succeed, got {code}, err={err!r}")
+    assert_true(out.strip().startswith("msg-"), f"{label}: stdout should contain queued id: {out!r}")
+    queue = json.loads((tmpdir / "pending.json").read_text(encoding="utf-8"))
+    assert_true(queue[0].get("watchdog_delay_sec") == 1.5, f"{label}: finite watchdog preserved: {queue}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_watchdog_inf_with_notice_reports_finite_error_first(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--watchdog", "inf", kind="notice"))
+    assert_true(code == 2 and out == "", f"{label}: notice+inf should fail cleanly: code={code} out={out!r}")
+    assert_true("finite non-negative" in err and "got inf" in err, f"{label}: malformed value should win precedence: {err!r}")
+    assert_true("--watchdog only applies" not in err, f"{label}: kind error must not mask malformed value: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_watchdog_zero_with_notice_still_rejects_request_only(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--watchdog", "0", kind="notice"))
+    assert_true(code == 2 and out == "", f"{label}: notice+0 should fail cleanly: code={code} out={out!r}")
+    assert_true("--watchdog only applies" in err and "finite non-negative" not in err, f"{label}: finite 0 should reach kind check: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_watchdog_abc_argparse_error(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--watchdog", "abc"))
+    assert_true(code == 2, f"{label}: argparse invalid float exits 2, got {code}")
+    assert_true(out == "", f"{label}: argparse error has no stdout: {out!r}")
+    assert_true("invalid float value" in err and "abc" in err, f"{label}: argparse diagnostic preserved: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_extend_wait_zero_negative_nan_inf_rejected(label: str, tmpdir: Path) -> None:
+    bew = _import_extend_wait_module()
+    bew.request_extend = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("request_extend must not run for invalid seconds"))
+    for raw, expected in [("0", "0"), ("-1", "-1"), ("nan", "nan"), ("inf", "inf"), ("-inf", "-inf")]:
+        argv = ["msg-test", "--", raw] if raw == "-inf" else ["msg-test", raw]
+        code, out, err = _run_extend_wait_main(bew, argv)
+        assert_true(code == 2, f"{label}: extend_wait {raw!r} exits 2, got {code}")
+        assert_true(out == "", f"{label}: invalid extend_wait has no stdout: {out!r}")
+        assert_true("finite positive" in err and f"got {expected}" in err, f"{label}: error should explain rule and value for {raw!r}: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_extend_wait_finite_positive_calls_request_extend(label: str, tmpdir: Path) -> None:
+    bew = _import_extend_wait_module()
+    calls: list[tuple[str, str, str, float]] = []
+    bew.resolve_caller_from_pane = lambda **kwargs: bridge_identity.CallerResolution(True, "test-session", "alice")  # type: ignore[assignment]
+    bew.ensure_daemon_running = lambda session: ""
+    bew.room_status = lambda session: argparse.Namespace(active_enough_for_enqueue=True, reason="ok")
+    bew.load_session = lambda session: _participants_state(["alice", "bob"])
+
+    def request_extend(session: str, sender: str, message_id: str, seconds: float) -> tuple[bool, dict, str]:
+        calls.append((session, sender, message_id, seconds))
+        return True, {"message_id": message_id, "new_deadline": "2026-04-27T00:00:00.000000Z"}, ""
+
+    bew.request_extend = request_extend
+    code, out, err = _run_extend_wait_main(bew, ["msg-test", "1.25", "--session", "test-session", "--from", "alice", "--allow-spoof"])
+    assert_true(code == 0, f"{label}: finite extend_wait should succeed, got {code}, err={err!r}")
+    assert_true(calls == [("test-session", "alice", "msg-test", 1.25)], f"{label}: request_extend call mismatch: {calls}")
+    summary = json.loads(out)
+    assert_true(summary.get("seconds") == 1.25 and summary.get("message_id") == "msg-test", f"{label}: stdout summary mismatch: {summary}")
+    print(f"  PASS  {label}")
+
+
+def scenario_alarm_negative_nan_inf_minus_inf_rejected(label: str, tmpdir: Path) -> None:
+    ba = _import_alarm_module()
+    ba.request_alarm = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("request_alarm must not run for invalid delay"))
+    for raw, expected in [("-1", "-1"), ("nan", "nan"), ("inf", "inf"), ("-inf", "-inf")]:
+        argv = ["--", raw] if raw == "-inf" else [raw]
+        code, out, err = _run_alarm_main(ba, argv)
+        assert_true(code == 2, f"{label}: alarm {raw!r} exits 2, got {code}")
+        assert_true(out == "", f"{label}: invalid alarm has no stdout: {out!r}")
+        assert_true("finite non-negative" in err and f"got {expected}" in err, f"{label}: error should explain rule and value for {raw!r}: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_alarm_zero_and_finite_positive_call_request_alarm(label: str, tmpdir: Path) -> None:
+    ba = _import_alarm_module()
+    calls: list[tuple[str, str, float, str | None]] = []
+    ba.resolve_caller_from_pane = lambda **kwargs: bridge_identity.CallerResolution(True, "test-session", "alice")  # type: ignore[assignment]
+    ba.ensure_daemon_running = lambda session: ""
+    ba.room_status = lambda session: argparse.Namespace(active_enough_for_enqueue=True, reason="ok")
+    ba.load_session = lambda session: _participants_state(["alice", "bob"])
+
+    def request_alarm(session: str, sender: str, delay_seconds: float, body: str | None) -> tuple[bool, str, str]:
+        calls.append((session, sender, delay_seconds, body))
+        return True, f"wake-{format(delay_seconds, 'g')}", ""
+
+    ba.request_alarm = request_alarm
+    code0, out0, err0 = _run_alarm_main(ba, ["0", "--note", "now", "--session", "test-session", "--from", "alice", "--allow-spoof"])
+    code1, out1, err1 = _run_alarm_main(ba, ["2.5", "--session", "test-session", "--from", "alice", "--allow-spoof"])
+    assert_true(code0 == 0 and out0.strip() == "wake-0", f"{label}: zero alarm should succeed: code={code0} out={out0!r} err={err0!r}")
+    assert_true(code1 == 0 and out1.strip() == "wake-2.5", f"{label}: positive alarm should succeed: code={code1} out={out1!r} err={err1!r}")
+    assert_true(calls == [("test-session", "alice", 0.0, "now"), ("test-session", "alice", 2.5, None)], f"{label}: request_alarm calls mismatch: {calls}")
+    print(f"  PASS  {label}")
+
+
+def scenario_resolve_default_watchdog_seconds_env_table(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    cases: list[tuple[str | None, float | None]] = [
+        (None, 300.0),
+        ("300", 300.0),
+        ("0", None),
+        ("-1", None),
+        ("inf", 300.0),
+        ("nan", 300.0),
+        ("abc", 300.0),
+    ]
+    for raw, expected in cases:
+        with patched_environ(AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC=raw):
+            actual = be._resolve_default_watchdog_seconds()
+        assert_true(actual == expected, f"{label}: env {raw!r} expected {expected!r}, got {actual!r}")
+    print(f"  PASS  {label}")
+
+
+def _daemon_command_result(d: bridge_daemon.BridgeDaemon, payload: dict) -> dict:
+    raw = json.dumps(payload, ensure_ascii=True).encode("utf-8") + b"\n"
+    return d.handle_command_connection(FakeCommandConn(raw))  # type: ignore[arg-type]
+
+
+def scenario_daemon_socket_alarm_op_rejects_non_finite(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    for value, expected in [(float("nan"), "nan"), (float("inf"), "inf"), (float("-inf"), "-inf")]:
+        before = dict(d.watchdogs)
+        result = _daemon_command_result(d, {"op": "alarm", "from": "claude", "delay_seconds": value})
+        assert_true(result.get("ok") is False, f"{label}: alarm {expected} should be rejected: {result}")
+        assert_true("finite non-negative" in str(result.get("error") or ""), f"{label}: alarm error should mention finite non-negative: {result}")
+        assert_true(d.watchdogs == before, f"{label}: rejected alarm must not mutate watchdogs")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_socket_extend_watchdog_op_rejects_non_finite(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    for value, expected in [(float("nan"), "nan"), (float("inf"), "inf"), (float("-inf"), "-inf")]:
+        before = dict(d.watchdogs)
+        result = _daemon_command_result(d, {"op": "extend_watchdog", "from": "claude", "message_id": "msg-test", "seconds": value})
+        assert_true(result.get("ok") is False, f"{label}: extend {expected} should be rejected: {result}")
+        assert_true("finite positive" in str(result.get("error") or ""), f"{label}: extend error should mention finite positive: {result}")
+        assert_true(d.watchdogs == before, f"{label}: rejected extend must not mutate watchdogs")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_upsert_message_watchdog_rejects_non_finite(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = test_message("msg-upsert-nonfinite", frm="claude", to="codex", status="delivered")
+    d.queue.update(lambda queue: queue.append(msg) or None)
+    for value, expected in [(float("nan"), "nan"), (float("inf"), "inf"), (float("-inf"), "-inf")]:
+        ok, err, deadline = d.upsert_message_watchdog("claude", "msg-upsert-nonfinite", value)
+        assert_true(not ok and err == "seconds_must_be_positive" and deadline is None, f"{label}: upsert {expected} should reject: {(ok, err, deadline)}")
+    assert_true(not d.watchdogs, f"{label}: rejected upserts must not arm watchdogs: {d.watchdogs}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_register_alarm_rejects_non_finite_and_negative(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    for value in ("not-a-number", float("nan"), float("inf"), float("-inf"), -1.0):
+        wake_id = d.register_alarm("claude", value, None)  # type: ignore[arg-type]
+        assert_true(wake_id is None, f"{label}: register_alarm must reject {value!r}, got {wake_id!r}")
+    assert_true(not d.watchdogs, f"{label}: rejected alarms must not mutate watchdogs")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_mark_message_delivered_ignores_non_finite_watchdog(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = test_message("msg-stale-watchdog-inf", frm="claude", to="codex", status="inflight")
+    msg["watchdog_delay_sec"] = float("inf")
+    d.queue.update(lambda queue: queue.append(msg) or None)
+    delivered = d.mark_message_delivered_by_id("codex", "msg-stale-watchdog-inf")
+    assert_true(delivered is not None and delivered.get("status") == "delivered", f"{label}: message should still be delivered: {delivered}")
+    assert_true(not any(wd.get("ref_message_id") == "msg-stale-watchdog-inf" for wd in d.watchdogs.values()), f"{label}: non-finite stored delay must not arm watchdog: {d.watchdogs}")
+    queued = next((it for it in d.queue.read() if it.get("id") == "msg-stale-watchdog-inf"), None)
+    assert_true(queued is not None and queued.get("status") == "delivered", f"{label}: queue row should be delivered: {queued}")
+    print(f"  PASS  {label}")
 
 
 def scenario_peer_body_size_helper_boundaries(label: str, tmpdir: Path) -> None:
@@ -6260,6 +6580,74 @@ def _run_send_peer_with_fake_subprocess(
     finally:
         bs.subprocess.run = old_run
     return code, out, err, calls
+
+
+def scenario_send_peer_watchdog_notice_inf_reports_finite_error_first_at_shim(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--watchdog", "inf", "--to", "bob", "body"],
+        stdin_isatty=True,
+    )
+    assert_true(code == 2 and out == "" and calls == [], f"{label}: notice+inf should reject before subprocess: code={code} out={out!r} calls={calls}")
+    assert_true("finite non-negative" in err and "got inf" in err, f"{label}: malformed watchdog value should win at shim: {err!r}")
+    assert_true("only applies to --kind request" not in err, f"{label}: kind error must not mask malformed value: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_watchdog_notice_zero_still_rejects_request_only_at_shim(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--watchdog", "0", "--to", "bob", "body"],
+        stdin_isatty=True,
+    )
+    assert_true(code == 2 and out == "" and calls == [], f"{label}: notice+0 should reject before subprocess: code={code} out={out!r} calls={calls}")
+    assert_true("only applies to --kind request" in err and "finite non-negative" not in err, f"{label}: finite zero should reach kind check: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_watchdog_bare_minus_inf_argparse_error_at_shim(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--watchdog", "-inf", "--to", "bob", "body"],
+        stdin_isatty=True,
+    )
+    assert_true(code == 2 and out == "" and calls == [], f"{label}: bare -inf should fail in shim argparse: code={code} out={out!r} calls={calls}")
+    assert_true("argument --watchdog" in err and "expected one argument" in err, f"{label}: argparse should own bare -inf diagnostic: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_watchdog_equals_minus_inf_reports_finite_error_at_shim(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--watchdog=-inf", "--to", "bob", "body"],
+        stdin_isatty=True,
+    )
+    assert_true(code == 2 and out == "" and calls == [], f"{label}: equals -inf should reject before subprocess: code={code} out={out!r} calls={calls}")
+    assert_true("finite non-negative" in err and "got -inf" in err, f"{label}: equals -inf should reach shim finite validator: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_watchdog_finite_value_forwarded_with_equals(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--watchdog", "1.5", "--to", "bob", "body"],
+        stdin_isatty=True,
+    )
+    assert_true(code == 0 and len(calls) == 1, f"{label}: wrapper should invoke enqueue once: code={code} err={err!r}")
+    cmd, _kwargs = calls[0]
+    assert_true("--watchdog=1.5" in cmd, f"{label}: watchdog value should be forwarded with equals: {cmd}")
+    assert_true("--watchdog" not in cmd, f"{label}: wrapper must not forward watchdog as a separate argv token: {cmd}")
+    print(f"  PASS  {label}")
 
 
 def scenario_send_peer_rejects_split_inline_body(label: str, tmpdir: Path) -> None:
@@ -7238,6 +7626,25 @@ def main() -> int:
             ("extend_wait_not_owner", scenario_extend_wait_not_owner),
             ("duplicate_enqueue_does_not_cancel_alarm", scenario_duplicate_enqueue_does_not_cancel_alarm),
             ("alarm_op_invalid_delay_is_rejected", scenario_alarm_op_invalid_delay_is_rejected_not_crashed),
+            ("send_peer_watchdog_negative_one_rejected", scenario_send_peer_watchdog_negative_one_rejected),
+            ("send_peer_watchdog_nan_rejected", scenario_send_peer_watchdog_nan_rejected),
+            ("send_peer_watchdog_inf_rejected", scenario_send_peer_watchdog_inf_rejected),
+            ("send_peer_watchdog_minus_inf_rejected", scenario_send_peer_watchdog_minus_inf_rejected),
+            ("send_peer_watchdog_zero_disables_for_request", scenario_send_peer_watchdog_zero_disables_for_request),
+            ("send_peer_watchdog_finite_positive_succeeds", scenario_send_peer_watchdog_finite_positive_succeeds),
+            ("send_peer_watchdog_inf_with_notice_reports_finite_error_first", scenario_send_peer_watchdog_inf_with_notice_reports_finite_error_first),
+            ("send_peer_watchdog_zero_with_notice_still_rejects_request_only", scenario_send_peer_watchdog_zero_with_notice_still_rejects_request_only),
+            ("send_peer_watchdog_abc_argparse_error", scenario_send_peer_watchdog_abc_argparse_error),
+            ("extend_wait_zero_negative_nan_inf_rejected", scenario_extend_wait_zero_negative_nan_inf_rejected),
+            ("extend_wait_finite_positive_calls_request_extend", scenario_extend_wait_finite_positive_calls_request_extend),
+            ("alarm_negative_nan_inf_minus_inf_rejected", scenario_alarm_negative_nan_inf_minus_inf_rejected),
+            ("alarm_zero_and_finite_positive_call_request_alarm", scenario_alarm_zero_and_finite_positive_call_request_alarm),
+            ("resolve_default_watchdog_seconds_env_table", scenario_resolve_default_watchdog_seconds_env_table),
+            ("daemon_socket_alarm_op_rejects_non_finite", scenario_daemon_socket_alarm_op_rejects_non_finite),
+            ("daemon_socket_extend_watchdog_op_rejects_non_finite", scenario_daemon_socket_extend_watchdog_op_rejects_non_finite),
+            ("daemon_upsert_message_watchdog_rejects_non_finite", scenario_daemon_upsert_message_watchdog_rejects_non_finite),
+            ("daemon_register_alarm_rejects_non_finite_and_negative", scenario_daemon_register_alarm_rejects_non_finite_and_negative),
+            ("daemon_mark_message_delivered_ignores_non_finite_watchdog", scenario_daemon_mark_message_delivered_ignores_non_finite_watchdog),
             ("stale_watchdog_skipped", scenario_stale_watchdog_skipped),
             ("watchdog_pending_text_omits_held_interrupt", scenario_watchdog_pending_text_omits_held_interrupt),
             ("pane_mode_pending_defers_without_attempt", scenario_pane_mode_pending_defers_without_attempt),
@@ -7427,6 +7834,11 @@ def main() -> int:
             ("daemon_startup_backfill_summary_logs_repair_hint", scenario_daemon_startup_backfill_summary_logs_repair_hint),
             ("peer_body_size_helper_boundaries", scenario_peer_body_size_helper_boundaries),
             ("send_peer_rejects_oversized_body_before_subprocess", scenario_send_peer_rejects_oversized_body_before_subprocess),
+            ("send_peer_watchdog_notice_inf_reports_finite_error_first_at_shim", scenario_send_peer_watchdog_notice_inf_reports_finite_error_first_at_shim),
+            ("send_peer_watchdog_notice_zero_still_rejects_request_only_at_shim", scenario_send_peer_watchdog_notice_zero_still_rejects_request_only_at_shim),
+            ("send_peer_watchdog_bare_minus_inf_argparse_error_at_shim", scenario_send_peer_watchdog_bare_minus_inf_argparse_error_at_shim),
+            ("send_peer_watchdog_equals_minus_inf_reports_finite_error_at_shim", scenario_send_peer_watchdog_equals_minus_inf_reports_finite_error_at_shim),
+            ("send_peer_watchdog_finite_value_forwarded_with_equals", scenario_send_peer_watchdog_finite_value_forwarded_with_equals),
             ("send_peer_rejects_split_inline_body", scenario_send_peer_rejects_split_inline_body),
             ("send_peer_rejects_implicit_split_inline_body", scenario_send_peer_rejects_implicit_split_inline_body),
             ("send_peer_rejects_option_after_destination", scenario_send_peer_rejects_option_after_destination),

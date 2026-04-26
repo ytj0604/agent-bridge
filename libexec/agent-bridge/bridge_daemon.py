@@ -3,6 +3,7 @@ import argparse
 from collections import OrderedDict
 import hashlib
 import json
+import math
 import os
 import signal
 import socket
@@ -562,8 +563,8 @@ class BridgeDaemon:
                 delay_value = float(delay)
             except (TypeError, ValueError):
                 return {"ok": False, "error": "delay_seconds must be a number"}
-            if delay_value < 0:
-                return {"ok": False, "error": "delay_seconds must be non-negative"}
+            if not math.isfinite(delay_value) or delay_value < 0:
+                return {"ok": False, "error": "delay_seconds must be a finite non-negative number"}
             body = request.get("body")
             wake_id = self.register_alarm(sender, delay_value, body if isinstance(body, str) else None)
             if not wake_id:
@@ -611,8 +612,8 @@ class BridgeDaemon:
                 additional_sec = float(seconds)
             except (TypeError, ValueError):
                 return {"ok": False, "error": "seconds must be a number"}
-            if additional_sec <= 0:
-                return {"ok": False, "error": "seconds must be positive"}
+            if not math.isfinite(additional_sec) or additional_sec <= 0:
+                return {"ok": False, "error": "seconds must be a finite positive number"}
             ok, err, deadline = self.upsert_message_watchdog(sender, message_id, additional_sec)
             if not ok:
                 return {"ok": False, "error": err or "extend_failed"}
@@ -1613,9 +1614,11 @@ class BridgeDaemon:
         # accepted v1.5 trade-off.
         if message and message.get("watchdog_delay_sec") is not None:
             try:
-                delay = max(0.0, float(message["watchdog_delay_sec"]))
+                raw_delay = float(message["watchdog_delay_sec"])
             except (TypeError, ValueError):
                 delay = None
+            else:
+                delay = raw_delay if math.isfinite(raw_delay) and raw_delay >= 0 else None
             if delay is not None:
                 deadline = datetime.now(timezone.utc) + timedelta(seconds=delay)
                 arm_msg = dict(message)
@@ -1643,7 +1646,13 @@ class BridgeDaemon:
             # use agent_view_peer / agent_interrupt_peer to unblock instead.
             if item.get("status") != "delivered":
                 return False, "message_not_in_delivered_state", None
-            new_deadline = datetime.now(timezone.utc) + timedelta(seconds=max(0.0, float(additional_sec)))
+            try:
+                additional_value = float(additional_sec)
+            except (TypeError, ValueError):
+                return False, "seconds_must_be_positive", None
+            if not math.isfinite(additional_value) or additional_value <= 0:
+                return False, "seconds_must_be_positive", None
+            new_deadline = datetime.now(timezone.utc) + timedelta(seconds=additional_value)
             new_deadline_iso = new_deadline.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
             for wake_id in list(self.watchdogs.keys()):
                 wd = self.watchdogs.get(wake_id)
@@ -1656,7 +1665,7 @@ class BridgeDaemon:
                 "watchdog_extended",
                 message_id=message_id,
                 new_deadline=new_deadline_iso,
-                additional_sec=float(additional_sec),
+                additional_sec=additional_value,
                 status=item.get("status"),
             )
             return True, None, new_deadline_iso
@@ -1881,8 +1890,10 @@ class BridgeDaemon:
         if not sender or sender == "bridge":
             return None
         try:
-            delay = max(0.0, float(delay_seconds))
+            delay = float(delay_seconds)
         except (TypeError, ValueError):
+            return None
+        if not math.isfinite(delay) or delay < 0:
             return None
         deadline = time.time() + delay
         wake_id = short_id("wake")

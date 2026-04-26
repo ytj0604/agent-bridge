@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import socket
 import sys
@@ -62,6 +63,13 @@ def main() -> int:
     parser.add_argument("--allow-spoof", action="store_true")
     args = parser.parse_args()
 
+    if not math.isfinite(args.delay_seconds) or args.delay_seconds < 0:
+        print(
+            f"agent_alarm: delay_seconds must be a finite non-negative number, got {format(args.delay_seconds, 'g')}",
+            file=sys.stderr,
+        )
+        return 2
+
     session = args.session or os.environ.get("AGENT_BRIDGE_SESSION") or ""
     sender = args.sender or os.environ.get("AGENT_BRIDGE_AGENT") or ""
 
@@ -100,10 +108,6 @@ def main() -> int:
             f"agent_alarm: sender {sender!r} is not active in bridge room {session!r}; active aliases: {aliases}.",
             file=sys.stderr,
         )
-        return 2
-
-    if args.delay_seconds < 0:
-        print("agent_alarm: delay_seconds must be non-negative", file=sys.stderr)
         return 2
 
     ok, wake_id, error = request_alarm(session, sender, args.delay_seconds, args.note)

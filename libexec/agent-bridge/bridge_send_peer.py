@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -366,6 +367,13 @@ def main() -> int:
         print(size_error, file=sys.stderr)
         return 2
 
+    if args.watchdog is not None and (not math.isfinite(args.watchdog) or args.watchdog < 0):
+        print(
+            f"agent_send_peer: --watchdog must be a finite non-negative number, got {format(args.watchdog, 'g')}",
+            file=sys.stderr,
+        )
+        return 2
+
     # --watchdog only makes sense for kind=request. Notices have no return
     # route, so a watchdog watching for "no reply" is meaningless. For
     # follow-ups expected on a notice-driven flow, use agent_alarm.
@@ -395,7 +403,7 @@ def main() -> int:
     if args.force:
         cmd.append("--force")
     if args.watchdog is not None:
-        cmd += ["--watchdog", str(args.watchdog)]
+        cmd.append(f"--watchdog={args.watchdog}")
     if args.target_all:
         cmd.append("--all")
     elif target:

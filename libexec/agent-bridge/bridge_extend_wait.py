@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import socket
 import sys
@@ -65,8 +66,11 @@ def main() -> int:
     parser.add_argument("--allow-spoof", action="store_true")
     args = parser.parse_args()
 
-    if args.seconds <= 0:
-        print("agent_extend_wait: seconds must be positive", file=sys.stderr)
+    if not math.isfinite(args.seconds) or args.seconds <= 0:
+        print(
+            f"agent_extend_wait: seconds must be a finite positive number, got {format(args.seconds, 'g')}",
+            file=sys.stderr,
+        )
         return 2
 
     session = args.session or os.environ.get("AGENT_BRIDGE_SESSION") or ""
