@@ -5999,6 +5999,36 @@ def scenario_view_peer_doc_surfaces_disclose_search_semantics(label: str, tmpdir
     print(f"  PASS  {label}")
 
 
+def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir: Path) -> None:
+    phrase = "interrupt can be a no-op: the response and queued follow-ups still flow"
+    command_shape = "agent_interrupt_peer <alias>"
+
+    interrupt_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith(f"- {command_shape} :")]
+    assert_true(len(interrupt_lines) == 1, f"{label}: expected one default interrupt cheat-sheet line, got {interrupt_lines!r}")
+    assert_true(phrase in interrupt_lines[0], f"{label}: cheat-sheet interrupt line must disclose no-op race: {interrupt_lines[0]!r}")
+    assert_true("force-cancel" not in interrupt_lines[0], f"{label}: default interrupt line must not imply force-cancel: {interrupt_lines[0]!r}")
+
+    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
+    assert_true(command_shape in probe, f"{label}: probe prompt must keep the interrupt command shape")
+    assert_true(phrase in probe, f"{label}: probe prompt must disclose no-op race")
+    assert_true("force-cancel" not in probe, f"{label}: probe prompt must not imply force-cancel")
+
+    help_result = subprocess.run(
+        [sys.executable, str(LIBEXEC / "bridge_interrupt_peer.py"), "--help"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    help_text = help_result.stdout + help_result.stderr
+    normalized_help = " ".join(help_text.split())
+    assert_true(help_result.returncode == 0, f"{label}: agent_interrupt_peer --help should exit 0, got {help_result.returncode}: {help_text!r}")
+    assert_true("--clear-hold" in help_text, f"{label}: --help output must include interrupt-specific options")
+    assert_true(phrase in normalized_help, f"{label}: --help output must disclose no-op race: {help_text!r}")
+    assert_true("force-cancel" not in normalized_help, f"{label}: --help output must not imply force-cancel: {help_text!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_view_peer_render_output_model_safe(label: str, tmpdir: Path) -> None:
     bv = _import_view_peer()
     import contextlib
@@ -9375,6 +9405,7 @@ def main() -> int:
             ("view_peer_nonempty_search_still_reaches_validation", scenario_view_peer_nonempty_search_still_reaches_validation),
             ("view_peer_search_with_page_after_a19_reports_page_error", scenario_view_peer_search_with_page_after_a19_reports_page_error),
             ("view_peer_doc_surfaces_disclose_search_semantics", scenario_view_peer_doc_surfaces_disclose_search_semantics),
+            ("interrupt_peer_doc_surfaces_disclose_no_op_race", scenario_interrupt_peer_doc_surfaces_disclose_no_op_race),
             ("view_peer_render_output_model_safe", scenario_view_peer_render_output_model_safe),
             ("view_peer_search_explicit_snapshot_uses_safe_ref", scenario_view_peer_search_explicit_snapshot_uses_safe_ref),
             ("view_peer_snapshot_ref_collision_unique", scenario_view_peer_snapshot_ref_collision_unique),

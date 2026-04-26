@@ -56,7 +56,11 @@ def send_command(bridge_session: str, payload: dict) -> tuple[bool, dict, str]:
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="agent_interrupt_peer",
-        description="Interrupt a peer (default), force-clear a legacy interrupt hold, or inspect peer status.",
+        description=(
+            "Send ESC and cancel the active peer message (default), force-clear a legacy interrupt hold, "
+            "or inspect peer status. If the peer is already past the inflight phase, interrupt can be "
+            "a no-op: the response and queued follow-ups still flow."
+        ),
     )
     parser.add_argument("target", nargs="?", help="peer alias to act on (omit with --status to query all peers)")
     mode = parser.add_mutually_exclusive_group()
