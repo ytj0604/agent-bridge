@@ -31,6 +31,7 @@ def model_cheat_sheet() -> list[str]:
         "- A watchdog wake explicitly tells you to choose ONE of: agent_extend_wait <msg_id> <sec>, agent_interrupt_peer <alias>, or just agent_view_peer <alias> first to inspect. Pick one — it's not a polling primitive.",
         "- agent_alarm is for 'I delegated work via notice and want a safety wake if no follow-up arrives'. It is NOT for waiting on auto-routed reply results — for that use --watchdog / agent_extend_wait.",
         "- Do not poll with agent_view_peer or schedule a wakeup to check progress; use agent_view_peer only when you suspect the peer is stuck or need to debug the bridge.",
+        "- If a human types into a pane while a bridge prompt is delivered but unsubmitted, the bridge cancels that delivered message, emits [bridge:interrupted] prompt_intercepted to the original sender, and drops that turn; expect model-driven retries.",
         "- Never read bridge state files directly. Replies arrive as [bridge:*] prompts; use the bridge commands above for everything else.",
         "- Large payloads (design docs, code, long plans): inline agent_send_peer bodies are limited to 11000 chars. Write larger content to a shared path under /tmp/agent-bridge-share/ and send only the path + brief description. Peers read the file directly. Inlining big bodies is slow and can break paste-burst submit.",
     ]
@@ -77,6 +78,7 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "  - Put all agent_send_peer options before --to/--all or before an implicit leading alias, except --stdin may appear after the destination. If an inline body is split into multiple shell arguments, the command fails closed.\n"
         "  - A watchdog wake means: pick ONE of agent_extend_wait, agent_interrupt_peer, or agent_view_peer (to inspect first). It is not a polling primitive.\n"
         "  - agent_alarm is for 'I delegated via notice and want a safety wake if no follow-up arrives'. It is NOT for waiting on auto-routed reply results — for that use --watchdog / agent_extend_wait.\n"
+        "  - If a human types into a pane while a bridge prompt is delivered but unsubmitted, the bridge cancels that delivered message, emits [bridge:interrupted] prompt_intercepted to the original sender, and drops that turn; expect model-driven retries.\n"
         "  - Inline message bodies are limited to 11000 chars. For larger bodies (design docs, code, long plans), write to /tmp/agent-bridge-share/<file> and send only the path + brief description. Inlining big content is slow and can break paste-burst submit.\n"
         "  - Never read bridge state files directly; use the commands above.\n"
         "\n"

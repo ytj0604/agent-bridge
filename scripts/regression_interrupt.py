@@ -6029,6 +6029,36 @@ def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir:
     print(f"  PASS  {label}")
 
 
+def scenario_prompt_intercepted_doc_surfaces_disclose_user_typing_collision(label: str, tmpdir: Path) -> None:
+    phrase = (
+        "If a human types into a pane while a bridge prompt is delivered but unsubmitted, "
+        "the bridge cancels that delivered message, emits [bridge:interrupted] "
+        "prompt_intercepted to the original sender, and drops that turn; expect "
+        "model-driven retries."
+    )
+    critical_substrings = [
+        "delivered but unsubmitted",
+        "[bridge:interrupted] prompt_intercepted",
+        "drops that turn",
+        "expect model-driven retries",
+    ]
+
+    matching_lines = [
+        line for line in bridge_instructions.model_cheat_sheet()
+        if "prompt_intercepted" in line or "delivered but unsubmitted" in line
+    ]
+    assert_true(len(matching_lines) == 1, f"{label}: expected one prompt_intercepted cheat-sheet bullet, got {matching_lines!r}")
+    assert_true(phrase in matching_lines[0], f"{label}: cheat-sheet bullet must disclose user-typing collision exactly: {matching_lines[0]!r}")
+
+    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
+    assert_true(phrase in probe, f"{label}: probe prompt must disclose user-typing collision exactly")
+
+    for needle in critical_substrings:
+        assert_true(needle in matching_lines[0], f"{label}: cheat-sheet bullet missing critical substring {needle!r}: {matching_lines[0]!r}")
+        assert_true(needle in probe, f"{label}: probe prompt missing critical substring {needle!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_view_peer_render_output_model_safe(label: str, tmpdir: Path) -> None:
     bv = _import_view_peer()
     import contextlib
@@ -9406,6 +9436,7 @@ def main() -> int:
             ("view_peer_search_with_page_after_a19_reports_page_error", scenario_view_peer_search_with_page_after_a19_reports_page_error),
             ("view_peer_doc_surfaces_disclose_search_semantics", scenario_view_peer_doc_surfaces_disclose_search_semantics),
             ("interrupt_peer_doc_surfaces_disclose_no_op_race", scenario_interrupt_peer_doc_surfaces_disclose_no_op_race),
+            ("prompt_intercepted_doc_surfaces_disclose_user_typing_collision", scenario_prompt_intercepted_doc_surfaces_disclose_user_typing_collision),
             ("view_peer_render_output_model_safe", scenario_view_peer_render_output_model_safe),
             ("view_peer_search_explicit_snapshot_uses_safe_ref", scenario_view_peer_search_explicit_snapshot_uses_safe_ref),
             ("view_peer_snapshot_ref_collision_unique", scenario_view_peer_snapshot_ref_collision_unique),
