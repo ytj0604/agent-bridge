@@ -1822,6 +1822,230 @@ def scenario_join_probe_passes_pane_id_to_wait(label: str, tmpdir: Path) -> None
     print(f"  PASS  {label}")
 
 
+def scenario_bridge_attach_start_daemon_argv_includes_from_start(label: str, tmpdir: Path) -> None:
+    captured: dict[str, list[str]] = {}
+    old_run = bridge_attach.run
+
+    def fake_run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+        captured["cmd"] = list(cmd)
+        payload = {"pid": 12345, "pid_file": "/tmp/pid", "log_file": "/tmp/log", "command_socket": "/tmp/sock"}
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    state = {
+        "bus_file": str(tmpdir / "events.raw.jsonl"),
+        "events_file": str(tmpdir / "events.jsonl"),
+        "queue_file": str(tmpdir / "pending.json"),
+        "participants": {
+            "claude": {"agent_type": "claude", "pane": "%1"},
+            "codex": {"agent_type": "codex", "pane": "%2"},
+        },
+    }
+    try:
+        bridge_attach.run = fake_run  # type: ignore[assignment]
+        result = bridge_attach.start_daemon(argparse.Namespace(session="test-session"), state)
+    finally:
+        bridge_attach.run = old_run  # type: ignore[assignment]
+
+    cmd = captured.get("cmd") or []
+    assert_true(result.get("pid") == 12345, f"{label}: fake daemon result should parse")
+    assert_true("--from-start" in cmd, f"{label}: attach-started daemon ctl command must include --from-start: {cmd}")
+    assert_true(cmd[0].endswith("bridge_daemon_ctl.py") and "start" in cmd, f"{label}: expected daemon_ctl start command: {cmd}")
+    for flag, value in (
+        ("--state-file", state["bus_file"]),
+        ("--public-state-file", state["events_file"]),
+        ("--queue-file", state["queue_file"]),
+        ("--session", "test-session"),
+    ):
+        assert_true(flag in cmd and cmd[cmd.index(flag) + 1] == value, f"{label}: {flag} not preserved in command: {cmd}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_daemon_ctl_start_subparser_accepts_from_start(label: str, tmpdir: Path) -> None:
+    import contextlib
+    import importlib
+    import io
+
+    ctl = _import_daemon_ctl()
+    old_argv = sys.argv[:]
+    old_env = {key: os.environ.get(key) for key in ("AGENT_BRIDGE_STATE_DIR", "AGENT_BRIDGE_RUN_DIR", "AGENT_BRIDGE_LOG_DIR")}
+    out = io.StringIO()
+    try:
+        os.environ["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
+        os.environ["AGENT_BRIDGE_RUN_DIR"] = str(tmpdir / "run")
+        os.environ["AGENT_BRIDGE_LOG_DIR"] = str(tmpdir / "log")
+        importlib.reload(ctl)
+        sys.argv = [
+            "bridge_daemon_ctl.py",
+            "start",
+            "-s",
+            "test-session",
+            "--state-file",
+            str(tmpdir / "events.raw.jsonl"),
+            "--public-state-file",
+            str(tmpdir / "events.jsonl"),
+            "--queue-file",
+            str(tmpdir / "pending.json"),
+            "--from-start",
+            "--dry-run",
+            "--json",
+        ]
+        with contextlib.redirect_stdout(out):
+            code = ctl.main()
+    finally:
+        sys.argv = old_argv
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        importlib.reload(ctl)
+
+    result = json.loads(out.getvalue())
+    command = result.get("command") or []
+    assert_true(code == 0, f"{label}: ctl main should accept --from-start, got {code}")
+    assert_true(result.get("dry_run") is True, f"{label}: start dry-run result expected: {result}")
+    assert_true("--from-start" in command, f"{label}: parsed --from-start should reach dry-run daemon argv: {command}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_command_forwards_from_start(label: str, tmpdir: Path) -> None:
+    ctl = _import_daemon_ctl()
+    args = argparse.Namespace(
+        session="test-session",
+        state_file=str(tmpdir / "events.raw.jsonl"),
+        public_state_file=str(tmpdir / "events.jsonl"),
+        queue_file=str(tmpdir / "pending.json"),
+        claude_pane="",
+        codex_pane="",
+        max_hops=None,
+        submit_delay=None,
+        submit_timeout=None,
+        from_start=True,
+    )
+    cmd = ctl.daemon_command(args)
+    assert_true("--from-start" in cmd, f"{label}: daemon_command must forward from_start=True: {cmd}")
+    args.from_start = False
+    cmd_without = ctl.daemon_command(args)
+    assert_true("--from-start" not in cmd_without, f"{label}: daemon_command must omit from_start=False: {cmd_without}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_daemon_ctl_start_argv_includes_from_start_end_to_end(label: str, tmpdir: Path) -> None:
+    import importlib
+
+    ctl = _import_daemon_ctl()
+    old_env = {key: os.environ.get(key) for key in ("AGENT_BRIDGE_STATE_DIR", "AGENT_BRIDGE_RUN_DIR", "AGENT_BRIDGE_LOG_DIR")}
+    try:
+        os.environ["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
+        os.environ["AGENT_BRIDGE_RUN_DIR"] = str(tmpdir / "run")
+        os.environ["AGENT_BRIDGE_LOG_DIR"] = str(tmpdir / "log")
+        importlib.reload(ctl)
+        paths = ctl.session_paths("test-session")
+        for path in (paths["pid"], paths["meta"], paths["lock"], paths["stop"], paths["socket"], paths["log"]):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        args = argparse.Namespace(
+            session="test-session",
+            state_file=str(tmpdir / "events.raw.jsonl"),
+            public_state_file=str(tmpdir / "events.jsonl"),
+            queue_file=str(tmpdir / "pending.json"),
+            claude_pane="",
+            codex_pane="",
+            replace=True,
+            dry_run=True,
+            stop_timeout=1.0,
+            max_hops=None,
+            submit_delay=None,
+            submit_timeout=None,
+            from_start=True,
+        )
+        result = ctl.start_under_lock(args, paths)
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        importlib.reload(ctl)
+
+    command = result.get("command") or []
+    assert_true(result.get("dry_run") is True, f"{label}: start_under_lock dry-run expected: {result}")
+    assert_true("--from-start" in command, f"{label}: start_under_lock dry-run argv must include --from-start: {command}")
+    print(f"  PASS  {label}")
+
+
+def _plant_attach_window_prompt_submit(d: bridge_daemon.BridgeDaemon, *, record_file: bool = True) -> dict:
+    message = test_message("msg-attach-window", frm="alice", to="bob", status="inflight")
+    message["nonce"] = "nonce-attach-window"
+    message["delivery_attempts"] = 1
+    d.queue.update(lambda queue: queue.append(message))
+    record = {
+        "ts": utc_now(),
+        "agent": "codex",
+        "bridge_agent": "bob",
+        "event": "prompt_submitted",
+        "bridge_session": "test-session",
+        "nonce": "nonce-attach-window",
+        "turn_id": "turn-attach-window",
+    }
+    if record_file:
+        d.state_file.write_text(json.dumps(record, ensure_ascii=True) + "\n", encoding="utf-8")
+    return record
+
+
+def scenario_daemon_follow_from_start_replays_prompt_submitted(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.from_start = True
+    _plant_attach_window_prompt_submit(d)
+    d.follow()
+    ctx = d.current_prompt_by_agent.get("bob") or {}
+    item = _queue_item(d, "msg-attach-window") or {}
+    assert_true(ctx.get("id") == "msg-attach-window", f"{label}: from_start must replay prompt_submitted and bind ctx: {ctx}")
+    assert_true(ctx.get("turn_id") == "turn-attach-window", f"{label}: turn id must be preserved: {ctx}")
+    assert_true(d.busy.get("bob") is True, f"{label}: replayed prompt_submitted should mark bob busy")
+    assert_true(item.get("status") == "delivered", f"{label}: replayed prompt_submitted should mark queue delivered: {item}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_follow_from_start_false_skips_pre_existing_record(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.from_start = False
+    _plant_attach_window_prompt_submit(d)
+    d.follow()
+    ctx = d.current_prompt_by_agent.get("bob") or {}
+    item = _queue_item(d, "msg-attach-window") or {}
+    assert_true(not ctx.get("id"), f"{label}: default seek-EOF path must skip pre-existing prompt_submitted: {ctx}")
+    assert_true(d.busy.get("bob") is not True, f"{label}: bob should not become busy from skipped record")
+    assert_true(item.get("status") == "inflight", f"{label}: skipped prompt_submitted should leave queue inflight: {item}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_follow_from_start_handles_self_daemon_started_safely(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.from_start = True
+    before_participants = dict(d.participants)
+    before_queue = d.queue.read()
+    d.follow()
+    after_queue = d.queue.read()
+    events = read_events(d.state_file)
+    assert_true(d.participants == before_participants, f"{label}: daemon_started self-record must not mutate participants")
+    assert_true(after_queue == before_queue, f"{label}: daemon_started self-record must not mutate queue: {after_queue}")
+    assert_true(any(e.get("event") == "daemon_started" for e in events), f"{label}: daemon_started should be logged")
+    assert_true(not any(e.get("event") == "record_handler_failed" for e in events), f"{label}: daemon_started replay must not fail handler: {events}")
+    print(f"  PASS  {label}")
+
+
 # ---------- v1.5.2 scenarios: state-based delivery matching + consume-once ----------
 
 def _make_inflight(
@@ -6843,6 +7067,13 @@ def main() -> int:
             ("wait_for_probe_retries_enter_with_pane_id", scenario_wait_for_probe_retries_enter_with_pane_id),
             ("wait_for_probe_no_retry_without_pane_id", scenario_wait_for_probe_no_retry_without_pane_id),
             ("join_probe_passes_pane_id_to_wait", scenario_join_probe_passes_pane_id_to_wait),
+            ("bridge_attach_start_daemon_argv_includes_from_start", scenario_bridge_attach_start_daemon_argv_includes_from_start),
+            ("bridge_daemon_ctl_start_subparser_accepts_from_start", scenario_bridge_daemon_ctl_start_subparser_accepts_from_start),
+            ("daemon_command_forwards_from_start", scenario_daemon_command_forwards_from_start),
+            ("bridge_daemon_ctl_start_argv_includes_from_start_end_to_end", scenario_bridge_daemon_ctl_start_argv_includes_from_start_end_to_end),
+            ("daemon_follow_from_start_replays_prompt_submitted", scenario_daemon_follow_from_start_replays_prompt_submitted),
+            ("daemon_follow_from_start_false_skips_pre_existing_record", scenario_daemon_follow_from_start_false_skips_pre_existing_record),
+            ("daemon_follow_from_start_handles_self_daemon_started_safely", scenario_daemon_follow_from_start_handles_self_daemon_started_safely),
             ("orphan_nonce_in_user_prompt", scenario_orphan_nonce_in_user_prompt),
             ("prompt_intercept_request_notice_body", scenario_prompt_intercept_request_notice_body),
             ("prompt_intercept_bridge_notice_no_source_notice", scenario_prompt_intercept_bridge_notice_no_source_notice),

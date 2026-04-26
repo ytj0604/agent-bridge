@@ -949,6 +949,9 @@ def start_daemon(args: argparse.Namespace, state: dict) -> dict:
         "start",
         "--replace",
         "--json",
+        # Fresh attach just archived the prior room bus and touched a new
+        # events.raw.jsonl, so offset 0 is the correct generation boundary.
+        "--from-start",
         "--session",
         args.session,
         "--state-file",

@@ -103,6 +103,8 @@ def daemon_command(args: argparse.Namespace) -> list[str]:
         cmd += ["--submit-delay", str(args.submit_delay)]
     if args.submit_timeout is not None:
         cmd += ["--submit-timeout", str(args.submit_timeout)]
+    if getattr(args, "from_start", False):
+        cmd += ["--from-start"]
     return cmd
 
 
@@ -795,6 +797,7 @@ def main() -> int:
     p_start.add_argument("--replace", action="store_true")
     p_start.add_argument("--dry-run", action="store_true")
     p_start.add_argument("--json", action="store_true")
+    p_start.add_argument("--from-start", action="store_true")
     p_start.add_argument("--health-delay", type=float, default=0.35)
     p_start.add_argument("--stop-timeout", type=float, default=5.0)
     p_start.add_argument("--max-hops", type=int)
