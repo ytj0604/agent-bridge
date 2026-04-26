@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Interrupt a peer or manage interrupt hold state.
+"""Interrupt a peer or manage legacy interrupt hold state.
 
 Modes:
-- (default) ESC + cancel + enter held_interrupt:
+- (default) ESC + cancel active peer turn; pending corrections may continue:
     agent_interrupt_peer <alias>
-- Force-release the hold without sending ESC (UNSAFE if peer might still
-  be running — see warning printed by daemon):
+- Force-release a legacy hold without sending ESC (UNSAFE if peer might
+  still be running — see warning printed by daemon):
     agent_interrupt_peer <alias> --clear-hold
 - Inspect status of a peer or all peers:
     agent_interrupt_peer [<alias>] --status
@@ -55,11 +55,11 @@ def send_command(bridge_session: str, payload: dict) -> tuple[bool, dict, str]:
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="agent_interrupt_peer",
-        description="Interrupt a peer (default), force-clear an interrupt hold, or inspect peer status.",
+        description="Interrupt a peer (default), force-clear a legacy interrupt hold, or inspect peer status.",
     )
     parser.add_argument("target", nargs="?", help="peer alias to act on (omit with --status to query all peers)")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--clear-hold", action="store_true", help="force-release held_interrupt without sending ESC (UNSAFE if peer is still running)")
+    mode.add_argument("--clear-hold", action="store_true", help="force-release a legacy held_interrupt without sending ESC (UNSAFE if peer is still running)")
     mode.add_argument("--status", action="store_true", help="show busy/held/queue state for the target (or all peers if no target)")
     parser.add_argument("--session", dest="session")
     parser.add_argument("--from", dest="sender")

@@ -403,7 +403,8 @@ def scenario_aggregate_interrupt_synthetic(label: str, tmpdir: Path) -> None:
     d.panes["w1"] = "%96"
     result = d.handle_interrupt(sender="manager", target="w1")
     assert_true(result.get("esc_sent") is True, f"{label}: ESC should be reported as sent in dry_run")
-    assert_true("w1" in d.held_interrupt, f"{label}: w1 should be held")
+    assert_true(result.get("held") is False, f"{label}: interrupt should not enter held state")
+    assert_true("w1" not in d.held_interrupt, f"{label}: w1 should not be held")
     # Now simulate w2 producing its real reply → aggregate should complete
     d.current_prompt_by_agent["w2"] = {
         "id": "msg-w2", "from": "manager", "auto_return": True,
@@ -416,6 +417,241 @@ def scenario_aggregate_interrupt_synthetic(label: str, tmpdir: Path) -> None:
     events = read_events(Path(d.state_file))
     queued_aggregate_result = any(e.get("event") == "aggregate_result_queued" and e.get("aggregate_id") == agg_id for e in events)
     assert_true(queued_aggregate_result, f"{label}: aggregate_result should be queued after w1 synthetic + w2 real")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_pending_replacement_delivers(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_delivered_context(d, "msg-old", "alice", "bob", "n-old", turn_id="turn-old")
+    replacement = test_message("msg-new", frm="alice", to="bob", status="pending")
+    d.queue.update(lambda queue: (queue.append(replacement), None)[1])
+
+    result = d.handle_interrupt(sender="alice", target="bob")
+
+    assert_true(result.get("esc_sent") is True, f"{label}: interrupt should send ESC in dry_run")
+    assert_true(result.get("held") is False, f"{label}: interrupt should not enter held state")
+    assert_true("bob" not in d.held_interrupt, f"{label}: held_interrupt must stay clear")
+    assert_true(_queue_item(d, "msg-old") is None, f"{label}: old delivered message should be cancelled")
+    new_item = _queue_item(d, "msg-new")
+    assert_true(new_item is not None and new_item.get("status") == "inflight", f"{label}: replacement should deliver immediately, got {new_item}")
+    assert_true(d.reserved.get("bob") == "msg-new", f"{label}: replacement should reserve bob")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_new_replacement_after_interrupt_delivers(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_delivered_context(d, "msg-old", "alice", "bob", "n-old", turn_id="turn-old")
+
+    result = d.handle_interrupt(sender="alice", target="bob")
+    assert_true(result.get("held") is False, f"{label}: interrupt should not enter held state")
+    d.queue_message(test_message("msg-new", frm="alice", to="bob", status="pending"))
+
+    new_item = _queue_item(d, "msg-new")
+    assert_true(new_item is not None and new_item.get("status") == "inflight", f"{label}: post-interrupt replacement should deliver immediately, got {new_item}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupted_late_prompt_submitted_before_replacement(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_inflight(d, "msg-old", "alice", "bob", "n-old")
+
+    d.handle_interrupt(sender="alice", target="bob")
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": "n-old", "turn_id": "turn-old", "prompt": ""})
+
+    assert_true("bob" not in d.current_prompt_by_agent, f"{label}: old prompt_submitted must not create active ctx")
+    d.queue_message(test_message("msg-new", frm="alice", to="bob", status="pending"))
+    new_item = _queue_item(d, "msg-new")
+    assert_true(new_item is not None and new_item.get("status") == "inflight", f"{label}: replacement should deliver after suppressed old prompt")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(any(e.get("event") == "interrupted_prompt_submitted_suppressed" for e in events), f"{label}: suppression should be logged")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupted_late_prompt_submitted_after_replacement(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_inflight(d, "msg-old", "alice", "bob", "n-old")
+    d.queue.update(lambda queue: (queue.append(test_message("msg-new", frm="alice", to="bob", status="pending")), None)[1])
+
+    d.handle_interrupt(sender="alice", target="bob")
+    new_item = _queue_item(d, "msg-new")
+    assert_true(new_item is not None and new_item.get("status") == "inflight", f"{label}: replacement should be inflight")
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": new_item.get("nonce"), "turn_id": "turn-new", "prompt": ""})
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": "n-old", "turn_id": "turn-old", "prompt": ""})
+
+    ctx = d.current_prompt_by_agent.get("bob") or {}
+    assert_true(ctx.get("id") == "msg-new" and ctx.get("turn_id") == "turn-new", f"{label}: old prompt_submitted must not intercept replacement ctx: {ctx}")
+    assert_true(_queue_item(d, "msg-new") is not None and _queue_item(d, "msg-new").get("status") == "delivered", f"{label}: replacement must remain delivered")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(not any(e.get("event") == "active_prompt_intercepted" for e in events), f"{label}: old prompt must not trigger intercept")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupted_late_turn_stop_preserves_replacement(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_delivered_context(d, "msg-old", "alice", "bob", "n-old", turn_id="turn-old")
+    d.queue.update(lambda queue: (queue.append(test_message("msg-new", frm="alice", to="bob", status="pending")), None)[1])
+
+    d.handle_interrupt(sender="alice", target="bob")
+    new_item = _queue_item(d, "msg-new")
+    assert_true(new_item is not None, f"{label}: replacement should exist")
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": new_item.get("nonce"), "turn_id": "turn-new", "prompt": ""})
+    d.handle_response_finished({"agent": "bob", "bridge_agent": "bob", "turn_id": "turn-old", "last_assistant_message": "late old"})
+
+    ctx = d.current_prompt_by_agent.get("bob") or {}
+    assert_true(ctx.get("id") == "msg-new", f"{label}: late old Stop must not clear replacement ctx")
+    assert_true(not any(item.get("kind") == "result" and item.get("to") == "alice" and "late old" in str(item.get("body") or "") for item in d.queue.read()), f"{label}: late old Stop must not route")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupted_no_turn_stop_no_context_suppressed(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_delivered_context(d, "msg-old", "alice", "bob", "n-old", turn_id=None)
+
+    d.handle_interrupt(sender="alice", target="bob")
+    d.handle_response_finished({"agent": "bob", "bridge_agent": "bob", "turn_id": None, "last_assistant_message": "late old"})
+
+    assert_true("bob" not in d.interrupted_turns, f"{label}: psubseen no-context tombstone should be consumed")
+    assert_true(not any(item.get("kind") == "result" and item.get("to") == "alice" for item in d.queue.read()), f"{label}: stale no-context Stop must not route")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupted_no_turn_race_routes_replacement_then_suppresses_old(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_inflight(d, "msg-old", "alice", "bob", "n-old")
+    d.queue.update(lambda queue: (queue.append(test_message("msg-new", frm="alice", to="bob", status="pending")), None)[1])
+
+    d.handle_interrupt(sender="alice", target="bob")
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": "n-old", "turn_id": None, "prompt": ""})
+    new_item = _queue_item(d, "msg-new")
+    assert_true(new_item is not None and new_item.get("status") == "inflight", f"{label}: replacement should be inflight")
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": new_item.get("nonce"), "turn_id": None, "prompt": ""})
+    d.handle_response_finished({"agent": "bob", "bridge_agent": "bob", "turn_id": None, "last_assistant_message": "replacement ok"})
+
+    assert_true(any(item.get("kind") == "result" and item.get("to") == "alice" and "replacement ok" in str(item.get("body") or "") for item in d.queue.read()), f"{label}: fast replacement no-turn response should route")
+    d.handle_response_finished({"agent": "bob", "bridge_agent": "bob", "turn_id": None, "last_assistant_message": "late old"})
+    assert_true(not any(item.get("kind") == "result" and item.get("to") == "alice" and "late old" in str(item.get("body") or "") for item in d.queue.read()), f"{label}: later old no-turn Stop should not route")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupted_inflight_tombstone_retains_on_unrelated_stop(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _make_inflight(d, "msg-old", "alice", "bob", "n-old")
+
+    d.handle_interrupt(sender="alice", target="bob")
+    assert_true(d.interrupted_turns.get("bob"), f"{label}: inflight interrupt should create tombstone")
+    d.handle_response_finished({"agent": "bob", "bridge_agent": "bob", "turn_id": None, "last_assistant_message": "unrelated"})
+    tombstones = d.interrupted_turns.get("bob") or []
+    assert_true(tombstones and tombstones[0].get("message_id") == "msg-old", f"{label}: psubseen=False tombstone must survive unrelated no-context Stop")
+
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": "n-old", "turn_id": None, "prompt": ""})
+    tombstones = d.interrupted_turns.get("bob") or []
+    assert_true(tombstones and tombstones[0].get("prompt_submitted_seen") is True, f"{label}: delayed old prompt_submitted should still be suppressed and mark psubseen")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupted_empty_values_do_not_match_tombstone(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.interrupted_turns["bob"] = [{
+        "message_id": "msg-old",
+        "turn_id": "",
+        "nonce": "",
+        "prior_sender": "alice",
+        "by_sender": "alice",
+        "cancelled_message_ids": ["msg-old"],
+        "interrupted_ts": time.time(),
+        "prompt_submitted_seen": False,
+        "superseded_by_prompt": False,
+    }]
+
+    d.handle_prompt_submitted({"agent": "bob", "bridge_agent": "bob", "nonce": "", "turn_id": None, "prompt": "manual"})
+
+    ctx = d.current_prompt_by_agent.get("bob") or {}
+    assert_true(ctx.get("id") is None and ctx.get("turn_id") is None, f"{label}: empty hook values should be treated as normal user prompt, got {ctx}")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(not any(e.get("event") == "interrupted_prompt_submitted_suppressed" for e in events), f"{label}: empty values must not match tombstone")
+    assert_true(d.interrupted_turns.get("bob"), f"{label}: tombstone should remain")
+    print(f"  PASS  {label}")
+
+
+def scenario_aggregate_late_real_stop_after_interrupt_does_not_overwrite(label: str, tmpdir: Path) -> None:
+    participants = {
+        "manager": {"alias": "manager", "agent_type": "claude", "pane": "%97"},
+        "w1": {"alias": "w1", "agent_type": "codex", "pane": "%96"},
+        "w2": {"alias": "w2", "agent_type": "codex", "pane": "%95"},
+    }
+    d = make_daemon(tmpdir, participants)
+    agg_id = "agg-late-stop"
+    msg_w1 = _make_delivered_context(
+        d,
+        "msg-w1",
+        "manager",
+        "w1",
+        "n-w1",
+        turn_id="turn-w1",
+        aggregate_id=agg_id,
+        aggregate_expected=["w1", "w2"],
+        aggregate_message_ids={"w1": "msg-w1", "w2": "msg-w2"},
+    )
+    _make_delivered_context(
+        d,
+        "msg-w2",
+        "manager",
+        "w2",
+        "n-w2",
+        turn_id="turn-w2",
+        aggregate_id=agg_id,
+        aggregate_expected=["w1", "w2"],
+        aggregate_message_ids={"w1": "msg-w1", "w2": "msg-w2"},
+    )
+    # Keep both delivered rows; _make_delivered_context returned msg_w1
+    # above only to make the aggregate metadata explicit for readers.
+    assert_true(msg_w1.get("aggregate_id") == agg_id, f"{label}: aggregate fixture expected")
+
+    d.handle_interrupt(sender="manager", target="w1")
+    d.handle_response_finished({"agent": "w1", "bridge_agent": "w1", "turn_id": "turn-w1", "last_assistant_message": "late real"})
+    d.handle_response_finished({"agent": "w2", "bridge_agent": "w2", "turn_id": "turn-w2", "last_assistant_message": "w2 ok"})
+
+    data = read_json(d.aggregate_file, {"aggregates": {}})
+    replies = ((data.get("aggregates") or {}).get(agg_id) or {}).get("replies") or {}
+    w1_body = str((replies.get("w1") or {}).get("body") or "")
+    assert_true("late real" not in w1_body, f"{label}: late real w1 Stop must not overwrite synthetic aggregate reply: {w1_body!r}")
+    assert_true("interrupted" in w1_body, f"{label}: synthetic interrupted aggregate reply should remain: {w1_body!r}")
     print(f"  PASS  {label}")
 
 
@@ -5427,6 +5663,16 @@ def main() -> int:
             ("esc_fail_no_state_change", scenario_esc_fail_no_state_change),
             ("clear_hold_logs_event", scenario_clear_hold),
             ("aggregate_interrupt_synthetic_reply", scenario_aggregate_interrupt_synthetic),
+            ("interrupt_pending_replacement_delivers", scenario_interrupt_pending_replacement_delivers),
+            ("interrupt_new_replacement_after_interrupt_delivers", scenario_interrupt_new_replacement_after_interrupt_delivers),
+            ("interrupted_late_prompt_submitted_before_replacement", scenario_interrupted_late_prompt_submitted_before_replacement),
+            ("interrupted_late_prompt_submitted_after_replacement", scenario_interrupted_late_prompt_submitted_after_replacement),
+            ("interrupted_late_turn_stop_preserves_replacement", scenario_interrupted_late_turn_stop_preserves_replacement),
+            ("interrupted_no_turn_stop_no_context_suppressed", scenario_interrupted_no_turn_stop_no_context_suppressed),
+            ("interrupted_no_turn_race_routes_replacement_then_suppresses_old", scenario_interrupted_no_turn_race_routes_replacement_then_suppresses_old),
+            ("interrupted_inflight_tombstone_retains_on_unrelated_stop", scenario_interrupted_inflight_tombstone_retains_on_unrelated_stop),
+            ("interrupted_empty_values_do_not_match_tombstone", scenario_interrupted_empty_values_do_not_match_tombstone),
+            ("aggregate_late_real_stop_after_interrupt_does_not_overwrite", scenario_aggregate_late_real_stop_after_interrupt_does_not_overwrite),
             ("watchdog_cancel_on_empty_response", scenario_watchdog_cancel_on_empty_response),
             ("alarm_cancelled_by_qualifying_request", scenario_alarm_cancelled_by_qualifying_request),
             ("socket_path_alarm_cancel", scenario_socket_path_alarm_cancel),

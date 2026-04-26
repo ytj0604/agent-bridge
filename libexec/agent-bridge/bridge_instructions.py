@@ -14,8 +14,8 @@ def model_cheat_sheet() -> list[str]:
         "- For apostrophes, newlines, text beginning with '-', or any complex body, use stdin: agent_send_peer --to <alias> --stdin <<'EOF' ... EOF. Quote the heredoc delimiter as <<'EOF' when the body must be literal.",
         "- agent_alarm <sec> [--note 'text'] : schedule a self-addressed wake notice. The alarm is automatically cancelled when ANY incoming peer message (kind != result, from != you, from != bridge) arrives at you; that triggering message is prepended with a [bridge:alarm_cancelled] notice telling you to re-arm if it is not what you were waiting for.",
         "- agent_extend_wait <message_id> <sec> : after a watchdog wake, keep waiting on the SAME request for <sec> more seconds. Only the original sender can extend; aggregate broadcasts cannot be per-message extended.",
-        "- agent_interrupt_peer <alias> : send ESC and CANCEL the active in-flight message (it is removed, not requeued). Pending messages stay queued. The peer enters held_interrupt state; new messages are NOT delivered until either the next response_finished arrives (auto-release) OR you run 'agent_interrupt_peer <alias> --clear-hold' (manual). If ESC injection fails (no pane / tmux error), the bridge fail-closes and changes no state.",
-        "- agent_interrupt_peer <alias> --clear-hold : force-release a held_interrupt without sending ESC. UNSAFE if the peer might still be running a turn — late Stop events can misroute. Inspect with --status first.",
+        "- agent_interrupt_peer <alias> : use when you sent the wrong prompt or a peer is stuck. ESC + cancel the active message; it is removed, not requeued. No default hold: queued or newly sent corrections may deliver after ESC succeeds. Identifiable late output from the cancelled turn is ignored.",
+        "- agent_interrupt_peer <alias> --clear-hold : force-release a legacy held_interrupt without sending ESC. UNSAFE if the peer might still be running a turn — late Stop events can misroute. Inspect with --status first.",
         "- agent_interrupt_peer [<alias>] --status : print busy / held / current_prompt_id / delivered+pending counts for the target (or all peers if no alias).",
         "- agent_view_peer <alias> --onboard [--tail N] : capture a stable screen/history snapshot.",
         "- agent_view_peer <alias> --older : page older lines from that snapshot.",
@@ -65,7 +65,7 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "\n"
         "Inspecting / interrupting:\n"
         "  agent_view_peer <alias> --onboard                    - snapshot peer's pane (debug only — do NOT poll for progress).\n"
-        "  agent_interrupt_peer <alias>                         - ESC + cancel peer's active turn; peer enters held_interrupt and stops accepting new messages until its next response_finished arrives or you run --clear-hold (check --status before clearing).\n"
+        "  agent_interrupt_peer <alias>                         - use for a wrong prompt or stuck peer; ESC + cancel active message, then queued/new corrections may deliver without a hold.\n"
         "  agent_interrupt_peer [<alias>] --status              - show busy/held/queue state for one or all peers.\n"
         "\n"
         "Behavior rules:\n"
