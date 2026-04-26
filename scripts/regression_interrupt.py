@@ -317,7 +317,7 @@ def scenario_lifecycle(label: str, tmpdir: Path) -> None:
     print(f"  PASS  {label}")
 
 
-def scenario_held_blocks_delivery(label: str, tmpdir: Path) -> None:
+def scenario_held_interrupt_does_not_block_delivery(label: str, tmpdir: Path) -> None:
     participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
     d = make_daemon(tmpdir, participants)
     # Manually plant a held_interrupt without the full ESC dance
@@ -336,18 +336,40 @@ def scenario_held_blocks_delivery(label: str, tmpdir: Path) -> None:
         "source": "test", "bridge_session": "test-session",
         "status": "pending", "nonce": None, "delivery_attempts": 0,
     }
-    d.enqueue_ipc_message(new_msg)
-    # try_deliver should NOT pick this up because bob is held
+    d.queue.update(lambda queue: queue.append(new_msg))
     d.try_deliver("codex")
     item = next((it for it in d.queue.read() if it.get("id") == "msg-test-2"), None)
-    assert_true(item is not None and item.get("status") == "pending", f"{label}: held target must not consume new pending message")
-    # Release hold via response_finished and verify delivery proceeds
-    finish_record = {"agent": "codex", "bridge_agent": "codex", "last_assistant_message": "drained"}
-    d.handle_response_finished(finish_record)
-    assert_true("codex" not in d.held_interrupt, f"{label}: held_interrupt must clear on response_finished")
+    assert_true(item is not None and item.get("status") == "inflight", f"{label}: held marker must not block delivery, got {item}")
+    assert_true("codex" in d.held_interrupt, f"{label}: delivery must not clear the legacy marker")
+    print(f"  PASS  {label}")
+
+
+def scenario_reserve_next_ignores_held_marker(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    d.held_interrupt["codex"] = {
+        "since": utc_now(),
+        "since_ts": time.time(),
+        "prior_message_id": "msg-prior",
+        "reason": "legacy",
+    }
+    d.queue.update(lambda queue: queue.append(test_message("msg-held-reserve", frm="claude", to="codex", status="pending")))
+    reserved = d.reserve_next("codex")
+    item = _queue_item(d, "msg-held-reserve")
+    assert_true(reserved is not None and reserved.get("id") == "msg-held-reserve", f"{label}: reserve_next must select pending despite held marker")
+    assert_true(item is not None and item.get("status") == "inflight", f"{label}: queue row must move to inflight")
+    assert_true("codex" in d.held_interrupt, f"{label}: reserve_next must not clear held marker")
+    print(f"  PASS  {label}")
+
+
+def scenario_held_marker_persists_through_delivery(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    d.held_interrupt["codex"] = {"since": utc_now(), "since_ts": time.time(), "prior_message_id": "msg-old"}
+    d.queue.update(lambda queue: queue.append(test_message("msg-held-persist", frm="claude", to="codex", status="pending")))
     d.try_deliver("codex")
-    item = next((it for it in d.queue.read() if it.get("id") == "msg-test-2"), None)
-    assert_true(item is not None and item.get("status") == "inflight", f"{label}: after hold release, pending should reserve to inflight (got {item.get('status') if item else 'missing'})")
+    assert_true((_queue_item(d, "msg-held-persist") or {}).get("status") == "inflight", f"{label}: delivery expected")
+    assert_true((d.held_interrupt.get("codex") or {}).get("prior_message_id") == "msg-old", f"{label}: marker lifecycle must survive delivery")
     print(f"  PASS  {label}")
 
 
@@ -389,6 +411,39 @@ def scenario_clear_hold(label: str, tmpdir: Path) -> None:
     info = d.release_hold("codex", reason="manual_clear_by_alice", by_sender="claude")
     assert_true(info is not None, f"{label}: release_hold should return info")
     assert_true("codex" not in d.held_interrupt, f"{label}: hold should be cleared")
+    events = read_events(Path(d.state_file))
+    assert_true(any(e.get("event") == "hold_force_resumed" for e in events), f"{label}: hold_force_resumed should be logged")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_hold_socket_still_pops_held(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    d.held_interrupt["codex"] = {
+        "since": utc_now(),
+        "since_ts": time.time(),
+        "prior_message_id": "msg-prior",
+        "reason": "legacy",
+    }
+
+    class FakeConn:
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+            self.used = False
+
+        def recv(self, _size: int) -> bytes:
+            if self.used:
+                return b""
+            self.used = True
+            return self.payload
+
+        def getsockopt(self, *_args) -> bytes:
+            raise OSError("no peer credentials in test")
+
+    payload = json.dumps({"op": "clear_hold", "from": "claude", "target": "codex"}).encode("utf-8") + b"\n"
+    result = d.handle_command_connection(FakeConn(payload))  # type: ignore[arg-type]
+    assert_true(result.get("ok") is True and result.get("had_hold") is True, f"{label}: clear_hold socket op should report held marker: {result}")
+    assert_true("codex" not in d.held_interrupt, f"{label}: clear_hold socket op must pop held marker")
     events = read_events(Path(d.state_file))
     assert_true(any(e.get("event") == "hold_force_resumed" for e in events), f"{label}: hold_force_resumed should be logged")
     print(f"  PASS  {label}")
@@ -1353,6 +1408,27 @@ def scenario_stale_watchdog_skipped(label: str, tmpdir: Path) -> None:
     print(f"  PASS  {label}")
 
 
+def scenario_watchdog_pending_text_omits_held_interrupt(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = test_message("msg-wd-pending-text", frm="claude", to="codex", status="pending")
+    d.queue.update(lambda queue: queue.append(msg))
+    text = d.build_watchdog_fire_text({
+        "sender": "claude",
+        "deadline": time.time(),
+        "ref_message_id": "msg-wd-pending-text",
+        "ref_aggregate_id": None,
+        "ref_to": "codex",
+        "ref_kind": "request",
+        "ref_intent": "test",
+        "is_alarm": False,
+    })
+    assert_true("held_interrupt" not in text, f"{label}: watchdog text must not mention held_interrupt: {text!r}")
+    assert_true("--clear-hold" not in text, f"{label}: watchdog text must not recommend clear-hold: {text!r}")
+    assert_true("agent_interrupt_peer codex --status" in text, f"{label}: watchdog text should still recommend status inspection: {text!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_pane_mode_pending_defers_without_attempt(label: str, tmpdir: Path) -> None:
     participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
     d = make_daemon(tmpdir, participants)
@@ -2213,6 +2289,162 @@ def scenario_held_drain_stale_stop_preserves_new_ctx(label: str, tmpdir: Path) -
     events = read_events(tmpdir / "events.raw.jsonl")
     assert_true(any(e.get("event") == "held_drain_stale_stop" for e in events), f"{label}: stale Stop log expected")
     assert_true(not any(e.get("event") == "message_delivery_attempted" and e.get("message_id") == "msg-pending-held-stale" for e in events), f"{label}: no delivery attempt expected")
+    print(f"  PASS  {label}")
+
+
+def scenario_stale_hold_ignored_active_context_routes_normally(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = _active_turn(d, message_id="msg-hold-new", nonce="n-hold-new", turn_id="active-turn")
+    d.held_interrupt["claude"] = {
+        "since": utc_now(),
+        "since_ts": time.time(),
+        "prior_message_id": "msg-hold-old",
+        "prior_sender": "codex",
+    }
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "active-turn", "last_assistant_message": "real reply"})
+    assert_true("claude" not in d.held_interrupt, f"{label}: stale hold marker must be popped")
+    assert_true(d.current_prompt_by_agent.get("claude") is None, f"{label}: active ctx should clear normally")
+    assert_true(d.busy.get("claude") is False, f"{label}: busy should clear normally")
+    assert_true(_queue_item(d, "msg-hold-new") is None, f"{label}: delivered row should be removed")
+    results = _auto_return_results(d, "claude", "codex")
+    assert_true(len(results) == 1 and results[0].get("reply_to") == msg["id"], f"{label}: normal result should route")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    stale = next((e for e in events if e.get("event") == "stale_hold_ignored_active_context"), None)
+    assert_true(stale is not None, f"{label}: stale hold log expected")
+    assert_true(stale.get("target") == "claude", f"{label}: stale log target expected")
+    assert_true(stale.get("prior_message_id") == "msg-hold-old", f"{label}: stale log prior id expected")
+    assert_true(stale.get("active_message_id") == "msg-hold-new", f"{label}: stale log active id expected")
+    assert_true(stale.get("active_turn_id") == "active-turn", f"{label}: stale log active turn expected")
+    assert_true(stale.get("response_turn_id") == "active-turn", f"{label}: stale log response turn expected")
+    assert_true("hold_age_ms" in stale, f"{label}: stale log hold age field expected")
+    print(f"  PASS  {label}")
+
+
+def scenario_stale_hold_old_stop_with_active_ctx_applies_a4_mismatch(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    _active_turn(d, message_id="msg-hold-active", nonce="n-hold-active", turn_id="active-turn")
+    d.held_interrupt["claude"] = {"since": utc_now(), "since_ts": time.time(), "prior_message_id": "msg-hold-old"}
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "old-turn", "last_assistant_message": "old reply"})
+    ctx = d.current_prompt_by_agent.get("claude") or {}
+    assert_true("claude" not in d.held_interrupt, f"{label}: stale hold must be popped")
+    assert_true(ctx.get("id") == "msg-hold-active", f"{label}: active ctx must remain")
+    assert_true(d.busy.get("claude") is True, f"{label}: active turn remains busy")
+    assert_true((_queue_item(d, "msg-hold-active") or {}).get("status") == "delivered", f"{label}: delivered row should remain")
+    assert_true(ctx.get("turn_id_mismatch_response_turn_id") == "old-turn", f"{label}: A4 mismatch metadata expected")
+    assert_true(ctx.get("turn_id_mismatch_since_ts") is not None, f"{label}: mismatch since expected")
+    assert_true(_auto_return_results(d, "claude", "codex") == [], f"{label}: old Stop must not auto-route")
+    print(f"  PASS  {label}")
+
+
+def scenario_held_no_prior_id_with_active_ctx_classified_stale(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    _active_turn(d, message_id="msg-hold-noprior", nonce="n-hold-noprior", turn_id="active-turn")
+    d.held_interrupt["claude"] = {"since": utc_now(), "since_ts": time.time(), "reason": "legacy"}
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "active-turn", "last_assistant_message": "real reply"})
+    assert_true("claude" not in d.held_interrupt, f"{label}: no-prior held marker must be classified stale and popped")
+    assert_true(d.current_prompt_by_agent.get("claude") is None, f"{label}: matching response should still finish normally")
+    assert_true(len(_auto_return_results(d, "claude", "codex")) == 1, f"{label}: matching response should auto-route")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(any(e.get("event") == "stale_hold_ignored_active_context" and e.get("active_message_id") == "msg-hold-noprior" for e in events), f"{label}: stale log expected")
+    print(f"  PASS  {label}")
+
+
+def scenario_held_matching_prior_id_turn_id_mismatch_falls_through_to_a4(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    _active_turn(d, message_id="msg-hold-same-id", nonce="n-hold-same-id", turn_id="active-turn")
+    d.held_interrupt["claude"] = {"since": utc_now(), "since_ts": time.time(), "prior_message_id": "msg-hold-same-id"}
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "wrong-turn", "last_assistant_message": "wrong"})
+    ctx = d.current_prompt_by_agent.get("claude") or {}
+    assert_true("claude" not in d.held_interrupt, f"{label}: same-id wrong-turn hold must be popped as stale")
+    assert_true(ctx.get("id") == "msg-hold-same-id", f"{label}: active ctx must remain")
+    assert_true(ctx.get("turn_id_mismatch_response_turn_id") == "wrong-turn", f"{label}: A4 mismatch metadata expected")
+    assert_true(_auto_return_results(d, "claude", "codex") == [], f"{label}: wrong-turn response must not auto-route")
+    print(f"  PASS  {label}")
+
+
+def scenario_held_with_no_context_drain_still_works(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    d.busy["claude"] = True
+    d.held_interrupt["claude"] = {"since": utc_now(), "since_ts": time.time(), "prior_message_id": "msg-old"}
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "old-turn", "last_assistant_message": "drain"})
+    assert_true("claude" not in d.held_interrupt, f"{label}: no-context drain must release hold")
+    assert_true(d.busy.get("claude") is False, f"{label}: no-context drain must leave target idle")
+    assert_true(_auto_return_results(d, "claude", "codex") == [], f"{label}: held drain must not route")
+    print(f"  PASS  {label}")
+
+
+def scenario_held_matching_prior_id_with_matching_turn_drain_still_works(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    d.current_prompt_by_agent["claude"] = {
+        "id": "msg-held-drain",
+        "from": "codex",
+        "auto_return": True,
+        "turn_id": "active-turn",
+    }
+    d.busy["claude"] = True
+    d.held_interrupt["claude"] = {"since": utc_now(), "since_ts": time.time(), "prior_message_id": "msg-held-drain"}
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "active-turn", "last_assistant_message": "drain"})
+    assert_true("claude" not in d.held_interrupt, f"{label}: matching legacy drain must release hold")
+    assert_true(d.current_prompt_by_agent.get("claude") is None, f"{label}: matching legacy drain must clear ctx")
+    assert_true(d.busy.get("claude") is False, f"{label}: matching legacy drain must clear busy")
+    assert_true(_auto_return_results(d, "claude", "codex") == [], f"{label}: held drain must not auto-route")
+    print(f"  PASS  {label}")
+
+
+def scenario_held_with_interrupted_tombstone_match_classify_first(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    _active_turn(d, message_id="msg-hold-tombstone-active", nonce="n-hold-tombstone-active", turn_id="active-turn")
+    d.held_interrupt["claude"] = {"since": utc_now(), "since_ts": time.time(), "prior_message_id": "msg-old-held"}
+    d.interrupted_turns["claude"] = [{
+        "message_id": "msg-interrupted-old",
+        "turn_id": "old-turn",
+        "nonce": "n-old",
+        "prompt_submitted_seen": True,
+        "interrupted_ts": time.time(),
+    }]
+    d.handle_response_finished({"agent": "claude", "bridge_agent": "claude", "turn_id": "old-turn", "last_assistant_message": "old interrupted"})
+    assert_true("claude" not in d.held_interrupt, f"{label}: stale hold must be popped before tombstone early-return")
+    ctx = d.current_prompt_by_agent.get("claude") or {}
+    assert_true(ctx.get("id") == "msg-hold-tombstone-active", f"{label}: tombstone return must not clobber active ctx")
+    assert_true(_auto_return_results(d, "claude", "codex") == [], f"{label}: tombstone-suppressed response must not route")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(any(e.get("event") == "stale_hold_ignored_active_context" for e in events), f"{label}: stale hold log expected")
+    assert_true(any(e.get("event") == "response_skipped_stale" and e.get("reason") == "interrupted_drain" for e in events), f"{label}: interrupted tombstone log expected")
+    print(f"  PASS  {label}")
+
+
+def scenario_aggregate_leg_unaffected_by_held_marker(label: str, tmpdir: Path) -> None:
+    participants = {
+        "manager": {"alias": "manager", "agent_type": "claude", "pane": "%97"},
+        "w1": {"alias": "w1", "agent_type": "codex", "pane": "%96"},
+    }
+    d = make_daemon(tmpdir, participants)
+    agg_id = "agg-held-marker"
+    _active_turn(
+        d,
+        message_id="msg-held-agg-w1",
+        frm="manager",
+        to="w1",
+        nonce="n-held-agg-w1",
+        turn_id="active-turn",
+        aggregate_id=agg_id,
+        aggregate_expected=["w1"],
+        aggregate_message_ids={"w1": "msg-held-agg-w1"},
+    )
+    d.held_interrupt["w1"] = {"since": utc_now(), "since_ts": time.time(), "prior_message_id": "msg-old-agg"}
+    d.handle_response_finished({"agent": "w1", "bridge_agent": "w1", "turn_id": "active-turn", "last_assistant_message": "agg reply"})
+    assert_true("w1" not in d.held_interrupt, f"{label}: stale aggregate hold should be popped")
+    aggregate = (read_json(d.aggregate_file, {"aggregates": {}}).get("aggregates") or {}).get(agg_id) or {}
+    reply = ((aggregate.get("replies") or {}).get("w1") or {}).get("body") or ""
+    assert_true(reply == "agg reply", f"{label}: aggregate reply should be collected unchanged: {reply!r}")
+    assert_true(any(item.get("source") == "aggregate_return" and item.get("to") == "manager" for item in d.queue.read()), f"{label}: aggregate result should be queued")
     print(f"  PASS  {label}")
 
 
@@ -5330,7 +5562,7 @@ def scenario_daemon_undeliverable_request_returns_result(label: str, tmpdir: Pat
     }
     d = make_daemon(tmpdir, participants)
     d.dry_run = False
-    d.held_interrupt["alice"] = {"reason": "test_hold"}
+    d.busy["alice"] = True
     d.resolve_endpoint_detail = lambda target, purpose="write": {"ok": False, "pane": "", "reason": "process_mismatch", "probe_status": "mismatch", "detail": "gone", "should_detach": True}  # type: ignore[method-assign]
     calls: list[str] = []
     old_literal = bridge_daemon.run_tmux_send_literal
@@ -5356,7 +5588,7 @@ def scenario_interrupt_endpoint_lost_finalizes_delivered_non_aggregate(label: st
     }
     d = make_daemon(tmpdir, participants)
     d.dry_run = False
-    d.held_interrupt["alice"] = {"reason": "test_hold"}
+    d.busy["alice"] = True
     d.resolve_endpoint_detail = lambda target, purpose="write": {"ok": False, "pane": "", "reason": "process_mismatch", "probe_status": "mismatch", "detail": "gone", "should_detach": True}  # type: ignore[method-assign]
     msg = test_message("msg-delivered-lost", frm="alice", to="bob", status="delivered")
     d.queue.update(lambda queue: queue.append(msg))
@@ -5376,7 +5608,7 @@ def scenario_interrupt_endpoint_lost_finalizes_delivered_aggregate(label: str, t
     }
     d = make_daemon(tmpdir, participants)
     d.dry_run = False
-    d.held_interrupt["alice"] = {"reason": "test_hold"}
+    d.busy["alice"] = True
     d.resolve_endpoint_detail = lambda target, purpose="write": {"ok": False, "pane": "", "reason": "process_mismatch", "probe_status": "mismatch", "detail": "gone", "should_detach": True}  # type: ignore[method-assign]
     msg = test_message("msg-agg-lost", frm="alice", to="bob", status="delivered")
     msg["aggregate_id"] = "agg-lost"
@@ -6549,9 +6781,12 @@ def main() -> int:
     try:
         scenarios = [
             ("lifecycle_delivered_terminal", scenario_lifecycle),
-            ("held_blocks_delivery", scenario_held_blocks_delivery),
+            ("held_interrupt_does_not_block_delivery", scenario_held_interrupt_does_not_block_delivery),
+            ("reserve_next_ignores_held_marker", scenario_reserve_next_ignores_held_marker),
+            ("held_marker_persists_through_delivery", scenario_held_marker_persists_through_delivery),
             ("esc_fail_no_state_change", scenario_esc_fail_no_state_change),
             ("clear_hold_logs_event", scenario_clear_hold),
+            ("clear_hold_socket_still_pops_held", scenario_clear_hold_socket_still_pops_held),
             ("aggregate_interrupt_synthetic_reply", scenario_aggregate_interrupt_synthetic),
             ("interrupt_pending_replacement_delivers", scenario_interrupt_pending_replacement_delivers),
             ("interrupt_new_replacement_after_interrupt_delivers", scenario_interrupt_new_replacement_after_interrupt_delivers),
@@ -6593,6 +6828,7 @@ def main() -> int:
             ("duplicate_enqueue_does_not_cancel_alarm", scenario_duplicate_enqueue_does_not_cancel_alarm),
             ("alarm_op_invalid_delay_is_rejected", scenario_alarm_op_invalid_delay_is_rejected_not_crashed),
             ("stale_watchdog_skipped", scenario_stale_watchdog_skipped),
+            ("watchdog_pending_text_omits_held_interrupt", scenario_watchdog_pending_text_omits_held_interrupt),
             ("pane_mode_pending_defers_without_attempt", scenario_pane_mode_pending_defers_without_attempt),
             ("pane_mode_clears_then_delivers", scenario_pane_mode_clears_then_delivers),
             ("pane_mode_force_cancel_after_grace", scenario_pane_mode_force_cancel_after_grace),
@@ -6617,6 +6853,14 @@ def main() -> int:
             ("prompt_intercept_aggregate_completes", scenario_prompt_intercept_aggregate_completes),
             ("prompt_intercept_held_drain_noop", scenario_prompt_intercept_held_drain_noop),
             ("held_drain_stale_stop_preserves_new_ctx", scenario_held_drain_stale_stop_preserves_new_ctx),
+            ("stale_hold_ignored_active_context_routes_normally", scenario_stale_hold_ignored_active_context_routes_normally),
+            ("stale_hold_old_stop_with_active_ctx_applies_a4_mismatch", scenario_stale_hold_old_stop_with_active_ctx_applies_a4_mismatch),
+            ("held_no_prior_id_with_active_ctx_classified_stale", scenario_held_no_prior_id_with_active_ctx_classified_stale),
+            ("held_matching_prior_id_turn_id_mismatch_falls_through_to_a4", scenario_held_matching_prior_id_turn_id_mismatch_falls_through_to_a4),
+            ("held_with_no_context_drain_still_works", scenario_held_with_no_context_drain_still_works),
+            ("held_matching_prior_id_with_matching_turn_drain_still_works", scenario_held_matching_prior_id_with_matching_turn_drain_still_works),
+            ("held_with_interrupted_tombstone_match_classify_first", scenario_held_with_interrupted_tombstone_match_classify_first),
+            ("aggregate_leg_unaffected_by_held_marker", scenario_aggregate_leg_unaffected_by_held_marker),
             ("prompt_intercept_inflight_only_requeues", scenario_prompt_intercept_inflight_only_requeues),
             ("consume_once_basic", scenario_consume_once_basic),
             ("consume_once_empty_response", scenario_consume_once_empty_response),

@@ -390,10 +390,10 @@ class BridgeDaemon:
         self.stop_logged = False
         self.last_enter_ts: dict[str, float] = {}
         self.watchdogs: dict[str, dict] = {}
-        # held_interrupt is a legacy/manual recovery state. New default
+        # held_interrupt is a legacy/manual recovery marker. New default
         # interrupts no longer enter it; --clear-hold can still release old
-        # or manually planted holds. While set, reserve_next blocks delivery
-        # to that alias.
+        # or manually planted holds. It is informational for delivery: queued
+        # corrections are allowed to flow without waiting for --clear-hold.
         self.held_interrupt: dict[str, dict] = {}
         # interrupted_turns[alias] stores tombstones for interrupted prompts.
         # These do not block delivery; they suppress identifiable late
@@ -1024,8 +1024,6 @@ class BridgeDaemon:
         return str(detail.get("pane") or "") if detail.get("ok") else ""
 
     def next_pending_candidate(self, target: str) -> dict | None:
-        if target in self.held_interrupt:
-            return None
         if self.busy.get(target) or self.reserved.get(target):
             return None
 
@@ -1373,11 +1371,6 @@ class BridgeDaemon:
         self.try_deliver(str(message["to"]))
 
     def reserve_next(self, target: str) -> dict | None:
-        # Block delivery while target is held_interrupt: hold is released
-        # only by an incoming response_finished or an explicit clear_hold
-        # command, never by a timer.
-        if target in self.held_interrupt:
-            return None
         if self.busy.get(target) or self.reserved.get(target):
             return None
 
@@ -1984,9 +1977,9 @@ class BridgeDaemon:
         return (
             f"[bridge:watchdog] Your {kind} {msg_id} to {to} has been queued for "
             f"{elapsed_text} and is NOT yet delivered (status={status}). The peer may be "
-            "busy with an earlier prompt or in held_interrupt. "
-            f"Inspect with agent_interrupt_peer {to} --status, or release a stuck hold "
-            f"with agent_interrupt_peer {to} --clear-hold."
+            "busy with earlier delivered/inflight work, waiting on a pane-mode deferral, "
+            "or temporarily unreachable. "
+            f"Inspect with agent_interrupt_peer {to} --status or agent_view_peer {to}."
         )
 
     def _lookup_queue_item(self, message_id: str) -> dict | None:
@@ -3128,11 +3121,53 @@ class BridgeDaemon:
             response_turn_id = record.get("turn_id")
             context_turn_id = context.get("turn_id") if context else None
             held_info = self.held_interrupt.get(sender)
+            held_stale_turn_mismatch = False
+            # held_interrupt is now a legacy marker, not a delivery gate.
+            # Classify it before interrupted-tombstone matching so stale
+            # residue cannot survive an early tombstone return:
+            # - no marker: normal path
+            # - marker + no active ctx id: legacy held-drain
+            # - marker prior_id == active id and turn ids match (including
+            #   both absent): legacy held-drain
+            # - marker prior_id == active id but turn ids differ: stale
+            #   residue; pop it and let turn_id_mismatch handling run
+            # - marker prior_id absent/different from active id: stale
+            #   residue; pop it and continue with normal stale/terminal rules
+            if held_info is not None:
+                active_message_id = str(context.get("id") or "")
+                held_prior_message_id = str(held_info.get("prior_message_id") or "")
+                held_matches_active = bool(
+                    active_message_id
+                    and held_prior_message_id
+                    and held_prior_message_id == active_message_id
+                )
+                held_turns_match = response_turn_id == context_turn_id
+                legacy_held_drain = not active_message_id or (held_matches_active and held_turns_match)
+                if not legacy_held_drain:
+                    stale_info = self.held_interrupt.pop(sender, None) or held_info
+                    held_info = None
+                    held_stale_turn_mismatch = bool(active_message_id and response_turn_id != context_turn_id)
+                    hold_duration_ms = None
+                    since_ts = stale_info.get("since_ts")
+                    if isinstance(since_ts, (int, float)):
+                        hold_duration_ms = int(max(0.0, time.time() - float(since_ts)) * 1000)
+                    self.log(
+                        "stale_hold_ignored_active_context",
+                        target=sender,
+                        prior_message_id=stale_info.get("prior_message_id"),
+                        active_message_id=active_message_id,
+                        active_turn_id=context_turn_id,
+                        response_turn_id=response_turn_id,
+                        hold_age_ms=hold_duration_ms,
+                    )
             in_held = held_info is not None
             turn_id_mismatch = (
-                response_turn_id is not None
-                and context_turn_id is not None
-                and response_turn_id != context_turn_id
+                held_stale_turn_mismatch
+                or (
+                    response_turn_id is not None
+                    and context_turn_id is not None
+                    and response_turn_id != context_turn_id
+                )
             )
             fingerprint = self.response_fingerprint(record)
             first_time = self.processed_returns.add(fingerprint)

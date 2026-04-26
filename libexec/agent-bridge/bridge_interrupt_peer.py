@@ -4,8 +4,9 @@
 Modes:
 - (default) ESC + cancel active peer turn; pending corrections may continue:
     agent_interrupt_peer <alias>
-- Force-release a legacy hold without sending ESC (UNSAFE if peer might
-  still be running — see warning printed by daemon):
+- Clear legacy hold residue without sending ESC. Normally unnecessary for
+  post-v1.5 corrections (UNSAFE if peer might still be running — see warning
+  printed by daemon):
     agent_interrupt_peer <alias> --clear-hold
 - Inspect status of a peer or all peers:
     agent_interrupt_peer [<alias>] --status
@@ -59,7 +60,7 @@ def main() -> int:
     )
     parser.add_argument("target", nargs="?", help="peer alias to act on (omit with --status to query all peers)")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--clear-hold", action="store_true", help="force-release a legacy held_interrupt without sending ESC (UNSAFE if peer is still running)")
+    mode.add_argument("--clear-hold", action="store_true", help="clear legacy held_interrupt residue without sending ESC (normally unnecessary post-v1.5; unsafe if peer is still running)")
     mode.add_argument("--status", action="store_true", help="show busy/held/queue state for the target (or all peers if no target)")
     parser.add_argument("--session", dest="session")
     parser.add_argument("--from", dest="sender")
