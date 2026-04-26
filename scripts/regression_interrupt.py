@@ -6616,6 +6616,29 @@ def scenario_daemon_mark_message_delivered_ignores_non_finite_watchdog(label: st
     print(f"  PASS  {label}")
 
 
+def scenario_daemon_socket_ack_message_unsupported_does_not_delete_queue(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = test_message("msg-ack-unsupported", frm="claude", to="codex", status="inflight")
+    msg["nonce"] = "n-victim"
+    d.queue.update(lambda queue: queue.append(msg) or None)
+    before = list(d.queue.read())
+    result = _daemon_command_result(d, {"op": "ack_message", "nonce": "n-victim"})
+    assert_true(result.get("ok") is False, f"{label}: ack_message socket op should be unsupported: {result}")
+    assert_true("unsupported command" in str(result.get("error") or ""), f"{label}: unsupported error expected: {result}")
+    after = list(d.queue.read())
+    assert_true(before == after, f"{label}: unsupported ack_message op must not mutate queue: before={before} after={after}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_ack_message_helper_removed(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    assert_true(not hasattr(bridge_daemon.BridgeDaemon, "ack_message"), f"{label}: deprecated unsafe class helper must stay removed")
+    assert_true(not hasattr(d, "ack_message"), f"{label}: deprecated unsafe instance helper must stay removed")
+    print(f"  PASS  {label}")
+
+
 def scenario_peer_body_size_helper_boundaries(label: str, tmpdir: Path) -> None:
     import io
     ok, err = validate_peer_body_size("x" * MAX_INLINE_SEND_BODY_CHARS)
@@ -7751,6 +7774,8 @@ def main() -> int:
             ("daemon_upsert_message_watchdog_rejects_non_finite", scenario_daemon_upsert_message_watchdog_rejects_non_finite),
             ("daemon_register_alarm_rejects_non_finite_and_negative", scenario_daemon_register_alarm_rejects_non_finite_and_negative),
             ("daemon_mark_message_delivered_ignores_non_finite_watchdog", scenario_daemon_mark_message_delivered_ignores_non_finite_watchdog),
+            ("daemon_socket_ack_message_unsupported_does_not_delete_queue", scenario_daemon_socket_ack_message_unsupported_does_not_delete_queue),
+            ("daemon_ack_message_helper_removed", scenario_daemon_ack_message_helper_removed),
             ("stale_watchdog_skipped", scenario_stale_watchdog_skipped),
             ("watchdog_pending_text_omits_held_interrupt", scenario_watchdog_pending_text_omits_held_interrupt),
             ("pane_mode_pending_defers_without_attempt", scenario_pane_mode_pending_defers_without_attempt),

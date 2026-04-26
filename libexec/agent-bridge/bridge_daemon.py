@@ -1566,25 +1566,6 @@ class BridgeDaemon:
 
         self.queue.update(mutator)
 
-    def ack_message(self, nonce: str) -> dict | None:
-        # Deprecated: previously removed the matching item from queue at
-        # prompt_submit time. With the v1 message lifecycle, prompt_submit
-        # only marks status="delivered" via mark_message_delivered_by_id, and the
-        # queue removal happens at terminal handle_response_finished.
-        # Kept temporarily for any external callers; not used internally.
-        def mutator(queue: list[dict]) -> dict | None:
-            found = None
-            kept = []
-            for item in queue:
-                if item.get("nonce") == nonce:
-                    found = dict(item)
-                else:
-                    kept.append(item)
-            queue[:] = kept
-            return found
-
-        return self.queue.update(mutator)
-
     def mark_message_delivered_by_id(self, agent: str, message_id: str) -> dict | None:
         """Mark message status=delivered using id+recipient as the primary key.
 
