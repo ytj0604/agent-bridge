@@ -219,6 +219,7 @@ def main() -> int:
                 args.probe_timeout,
                 alias=alias,
                 pane_desc=f"{pane['pane_id']} ({pane['target']})",
+                pane_id=pane["pane_id"],
             )
             hook_session_id = probe_record["session_id"]
         except AttachProbeTimeout as exc:

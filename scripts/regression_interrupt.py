@@ -48,7 +48,9 @@ INSTALL_SHIM_TARGETS = DIRECT_EXECUTABLE_TARGETS[:-1]
 sys.path.insert(0, str(LIBEXEC))
 
 import bridge_daemon  # noqa: E402
+import bridge_attach  # noqa: E402
 import bridge_identity  # noqa: E402
+import bridge_join  # noqa: E402
 import bridge_pane_probe  # noqa: E402
 import bridge_response_guard  # noqa: E402
 from bridge_util import MAX_INLINE_SEND_BODY_CHARS, MAX_PEER_BODY_CHARS, read_json, read_limited_text, validate_peer_body_size, utc_now, write_json_atomic  # noqa: E402
@@ -1350,6 +1352,126 @@ def scenario_pane_mode_grace_zero_disables_cancel(label: str, tmpdir: Path) -> N
     queued = next((it for it in d.queue.read() if it.get("id") == "msg-mode-grace-zero"), None)
     assert_true(cancels == [], f"{label}: disabled grace must not force-cancel")
     assert_true(queued is not None and queued.get("status") == "pending", f"{label}: message should remain pending")
+    print(f"  PASS  {label}")
+
+
+class FakeProbeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _run_wait_for_probe_retry_case(tmpdir: Path, *, pane_id: str) -> list[tuple[str, ...]]:
+    calls: list[tuple[str, ...]] = []
+    fake_clock = FakeProbeClock()
+    discovery = tmpdir / "attach-discovery.jsonl"
+    old_time = bridge_attach.time
+    old_tmux = bridge_attach.tmux
+    old_discovery_file = bridge_attach.discovery_file
+    bridge_attach.time = fake_clock  # type: ignore[assignment]
+    bridge_attach.tmux = lambda *args, **kwargs: calls.append(tuple(str(arg) for arg in args)) or ""  # type: ignore[assignment]
+    bridge_attach.discovery_file = lambda: discovery  # type: ignore[assignment]
+    try:
+        try:
+            bridge_attach.wait_for_probe(
+                "probe-retry",
+                "codex",
+                1.25,
+                alias="codex-reviewer",
+                pane_desc="%42 (test:1.0)",
+                pane_id=pane_id,
+            )
+        except bridge_attach.AttachProbeTimeout:
+            pass
+        else:
+            raise AssertionError("wait_for_probe should time out without a discovery record")
+    finally:
+        bridge_attach.time = old_time  # type: ignore[assignment]
+        bridge_attach.tmux = old_tmux  # type: ignore[assignment]
+        bridge_attach.discovery_file = old_discovery_file  # type: ignore[assignment]
+    return calls
+
+
+def scenario_wait_for_probe_retries_enter_with_pane_id(label: str, tmpdir: Path) -> None:
+    calls = _run_wait_for_probe_retry_case(tmpdir, pane_id="%42")
+    assert_true(("send-keys", "-t", "%42", "Enter") in calls, f"{label}: expected retry Enter call, got {calls}")
+    print(f"  PASS  {label}")
+
+
+def scenario_wait_for_probe_no_retry_without_pane_id(label: str, tmpdir: Path) -> None:
+    calls = _run_wait_for_probe_retry_case(tmpdir, pane_id="")
+    assert_true(calls == [], f"{label}: empty pane_id must not retry Enter, got {calls}")
+    print(f"  PASS  {label}")
+
+
+def scenario_join_probe_passes_pane_id_to_wait(label: str, tmpdir: Path) -> None:
+    state_dir = tmpdir / "state"
+    session_dir = state_dir / "test-session"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(session_dir / "session.json", {"session": "test-session", "participants": {}})
+
+    captured: dict[str, object] = {}
+    old_env = {key: os.environ.get(key) for key in ("AGENT_BRIDGE_STATE_DIR", "AGENT_BRIDGE_CONFIG_DIR")}
+    old_argv = sys.argv[:]
+    old_send_prompt = bridge_join.send_prompt
+    old_wait_for_probe = bridge_join.wait_for_probe
+    old_update_registry = bridge_join.update_registry
+    old_update_pane_lock = bridge_join.update_pane_lock
+    old_backfill = bridge_join.backfill_session_process_identities
+    try:
+        os.environ["AGENT_BRIDGE_STATE_DIR"] = str(state_dir)
+        os.environ["AGENT_BRIDGE_CONFIG_DIR"] = str(tmpdir / "config")
+        bridge_join.send_prompt = lambda pane, prompt, delay: captured.update({"sent_pane": pane, "prompt": prompt, "delay": delay})  # type: ignore[assignment]
+
+        def fake_wait_for_probe(probe_id: str, agent: str, timeout: float, **kwargs) -> dict:
+            captured["probe_id"] = probe_id
+            captured["agent"] = agent
+            captured["timeout"] = timeout
+            captured["wait_kwargs"] = dict(kwargs)
+            return {"session_id": "sess-join", "cwd": "/work", "model": "model-x"}
+
+        bridge_join.wait_for_probe = fake_wait_for_probe  # type: ignore[assignment]
+        bridge_join.update_registry = lambda mapping: captured.update({"registry": mapping})  # type: ignore[assignment]
+        bridge_join.update_pane_lock = lambda mapping: captured.update({"pane_lock": mapping})  # type: ignore[assignment]
+        bridge_join.backfill_session_process_identities = lambda *args, **kwargs: {"codex-reviewer": {"status": "verified"}}  # type: ignore[assignment]
+        sys.argv = [
+            "bridge_join.py",
+            "--session",
+            "test-session",
+            "--agent",
+            "codex",
+            "--alias",
+            "codex-reviewer",
+            "--pane",
+            "%42",
+            "--pane-target",
+            "test:1.0",
+            "--no-resolve-pane",
+            "--no-notify",
+        ]
+        code = bridge_join.main()
+    finally:
+        sys.argv = old_argv
+        bridge_join.send_prompt = old_send_prompt  # type: ignore[assignment]
+        bridge_join.wait_for_probe = old_wait_for_probe  # type: ignore[assignment]
+        bridge_join.update_registry = old_update_registry  # type: ignore[assignment]
+        bridge_join.update_pane_lock = old_update_pane_lock  # type: ignore[assignment]
+        bridge_join.backfill_session_process_identities = old_backfill  # type: ignore[assignment]
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    wait_kwargs = captured.get("wait_kwargs") or {}
+    assert_true(code == 0, f"{label}: bridge_join.main should return 0, got {code}")
+    assert_true(captured.get("sent_pane") == "%42", f"{label}: probe should be sent to selected pane")
+    assert_true(isinstance(wait_kwargs, dict) and wait_kwargs.get("pane_id") == "%42", f"{label}: join must pass pane_id to wait_for_probe, got {wait_kwargs}")
     print(f"  PASS  {label}")
 
 
@@ -4412,6 +4534,9 @@ def main() -> int:
             ("enter_deferred_survives_stale_requeue_and_restart", scenario_enter_deferred_survives_stale_requeue_and_restart),
             ("pre_enter_probe_failure_defers_enter", scenario_pre_enter_probe_failure_defers_enter),
             ("pane_mode_grace_zero_disables_cancel", scenario_pane_mode_grace_zero_disables_cancel),
+            ("wait_for_probe_retries_enter_with_pane_id", scenario_wait_for_probe_retries_enter_with_pane_id),
+            ("wait_for_probe_no_retry_without_pane_id", scenario_wait_for_probe_no_retry_without_pane_id),
+            ("join_probe_passes_pane_id_to_wait", scenario_join_probe_passes_pane_id_to_wait),
             ("orphan_nonce_in_user_prompt", scenario_orphan_nonce_in_user_prompt),
             ("prompt_intercept_request_notice_body", scenario_prompt_intercept_request_notice_body),
             ("prompt_intercept_bridge_notice_no_source_notice", scenario_prompt_intercept_bridge_notice_no_source_notice),
