@@ -55,6 +55,7 @@ import bridge_identity  # noqa: E402
 import bridge_join  # noqa: E402
 import bridge_pane_probe  # noqa: E402
 import bridge_response_guard  # noqa: E402
+import bridge_codex_config  # noqa: E402
 from bridge_util import MAX_INLINE_SEND_BODY_CHARS, MAX_PEER_BODY_CHARS, read_json, read_limited_text, validate_peer_body_size, utc_now, write_json_atomic  # noqa: E402
 
 
@@ -4300,7 +4301,7 @@ def _write_fake_uninstall_tree(root: Path) -> None:
     shutil.copy2(ROOT / "uninstall.sh", root / "uninstall.sh")
     libexec = root / "libexec" / "agent-bridge"
     libexec.mkdir(parents=True, exist_ok=True)
-    for name in ("bridge_uninstall_hooks.py", "bridge_util.py"):
+    for name in ("bridge_uninstall_hooks.py", "bridge_codex_config.py", "bridge_util.py"):
         shutil.copy2(LIBEXEC / name, libexec / name)
 
 
@@ -4549,6 +4550,45 @@ def _run_bridge_install_hooks(
         env=_fake_install_env(tmpdir),
         timeout=10,
     )
+
+
+def _run_bridge_uninstall_hooks(
+    tmpdir: Path,
+    *,
+    claude_settings: Path | None = None,
+    codex_hooks: Path | None = None,
+    codex_config: Path | None = None,
+    skip_claude: bool = False,
+    skip_codex: bool = False,
+    dry_run: bool = False,
+) -> subprocess.CompletedProcess:
+    cmd = [
+        sys.executable,
+        str(ROOT / "libexec" / "agent-bridge" / "bridge_uninstall_hooks.py"),
+        "--claude-settings",
+        str(claude_settings or (tmpdir / "settings.json")),
+        "--codex-hooks",
+        str(codex_hooks or (tmpdir / "hooks.json")),
+        "--codex-config",
+        str(codex_config or (tmpdir / "config.toml")),
+    ]
+    if skip_claude:
+        cmd.append("--skip-claude")
+    if skip_codex:
+        cmd.append("--skip-codex")
+    if dry_run:
+        cmd.append("--dry-run")
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=_fake_install_env(tmpdir),
+        timeout=10,
+    )
+
+
+def _managed_marker(path: Path) -> Path:
+    return bridge_codex_config.managed_marker_path(path)
 
 
 def _assert_hook_config_unchanged(label: str, path: Path, before: bytes, proc: subprocess.CompletedProcess, *needles: str) -> None:
@@ -5033,6 +5073,390 @@ def scenario_bridge_install_hooks_codex_config_already_enabled_is_byte_unchanged
     assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
     assert_true("codex_hooks already enabled" in proc.stdout and "disable_paste_burst already enabled" in proc.stdout, f"{label}: stdout should report already-enabled actions: {proc.stdout!r}")
     assert_true(config.read_bytes() == before, f"{label}: already-enabled scoped config must remain byte-identical")
+    print(f"  PASS  {label}")
+
+
+def _read_managed_marker(path: Path) -> dict:
+    return json.loads(_managed_marker(path).read_text(encoding="utf-8"))
+
+
+def scenario_codex_config_marker_records_and_uninstall_restores_updated_values(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-marker-updated.toml"
+    original = (
+        "disable_paste_burst = false  # old top-level value\n"
+        "\n"
+        "[features]\n"
+        "  codex_hooks = false  # old feature value\n"
+    )
+    config.write_text(original, encoding="utf-8")
+
+    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
+    text = config.read_text(encoding="utf-8")
+    assert_true("disable_paste_burst = true  # old top-level value\n" in text, f"{label}: top-level flag should flip true: {text!r}")
+    assert_true("  codex_hooks = true  # old feature value\n" in text, f"{label}: feature flag should flip true: {text!r}")
+    marker = _read_managed_marker(config)
+    assert_true(marker.get("codex_config") == bridge_codex_config.normalize_config_path(config), f"{label}: marker path should be normalized: {marker!r}")
+    flags = marker.get("flags") or {}
+    assert_true(flags.get(bridge_codex_config.DISABLE_PASTE_FLAG, {}).get("original_line") == "disable_paste_burst = false  # old top-level value\n", f"{label}: marker should record exact top-level line: {marker!r}")
+    assert_true(flags.get(bridge_codex_config.CODEX_HOOKS_FLAG, {}).get("original_line") == "  codex_hooks = false  # old feature value\n", f"{label}: marker should record exact feature line: {marker!r}")
+
+    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(uninstall.returncode == 0, f"{label}: uninstall should succeed: {uninstall.stderr!r}")
+    assert_true(config.read_text(encoding="utf-8") == original, f"{label}: uninstall should restore original bytes")
+    assert_true(not _managed_marker(config).exists(), f"{label}: uninstall should remove managed marker")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_marker_records_inserted_keys_and_uninstall_removes_them(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-marker-inserted.toml"
+    original = 'title = "keep"\n[profile]\nname = "p"\n\n'
+    config.write_text(original, encoding="utf-8")
+
+    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
+    marker = _read_managed_marker(config)
+    flags = marker.get("flags") or {}
+    assert_true(flags.get(bridge_codex_config.CODEX_HOOKS_FLAG, {}).get("operation") == "inserted", f"{label}: codex_hooks should be marked inserted: {marker!r}")
+    assert_true(flags.get(bridge_codex_config.CODEX_HOOKS_FLAG, {}).get("section_inserted") is True, f"{label}: inserted [features] section should be recorded: {marker!r}")
+    assert_true(flags.get(bridge_codex_config.DISABLE_PASTE_FLAG, {}).get("operation") == "inserted", f"{label}: disable flag should be marked inserted: {marker!r}")
+
+    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(uninstall.returncode == 0, f"{label}: uninstall should succeed: {uninstall.stderr!r}")
+    assert_true(config.read_text(encoding="utf-8") == original, f"{label}: uninstall should remove inserted bridge keys only")
+    assert_true(not _managed_marker(config).exists(), f"{label}: uninstall should remove marker")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_missing_created_by_install_removed_on_uninstall_when_bridge_only(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "missing-codex" / "config.toml"
+    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(install.returncode == 0, f"{label}: install should create missing config: {install.stderr!r}")
+    assert_true(config.exists(), f"{label}: config should exist after install")
+    marker = _read_managed_marker(config)
+    assert_true(marker.get("config_existed") is False, f"{label}: marker should record bridge-created config: {marker!r}")
+
+    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(uninstall.returncode == 0, f"{label}: uninstall should succeed: {uninstall.stderr!r}")
+    assert_true(not config.exists(), f"{label}: bridge-created config should be removed")
+    assert_true(not _managed_marker(config).exists(), f"{label}: marker should be removed")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_already_enabled_keys_create_no_marker(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-no-marker.toml"
+    original = "disable_paste_burst = true\n[features]\ncodex_hooks = true\n"
+    config.write_text(original, encoding="utf-8")
+
+    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
+    assert_true("already enabled" in install.stdout, f"{label}: install should report already-enabled flags: {install.stdout!r}")
+    assert_true(config.read_text(encoding="utf-8") == original, f"{label}: config should remain unchanged")
+    assert_true(not _managed_marker(config).exists(), f"{label}: already-enabled flags should not create marker")
+
+    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(uninstall.returncode == 0, f"{label}: uninstall should no-op cleanly: {uninstall.stderr!r}")
+    assert_true(config.read_text(encoding="utf-8") == original, f"{label}: uninstall without marker should leave config unchanged")
+    assert_true(not _managed_marker(config).exists(), f"{label}: marker should still be absent")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_reinstall_preserves_original_marker(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-reinstall.toml"
+    original = "disable_paste_burst = false\n[features]\ncodex_hooks = false\n"
+    config.write_text(original, encoding="utf-8")
+
+    first = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(first.returncode == 0, f"{label}: first install should succeed: {first.stderr!r}")
+    marker_after_first = _read_managed_marker(config)
+    second = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(second.returncode == 0, f"{label}: reinstall should succeed: {second.stderr!r}")
+    marker_after_second = _read_managed_marker(config)
+    assert_true(marker_after_second == marker_after_first, f"{label}: reinstall must preserve original marker entries: first={marker_after_first!r} second={marker_after_second!r}")
+
+    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(uninstall.returncode == 0, f"{label}: uninstall should succeed: {uninstall.stderr!r}")
+    assert_true(config.read_text(encoding="utf-8") == original, f"{label}: original false values should be restored")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_user_changed_after_install_is_not_clobbered(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-user-change.toml"
+    original = "disable_paste_burst = false\n[features]\ncodex_hooks = false\n"
+    config.write_text(original, encoding="utf-8")
+    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
+
+    config.write_text("disable_paste_burst = false\n[features]\ncodex_hooks = true\n", encoding="utf-8")
+    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(uninstall.returncode == 0, f"{label}: uninstall should succeed despite user edit: {uninstall.stderr!r}")
+    text = config.read_text(encoding="utf-8")
+    assert_true("disable_paste_burst = false\n" in text, f"{label}: user-changed top-level key should remain false: {text!r}")
+    assert_true("codex_hooks = false\n" in text, f"{label}: untouched bridge-managed feature key should restore: {text!r}")
+    assert_true("skipping disable_paste_burst restore" in uninstall.stdout, f"{label}: uninstall should report skipped user-changed key: {uninstall.stdout!r}")
+    assert_true(not _managed_marker(config).exists(), f"{label}: marker should be removed after uninstall")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_dry_run_install_writes_no_marker_or_config(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-dry-marker.toml"
+    original = "disable_paste_burst = false\n[features]\ncodex_hooks = false\n"
+    config.write_text(original, encoding="utf-8")
+    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True, dry_run=True)
+    assert_true(proc.returncode == 0, f"{label}: dry-run install should succeed: {proc.stderr!r}")
+    assert_true("codex_hooks enabled" in proc.stdout and "disable_paste_burst enabled" in proc.stdout, f"{label}: dry-run should report planned actions: {proc.stdout!r}")
+    assert_true(config.read_text(encoding="utf-8") == original, f"{label}: dry-run install must not write config")
+    assert_true(not _managed_marker(config).exists(), f"{label}: dry-run install must not write marker")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_dry_run_uninstall_with_marker_writes_no_config_or_marker(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-dry-uninstall.toml"
+    config.write_text("disable_paste_burst = false\n[features]\ncodex_hooks = false\n", encoding="utf-8")
+    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
+    before_config = config.read_bytes()
+    marker_path = _managed_marker(config)
+    before_marker = marker_path.read_bytes()
+
+    proc = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True, dry_run=True)
+    assert_true(proc.returncode == 0, f"{label}: dry-run uninstall should succeed: {proc.stderr!r}")
+    assert_true("would remove managed marker" in proc.stdout, f"{label}: dry-run uninstall should report marker retention: {proc.stdout!r}")
+    assert_true(config.read_bytes() == before_config, f"{label}: dry-run uninstall must not write config")
+    assert_true(marker_path.read_bytes() == before_marker, f"{label}: dry-run uninstall must not remove or rewrite marker")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_skip_codex_does_not_touch_config_or_marker(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-skip-codex.toml"
+    config.write_text("disable_paste_burst = false\n[features]\ncodex_hooks = false\n", encoding="utf-8")
+    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
+    before_config = config.read_bytes()
+    marker_path = _managed_marker(config)
+    before_marker = marker_path.read_bytes()
+
+    proc = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True, skip_codex=True)
+    assert_true(proc.returncode == 0, f"{label}: --skip-codex uninstall should succeed: {proc.stderr!r}")
+    assert_true(config.read_bytes() == before_config, f"{label}: --skip-codex must not touch config")
+    assert_true(marker_path.read_bytes() == before_marker, f"{label}: --skip-codex must not touch marker")
+    print(f"  PASS  {label}")
+
+
+def _write_valid_marker(config: Path, *, version: int = 1, codex_config: str | None = None, flags: dict | None = None) -> Path:
+    marker = _managed_marker(config)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        json.dumps({
+            "version": version,
+            "codex_config": codex_config if codex_config is not None else bridge_codex_config.normalize_config_path(config),
+            "config_existed": True,
+            "flags": flags if flags is not None else {},
+        }, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return marker
+
+
+def scenario_codex_config_uninstall_with_malformed_marker_aborts_clean(label: str, tmpdir: Path) -> None:
+    home = tmpdir / "malformed-home"
+    claude, codex_hooks = _write_seed_hook_configs(home)
+    config = home / ".codex" / "config.toml"
+    config.write_text("disable_paste_burst = true\n[features]\ncodex_hooks = true\n", encoding="utf-8")
+    marker = _managed_marker(config)
+    marker.write_bytes(b'{"version":')
+    before_claude = claude.read_bytes()
+    before_hooks = codex_hooks.read_bytes()
+    before_config = config.read_bytes()
+    before_marker = marker.read_bytes()
+
+    proc = _run_bridge_uninstall_hooks(tmpdir, claude_settings=claude, codex_hooks=codex_hooks, codex_config=config)
+    assert_true(proc.returncode != 0, f"{label}: malformed marker should abort")
+    assert_true("invalid managed marker" in proc.stderr and "refusing to restore" in proc.stderr, f"{label}: targeted marker error expected: {proc.stderr!r}")
+    assert_true(claude.read_bytes() == before_claude, f"{label}: Claude hooks must be unchanged after preflight failure")
+    assert_true(codex_hooks.read_bytes() == before_hooks, f"{label}: Codex hooks must be unchanged after preflight failure")
+    assert_true(config.read_bytes() == before_config, f"{label}: Codex config must be unchanged after preflight failure")
+    assert_true(marker.read_bytes() == before_marker, f"{label}: malformed marker bytes should remain for inspection")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_uninstall_with_unknown_marker_version_aborts(label: str, tmpdir: Path) -> None:
+    home = tmpdir / "unknown-version-home"
+    claude, codex_hooks = _write_seed_hook_configs(home)
+    config = home / ".codex" / "config.toml"
+    config.write_text("disable_paste_burst = true\n[features]\ncodex_hooks = true\n", encoding="utf-8")
+    _write_valid_marker(config, version=99)
+    before_claude = claude.read_bytes()
+    before_hooks = codex_hooks.read_bytes()
+    before_config = config.read_bytes()
+
+    proc = _run_bridge_uninstall_hooks(tmpdir, claude_settings=claude, codex_hooks=codex_hooks, codex_config=config)
+    assert_true(proc.returncode != 0, f"{label}: unknown marker version should abort")
+    assert_true("unsupported marker schema version 99" in proc.stderr and "Manually inspect" in proc.stderr, f"{label}: unsupported-version guidance expected: {proc.stderr!r}")
+    assert_true(claude.read_bytes() == before_claude, f"{label}: Claude hooks must remain unchanged")
+    assert_true(codex_hooks.read_bytes() == before_hooks, f"{label}: Codex hooks must remain unchanged")
+    assert_true(config.read_bytes() == before_config, f"{label}: config must remain unchanged")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_uninstall_with_marker_path_mismatch_aborts(label: str, tmpdir: Path) -> None:
+    home = tmpdir / "path-mismatch-home"
+    claude, codex_hooks = _write_seed_hook_configs(home)
+    config = home / ".codex" / "config.toml"
+    config.write_text("disable_paste_burst = true\n[features]\ncodex_hooks = true\n", encoding="utf-8")
+    _write_valid_marker(config, codex_config=str(tmpdir / "other" / "config.toml"))
+    before_claude = claude.read_bytes()
+    before_hooks = codex_hooks.read_bytes()
+    before_config = config.read_bytes()
+
+    proc = _run_bridge_uninstall_hooks(tmpdir, claude_settings=claude, codex_hooks=codex_hooks, codex_config=config)
+    assert_true(proc.returncode != 0, f"{label}: marker path mismatch should abort")
+    assert_true("belongs to" in proc.stderr and "refusing to restore" in proc.stderr, f"{label}: path mismatch error expected: {proc.stderr!r}")
+    assert_true(claude.read_bytes() == before_claude, f"{label}: Claude hooks must remain unchanged")
+    assert_true(codex_hooks.read_bytes() == before_hooks, f"{label}: Codex hooks must remain unchanged")
+    assert_true(config.read_bytes() == before_config, f"{label}: config must remain unchanged")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_uninstall_with_unknown_flag_key_aborts(label: str, tmpdir: Path) -> None:
+    home = tmpdir / "unknown-flag-home"
+    claude, codex_hooks = _write_seed_hook_configs(home)
+    config = home / ".codex" / "config.toml"
+    config.write_text("disable_paste_burst = true\n[features]\ncodex_hooks = true\n", encoding="utf-8")
+    marker = _write_valid_marker(config, flags={"unknown.flag": {"operation": "inserted"}})
+    before_claude = claude.read_bytes()
+    before_hooks = codex_hooks.read_bytes()
+    before_config = config.read_bytes()
+    before_marker = marker.read_bytes()
+
+    proc = _run_bridge_uninstall_hooks(tmpdir, claude_settings=claude, codex_hooks=codex_hooks, codex_config=config)
+    assert_true(proc.returncode != 0, f"{label}: unknown flag key should abort")
+    assert_true("unknown flag key 'unknown.flag'" in proc.stderr and "refusing to restore" in proc.stderr, f"{label}: unknown-flag error expected: {proc.stderr!r}")
+    assert_true(claude.read_bytes() == before_claude, f"{label}: Claude hooks must remain unchanged")
+    assert_true(codex_hooks.read_bytes() == before_hooks, f"{label}: Codex hooks must remain unchanged")
+    assert_true(config.read_bytes() == before_config, f"{label}: config must remain unchanged")
+    assert_true(marker.read_bytes() == before_marker, f"{label}: marker must remain unchanged for inspection")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_uninstall_with_invalid_operation_aborts(label: str, tmpdir: Path) -> None:
+    home = tmpdir / "invalid-operation-home"
+    claude, codex_hooks = _write_seed_hook_configs(home)
+    config = home / ".codex" / "config.toml"
+    config.write_text("disable_paste_burst = true\n[features]\ncodex_hooks = true\n", encoding="utf-8")
+    marker = _write_valid_marker(config, flags={bridge_codex_config.DISABLE_PASTE_FLAG: {"operation": "delete"}})
+    before_claude = claude.read_bytes()
+    before_hooks = codex_hooks.read_bytes()
+    before_config = config.read_bytes()
+    before_marker = marker.read_bytes()
+
+    proc = _run_bridge_uninstall_hooks(tmpdir, claude_settings=claude, codex_hooks=codex_hooks, codex_config=config)
+    assert_true(proc.returncode != 0, f"{label}: invalid marker operation should abort")
+    assert_true("unsupported marker operation 'delete'" in proc.stderr and bridge_codex_config.DISABLE_PASTE_FLAG in proc.stderr, f"{label}: invalid-operation error expected: {proc.stderr!r}")
+    assert_true(claude.read_bytes() == before_claude, f"{label}: Claude hooks must remain unchanged")
+    assert_true(codex_hooks.read_bytes() == before_hooks, f"{label}: Codex hooks must remain unchanged")
+    assert_true(config.read_bytes() == before_config, f"{label}: config must remain unchanged")
+    assert_true(marker.read_bytes() == before_marker, f"{label}: marker must remain unchanged for inspection")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_uninstall_with_updated_missing_original_line_aborts(label: str, tmpdir: Path) -> None:
+    home = tmpdir / "missing-original-line-home"
+    claude, codex_hooks = _write_seed_hook_configs(home)
+    config = home / ".codex" / "config.toml"
+    config.write_text("disable_paste_burst = true\n[features]\ncodex_hooks = true\n", encoding="utf-8")
+    marker = _write_valid_marker(config, flags={bridge_codex_config.DISABLE_PASTE_FLAG: {"operation": "updated"}})
+    before_claude = claude.read_bytes()
+    before_hooks = codex_hooks.read_bytes()
+    before_config = config.read_bytes()
+    before_marker = marker.read_bytes()
+
+    proc = _run_bridge_uninstall_hooks(tmpdir, claude_settings=claude, codex_hooks=codex_hooks, codex_config=config)
+    assert_true(proc.returncode != 0, f"{label}: updated entry missing original_line should abort")
+    assert_true("missing/non-string original_line" in proc.stderr and bridge_codex_config.DISABLE_PASTE_FLAG in proc.stderr, f"{label}: original_line error expected: {proc.stderr!r}")
+    assert_true(claude.read_bytes() == before_claude, f"{label}: Claude hooks must remain unchanged")
+    assert_true(codex_hooks.read_bytes() == before_hooks, f"{label}: Codex hooks must remain unchanged")
+    assert_true(config.read_bytes() == before_config, f"{label}: config must remain unchanged")
+    assert_true(marker.read_bytes() == before_marker, f"{label}: marker must remain unchanged for inspection")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_marker_write_failure_aborts_before_config_write(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-marker-write-failure.toml"
+    original = "disable_paste_burst = false\n[features]\ncodex_hooks = false\n"
+    config.write_text(original, encoding="utf-8")
+    old_write_marker = bridge_codex_config._write_marker
+
+    def fail_marker_write(_marker_path: Path, _marker: dict) -> None:
+        raise SystemExit("agent-bridge: failed to write managed marker (simulated)")
+
+    bridge_codex_config._write_marker = fail_marker_write
+    try:
+        try:
+            bridge_codex_config.ensure_codex_config_flags(config, dry_run=False)
+        except SystemExit as exc:
+            message = str(exc)
+        else:
+            raise AssertionError(f"{label}: simulated marker write failure should abort")
+    finally:
+        bridge_codex_config._write_marker = old_write_marker
+    assert_true("failed to write managed marker" in message, f"{label}: targeted marker-write error expected: {message!r}")
+    assert_true(config.read_text(encoding="utf-8") == original, f"{label}: config write must not happen after marker write failure")
+    assert_true(not _managed_marker(config).exists(), f"{label}: marker should not be created after simulated write failure")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_inserted_features_section_with_user_added_keys_keeps_section(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-user-features.toml"
+    config.write_text('title = "keep"\n', encoding="utf-8")
+    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
+    text = config.read_text(encoding="utf-8")
+    config.write_text(text.replace("codex_hooks = true\n", "codex_hooks = true\nfoo = \"bar\"\n"), encoding="utf-8")
+
+    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(uninstall.returncode == 0, f"{label}: uninstall should succeed: {uninstall.stderr!r}")
+    text = config.read_text(encoding="utf-8")
+    assert_true("[features]\nfoo = \"bar\"\n" in text, f"{label}: user-added features key should keep section alive: {text!r}")
+    assert_true("codex_hooks = true" not in text, f"{label}: bridge-managed codex_hooks should be removed: {text!r}")
+    assert_true("disable_paste_burst = true" not in text, f"{label}: bridge-managed top-level disable should be removed: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_existing_empty_config_records_existed_true_and_uninstall_keeps_it(label: str, tmpdir: Path) -> None:
+    config = tmpdir / "codex-config-empty-existing.toml"
+    config.write_text("", encoding="utf-8")
+    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(install.returncode == 0, f"{label}: install should populate empty existing config: {install.stderr!r}")
+    marker = _read_managed_marker(config)
+    assert_true(marker.get("config_existed") is True, f"{label}: marker should record existing empty config: {marker!r}")
+
+    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
+    assert_true(uninstall.returncode == 0, f"{label}: uninstall should succeed: {uninstall.stderr!r}")
+    assert_true(config.exists(), f"{label}: pre-existing empty config should not be deleted")
+    assert_true(config.read_bytes() == b"", f"{label}: pre-existing empty config should return to empty bytes")
+    assert_true(not _managed_marker(config).exists(), f"{label}: marker should be removed")
+    print(f"  PASS  {label}")
+
+
+def scenario_codex_config_marker_normalized_path_accepts_equivalent_path(label: str, tmpdir: Path) -> None:
+    codex_dir = tmpdir / "codex-normalized"
+    subdir = codex_dir / "subdir"
+    subdir.mkdir(parents=True)
+    config_alias = subdir / ".." / "config.toml"
+    config_resolved = codex_dir / "config.toml"
+    original = "disable_paste_burst = false\n[features]\ncodex_hooks = false\n"
+    config_alias.write_text(original, encoding="utf-8")
+
+    install = _run_bridge_install_hooks(tmpdir, codex_config=config_alias, skip_claude=True)
+    assert_true(install.returncode == 0, f"{label}: install via alias path should succeed: {install.stderr!r}")
+    marker = _read_managed_marker(config_resolved)
+    assert_true(marker.get("codex_config") == bridge_codex_config.normalize_config_path(config_resolved), f"{label}: marker should store normalized path: {marker!r}")
+
+    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config_resolved, skip_claude=True)
+    assert_true(uninstall.returncode == 0, f"{label}: uninstall via equivalent normalized path should succeed: {uninstall.stderr!r}")
+    assert_true(config_resolved.read_text(encoding="utf-8") == original, f"{label}: config should restore through normalized path comparison")
+    assert_true(not _managed_marker(config_resolved).exists(), f"{label}: marker should be removed")
     print(f"  PASS  {label}")
 
 
@@ -8742,6 +9166,25 @@ def main() -> int:
             ("bridge_install_hooks_codex_config_commented_out_assignments_ignored", scenario_bridge_install_hooks_codex_config_commented_out_assignments_ignored),
             ("bridge_install_hooks_codex_config_no_trailing_newline_handled", scenario_bridge_install_hooks_codex_config_no_trailing_newline_handled),
             ("bridge_install_hooks_codex_config_already_enabled_is_byte_unchanged", scenario_bridge_install_hooks_codex_config_already_enabled_is_byte_unchanged),
+            ("codex_config_marker_records_and_uninstall_restores_updated_values", scenario_codex_config_marker_records_and_uninstall_restores_updated_values),
+            ("codex_config_marker_records_inserted_keys_and_uninstall_removes_them", scenario_codex_config_marker_records_inserted_keys_and_uninstall_removes_them),
+            ("codex_config_missing_created_by_install_removed_on_uninstall_when_bridge_only", scenario_codex_config_missing_created_by_install_removed_on_uninstall_when_bridge_only),
+            ("codex_config_already_enabled_keys_create_no_marker", scenario_codex_config_already_enabled_keys_create_no_marker),
+            ("codex_config_reinstall_preserves_original_marker", scenario_codex_config_reinstall_preserves_original_marker),
+            ("codex_config_user_changed_after_install_is_not_clobbered", scenario_codex_config_user_changed_after_install_is_not_clobbered),
+            ("codex_config_dry_run_install_writes_no_marker_or_config", scenario_codex_config_dry_run_install_writes_no_marker_or_config),
+            ("codex_config_dry_run_uninstall_with_marker_writes_no_config_or_marker", scenario_codex_config_dry_run_uninstall_with_marker_writes_no_config_or_marker),
+            ("codex_config_skip_codex_does_not_touch_config_or_marker", scenario_codex_config_skip_codex_does_not_touch_config_or_marker),
+            ("codex_config_uninstall_with_malformed_marker_aborts_clean", scenario_codex_config_uninstall_with_malformed_marker_aborts_clean),
+            ("codex_config_uninstall_with_unknown_marker_version_aborts", scenario_codex_config_uninstall_with_unknown_marker_version_aborts),
+            ("codex_config_uninstall_with_marker_path_mismatch_aborts", scenario_codex_config_uninstall_with_marker_path_mismatch_aborts),
+            ("codex_config_uninstall_with_unknown_flag_key_aborts", scenario_codex_config_uninstall_with_unknown_flag_key_aborts),
+            ("codex_config_uninstall_with_invalid_operation_aborts", scenario_codex_config_uninstall_with_invalid_operation_aborts),
+            ("codex_config_uninstall_with_updated_missing_original_line_aborts", scenario_codex_config_uninstall_with_updated_missing_original_line_aborts),
+            ("codex_config_marker_write_failure_aborts_before_config_write", scenario_codex_config_marker_write_failure_aborts_before_config_write),
+            ("codex_config_inserted_features_section_with_user_added_keys_keeps_section", scenario_codex_config_inserted_features_section_with_user_added_keys_keeps_section),
+            ("codex_config_existing_empty_config_records_existed_true_and_uninstall_keeps_it", scenario_codex_config_existing_empty_config_records_existed_true_and_uninstall_keeps_it),
+            ("codex_config_marker_normalized_path_accepts_equivalent_path", scenario_codex_config_marker_normalized_path_accepts_equivalent_path),
             ("restart_dry_run_no_side_effect", scenario_restart_dry_run_no_side_effect),
             ("recover_orphan_delivered", scenario_recover_orphan_delivered),
             ("recover_orphan_delivered_aggregate_member", scenario_recover_orphan_delivered_aggregate_member),
