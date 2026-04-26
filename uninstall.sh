@@ -70,8 +70,16 @@ run_or_print() {
 }
 
 if [[ "$remove_hooks" == "1" ]]; then
+  helper="$libexec_dir/bridge_uninstall_hooks.py"
+  hook_args=()
+  if [[ "$dry_run" == "1" ]]; then
+    hook_args+=("--dry-run")
+  fi
   echo "remove Claude/Codex hook entries"
-  run_or_print python3 "$libexec_dir/bridge_uninstall_hooks.py"
+  if ! python3 "$helper" "${hook_args[@]}"; then
+    echo "uninstall.sh: hook removal helper failed; aborting" >&2
+    exit 1
+  fi
 fi
 
 if [[ "$remove_shims" == "1" ]]; then

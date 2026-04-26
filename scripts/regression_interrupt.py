@@ -4296,6 +4296,146 @@ def scenario_healthcheck_executable_helper_distinguishes_states(label: str, tmpd
     print(f"  PASS  {label}")
 
 
+def _write_fake_uninstall_tree(root: Path) -> None:
+    shutil.copy2(ROOT / "uninstall.sh", root / "uninstall.sh")
+    libexec = root / "libexec" / "agent-bridge"
+    libexec.mkdir(parents=True, exist_ok=True)
+    for name in ("bridge_uninstall_hooks.py", "bridge_util.py"):
+        shutil.copy2(LIBEXEC / name, libexec / name)
+
+
+def _write_seed_hook_configs(home: Path) -> tuple[Path, Path]:
+    claude = home / ".claude" / "settings.json"
+    codex = home / ".codex" / "hooks.json"
+    claude.parent.mkdir(parents=True, exist_ok=True)
+    codex.parent.mkdir(parents=True, exist_ok=True)
+    claude.write_text(json.dumps({
+        "hooks": {
+            "Stop": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": "/tmp/bridge-hook --agent claude"},
+                        {"type": "command", "command": "echo keep-claude"},
+                    ]
+                }
+            ],
+            "Notification": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": "/tmp/agent-bridge/hooks/bridge-hook --agent claude"},
+                    ]
+                }
+            ],
+        },
+        "user": "preserve",
+    }, indent=2) + "\n", encoding="utf-8")
+    codex.write_text(json.dumps({
+        "hooks": {
+            "Stop": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": "/tmp/bridge-hook --agent codex"},
+                        {"type": "command", "command": "echo keep-codex"},
+                    ]
+                }
+            ],
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": "/tmp/agent-bridge/hooks/bridge-hook --agent codex"},
+                    ]
+                }
+            ],
+        },
+        "user": "preserve",
+    }, indent=2) + "\n", encoding="utf-8")
+    return claude, codex
+
+
+def _run_fake_uninstall(
+    root: Path,
+    *,
+    env: dict[str, str],
+    extra_args: list[str] | None = None,
+) -> subprocess.CompletedProcess:
+    cmd = ["bash", str(root / "uninstall.sh"), "--bin-dir", str(Path(env["XDG_BIN_HOME"]))]
+    cmd.extend(extra_args or [])
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+
+def scenario_uninstall_sh_dry_run_invokes_hook_helper_with_dry_run(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "uninstall-dry-run"
+    root.mkdir()
+    _write_fake_uninstall_tree(root)
+    env = _fake_install_env(tmpdir / "dry-env")
+    claude, codex = _write_seed_hook_configs(Path(env["HOME"]))
+    before_claude = claude.read_bytes()
+    before_codex = codex.read_bytes()
+
+    proc = _run_fake_uninstall(root, env=env, extra_args=["--dry-run", "--keep-shims"])
+    assert_true(proc.returncode == 0, f"{label}: dry-run uninstall should succeed: {proc.stderr!r}")
+    assert_true("removed 2 hook command(s)" in proc.stdout, f"{label}: helper output should show removal count: {proc.stdout!r}")
+    assert_true(proc.stdout.count("removed 2 hook command(s)") == 2, f"{label}: helper output should include Claude and Codex counts: {proc.stdout!r}")
+    assert_true("dry-run: python3" not in proc.stdout and "bridge_uninstall_hooks.py" not in proc.stdout, f"{label}: hook helper must be invoked, not printed as dry-run command: {proc.stdout!r}")
+    assert_true(claude.read_bytes() == before_claude, f"{label}: Claude config must be byte-identical under dry-run")
+    assert_true(codex.read_bytes() == before_codex, f"{label}: Codex hooks config must be byte-identical under dry-run")
+    print(f"  PASS  {label}")
+
+
+def scenario_uninstall_sh_non_dry_run_removes_hook_entries(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "uninstall-real"
+    root.mkdir()
+    _write_fake_uninstall_tree(root)
+    env = _fake_install_env(tmpdir / "real-env")
+    claude, codex = _write_seed_hook_configs(Path(env["HOME"]))
+
+    proc = _run_fake_uninstall(root, env=env, extra_args=["--keep-shims"])
+    assert_true(proc.returncode == 0, f"{label}: temp uninstall should succeed: {proc.stderr!r}")
+    claude_text = claude.read_text(encoding="utf-8")
+    codex_text = codex.read_text(encoding="utf-8")
+    assert_true("bridge-hook" not in claude_text and "agent-bridge" not in claude_text, f"{label}: Claude bridge hooks should be removed: {claude_text!r}")
+    assert_true("bridge-hook" not in codex_text and "agent-bridge" not in codex_text, f"{label}: Codex bridge hooks should be removed: {codex_text!r}")
+    assert_true("echo keep-claude" in claude_text and '"user": "preserve"' in claude_text, f"{label}: Claude user entries should remain: {claude_text!r}")
+    assert_true("echo keep-codex" in codex_text and '"user": "preserve"' in codex_text, f"{label}: Codex user entries should remain: {codex_text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_uninstall_sh_keep_hooks_skips_helper_under_dry_run(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "uninstall-keep-hooks"
+    root.mkdir()
+    _write_fake_uninstall_tree(root)
+    sentinel = root / "libexec" / "agent-bridge" / "bridge_uninstall_hooks.py"
+    sentinel.write_text("#!/usr/bin/env python3\nraise SystemExit(42)\n", encoding="utf-8")
+    env = _fake_install_env(tmpdir / "keep-hooks-env")
+
+    proc = _run_fake_uninstall(root, env=env, extra_args=["--dry-run", "--keep-hooks", "--keep-shims"])
+    assert_true(proc.returncode == 0, f"{label}: --keep-hooks must skip failing sentinel helper: {proc.stderr!r}")
+    assert_true("remove Claude/Codex hook entries" not in proc.stdout, f"{label}: hook section should be skipped entirely: {proc.stdout!r}")
+    assert_true("removed " not in proc.stdout, f"{label}: no helper output expected: {proc.stdout!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_uninstall_sh_hook_helper_failure_aborts(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "uninstall-helper-fails"
+    root.mkdir()
+    _write_fake_uninstall_tree(root)
+    sentinel = root / "libexec" / "agent-bridge" / "bridge_uninstall_hooks.py"
+    sentinel.write_text("#!/usr/bin/env python3\nraise SystemExit(42)\n", encoding="utf-8")
+    env = _fake_install_env(tmpdir / "helper-fails-env")
+
+    proc = _run_fake_uninstall(root, env=env, extra_args=["--keep-shims"])
+    assert_true(proc.returncode == 1, f"{label}: helper failure should map to uninstall.sh failure exit 1, got {proc.returncode}")
+    assert_true("uninstall.sh: hook removal helper failed; aborting" in proc.stderr, f"{label}: targeted helper failure expected: {proc.stderr!r}")
+    assert_true("uninstall complete" not in proc.stdout, f"{label}: script must abort before completion message: {proc.stdout!r}")
+    print(f"  PASS  {label}")
+
+
 def _write_fake_install_tree(root: Path, *, omit: Path | None = None) -> None:
     shutil.copy2(ROOT / "install.sh", root / "install.sh")
     for _, relative in INSTALL_SHIM_TARGETS:
@@ -8571,6 +8711,10 @@ def main() -> int:
             ("queue_status_counts_missing_file", scenario_queue_status_counts_missing_file),
             ("uninstall_helper_print_paths", scenario_uninstall_helper_print_paths),
             ("uninstall_helper_refuses_dangerous_path", scenario_uninstall_helper_refuses_dangerous_path),
+            ("uninstall_sh_dry_run_invokes_hook_helper_with_dry_run", scenario_uninstall_sh_dry_run_invokes_hook_helper_with_dry_run),
+            ("uninstall_sh_non_dry_run_removes_hook_entries", scenario_uninstall_sh_non_dry_run_removes_hook_entries),
+            ("uninstall_sh_keep_hooks_skips_helper_under_dry_run", scenario_uninstall_sh_keep_hooks_skips_helper_under_dry_run),
+            ("uninstall_sh_hook_helper_failure_aborts", scenario_uninstall_sh_hook_helper_failure_aborts),
             ("direct_exec_targets_executable", scenario_direct_exec_targets_executable),
             ("healthcheck_executable_helper_distinguishes_states", scenario_healthcheck_executable_helper_distinguishes_states),
             ("install_sh_chmods_target_or_fails", scenario_install_sh_chmods_target_or_fails),
