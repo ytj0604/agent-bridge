@@ -176,6 +176,10 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.stdin and args.body is not None:
+        print("agent_send_peer: use either --body or --stdin, not both", file=sys.stderr)
+        return 2
+
     bridge_session = args.bridge_session or os.environ.get("AGENT_BRIDGE_SESSION")
     if not bridge_session:
         print(

@@ -6259,6 +6259,112 @@ def _write_json(path: Path, data) -> None:
     path.write_text(json.dumps(data, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
 
 
+def scenario_enqueue_rejects_body_and_stdin_before_session_lookup(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    calls = {"read": 0, "ensure": 0}
+
+    def fail_read(_stream):
+        calls["read"] += 1
+        raise AssertionError("stdin must not be consumed when --body and --stdin conflict")
+
+    def fail_ensure(_session: str) -> str:
+        calls["ensure"] += 1
+        raise AssertionError("daemon ensure must not run when --body and --stdin conflict")
+
+    be.read_limited_text = fail_read
+    be.ensure_daemon_running = fail_ensure
+    code, out, err = _run_enqueue_main(be, ["--from", "alice", "--body", "inline", "--stdin"], stdin_text="stdin body")
+    assert_true(code == 2, f"{label}: body+stdin conflict exits 2, got {code}")
+    assert_true(out == "", f"{label}: conflict has no stdout: {out!r}")
+    assert_true("use either --body or --stdin, not both" in err, f"{label}: conflict error missing: {err!r}")
+    assert_true("cannot infer bridge session" not in err, f"{label}: conflict must win before session lookup: {err!r}")
+    assert_true("--body or --stdin content is required" not in err, f"{label}: conflict must win before empty-body check: {err!r}")
+    assert_true(calls == {"read": 0, "ensure": 0}, f"{label}: conflict must not consume stdin or ensure daemon: {calls}")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_rejects_empty_body_and_stdin(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    be.read_limited_text = lambda _stream: (_ for _ in ()).throw(AssertionError("stdin must not be consumed"))
+    be.ensure_daemon_running = lambda _session: (_ for _ in ()).throw(AssertionError("daemon ensure must not run"))
+    code, out, err = _run_enqueue_main(be, ["--from", "alice", "--body", "", "--stdin"], stdin_text="stdin body")
+    assert_true(code == 2, f"{label}: empty body+stdin conflict exits 2, got {code}")
+    assert_true(out == "", f"{label}: conflict has no stdout: {out!r}")
+    assert_true("use either --body or --stdin, not both" in err, f"{label}: conflict error expected: {err!r}")
+    assert_true("--body or --stdin content is required" not in err, f"{label}: empty-body error must not mask explicit conflict: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_rejects_body_and_stdin_argv_order_independent(label: str, tmpdir: Path) -> None:
+    for suffix in (["--body", "inline", "--stdin"], ["--stdin", "--body", "inline"]):
+        be = _import_enqueue_module()
+        be.read_limited_text = lambda _stream: (_ for _ in ()).throw(AssertionError("stdin must not be consumed"))
+        be.ensure_daemon_running = lambda _session: (_ for _ in ()).throw(AssertionError("daemon ensure must not run"))
+        code, out, err = _run_enqueue_main(be, ["--from", "alice", *suffix], stdin_text="stdin body")
+        assert_true(code == 2 and out == "", f"{label}: conflict {suffix} exits 2 with no stdout: code={code} out={out!r}")
+        assert_true("use either --body or --stdin, not both" in err, f"{label}: order {suffix} should use conflict error: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_body_only_still_works(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    queue_file = tmpdir / "pending.json"
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "alice",
+            "--to", "bob",
+            "--body", "inline",
+            "--queue-file", str(queue_file),
+            "--state-file", str(tmpdir / "events.raw.jsonl"),
+            "--public-state-file", str(tmpdir / "events.jsonl"),
+        ],
+    )
+    assert_true(code == 0, f"{label}: body-only enqueue should succeed, got {code}, err={err!r}")
+    assert_true(out.strip().startswith("msg-"), f"{label}: body-only enqueue returns id: {out!r}")
+    queue = json.loads(queue_file.read_text(encoding="utf-8"))
+    assert_true(queue and queue[0].get("body") == "inline", f"{label}: inline body preserved: {queue}")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_stdin_only_still_works(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    queue_file = tmpdir / "pending.json"
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "alice",
+            "--to", "bob",
+            "--stdin",
+            "--queue-file", str(queue_file),
+            "--state-file", str(tmpdir / "events.raw.jsonl"),
+            "--public-state-file", str(tmpdir / "events.jsonl"),
+        ],
+        stdin_text="stdin body",
+    )
+    assert_true(code == 0, f"{label}: stdin-only enqueue should succeed, got {code}, err={err!r}")
+    assert_true(out.strip().startswith("msg-"), f"{label}: stdin-only enqueue returns id: {out!r}")
+    queue = json.loads(queue_file.read_text(encoding="utf-8"))
+    assert_true(queue and queue[0].get("body") == "stdin body", f"{label}: stdin body preserved: {queue}")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_bare_body_without_value_remains_argparse_owned(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    code, out, err = _run_enqueue_main(be, ["--from", "alice", "--body"])
+    assert_true(code == 2, f"{label}: bare --body should exit 2, got {code}")
+    assert_true(out == "", f"{label}: argparse error has no stdout: {out!r}")
+    assert_true("argument --body: expected one argument" in err, f"{label}: argparse should own bare --body error: {err!r}")
+    assert_true("use either --body or --stdin" not in err, f"{label}: custom conflict must not mask bare --body argparse error: {err!r}")
+    print(f"  PASS  {label}")
+
+
 def _enqueue_watchdog_argv(tmpdir: Path, *extra: str, kind: str = "request") -> list[str]:
     return [
         "--session", "test-session",
@@ -7861,6 +7967,12 @@ def main() -> int:
             ("send_peer_rejects_pipe_with_positional_body", scenario_send_peer_rejects_pipe_with_positional_body),
             ("send_peer_pipe_only_body_still_supported", scenario_send_peer_pipe_only_body_still_supported),
             ("send_peer_precheck_option_table_matches_parser", scenario_send_peer_precheck_option_table_matches_parser),
+            ("enqueue_rejects_body_and_stdin_before_session_lookup", scenario_enqueue_rejects_body_and_stdin_before_session_lookup),
+            ("enqueue_rejects_empty_body_and_stdin", scenario_enqueue_rejects_empty_body_and_stdin),
+            ("enqueue_rejects_body_and_stdin_argv_order_independent", scenario_enqueue_rejects_body_and_stdin_argv_order_independent),
+            ("enqueue_body_only_still_works", scenario_enqueue_body_only_still_works),
+            ("enqueue_stdin_only_still_works", scenario_enqueue_stdin_only_still_works),
+            ("enqueue_bare_body_without_value_remains_argparse_owned", scenario_enqueue_bare_body_without_value_remains_argparse_owned),
             ("enqueue_rejects_oversized_body_unchanged", scenario_enqueue_rejects_oversized_body_unchanged),
             ("enqueue_stdin_rejects_oversized_body_unchanged", scenario_enqueue_stdin_rejects_oversized_body_unchanged),
             ("alarm_cancel_preserves_at_limit_body", scenario_alarm_cancel_preserves_at_limit_body),
