@@ -27,7 +27,7 @@ def model_cheat_sheet() -> list[str]:
         "- notice: the bridge does NOT route any reply back. Even if the peer writes a response, it stays in the peer's pane — observe via agent_view_peer. If you need an answer, use request, not notice. The kind on the wire beats any 'please reply' hint in the body.",
         "- result: internal kind for auto-returned replies. Cannot be sent directly by agents.",
         "Waking and timing:",
-        "- After sending a request, do not sleep or poll for the reply. Continue independent local work or end your turn. The peer's reply arrives automatically as a [bridge:*] result. With the default watchdog enabled you also get a [bridge:watchdog] notice if the peer takes too long.",
+        "- After sending a request, continue independent local work if useful. End your turn; sleep/polling blocks the wake you await. The peer's reply arrives automatically as a [bridge:*] result. With the default watchdog enabled you also get a [bridge:watchdog] notice if the peer takes too long.",
         "- A watchdog wake explicitly tells you to choose ONE of: agent_extend_wait <msg_id> <sec>, agent_interrupt_peer <alias>, or just agent_view_peer <alias> first to inspect. Pick one — it's not a polling primitive.",
         "- agent_alarm is for 'I delegated work via notice and want a safety wake if no follow-up arrives'. It is NOT for waiting on auto-routed reply results — for that use --watchdog / agent_extend_wait.",
         "- Do not poll with agent_view_peer or schedule a wakeup to check progress; use agent_view_peer only when you suspect the peer is stuck or need to debug the bridge.",
@@ -54,7 +54,7 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "use shell commands for peer messaging.\n"
         "\n"
         "Sending:\n"
-        "  agent_send_peer --to <alias> 'body'                  - request (default). Inline body must be one shell argument. Peer's next reply auto-routes back as [bridge:*] result. Do not sleep/poll for it; continue independent local work or end your turn.\n"
+        "  agent_send_peer --to <alias> 'body'                  - request (default). Inline body must be one shell argument. Peer's next reply auto-routes back as [bridge:*] result. End your turn; sleep/polling blocks the wake you await.\n"
         "  agent_send_peer <alias> 'body'                       - shorthand for --to <alias>; put options before the alias.\n"
         "  agent_send_peer --to <a>,<b>[,...] 'body'            - partial broadcast to listed peers; one aggregated result after all listed peers reply.\n"
         "  agent_send_peer --kind notice --to <alias> 'body'    - fire-and-forget. Bridge will NOT route any reply back even if peer answers. Use request when you need an answer.\n"
@@ -73,7 +73,7 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "  agent_interrupt_peer [<alias>] --status              - show busy/held/queue state for one or all peers.\n"
         "\n"
         "Behavior rules:\n"
-        "  - After sending a request, do not sleep or poll for the reply. Continue independent local work or end your turn; the reply arrives later as a [bridge:*] result.\n"
+        "  - After sending a request, continue independent local work if useful. End your turn; sleep/polling blocks the wake you await. The reply arrives later as a [bridge:*] result.\n"
         "  - Body text CANNOT override the kind on the wire. Writing 'please reply' inside a notice does nothing — the bridge will not route any response.\n"
         "  - Put all agent_send_peer options before --to/--all or before an implicit leading alias, except --stdin may appear after the destination. If an inline body is split into multiple shell arguments, the command fails closed.\n"
         "  - A watchdog wake means: pick ONE of agent_extend_wait, agent_interrupt_peer, or agent_view_peer (to inspect first). It is not a polling primitive.\n"

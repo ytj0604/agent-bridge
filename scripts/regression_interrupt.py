@@ -1572,6 +1572,21 @@ def scenario_stale_watchdog_skipped(label: str, tmpdir: Path) -> None:
     print(f"  PASS  {label}")
 
 
+def scenario_alarm_fire_text_includes_rearm_hint(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    hint = "Re-arm via agent_alarm <sec> if still waiting."
+
+    no_note = d.build_watchdog_fire_text({"is_alarm": True, "alarm_body": ""})
+    assert_true(no_note == f"[bridge:alarm] Wake elapsed. {hint}", f"{label}: alarm text must be compact and actionable: {no_note!r}")
+
+    with_note = d.build_watchdog_fire_text({"is_alarm": True, "alarm_body": "check build"})
+    assert_true("Note: check build" in with_note, f"{label}: alarm text must preserve custom note: {with_note!r}")
+    assert_true(hint in with_note, f"{label}: alarm note text must include re-arm hint: {with_note!r}")
+    assert_true(with_note.index("Note: check build") < with_note.index(hint), f"{label}: note should precede re-arm hint: {with_note!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_watchdog_pending_text_omits_held_interrupt(label: str, tmpdir: Path) -> None:
     participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
     d = make_daemon(tmpdir, participants)
@@ -6059,6 +6074,34 @@ def scenario_prompt_intercepted_doc_surfaces_disclose_user_typing_collision(labe
     print(f"  PASS  {label}")
 
 
+def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, tmpdir: Path) -> None:
+    phrase = "End your turn; sleep/polling blocks the wake you await."
+    old_fragments = ["do not sleep or poll", "Do not sleep/poll"]
+
+    cheat_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- After sending a request,")]
+    assert_true(len(cheat_lines) == 1, f"{label}: expected one cheat-sheet request-wait rule, got {cheat_lines!r}")
+    cheat_line = cheat_lines[0]
+    assert_true(phrase in cheat_line, f"{label}: cheat-sheet request-wait rule must name blocking consequence: {cheat_line!r}")
+    for old in old_fragments:
+        assert_true(old not in cheat_line, f"{label}: cheat-sheet request-wait rule should drop old wording {old!r}: {cheat_line!r}")
+
+    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
+    probe_lines = [line.strip() for line in probe.splitlines()]
+    sending_lines = [
+        line for line in probe_lines
+        if line.startswith("agent_send_peer --to <alias> 'body'") and "request (default)" in line
+    ]
+    behavior_lines = [line for line in probe_lines if line.startswith("- After sending a request,")]
+    assert_true(len(sending_lines) == 1, f"{label}: expected one probe request sending line, got {sending_lines!r}")
+    assert_true(len(behavior_lines) == 1, f"{label}: expected one probe request behavior rule, got {behavior_lines!r}")
+    for surface, line in (("probe sending line", sending_lines[0]), ("probe behavior rule", behavior_lines[0])):
+        assert_true(phrase in line, f"{label}: {surface} must name blocking consequence: {line!r}")
+        assert_true("[bridge:*] result" in line, f"{label}: {surface} must preserve auto-route mention: {line!r}")
+        for old in old_fragments:
+            assert_true(old not in line, f"{label}: {surface} should drop old wording {old!r}: {line!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_view_peer_render_output_model_safe(label: str, tmpdir: Path) -> None:
     bv = _import_view_peer()
     import contextlib
@@ -8324,6 +8367,7 @@ def scenario_send_peer_single_inline_body_uses_stdin_handoff(label: str, tmpdir:
 def scenario_send_peer_request_success_prints_anti_wait_hint(label: str, tmpdir: Path) -> None:
     bs = _import_send_peer_module()
     _patch_send_peer_for_unit(bs)
+    consequence = "End your turn; sleep/polling blocks the wake you await."
     code, out, err, calls = _run_send_peer_with_fake_subprocess(
         bs,
         ["--session", "test-session", "--from", "alice", "--to", "bob", "hello world"],
@@ -8332,14 +8376,16 @@ def scenario_send_peer_request_success_prints_anti_wait_hint(label: str, tmpdir:
     )
     assert_true(code == 0 and len(calls) == 1, f"{label}: request should succeed: code={code} err={err!r}")
     assert_true(out == "msg-test123\n", f"{label}: enqueue stdout must be preserved exactly: {out!r}")
-    assert_true("Waiting for a bridge follow-up?" in err, f"{label}: common hint missing: {err!r}")
-    assert_true("notice sent" not in err, f"{label}: request must not print notice alarm hint: {err!r}")
+    assert_true(consequence in err, f"{label}: common consequence hint missing: {err!r}")
+    assert_true("notice sent" not in err and "Safety wake" not in err, f"{label}: request must not print notice alarm hint: {err!r}")
     print(f"  PASS  {label}")
 
 
 def scenario_send_peer_notice_success_prints_alarm_and_anti_wait_hints(label: str, tmpdir: Path) -> None:
     bs = _import_send_peer_module()
     _patch_send_peer_for_unit(bs)
+    safety = "notice sent. Safety wake: agent_alarm <sec> --note '<desc>'."
+    consequence = "End your turn; sleep/polling blocks the wake you await."
     code, out, err, calls = _run_send_peer_with_fake_subprocess(
         bs,
         ["--session", "test-session", "--from", "alice", "--kind", "notice", "--to", "bob", "hello world"],
@@ -8348,9 +8394,9 @@ def scenario_send_peer_notice_success_prints_alarm_and_anti_wait_hints(label: st
     )
     assert_true(code == 0 and len(calls) == 1, f"{label}: notice should succeed: code={code} err={err!r}")
     assert_true(out == "msg-notice123\n", f"{label}: enqueue stdout must be preserved exactly: {out!r}")
-    assert_true("notice sent" in err and "agent_alarm" in err, f"{label}: notice alarm hint missing: {err!r}")
-    assert_true("Waiting for a bridge follow-up?" in err, f"{label}: common hint missing: {err!r}")
-    assert_true(err.index("notice sent") < err.index("Waiting for a bridge follow-up?"), f"{label}: notice-specific hint should come first: {err!r}")
+    assert_true(safety in err, f"{label}: notice alarm hint missing: {err!r}")
+    assert_true(consequence in err, f"{label}: common consequence hint missing: {err!r}")
+    assert_true(err.index(safety) < err.index(consequence), f"{label}: notice-specific hint should come first: {err!r}")
     print(f"  PASS  {label}")
 
 
@@ -8366,7 +8412,7 @@ def scenario_send_peer_subprocess_failure_prints_no_success_hint(label: str, tmp
     )
     assert_true(code == 1 and len(calls) == 1, f"{label}: subprocess failure should propagate: code={code}")
     assert_true(out == "enqueue failed details\n", f"{label}: failure stdout still comes from subprocess: {out!r}")
-    assert_true("notice sent" not in err and "Waiting for a bridge follow-up?" not in err, f"{label}: success hints must not print on failure: {err!r}")
+    assert_true("notice sent" not in err and "Safety wake" not in err and "sleep/polling blocks" not in err, f"{label}: success hints must not print on failure: {err!r}")
     print(f"  PASS  {label}")
 
 
@@ -9312,6 +9358,7 @@ def main() -> int:
             ("daemon_socket_ack_message_unsupported_does_not_delete_queue", scenario_daemon_socket_ack_message_unsupported_does_not_delete_queue),
             ("daemon_ack_message_helper_removed", scenario_daemon_ack_message_helper_removed),
             ("stale_watchdog_skipped", scenario_stale_watchdog_skipped),
+            ("alarm_fire_text_includes_rearm_hint", scenario_alarm_fire_text_includes_rearm_hint),
             ("watchdog_pending_text_omits_held_interrupt", scenario_watchdog_pending_text_omits_held_interrupt),
             ("pane_mode_pending_defers_without_attempt", scenario_pane_mode_pending_defers_without_attempt),
             ("pane_mode_clears_then_delivers", scenario_pane_mode_clears_then_delivers),
@@ -9490,6 +9537,7 @@ def main() -> int:
             ("view_peer_doc_surfaces_disclose_search_semantics", scenario_view_peer_doc_surfaces_disclose_search_semantics),
             ("interrupt_peer_doc_surfaces_disclose_no_op_race", scenario_interrupt_peer_doc_surfaces_disclose_no_op_race),
             ("prompt_intercepted_doc_surfaces_disclose_user_typing_collision", scenario_prompt_intercepted_doc_surfaces_disclose_user_typing_collision),
+            ("send_peer_wait_doc_surfaces_name_blocking_consequence", scenario_send_peer_wait_doc_surfaces_name_blocking_consequence),
             ("view_peer_render_output_model_safe", scenario_view_peer_render_output_model_safe),
             ("view_peer_search_explicit_snapshot_uses_safe_ref", scenario_view_peer_search_explicit_snapshot_uses_safe_ref),
             ("view_peer_snapshot_ref_collision_unique", scenario_view_peer_snapshot_ref_collision_unique),

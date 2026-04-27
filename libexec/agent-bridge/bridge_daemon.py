@@ -1934,10 +1934,11 @@ class BridgeDaemon:
     def build_watchdog_fire_text(self, wd: dict) -> str:
         if wd.get("is_alarm"):
             custom = str(wd.get("alarm_body") or "").strip()
-            base = "[bridge:alarm] Scheduled wake-up elapsed."
+            base = "[bridge:alarm] Wake elapsed."
+            hint = "Re-arm via agent_alarm <sec> if still waiting."
             if custom:
-                return f"{base} Note: {custom}"
-            return base
+                return f"{base} Note: {custom}. {hint}"
+            return f"{base} {hint}"
         agg = wd.get("ref_aggregate_id")
         if agg:
             return (

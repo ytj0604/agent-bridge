@@ -28,8 +28,7 @@ SHELL_BODY_HINT = (
     "agent_send_peer --to <alias> --stdin <<'EOF' ... EOF"
 )
 FOLLOW_UP_WAIT_HINT = (
-    "Waiting for a bridge follow-up? Do not sleep or poll; "
-    "continue independent local work or end your turn."
+    "End your turn; sleep/polling blocks the wake you await."
 )
 AMBIENT_STDIN_READ_BYTES = (MAX_INLINE_SEND_BODY_CHARS + 1) * 4 + 4
 
@@ -479,8 +478,7 @@ def main() -> int:
         # Notices have no auto-routed reply. Hint the model to set an alarm
         # so they have a safety wake if the follow-up never comes.
         print(
-            "notice sent. If you expect a follow-up message and want a safety wake, "
-            "run: agent_alarm <sec> --note '<desc>'",
+            "notice sent. Safety wake: agent_alarm <sec> --note '<desc>'.",
             file=sys.stderr,
         )
     if proc.returncode == 0:
