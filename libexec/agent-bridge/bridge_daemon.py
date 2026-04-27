@@ -76,6 +76,7 @@ EMPTY_RESPONSE_BODY = "(empty response)"
 WATCHDOG_PHASE_DELIVERY = "delivery"
 WATCHDOG_PHASE_RESPONSE = "response"
 WATCHDOG_PHASE_ALARM = "alarm"
+WAIT_STATUS_SECTION_LIMIT = 50
 RESPONSE_LIKE_TOMBSTONE_REASONS = {
     # Tombstone reasons emitted today include terminal_response,
     # reply_received, interrupted_tombstone_terminal, aggregate_complete,
@@ -756,6 +757,14 @@ class BridgeDaemon:
             if result.get("cancelled") and target:
                 self.try_deliver(target)
             return result
+        if op == "wait_status":
+            self.reload_participants()
+            sender = str(request.get("from") or "")
+            if not sender:
+                return {"ok": False, "error": "sender required"}
+            if sender == "bridge" or sender not in self.participants:
+                return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
+            return self.build_wait_status(sender)
         if op == "status":
             self.reload_participants()
             target = str(request.get("target") or "")
@@ -1569,6 +1578,194 @@ class BridgeDaemon:
                 reason=reason,
             )
         return removed
+
+    def _wait_status_section(self, items: list[dict], *, limit: int = WAIT_STATUS_SECTION_LIMIT) -> dict:
+        limited = items[:limit]
+        total = len(items)
+        return {
+            "total_count": total,
+            "returned_count": len(limited),
+            "truncated": total > len(limited),
+            "items": limited,
+        }
+
+    def _wait_status_deadline_iso(self, deadline: object) -> str:
+        try:
+            value = float(deadline)
+        except (TypeError, ValueError):
+            return ""
+        if not math.isfinite(value):
+            return ""
+        return datetime.fromtimestamp(value, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    def _wait_status_message_watchdog_index(self, caller: str, watchdogs: dict[str, dict]) -> dict[str, list[dict]]:
+        by_message: dict[str, list[dict]] = {}
+        for wake_id, wd in watchdogs.items():
+            if wd.get("is_alarm"):
+                continue
+            if str(wd.get("sender") or "") != caller:
+                continue
+            message_id = str(wd.get("ref_message_id") or "")
+            if not message_id:
+                continue
+            by_message.setdefault(message_id, []).append({
+                "wake_id": wake_id,
+                "phase": self.normalize_watchdog_phase(wd),
+                "deadline": self._wait_status_deadline_iso(wd.get("deadline")),
+            })
+        return by_message
+
+    def _wait_status_counts(self, sections: dict[str, dict]) -> dict:
+        return {
+            name: {
+                "total_count": section.get("total_count", 0),
+                "returned_count": section.get("returned_count", 0),
+                "truncated": bool(section.get("truncated")),
+            }
+            for name, section in sections.items()
+        }
+
+    def _build_outstanding_requests(self, caller: str, queue: list[dict], watchdogs_by_message: dict[str, list[dict]]) -> list[dict]:
+        rows: list[dict] = []
+        active_statuses = {"pending", "inflight", "submitted", "delivered"}
+        for item in queue:
+            if str(item.get("from") or "") != caller:
+                continue
+            if normalize_kind(item.get("kind"), "request") != "request":
+                continue
+            if not bool(item.get("auto_return")):
+                continue
+            status = str(item.get("status") or "")
+            if status not in active_statuses:
+                continue
+            message_id = str(item.get("id") or "")
+            rows.append({
+                "message_id": message_id,
+                "target": item.get("to"),
+                "status": status,
+                "kind": normalize_kind(item.get("kind"), "request"),
+                "intent": item.get("intent"),
+                "created_ts": item.get("created_ts"),
+                "updated_ts": item.get("updated_ts"),
+                "inflight_ts": item.get("inflight_ts"),
+                "delivered_ts": item.get("delivered_ts"),
+                "aggregate_id": item.get("aggregate_id") or "",
+                "watchdog_wake_ids": [wd.get("wake_id") for wd in watchdogs_by_message.get(message_id, [])],
+            })
+        return rows
+
+    def _build_wait_status_watchdogs(self, caller: str, watchdogs: dict[str, dict]) -> list[dict]:
+        rows: list[dict] = []
+        for wake_id, wd in watchdogs.items():
+            if wd.get("is_alarm"):
+                continue
+            if str(wd.get("sender") or "") != caller:
+                continue
+            rows.append({
+                "wake_id": wake_id,
+                "message_id": wd.get("ref_message_id") or "",
+                "aggregate_id": wd.get("ref_aggregate_id") or "",
+                "target": wd.get("ref_to") or "",
+                "phase": self.normalize_watchdog_phase(wd),
+                "deadline": self._wait_status_deadline_iso(wd.get("deadline")),
+                "kind": wd.get("ref_kind") or "",
+                "intent": wd.get("ref_intent") or "",
+            })
+        return rows
+
+    def _build_wait_status_alarms(self, caller: str, watchdogs: dict[str, dict]) -> list[dict]:
+        rows: list[dict] = []
+        for wake_id, wd in watchdogs.items():
+            if not wd.get("is_alarm"):
+                continue
+            if str(wd.get("sender") or "") != caller:
+                continue
+            rows.append({
+                "wake_id": wake_id,
+                "deadline": self._wait_status_deadline_iso(wd.get("deadline")),
+                "note": str(wd.get("alarm_body") or ""),
+            })
+        return rows
+
+    def _build_wait_status_pending_inbound(self, caller: str, queue: list[dict]) -> list[dict]:
+        rows: list[dict] = []
+        for item in queue:
+            if str(item.get("to") or "") != caller:
+                continue
+            if str(item.get("status") or "") != "pending":
+                continue
+            body = str(item.get("body") or "")
+            rows.append({
+                "message_id": item.get("id"),
+                "kind": normalize_kind(item.get("kind"), "notice"),
+                "from": item.get("from"),
+                "intent": item.get("intent"),
+                "created_ts": item.get("created_ts"),
+                "reply_to": item.get("reply_to"),
+                "ref_message_id": item.get("ref_message_id") or "",
+                "ref_aggregate_id": item.get("ref_aggregate_id") or "",
+                "source": item.get("source") or "",
+                "body_chars": len(body),
+            })
+        return rows
+
+    def _build_wait_status_aggregates(self, caller: str, aggregates: dict) -> list[dict]:
+        rows: list[dict] = []
+        for aggregate_id, aggregate in (aggregates or {}).items():
+            if str(aggregate.get("requester") or "") != caller:
+                continue
+            if aggregate.get("delivered") or aggregate.get("status") == "complete":
+                continue
+            expected = [str(alias) for alias in aggregate.get("expected") or []]
+            replies = aggregate.get("replies") or {}
+            replied = sorted(str(alias) for alias in replies.keys())
+            missing = sorted(set(expected) - set(replied))
+            rows.append({
+                "aggregate_id": str(aggregate.get("id") or aggregate_id),
+                "causal_id": aggregate.get("causal_id") or "",
+                "intent": aggregate.get("intent") or "",
+                "expected_count": len(expected),
+                "replied_count": len(replied),
+                "missing_peers": missing,
+                "expected": expected,
+                "replied_peers": replied,
+                "message_ids": aggregate.get("message_ids") or {},
+                "updated_ts": aggregate.get("updated_ts") or "",
+            })
+        return rows
+
+    def build_wait_status(self, caller: str) -> dict:
+        with self.state_lock:
+            queue_snapshot = list(self.queue.read())
+            watchdog_snapshot = {wake_id: dict(wd) for wake_id, wd in self.watchdogs.items()}
+        try:
+            aggregate_data = read_json(self.aggregate_file, {"aggregates": {}})
+            aggregates = aggregate_data.get("aggregates") or {}
+        except Exception:
+            aggregates = {}
+
+        # This is a best-effort debug snapshot: queue/watchdogs are atomic
+        # with each other, while aggregate JSON is read after releasing
+        # state_lock to preserve the daemon's lock ordering.
+        watchdogs_by_message = self._wait_status_message_watchdog_index(caller, watchdog_snapshot)
+        sections = {
+            "outstanding_requests": self._wait_status_section(
+                self._build_outstanding_requests(caller, queue_snapshot, watchdogs_by_message)
+            ),
+            "aggregate_waits": self._wait_status_section(self._build_wait_status_aggregates(caller, aggregates)),
+            "alarms": self._wait_status_section(self._build_wait_status_alarms(caller, watchdog_snapshot)),
+            "watchdogs": self._wait_status_section(self._build_wait_status_watchdogs(caller, watchdog_snapshot)),
+            "pending_inbound": self._wait_status_section(self._build_wait_status_pending_inbound(caller, queue_snapshot)),
+        }
+        return {
+            "ok": True,
+            "bridge_session": self.bridge_session,
+            "caller": caller,
+            "generated_ts": utc_now(),
+            "limits": {"per_section": WAIT_STATUS_SECTION_LIMIT},
+            "summary": self._wait_status_counts(sections),
+            **sections,
+        }
 
     def reserve_next(self, target: str) -> dict | None:
         with self.state_lock:

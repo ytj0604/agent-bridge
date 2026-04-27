@@ -227,6 +227,7 @@ write_shim agent_alarm "$root/model-bin/agent_alarm"
 write_shim agent_interrupt_peer "$root/model-bin/agent_interrupt_peer"
 write_shim agent_extend_wait "$root/model-bin/agent_extend_wait"
 write_shim agent_cancel_message "$root/model-bin/agent_cancel_message"
+write_shim agent_wait_status "$root/model-bin/agent_wait_status"
 
 case ":$PATH:" in
   *":$bin_dir:"*) path_ok="1" ;;

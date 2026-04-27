@@ -48,7 +48,7 @@ USEFUL_ANCHOR_TOKEN_RE = re.compile(
     r"(?:\bmsg-[A-Za-z0-9]+\b|\bcausal-[A-Za-z0-9]+\b|\bwake-[A-Za-z0-9]+\b|"
     r"\bcap-[A-Za-z0-9]+\b|\bagg-[A-Za-z0-9]+\b|/[A-Za-z0-9_./-]{3,}|"
     r"\b[A-Za-z0-9_.-]+\.(?:py|sh|md|json|toml|txt|yaml|yml)\b|"
-    r"\b(?:agent_send_peer|agent_view_peer|agent_alarm|agent_interrupt_peer|agent_cancel_message|bridge|python3|pytest|rg|git)\b)"
+    r"\b(?:agent_send_peer|agent_view_peer|agent_alarm|agent_interrupt_peer|agent_cancel_message|agent_wait_status|bridge|python3|pytest|rg|git)\b)"
 )
 DURATION_COUNTER_RE = re.compile(
     r"\b\d+\s*(?:ms|s|sec|secs|seconds?|m|min|mins|minutes?|h|hr|hrs|hours?)\b|"
