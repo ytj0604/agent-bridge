@@ -59,7 +59,7 @@ import bridge_join  # noqa: E402
 import bridge_pane_probe  # noqa: E402
 import bridge_response_guard  # noqa: E402
 import bridge_codex_config  # noqa: E402
-from bridge_util import MAX_INLINE_SEND_BODY_CHARS, MAX_PEER_BODY_CHARS, read_json, read_limited_text, validate_peer_body_size, utc_now, write_json_atomic  # noqa: E402
+from bridge_util import MAX_INLINE_SEND_BODY_CHARS, MAX_PEER_BODY_CHARS, locked_json, read_json, read_limited_text, validate_peer_body_size, utc_now, write_json_atomic  # noqa: E402
 
 
 def make_daemon(tmpdir: Path, participants: dict[str, dict]) -> bridge_daemon.BridgeDaemon:
@@ -1257,9 +1257,9 @@ def scenario_aggregate_late_real_stop_after_interrupt_does_not_overwrite(label: 
 
 
 def scenario_watchdog_cancel_on_empty_response(label: str, tmpdir: Path) -> None:
-    # v1.5: watchdog arms at delivery, not enqueue. The cancel-on-empty
-    # invariant from v1 is preserved: even an empty/no-text response must
-    # still cancel the watchdog and auto-route an explicit sentinel result.
+    # Watchdog still does not arm at enqueue. Once a request is active, even
+    # an empty/no-text response must cancel the response watchdog and
+    # auto-route an explicit sentinel result.
     participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
     d = make_daemon(tmpdir, participants)
     msg = {
@@ -1271,7 +1271,7 @@ def scenario_watchdog_cancel_on_empty_response(label: str, tmpdir: Path) -> None
         "watchdog_delay_sec": 600.0,
     }
     d.enqueue_ipc_message(msg)
-    assert_true(not any(wd.get("ref_message_id") == "msg-wd-1" for wd in d.watchdogs.values()), f"{label}: watchdog must NOT be registered at enqueue (only arms at delivery)")
+    assert_true(not any(wd.get("ref_message_id") == "msg-wd-1" for wd in d.watchdogs.values()), f"{label}: watchdog must NOT be registered at enqueue")
     def assign(queue):
         for it in queue:
             if it.get("id") == "msg-wd-1":
@@ -1280,7 +1280,7 @@ def scenario_watchdog_cancel_on_empty_response(label: str, tmpdir: Path) -> None
         return None
     d.queue.update(assign)
     d.handle_prompt_submitted({"agent": "codex", "bridge_agent": "codex", "nonce": "wd-nonce", "turn_id": "t-wd", "prompt": ""})
-    assert_true(any(wd.get("ref_message_id") == "msg-wd-1" for wd in d.watchdogs.values()), f"{label}: watchdog must be registered after delivery (prompt_submitted)")
+    assert_true(any(wd.get("ref_message_id") == "msg-wd-1" and wd.get("watchdog_phase") == "response" for wd in d.watchdogs.values()), f"{label}: response watchdog must be registered after prompt_submitted")
     ctx = dict(d.current_prompt_by_agent.get("codex") or {})
     d.handle_response_finished({"agent": "codex", "bridge_agent": "codex", "turn_id": "t-wd", "last_assistant_message": ""})
     assert_true(not any(wd.get("ref_message_id") == "msg-wd-1" for wd in d.watchdogs.values()), f"{label}: watchdog must be cancelled even when response text is empty")
@@ -1572,9 +1572,9 @@ def scenario_extend_wait_unknown_message(label: str, tmpdir: Path) -> None:
 
 
 def scenario_extend_wait_pending_rejected(label: str, tmpdir: Path) -> None:
-    # D1 invariant: a request that has not yet been delivered to the peer
-    # has no watchdog (delivery-time arm). agent_extend_wait must reject
-    # such messages so D1 is not silently bypassed.
+    # Pending rows have no active delivery attempt yet, so extend_wait still
+    # rejects them. Once a row is inflight/submitted, the delivery watchdog is
+    # active and may be extended.
     participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
     d = make_daemon(tmpdir, participants)
     msg = {
@@ -1587,16 +1587,27 @@ def scenario_extend_wait_pending_rejected(label: str, tmpdir: Path) -> None:
     }
     d.enqueue_ipc_message(msg)
     ok, err, _ = d.upsert_message_watchdog("claude", "msg-pending-1", 60.0)
-    assert_true(not ok and err == "message_not_in_delivered_state", f"{label}: pending message must be rejected, got ok={ok}, err={err!r}")
-    # Same for inflight
+    assert_true(not ok and err == "message_not_extendable_state", f"{label}: pending message must be rejected, got ok={ok}, err={err!r}")
+    # Inflight delivery wait is extendable.
     def to_inflight(queue):
         for it in queue:
             if it.get("id") == "msg-pending-1":
                 it["status"] = "inflight"
+                it["inflight_ts"] = utc_now()
         return None
     d.queue.update(to_inflight)
     ok2, err2, _ = d.upsert_message_watchdog("claude", "msg-pending-1", 60.0)
-    assert_true(not ok2 and err2 == "message_not_in_delivered_state", f"{label}: inflight must also be rejected, got ok={ok2}, err={err2!r}")
+    assert_true(ok2, f"{label}: inflight delivery wait should extend, got ok={ok2}, err={err2!r}")
+    # Submitted is the same delivery phase: prompt submission is still not
+    # fully delivered until the bridge nonce is matched.
+    def to_submitted(queue):
+        for it in queue:
+            if it.get("id") == "msg-pending-1":
+                it["status"] = "submitted"
+        return None
+    d.queue.update(to_submitted)
+    ok3, err3, _ = d.upsert_message_watchdog("claude", "msg-pending-1", 60.0)
+    assert_true(ok3, f"{label}: submitted delivery wait should extend, got ok={ok3}, err={err3!r}")
     print(f"  PASS  {label}")
 
 
@@ -1614,6 +1625,366 @@ def scenario_extend_wait_not_owner(label: str, tmpdir: Path) -> None:
     d.queue.update(add)
     ok, err, _ = d.upsert_message_watchdog("codex", "msg-owner-1", 60.0)
     assert_true(not ok and err == "not_owner", f"{label}: non-sender must be rejected with not_owner, got ok={ok}, err={err!r}")
+    print(f"  PASS  {label}")
+
+
+def _watchdogs_for_message(d, message_id: str, phase: str | None = None) -> list[tuple[str, dict]]:
+    return [
+        (wake_id, wd)
+        for wake_id, wd in d.watchdogs.items()
+        if wd.get("ref_message_id") == message_id
+        and not wd.get("is_alarm")
+        and (phase is None or wd.get("watchdog_phase") == phase)
+    ]
+
+
+def _add_watchdog_request(d, message_id: str, *, frm: str = "claude", to: str = "codex", aggregate_id: str = "") -> None:
+    msg = test_message(message_id, frm=frm, to=to, status="pending")
+    msg["watchdog_delay_sec"] = 60.0
+    if aggregate_id:
+        msg["aggregate_id"] = aggregate_id
+        msg["aggregate_expected"] = ["codex", "bob"]
+        msg["aggregate_message_ids"] = {"codex": message_id, "bob": "msg-agg-bob"}
+    d.enqueue_ipc_message(msg)
+
+
+def scenario_delivery_watchdog_arms_on_reserve(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    _add_watchdog_request(d, "msg-delivery-arm")
+
+    d.try_deliver("codex")
+
+    item = _queue_item(d, "msg-delivery-arm")
+    assert_true(item is not None and item.get("status") == "inflight", f"{label}: delivery should reserve message: {item}")
+    matches = _watchdogs_for_message(d, "msg-delivery-arm", "delivery")
+    assert_true(len(matches) == 1, f"{label}: exactly one delivery watchdog expected, got {d.watchdogs}")
+    wd = matches[0][1]
+    assert_true(wd.get("ref_to") == "codex" and wd.get("sender") == "claude", f"{label}: watchdog should point to sender/target: {wd}")
+    print(f"  PASS  {label}")
+
+
+def scenario_delivery_watchdog_fire_inflight_notice(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    _add_watchdog_request(d, "msg-delivery-fire")
+    d.try_deliver("codex")
+    wake_id, wd = _watchdogs_for_message(d, "msg-delivery-fire", "delivery")[0]
+    wd["deadline"] = time.time() - 1.0
+    d.watchdogs[wake_id] = wd
+
+    d.check_watchdogs()
+
+    assert_true(wake_id not in d.watchdogs, f"{label}: delivery watchdog should fire once")
+    notices = [it for it in d.queue.read() if it.get("from") == "bridge" and it.get("to") == "claude" and it.get("intent") == "watchdog_wake"]
+    assert_true(len(notices) == 1, f"{label}: one watchdog notice expected, got {notices}")
+    body = notices[0].get("body") or ""
+    for token in ("not completed bridge delivery", "agent_extend_wait msg-delivery-fire <sec>", "agent_interrupt_peer codex", "agent_view_peer codex"):
+        assert_true(token in body, f"{label}: delivery watchdog body missing {token!r}: {body!r}")
+    assert_true("held_interrupt" not in body and "--clear-hold" not in body, f"{label}: delivery watchdog body should not mention hold internals: {body!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_delivery_watchdog_extend_replaces_wake(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    _add_watchdog_request(d, "msg-delivery-extend")
+    d.try_deliver("codex")
+    first_wake = _watchdogs_for_message(d, "msg-delivery-extend", "delivery")[0][0]
+
+    ok, err, _deadline = d.upsert_message_watchdog("claude", "msg-delivery-extend", 120.0)
+
+    assert_true(ok, f"{label}: inflight delivery watchdog should extend, got {err!r}")
+    matches = _watchdogs_for_message(d, "msg-delivery-extend", "delivery")
+    assert_true(len(matches) == 1, f"{label}: exactly one delivery watchdog after extend, got {d.watchdogs}")
+    assert_true(matches[0][0] != first_wake, f"{label}: extend should replace wake id")
+    print(f"  PASS  {label}")
+
+
+def scenario_delivery_watchdog_submitted_extend_and_text(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    _add_watchdog_request(d, "msg-delivery-submitted")
+    d.try_deliver("codex")
+    d.mark_message_submitted("msg-delivery-submitted")
+
+    ok, err, _deadline = d.upsert_message_watchdog("claude", "msg-delivery-submitted", 120.0)
+    assert_true(ok, f"{label}: submitted delivery watchdog should extend, got {err!r}")
+    wd = _watchdogs_for_message(d, "msg-delivery-submitted", "delivery")[0][1]
+    text = d.build_watchdog_fire_text(wd)
+    assert_true("status=submitted" in text and "agent_extend_wait msg-delivery-submitted <sec>" in text, f"{label}: submitted delivery text should be actionable: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_delivery_watchdog_aggregate_pending_extend_rejected(label: str, tmpdir: Path) -> None:
+    participants = {
+        "manager": {"alias": "manager", "agent_type": "claude", "pane": "%97"},
+        "w1": {"alias": "w1", "agent_type": "codex", "pane": "%96"},
+    }
+    d = make_daemon(tmpdir, participants)
+    msg = test_message("msg-agg-pending", frm="manager", to="w1", status="pending")
+    msg["watchdog_delay_sec"] = 60.0
+    msg["aggregate_id"] = "agg-pending"
+    msg["aggregate_expected"] = ["w1"]
+    msg["aggregate_message_ids"] = {"w1": "msg-agg-pending"}
+    d.enqueue_ipc_message(msg)
+
+    ok, err, _deadline = d.upsert_message_watchdog("manager", "msg-agg-pending", 120.0)
+
+    assert_true(not ok and err == "message_not_extendable_state", f"{label}: pending aggregate leg should be rejected, got ok={ok}, err={err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_delivery_watchdog_replaced_by_response_on_delivered(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    _add_watchdog_request(d, "msg-delivery-replace")
+    d.try_deliver("codex")
+    delivery_wake = _watchdogs_for_message(d, "msg-delivery-replace", "delivery")[0][0]
+    item = _queue_item(d, "msg-delivery-replace") or {}
+
+    d.handle_prompt_submitted({"agent": "codex", "bridge_agent": "codex", "nonce": item.get("nonce"), "turn_id": "t-replace", "prompt": ""})
+
+    delivery_matches = _watchdogs_for_message(d, "msg-delivery-replace", "delivery")
+    response_matches = _watchdogs_for_message(d, "msg-delivery-replace", "response")
+    assert_true(delivery_matches == [], f"{label}: delivery watchdog should be removed after delivered: {delivery_matches}")
+    assert_true(len(response_matches) == 1, f"{label}: response watchdog should replace delivery watchdog: {d.watchdogs}")
+    assert_true(response_matches[0][0] != delivery_wake, f"{label}: response watchdog should have a new wake id")
+    print(f"  PASS  {label}")
+
+
+def scenario_delivery_watchdog_requeue_cancels(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    _add_watchdog_request(d, "msg-delivery-requeue")
+    d.try_deliver("codex")
+    assert_true(_watchdogs_for_message(d, "msg-delivery-requeue", "delivery"), f"{label}: precondition delivery watchdog missing")
+    first_wake = _watchdogs_for_message(d, "msg-delivery-requeue", "delivery")[0][0]
+    def age(queue):
+        for it in queue:
+            if it.get("id") == "msg-delivery-requeue":
+                it["updated_ts"] = "1970-01-01T00:00:00.000000Z"
+        return None
+    d.queue.update(age)
+
+    d._requeue_stale_inflight_locked(time.time())
+
+    item = _queue_item(d, "msg-delivery-requeue")
+    assert_true(item is not None and item.get("status") == "inflight" and item.get("delivery_attempts") == 2, f"{label}: stale inflight should requeue then immediately retry delivery: {item}")
+    assert_true(first_wake not in d.watchdogs, f"{label}: requeue should cancel stale delivery watchdog wake id: {d.watchdogs}")
+    fresh = _watchdogs_for_message(d, "msg-delivery-requeue", "delivery")
+    assert_true(len(fresh) == 1 and fresh[0][0] != first_wake, f"{label}: immediate retry should arm a fresh delivery watchdog: {d.watchdogs}")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(
+        any(e.get("event") == "watchdog_cancelled" and e.get("wake_id") == first_wake and e.get("reason") == "prompt_submit_timeout" for e in events),
+        f"{label}: stale delivery watchdog cancellation should be logged: {events}",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_delivery_watchdog_mark_pending_cancels(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    _add_watchdog_request(d, "msg-delivery-pending")
+    d.try_deliver("codex")
+    first_wake = _watchdogs_for_message(d, "msg-delivery-pending", "delivery")[0][0]
+
+    d.mark_message_pending("msg-delivery-pending", "tmux paste failed")
+
+    item = _queue_item(d, "msg-delivery-pending")
+    assert_true(item is not None and item.get("status") == "pending", f"{label}: mark_message_pending should revert row to pending: {item}")
+    assert_true(first_wake not in d.watchdogs, f"{label}: pending rollback should cancel delivery watchdog: {d.watchdogs}")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(
+        any(e.get("event") == "watchdog_cancelled" and e.get("wake_id") == first_wake and e.get("reason") == "delivery_requeued" for e in events),
+        f"{label}: pending rollback watchdog cancellation should be logged: {events}",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_delivery_watchdog_pane_mode_reverts_cancel(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+
+    msg_mode = test_message("msg-delivery-mode", frm="claude", to="codex", status="pending")
+    msg_mode["watchdog_delay_sec"] = 60.0
+    d.enqueue_ipc_message(msg_mode)
+    d.try_deliver("codex")
+    mode_item = _queue_item(d, "msg-delivery-mode") or {}
+    mode_wake = _watchdogs_for_message(d, "msg-delivery-mode", "delivery")[0][0]
+    result_mode = d.defer_inflight_for_pane_mode(mode_item, "copy-mode")
+    assert_true(result_mode is not None and result_mode.get("status") == "pending", f"{label}: pane-mode defer should return pending row: {result_mode}")
+    assert_true(mode_wake not in d.watchdogs, f"{label}: pane-mode defer should cancel delivery watchdog: {d.watchdogs}")
+
+    probe_dir = tmpdir / "probe-failure"
+    d_probe = make_daemon(probe_dir, participants)
+    msg_probe = test_message("msg-delivery-probe", frm="claude", to="codex", status="pending")
+    msg_probe["watchdog_delay_sec"] = 60.0
+    d_probe.enqueue_ipc_message(msg_probe)
+    d_probe.try_deliver("codex")
+    probe_item = _queue_item(d_probe, "msg-delivery-probe") or {}
+    probe_wake = _watchdogs_for_message(d_probe, "msg-delivery-probe", "delivery")[0][0]
+    result_probe = d_probe.defer_inflight_for_pane_mode_probe_failed(probe_item, "probe failed")
+    assert_true(result_probe is not None and result_probe.get("status") == "pending", f"{label}: probe failure defer should return pending row: {result_probe}")
+    assert_true(probe_wake not in d_probe.watchdogs, f"{label}: probe failure defer should cancel delivery watchdog: {d_probe.watchdogs}")
+    events = read_events(tmpdir / "events.raw.jsonl") + read_events(probe_dir / "events.raw.jsonl")
+    cancelled_reasons = {
+        e.get("reason")
+        for e in events
+        if e.get("event") == "watchdog_cancelled" and e.get("watchdog_phase") == "delivery"
+    }
+    assert_true({"pane_mode_deferred", "pane_mode_probe_failed"}.issubset(cancelled_reasons), f"{label}: expected pane-mode cancellation reasons, got {cancelled_reasons}")
+    print(f"  PASS  {label}")
+
+
+def scenario_delivery_watchdog_phase_mismatch_skipped(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = test_message("msg-delivery-mismatch", frm="claude", to="codex", status="delivered")
+    d.queue.update(lambda queue: queue.append(msg))
+    wake_id = _plant_watchdog(d, "wake-delivery-mismatch", sender="claude", message_id="msg-delivery-mismatch", to="codex")
+    d.watchdogs[wake_id]["watchdog_phase"] = "delivery"
+
+    d.fire_watchdog(wake_id, dict(d.watchdogs[wake_id]))
+
+    assert_true(wake_id not in d.watchdogs, f"{label}: mismatched delivery watchdog should be removed")
+    notices = [it for it in d.queue.read() if it.get("intent") == "watchdog_wake"]
+    assert_true(not notices, f"{label}: mismatched delivery watchdog should not wake sender: {notices}")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    skipped = [e for e in events if e.get("event") == "watchdog_skipped_stale" and e.get("wake_id") == wake_id]
+    assert_true(skipped and skipped[0].get("reason") == "delivery_status_delivered", f"{label}: skip reason should record phase mismatch: {skipped}")
+    print(f"  PASS  {label}")
+
+
+def scenario_watchdog_phase_legacy_default_response(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    legacy = {
+        "sender": "claude",
+        "deadline": time.time(),
+        "ref_message_id": "msg-legacy-watchdog",
+        "ref_aggregate_id": None,
+        "ref_to": "codex",
+        "ref_kind": "request",
+        "ref_intent": "test",
+        "is_alarm": False,
+    }
+
+    assert_true(d.normalize_watchdog_phase(legacy) == "response", f"{label}: missing watchdog_phase should default to response")
+    print(f"  PASS  {label}")
+
+
+def scenario_delivery_watchdog_aggregate_leg_coexists_with_response(label: str, tmpdir: Path) -> None:
+    participants = {
+        "manager": {"alias": "manager", "agent_type": "claude", "pane": "%97"},
+        "w1": {"alias": "w1", "agent_type": "codex", "pane": "%96"},
+        "w2": {"alias": "w2", "agent_type": "codex", "pane": "%95"},
+    }
+    d = make_daemon(tmpdir, participants)
+    agg_id = "agg-delivery-watchdog"
+    msg1 = test_message("msg-agg-w1-delivery", frm="manager", to="w1", status="pending")
+    msg2 = test_message("msg-agg-w2-delivery", frm="manager", to="w2", status="pending")
+    for msg in (msg1, msg2):
+        msg["watchdog_delay_sec"] = 60.0
+        msg["aggregate_id"] = agg_id
+        msg["aggregate_expected"] = ["w1", "w2"]
+        msg["aggregate_message_ids"] = {"w1": "msg-agg-w1-delivery", "w2": "msg-agg-w2-delivery"}
+        d.enqueue_ipc_message(msg)
+    d.try_deliver("w1")
+    d.try_deliver("w2")
+    w1_item = _queue_item(d, "msg-agg-w1-delivery") or {}
+    d.handle_prompt_submitted({"agent": "w1", "bridge_agent": "w1", "nonce": w1_item.get("nonce"), "turn_id": "t-agg-w1", "prompt": ""})
+
+    assert_true(not _watchdogs_for_message(d, "msg-agg-w1-delivery", "delivery"), f"{label}: delivered aggregate leg should not keep delivery watchdog")
+    assert_true(_watchdogs_for_message(d, "msg-agg-w2-delivery", "delivery"), f"{label}: stuck aggregate leg should keep per-leg delivery watchdog")
+    aggregate_response = [
+        wd for wd in d.watchdogs.values()
+        if wd.get("ref_aggregate_id") == agg_id and wd.get("watchdog_phase") == "response"
+    ]
+    assert_true(len(aggregate_response) == 1, f"{label}: aggregate response watchdog should coexist with per-leg delivery watchdog: {d.watchdogs}")
+    w2_wake, w2_wd = _watchdogs_for_message(d, "msg-agg-w2-delivery", "delivery")[0]
+    w2_wd["deadline"] = time.time() - 1.0
+    d.watchdogs[w2_wake] = w2_wd
+    d.check_watchdogs()
+    notices = [it for it in d.queue.read() if it.get("from") == "bridge" and it.get("to") == "manager" and it.get("intent") == "watchdog_wake"]
+    assert_true(len(notices) == 1, f"{label}: aggregate delivery leg should wake requester once: {notices}")
+    body = str(notices[0].get("body") or "")
+    assert_true("msg-agg-w2-delivery" in body and "not completed bridge delivery" in body, f"{label}: aggregate delivery wake should be leg-specific delivery text: {body!r}")
+    assert_true("aggregate " not in body.lower(), f"{label}: aggregate delivery wake must not use aggregate-response wording: {body!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_delivery_watchdog_aggregate_interrupt_cancels_leg_only(label: str, tmpdir: Path) -> None:
+    participants = {
+        "manager": {"alias": "manager", "agent_type": "claude", "pane": "%97"},
+        "w1": {"alias": "w1", "agent_type": "codex", "pane": "%96"},
+        "w2": {"alias": "w2", "agent_type": "codex", "pane": "%95"},
+    }
+    d = make_daemon(tmpdir, participants)
+    agg_id = "agg-delivery-interrupt"
+    msg_w1 = test_message("msg-agg-int-w1", frm="manager", to="w1", status="pending")
+    msg_w2 = test_message("msg-agg-int-w2", frm="manager", to="w2", status="pending")
+    for msg in (msg_w1, msg_w2):
+        msg["watchdog_delay_sec"] = 60.0
+        msg["aggregate_id"] = agg_id
+        msg["aggregate_expected"] = ["w1", "w2"]
+        msg["aggregate_message_ids"] = {"w1": "msg-agg-int-w1", "w2": "msg-agg-int-w2"}
+        d.enqueue_ipc_message(msg)
+    d.try_deliver("w1")
+    d.try_deliver("w2")
+    w1_item = _queue_item(d, "msg-agg-int-w1") or {}
+    d.handle_prompt_submitted({"agent": "w1", "bridge_agent": "w1", "nonce": w1_item.get("nonce"), "turn_id": "t-agg-int-w1", "prompt": ""})
+    aggregate_wake = next(
+        wake_id for wake_id, wd in d.watchdogs.items()
+        if wd.get("ref_aggregate_id") == agg_id and wd.get("watchdog_phase") == "response"
+    )
+    w2_wake = _watchdogs_for_message(d, "msg-agg-int-w2", "delivery")[0][0]
+
+    result = d.handle_interrupt(sender="manager", target="w2")
+
+    assert_true(result.get("esc_sent") is True, f"{label}: interrupt should succeed")
+    assert_true(w2_wake not in d.watchdogs, f"{label}: interrupted delivery leg watchdog should be cancelled: {d.watchdogs}")
+    assert_true(aggregate_wake in d.watchdogs, f"{label}: aggregate response watchdog should remain after cancelling one delivery leg: {d.watchdogs}")
+    print(f"  PASS  {label}")
+
+
+def scenario_aggregate_response_watchdog_text_uses_progress(label: str, tmpdir: Path) -> None:
+    participants = {
+        "manager": {"alias": "manager", "agent_type": "claude", "pane": "%97"},
+        "w1": {"alias": "w1", "agent_type": "codex", "pane": "%96"},
+        "w2": {"alias": "w2", "agent_type": "codex", "pane": "%95"},
+    }
+    d = make_daemon(tmpdir, participants)
+    agg_id = "agg-response-text"
+    with locked_json(Path(d.aggregate_file), {"version": 1, "aggregates": {}}) as data:
+        data.setdefault("aggregates", {})[agg_id] = {
+            "id": agg_id,
+            "requester": "manager",
+            "expected": ["w1", "w2"],
+            "message_ids": {"w1": "msg-agg-text-w1", "w2": "msg-agg-text-w2"},
+            "replies": {"w1": {"from": "w1", "body": "ok", "reply_to": "msg-agg-text-w1"}},
+            "status": "collecting",
+            "delivered": False,
+        }
+    wd = {
+        "sender": "manager",
+        "deadline": time.time(),
+        "watchdog_phase": "response",
+        "ref_message_id": "msg-agg-text-w1",
+        "ref_aggregate_id": agg_id,
+        "ref_to": "w1",
+        "ref_kind": "request",
+        "ref_intent": "test",
+        "ref_causal_id": "causal-agg-text",
+        "ref_aggregate_expected": ["w1", "w2"],
+        "is_alarm": False,
+    }
+
+    text = d.build_watchdog_fire_text(wd)
+
+    assert_true(f"aggregate {agg_id} has not completed" in text, f"{label}: aggregate response text should identify aggregate: {text!r}")
+    assert_true("Replied: 1/2" in text and "Missing peers: w2" in text, f"{label}: aggregate response text should include progress: {text!r}")
+    assert_true("not completed bridge delivery" not in text, f"{label}: aggregate response text should not use delivery wording: {text!r}")
     print(f"  PASS  {label}")
 
 
@@ -6692,6 +7063,44 @@ def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, t
     print(f"  PASS  {label}")
 
 
+def scenario_watchdog_phase_doc_surfaces_are_consistent(label: str, tmpdir: Path) -> None:
+    phase_tokens = ["delivery/submission", "response", "same <sec> per phase", "up to two phase intervals"]
+    extend_tokens = ["inflight/submitted delivery", "delivered aggregate response"]
+
+    cheat = "\n".join(bridge_instructions.model_cheat_sheet())
+    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
+    for token in phase_tokens:
+        assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing watchdog phase token {token!r}")
+        assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing watchdog phase token {token!r}")
+    for token in extend_tokens:
+        assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing extend token {token!r}")
+
+    send_help = subprocess.run(
+        [sys.executable, str(LIBEXEC / "bridge_send_peer.py"), "--help"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    send_help_text = " ".join((send_help.stdout + send_help.stderr).split())
+    assert_true(send_help.returncode == 0, f"{label}: agent_send_peer --help should exit 0, got {send_help.returncode}: {send_help_text!r}")
+    for token in ("per phase", "delivery/submission", "response"):
+        assert_true(token in send_help_text, f"{label}: bridge_send_peer help missing {token!r}: {send_help_text!r}")
+
+    extend_help = subprocess.run(
+        [sys.executable, str(LIBEXEC / "bridge_extend_wait.py"), "--help"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    extend_help_text = " ".join((extend_help.stdout + extend_help.stderr).split())
+    assert_true(extend_help.returncode == 0, f"{label}: agent_extend_wait --help should exit 0, got {extend_help.returncode}: {extend_help_text!r}")
+    for token in ("delivery", "response"):
+        assert_true(token in extend_help_text, f"{label}: bridge_extend_wait help missing {token!r}: {extend_help_text!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_view_peer_render_output_model_safe(label: str, tmpdir: Path) -> None:
     bv = _import_view_peer()
     import contextlib
@@ -10707,6 +11116,20 @@ def main() -> int:
             ("extend_wait_unknown_message", scenario_extend_wait_unknown_message),
             ("extend_wait_pending_rejected", scenario_extend_wait_pending_rejected),
             ("extend_wait_not_owner", scenario_extend_wait_not_owner),
+            ("delivery_watchdog_arms_on_reserve", scenario_delivery_watchdog_arms_on_reserve),
+            ("delivery_watchdog_fire_inflight_notice", scenario_delivery_watchdog_fire_inflight_notice),
+            ("delivery_watchdog_extend_replaces_wake", scenario_delivery_watchdog_extend_replaces_wake),
+            ("delivery_watchdog_submitted_extend_and_text", scenario_delivery_watchdog_submitted_extend_and_text),
+            ("delivery_watchdog_aggregate_pending_extend_rejected", scenario_delivery_watchdog_aggregate_pending_extend_rejected),
+            ("delivery_watchdog_replaced_by_response_on_delivered", scenario_delivery_watchdog_replaced_by_response_on_delivered),
+            ("delivery_watchdog_requeue_cancels", scenario_delivery_watchdog_requeue_cancels),
+            ("delivery_watchdog_mark_pending_cancels", scenario_delivery_watchdog_mark_pending_cancels),
+            ("delivery_watchdog_pane_mode_reverts_cancel", scenario_delivery_watchdog_pane_mode_reverts_cancel),
+            ("delivery_watchdog_phase_mismatch_skipped", scenario_delivery_watchdog_phase_mismatch_skipped),
+            ("watchdog_phase_legacy_default_response", scenario_watchdog_phase_legacy_default_response),
+            ("delivery_watchdog_aggregate_leg_coexists_with_response", scenario_delivery_watchdog_aggregate_leg_coexists_with_response),
+            ("delivery_watchdog_aggregate_interrupt_cancels_leg_only", scenario_delivery_watchdog_aggregate_interrupt_cancels_leg_only),
+            ("aggregate_response_watchdog_text_uses_progress", scenario_aggregate_response_watchdog_text_uses_progress),
             ("duplicate_enqueue_does_not_cancel_alarm", scenario_duplicate_enqueue_does_not_cancel_alarm),
             ("alarm_op_invalid_delay_is_rejected", scenario_alarm_op_invalid_delay_is_rejected_not_crashed),
             ("send_peer_watchdog_negative_one_rejected", scenario_send_peer_watchdog_negative_one_rejected),
@@ -10918,6 +11341,7 @@ def main() -> int:
             ("interrupt_peer_doc_surfaces_disclose_no_op_race", scenario_interrupt_peer_doc_surfaces_disclose_no_op_race),
             ("prompt_intercepted_doc_surfaces_disclose_user_typing_collision", scenario_prompt_intercepted_doc_surfaces_disclose_user_typing_collision),
             ("send_peer_wait_doc_surfaces_name_blocking_consequence", scenario_send_peer_wait_doc_surfaces_name_blocking_consequence),
+            ("watchdog_phase_doc_surfaces_are_consistent", scenario_watchdog_phase_doc_surfaces_are_consistent),
             ("view_peer_render_output_model_safe", scenario_view_peer_render_output_model_safe),
             ("view_peer_search_explicit_snapshot_uses_safe_ref", scenario_view_peer_search_explicit_snapshot_uses_safe_ref),
             ("view_peer_snapshot_ref_collision_unique", scenario_view_peer_snapshot_ref_collision_unique),

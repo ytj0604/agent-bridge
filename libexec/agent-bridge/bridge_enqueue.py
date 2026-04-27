@@ -32,9 +32,9 @@ from bridge_util import (
 )
 
 # v1.5: enforce request-only watchdog and provide a default delay for
-# requests. Default 5 minutes, override via env. The watchdog itself is
-# armed at delivery time inside the daemon (mark_message_delivered uses
-# the watchdog_delay_sec metadata).
+# requests. Default 5 minutes, override via env. The daemon treats this
+# as a per-phase delay: delivery watchdog from inflight reservation, then
+# response watchdog after prompt submission marks the message delivered.
 USER_SENDABLE_KINDS = sorted({"request", "notice"})
 
 
@@ -172,7 +172,7 @@ def main() -> int:
         "--watchdog",
         type=float,
         default=None,
-        help="seconds (counted from delivery, i.e. when the prompt is injected into the peer's pane) after which to wake the sender if no response_finished arrived. 0 disables.",
+        help="seconds per phase after which to wake the sender: first if bridge delivery/submission stalls, then after prompt delivery if no response_finished arrived. 0 disables.",
     )
     args = parser.parse_args()
 

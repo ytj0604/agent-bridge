@@ -73,6 +73,9 @@ PANE_MODE_ENTER_DEFER_KEYS = (
 INTERRUPTED_TOMBSTONE_LIMIT_PER_AGENT = 16
 INTERRUPTED_TOMBSTONE_TTL_SECONDS = 600.0
 EMPTY_RESPONSE_BODY = "(empty response)"
+WATCHDOG_PHASE_DELIVERY = "delivery"
+WATCHDOG_PHASE_RESPONSE = "response"
+WATCHDOG_PHASE_ALARM = "alarm"
 _STOP_SIGNAL: int | None = None
 PROMPT_BODY_CONTROL_TRANSLATION = {
     codepoint: None
@@ -790,8 +793,9 @@ class BridgeDaemon:
         # against the now-queued item. The same step is invoked by
         # handle_external_message_queued for the file-fallback ingress
         # path, so the alarm-cancel semantics is defined in exactly one
-        # place (_apply_alarm_cancel_to_queued_message). Watchdog is
-        # armed later at delivery time inside mark_message_delivered_by_id.
+        # place (_apply_alarm_cancel_to_queued_message). Request watchdogs
+        # arm later in two phases: delivery at pending->inflight reservation,
+        # then response at inflight->delivered prompt submission.
         with self.state_lock:
             if any(it.get("id") == message["id"] for it in self.queue.read()):
                 self.log("message_enqueue_skipped_duplicate", message_id=message["id"], from_agent=message.get("from"), to=message.get("to"))
@@ -1247,7 +1251,10 @@ class BridgeDaemon:
                 return result
             return None
 
-        return self.queue.update(mutator)
+        result = self.queue.update(mutator)
+        if result:
+            self.cancel_watchdogs_for_message(message_id, reason="pane_mode_probe_failed", phase=WATCHDOG_PHASE_DELIVERY)
+        return result
 
     def blocked_duration(self, item: dict | None) -> float | None:
         if not item:
@@ -1396,7 +1403,10 @@ class BridgeDaemon:
                 return result
             return None
 
-        return self.queue.update(mutator)
+        result = self.queue.update(mutator)
+        if result:
+            self.cancel_watchdogs_for_message(message_id, reason="pane_mode_deferred", phase=WATCHDOG_PHASE_DELIVERY)
+        return result
 
     def mark_enter_deferred_for_pane_mode(self, message_id: str, target: str, mode: str, error: str = "") -> dict | None:
         now_ts = time.time()
@@ -1464,32 +1474,38 @@ class BridgeDaemon:
         self.try_deliver(str(message["to"]))
 
     def reserve_next(self, target: str) -> dict | None:
-        if (
-            self.busy.get(target)
-            or self.reserved.get(target)
-            or self.interrupt_partial_failure_blocks.get(target)
-        ):
-            return None
-
-        def mutator(queue: list[dict]) -> dict | None:
-            # `delivered` is also a delivery blocker so that, even after a
-            # daemon restart that wipes in-memory busy/reserved state, a
-            # message that was already injected into the peer's pane is
-            # not redelivered nor allowed to be overlaid by a fresh prompt
-            # before its terminal response_finished is observed.
-            if any(item.get("to") == target and item.get("status") in {"inflight", "submitted", "delivered"} for item in queue):
+        with self.state_lock:
+            if (
+                self.busy.get(target)
+                or self.reserved.get(target)
+                or self.interrupt_partial_failure_blocks.get(target)
+            ):
                 return None
-            for item in queue:
-                if item.get("to") != target or item.get("status") != "pending":
-                    continue
-                item["status"] = "inflight"
-                item["nonce"] = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
-                item["updated_ts"] = utc_now()
-                item["delivery_attempts"] = int(item.get("delivery_attempts") or 0) + 1
-                return dict(item)
-            return None
 
-        return self.queue.update(mutator)
+            def mutator(queue: list[dict]) -> dict | None:
+                # `delivered` is also a delivery blocker so that, even after a
+                # daemon restart that wipes in-memory busy/reserved state, a
+                # message that was already injected into the peer's pane is
+                # not redelivered nor allowed to be overlaid by a fresh prompt
+                # before its terminal response_finished is observed.
+                if any(item.get("to") == target and item.get("status") in {"inflight", "submitted", "delivered"} for item in queue):
+                    return None
+                for item in queue:
+                    if item.get("to") != target or item.get("status") != "pending":
+                        continue
+                    now_iso = utc_now()
+                    item["status"] = "inflight"
+                    item["nonce"] = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+                    item["inflight_ts"] = now_iso
+                    item["updated_ts"] = now_iso
+                    item["delivery_attempts"] = int(item.get("delivery_attempts") or 0) + 1
+                    return dict(item)
+                return None
+
+            message = self.queue.update(mutator)
+            if message:
+                self.arm_message_watchdog(message, WATCHDOG_PHASE_DELIVERY)
+            return message
 
     def try_deliver(self, target: str | None = None) -> None:
         self.reload_participants()
@@ -1650,6 +1666,7 @@ class BridgeDaemon:
                             item.pop(key, None)
 
         self.queue.update(mutator)
+        self.cancel_watchdogs_for_message(message_id, reason="delivery_requeued", phase=WATCHDOG_PHASE_DELIVERY)
 
     def mark_message_submitted(self, message_id: str) -> None:
         def mutator(queue: list[dict]) -> None:
@@ -1668,40 +1685,48 @@ class BridgeDaemon:
         v1.5.2 authoritative path. Verifies recipient and status before
         flipping state — never trust hook-extracted nonce alone.
         """
-        def mutator(queue: list[dict]) -> dict | None:
-            for item in queue:
-                if item.get("id") != message_id:
-                    continue
-                if item.get("to") != agent or item.get("status") != "inflight":
-                    return None
-                item["status"] = "delivered"
-                item["delivered_ts"] = utc_now()
-                item["updated_ts"] = utc_now()
-                item.pop("last_error", None)
-                for key in PANE_MODE_METADATA_KEYS + PANE_MODE_ENTER_DEFER_KEYS:
-                    item.pop(key, None)
-                return dict(item)
-            return None
+        with self.state_lock:
+            def mutator(queue: list[dict]) -> dict | None:
+                for item in queue:
+                    if item.get("id") != message_id:
+                        continue
+                    if item.get("to") != agent or item.get("status") != "inflight":
+                        return None
+                    now_iso = utc_now()
+                    item["status"] = "delivered"
+                    item["delivered_ts"] = now_iso
+                    item["updated_ts"] = now_iso
+                    item.pop("last_error", None)
+                    for key in PANE_MODE_METADATA_KEYS + PANE_MODE_ENTER_DEFER_KEYS:
+                        item.pop(key, None)
+                    return dict(item)
+                return None
 
-        message = self.queue.update(mutator)
-        # v1.5 semantics: arm the watchdog at delivery time. The countdown
-        # is "time since the prompt was actually injected into the peer's
-        # pane", not since enqueue. If the message is never delivered
-        # (peer held forever / dead), no watchdog ever fires; that is the
-        # accepted v1.5 trade-off.
-        if message and message.get("watchdog_delay_sec") is not None:
-            try:
-                raw_delay = float(message["watchdog_delay_sec"])
-            except (TypeError, ValueError):
-                delay = None
-            else:
-                delay = raw_delay if math.isfinite(raw_delay) and raw_delay >= 0 else None
-            if delay is not None:
-                deadline = datetime.now(timezone.utc) + timedelta(seconds=delay)
-                arm_msg = dict(message)
-                arm_msg["watchdog_at"] = deadline.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-                self.register_watchdog(arm_msg)
-        return message
+            message = self.queue.update(mutator)
+            if message:
+                self.cancel_watchdogs_for_message(str(message_id), reason="delivered", phase=WATCHDOG_PHASE_DELIVERY)
+                self.arm_message_watchdog(message, WATCHDOG_PHASE_RESPONSE)
+            return message
+
+    def arm_message_watchdog(self, message: dict, phase: str) -> None:
+        if message.get("watchdog_delay_sec") is None:
+            return
+        try:
+            raw_delay = float(message["watchdog_delay_sec"])
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(raw_delay) or raw_delay < 0:
+            return
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=raw_delay)
+        arm_msg = dict(message)
+        arm_msg["watchdog_phase"] = phase
+        arm_msg["watchdog_phase_started_ts"] = (
+            message.get("inflight_ts")
+            if phase == WATCHDOG_PHASE_DELIVERY
+            else message.get("delivered_ts")
+        ) or message.get("updated_ts") or message.get("created_ts")
+        arm_msg["watchdog_at"] = deadline.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        self.register_watchdog(arm_msg)
 
     def upsert_message_watchdog(self, sender: str, message_id: str, additional_sec: float) -> tuple[bool, str | None, str | None]:
         # All validation + upsert inside a single state_lock acquire so the
@@ -1715,14 +1740,11 @@ class BridgeDaemon:
                 return False, "message_not_found", None
             if str(item.get("from") or "") != sender:
                 return False, "not_owner", None
-            if item.get("aggregate_id"):
+            status = str(item.get("status") or "")
+            if status not in {"inflight", "submitted", "delivered"}:
+                return False, "message_not_extendable_state", None
+            if item.get("aggregate_id") and status == "delivered":
                 return False, "aggregate_extend_not_supported", None
-            # D1 semantic: a watchdog only counts down once the prompt has
-            # been delivered to the peer. Refuse to (re)arm for messages
-            # that are still pending/inflight/submitted; the sender should
-            # use agent_view_peer / agent_interrupt_peer to unblock instead.
-            if item.get("status") != "delivered":
-                return False, "message_not_in_delivered_state", None
             try:
                 additional_value = float(additional_sec)
             except (TypeError, ValueError):
@@ -1731,11 +1753,12 @@ class BridgeDaemon:
                 return False, "seconds_must_be_positive", None
             new_deadline = datetime.now(timezone.utc) + timedelta(seconds=additional_value)
             new_deadline_iso = new_deadline.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-            for wake_id in list(self.watchdogs.keys()):
-                wd = self.watchdogs.get(wake_id)
-                if wd and wd.get("ref_message_id") == message_id and not wd.get("is_alarm"):
-                    self.watchdogs.pop(wake_id, None)
+            phase = WATCHDOG_PHASE_RESPONSE if status == "delivered" else WATCHDOG_PHASE_DELIVERY
             arm_msg = dict(item)
+            arm_msg["watchdog_phase"] = phase
+            arm_msg["watchdog_phase_started_ts"] = (
+                item.get("delivered_ts") if phase == WATCHDOG_PHASE_RESPONSE else item.get("inflight_ts")
+            ) or item.get("updated_ts") or item.get("created_ts")
             arm_msg["watchdog_at"] = new_deadline_iso
             self.register_watchdog(arm_msg)
             self.log(
@@ -1743,7 +1766,8 @@ class BridgeDaemon:
                 message_id=message_id,
                 new_deadline=new_deadline_iso,
                 additional_sec=additional_value,
-                status=item.get("status"),
+                status=status,
+                watchdog_phase=phase,
             )
             return True, None, new_deadline_iso
 
@@ -1924,26 +1948,36 @@ class BridgeDaemon:
             return
         aggregate_id = message.get("aggregate_id")
         message_id = message.get("id")
+        phase = self.normalize_watchdog_phase(message)
         with self.state_lock:
-            if aggregate_id:
-                # An aggregate yields N messages with the same aggregate_id; only
-                # register a single watchdog so the sender receives at most one
-                # wake notice when the deadline elapses.
+            if aggregate_id and phase == WATCHDOG_PHASE_RESPONSE:
+                # Aggregate response watches are aggregate-wide: one wake tells
+                # the requester that the broadcast has not completed.
                 for existing in self.watchdogs.values():
-                    if existing.get("ref_aggregate_id") == aggregate_id and not existing.get("is_alarm"):
+                    if (
+                        existing
+                        and existing.get("ref_aggregate_id") == aggregate_id
+                        and self.normalize_watchdog_phase(existing) == WATCHDOG_PHASE_RESPONSE
+                        and not existing.get("is_alarm")
+                    ):
                         return
             elif message_id:
-                # Non-aggregate: dedupe by ref_message_id so that a redelivery
-                # or extend_wait does not produce two concurrent watchdogs for
-                # the same request.
+                # Delivery watches are per leg, including aggregate legs. For
+                # non-aggregate requests the response watch replaces the
+                # delivery watch by message id.
                 for wake_id_existing in list(self.watchdogs.keys()):
                     existing = self.watchdogs.get(wake_id_existing)
-                    if existing and existing.get("ref_message_id") == message_id and not existing.get("is_alarm"):
-                        self.watchdogs.pop(wake_id_existing, None)
+                    if not existing or existing.get("is_alarm") or existing.get("ref_message_id") != message_id:
+                        continue
+                    existing_phase = self.normalize_watchdog_phase(existing)
+                    if aggregate_id and phase == WATCHDOG_PHASE_DELIVERY and existing_phase != WATCHDOG_PHASE_DELIVERY:
+                        continue
+                    self.watchdogs.pop(wake_id_existing, None)
             wake_id = short_id("wake")
             self.watchdogs[wake_id] = {
                 "sender": sender,
                 "deadline": deadline,
+                "watchdog_phase": phase,
                 "ref_message_id": message.get("id"),
                 "ref_aggregate_id": message.get("aggregate_id"),
                 "ref_to": message.get("to"),
@@ -1952,6 +1986,7 @@ class BridgeDaemon:
                 "ref_causal_id": message.get("causal_id"),
                 "ref_aggregate_expected": list(message.get("aggregate_expected") or []),
                 "ref_created_ts": message.get("created_ts"),
+                "ref_phase_started_ts": message.get("watchdog_phase_started_ts"),
                 "is_alarm": bool(message.get("alarm")),
             }
             self.log(
@@ -1962,8 +1997,17 @@ class BridgeDaemon:
                 ref_aggregate_id=message.get("aggregate_id"),
                 deadline=deadline_iso,
                 kind=message.get("kind"),
+                watchdog_phase=phase,
                 is_alarm=bool(message.get("alarm")),
             )
+
+    def normalize_watchdog_phase(self, wd: dict) -> str:
+        if wd.get("is_alarm") or wd.get("alarm"):
+            return WATCHDOG_PHASE_ALARM
+        raw = str(wd.get("watchdog_phase") or "")
+        if raw in {WATCHDOG_PHASE_DELIVERY, WATCHDOG_PHASE_RESPONSE}:
+            return raw
+        return WATCHDOG_PHASE_RESPONSE
 
     def register_alarm(self, sender: str, delay_seconds: float, body: str | None = None) -> str | None:
         if not sender or sender == "bridge":
@@ -1980,6 +2024,7 @@ class BridgeDaemon:
             self.watchdogs[wake_id] = {
                 "sender": sender,
                 "deadline": deadline,
+                "watchdog_phase": WATCHDOG_PHASE_ALARM,
                 "ref_message_id": None,
                 "ref_aggregate_id": None,
                 "ref_to": None,
@@ -2008,6 +2053,8 @@ class BridgeDaemon:
 
     def stamp_turn_id_mismatch_post_watchdog_unblock(self, wd: dict) -> None:
         if wd.get("is_alarm"):
+            return
+        if self.normalize_watchdog_phase(wd) != WATCHDOG_PHASE_RESPONSE:
             return
         try:
             deadline = float(wd.get("deadline"))
@@ -2038,8 +2085,9 @@ class BridgeDaemon:
             if custom:
                 return f"{base} Note: {custom}. {hint}"
             return f"{base} {hint}"
+        phase = self.normalize_watchdog_phase(wd)
         agg = wd.get("ref_aggregate_id")
-        if agg:
+        if agg and phase == WATCHDOG_PHASE_RESPONSE:
             return (
                 f"[bridge:watchdog] aggregate {agg} has not completed within its deadline. "
                 f"{self._aggregate_watchdog_progress_text(agg, wd)} "
@@ -2056,7 +2104,7 @@ class BridgeDaemon:
                 "(stale entry). No action required."
             )
         status = str(item.get("status") or "")
-        if status == "delivered":
+        if phase == WATCHDOG_PHASE_RESPONSE and status == "delivered":
             return (
                 f"[bridge:watchdog] Your {kind} {msg_id} to {to} has been processing for "
                 f"{elapsed_text} without a response. Choose ONE of:\n"
@@ -2064,12 +2112,17 @@ class BridgeDaemon:
                 f"  agent_interrupt_peer {to}          (cancel and stop the peer)\n"
                 f"  agent_view_peer {to}               (inspect what the peer is doing)"
             )
-        # Pending / inflight / submitted: not yet delivered to peer.
+        if phase == WATCHDOG_PHASE_DELIVERY and status in {"inflight", "submitted"}:
+            return (
+                f"[bridge:watchdog] Your {kind} {msg_id} to {to} has not completed bridge delivery for "
+                f"{elapsed_text} (status={status}). Choose ONE of:\n"
+                f"  agent_extend_wait {msg_id} <sec>   (keep waiting on this same delivery attempt)\n"
+                f"  agent_interrupt_peer {to}          (cancel and stop the peer)\n"
+                f"  agent_view_peer {to}               (inspect the peer pane)"
+            )
         return (
-            f"[bridge:watchdog] Your {kind} {msg_id} to {to} has been queued for "
-            f"{elapsed_text} and is NOT yet delivered (status={status}). The peer may be "
-            "busy with earlier delivered/inflight work, waiting on a pane-mode deferral, "
-            "or temporarily unreachable. "
+            f"[bridge:watchdog] Your {kind} {msg_id} to {to} is in unexpected watchdog phase "
+            f"{phase!r} with queue status={status} after {elapsed_text}. "
             f"Inspect with agent_interrupt_peer {to} --status or agent_view_peer {to}."
         )
 
@@ -2084,9 +2137,15 @@ class BridgeDaemon:
     def _watchdog_elapsed_text(self, item: dict | None, wd: dict) -> str:
         ref_ts = None
         if item:
-            ref_ts = item.get("delivered_ts") or item.get("created_ts")
+            phase = self.normalize_watchdog_phase(wd)
+            if phase == WATCHDOG_PHASE_DELIVERY:
+                ref_ts = item.get("inflight_ts") or item.get("updated_ts") or item.get("created_ts")
+            elif phase == WATCHDOG_PHASE_RESPONSE:
+                ref_ts = item.get("delivered_ts") or item.get("created_ts")
+            else:
+                ref_ts = item.get("created_ts")
         if not ref_ts:
-            ref_ts = wd.get("ref_created_ts")
+            ref_ts = wd.get("ref_phase_started_ts") or wd.get("ref_created_ts")
         if not ref_ts:
             return "an unknown duration"
         try:
@@ -2118,6 +2177,43 @@ class BridgeDaemon:
             text += f" Missing peers: {', '.join(missing)}."
         return text
 
+    def watchdog_fire_skip_reason(self, wd: dict) -> str:
+        if wd.get("is_alarm"):
+            return ""
+        phase = self.normalize_watchdog_phase(wd)
+        message_id = str(wd.get("ref_message_id") or "")
+        aggregate_id = str(wd.get("ref_aggregate_id") or "")
+        if phase == WATCHDOG_PHASE_DELIVERY:
+            if not message_id:
+                return "delivery_missing_message_id"
+            item = self._lookup_queue_item(message_id)
+            if not item:
+                return "delivery_message_missing"
+            status = str(item.get("status") or "")
+            if status not in {"inflight", "submitted"}:
+                return f"delivery_status_{status or 'missing'}"
+            return ""
+        if phase == WATCHDOG_PHASE_RESPONSE and aggregate_id:
+            try:
+                data = read_json(self.aggregate_file, {"aggregates": {}})
+                aggregate = (data.get("aggregates") or {}).get(aggregate_id) or {}
+            except Exception:
+                aggregate = {}
+            if aggregate and (aggregate.get("delivered") or aggregate.get("status") == "complete"):
+                return "aggregate_complete"
+            return ""
+        if phase == WATCHDOG_PHASE_RESPONSE:
+            if not message_id:
+                return "response_missing_message_id"
+            item = self._lookup_queue_item(message_id)
+            if not item:
+                return "response_message_missing"
+            status = str(item.get("status") or "")
+            if status != "delivered":
+                return f"response_status_{status or 'missing'}"
+            return ""
+        return f"unknown_phase_{phase}"
+
     def fire_watchdog(self, wake_id: str, wd: dict) -> None:
         sender = str(wd.get("sender") or "")
         self.reload_participants()
@@ -2130,21 +2226,17 @@ class BridgeDaemon:
                 reason="sender_not_active",
             )
             return
-        # Stale skip: a non-aggregate, non-alarm watchdog whose target queue
-        # item is gone is stale (already responded / cancelled / etc). Do not
-        # wake the sender.
-        if (
-            not wd.get("is_alarm")
-            and not wd.get("ref_aggregate_id")
-            and wd.get("ref_message_id")
-            and self._lookup_queue_item(str(wd.get("ref_message_id"))) is None
-        ):
+        skip_reason = self.watchdog_fire_skip_reason(wd)
+        if skip_reason:
             self.watchdogs.pop(wake_id, None)
             self.log(
                 "watchdog_skipped_stale",
                 wake_id=wake_id,
                 sender=sender,
                 ref_message_id=wd.get("ref_message_id"),
+                ref_aggregate_id=wd.get("ref_aggregate_id"),
+                watchdog_phase=self.normalize_watchdog_phase(wd),
+                reason=skip_reason,
             )
             return
         self.stamp_turn_id_mismatch_post_watchdog_unblock(wd)
@@ -2176,6 +2268,7 @@ class BridgeDaemon:
             sender=sender,
             ref_message_id=wd.get("ref_message_id"),
             ref_aggregate_id=wd.get("ref_aggregate_id"),
+            watchdog_phase=self.normalize_watchdog_phase(wd),
             is_alarm=bool(wd.get("is_alarm")),
             synthetic_message_id=synthetic["id"],
         )
@@ -2212,8 +2305,11 @@ class BridgeDaemon:
             if msg_id:
                 self.last_enter_ts.pop(str(msg_id), None)
             agg_id = cm.get("aggregate_id")
-            if not agg_id and msg_id:
-                self.cancel_watchdogs_for_message(str(msg_id), reason=reason)
+            if msg_id:
+                if agg_id:
+                    self.cancel_watchdogs_for_message(str(msg_id), reason=reason, phase=WATCHDOG_PHASE_DELIVERY)
+                else:
+                    self.cancel_watchdogs_for_message(str(msg_id), reason=reason)
 
         # Active context's message_id should normally be in `cancelled`
         # when cancelling delivered messages, but defend against state that
@@ -2221,7 +2317,9 @@ class BridgeDaemon:
         cancelled_ids = {cm.get("id") for cm in cancelled}
         act_id = active_context.get("id")
         if act_id and act_id not in cancelled_ids:
-            if not active_context.get("aggregate_id"):
+            if active_context.get("aggregate_id"):
+                self.cancel_watchdogs_for_message(str(act_id), reason=reason, phase=WATCHDOG_PHASE_DELIVERY)
+            else:
                 self.cancel_watchdogs_for_message(str(act_id), reason=reason)
 
         for cm in cancelled:
@@ -2749,23 +2847,51 @@ class BridgeDaemon:
         self.try_deliver()
         return info
 
-    def cancel_watchdogs_for_message(self, message_id: str | None, reason: str = "reply_received") -> None:
+    def cancel_watchdogs_for_message(
+        self,
+        message_id: str | None,
+        reason: str = "reply_received",
+        *,
+        phase: str | None = None,
+    ) -> None:
         if not message_id:
             return
         for wake_id in list(self.watchdogs.keys()):
             wd = self.watchdogs.get(wake_id)
-            if wd and wd.get("ref_message_id") == message_id and not wd.get("is_alarm"):
+            if (
+                wd
+                and wd.get("ref_message_id") == message_id
+                and not wd.get("is_alarm")
+                and (phase is None or self.normalize_watchdog_phase(wd) == phase)
+            ):
                 self.watchdogs.pop(wake_id, None)
-                self.log("watchdog_cancelled", wake_id=wake_id, reason=reason, ref_message_id=message_id)
+                self.log(
+                    "watchdog_cancelled",
+                    wake_id=wake_id,
+                    reason=reason,
+                    ref_message_id=message_id,
+                    watchdog_phase=self.normalize_watchdog_phase(wd),
+                )
 
     def cancel_watchdogs_for_aggregate(self, aggregate_id: str | None, reason: str = "aggregate_complete") -> None:
         if not aggregate_id:
             return
         for wake_id in list(self.watchdogs.keys()):
             wd = self.watchdogs.get(wake_id)
-            if wd and wd.get("ref_aggregate_id") == aggregate_id and not wd.get("is_alarm"):
+            if (
+                wd
+                and wd.get("ref_aggregate_id") == aggregate_id
+                and self.normalize_watchdog_phase(wd) == WATCHDOG_PHASE_RESPONSE
+                and not wd.get("is_alarm")
+            ):
                 self.watchdogs.pop(wake_id, None)
-                self.log("watchdog_cancelled", wake_id=wake_id, reason=reason, ref_aggregate_id=aggregate_id)
+                self.log(
+                    "watchdog_cancelled",
+                    wake_id=wake_id,
+                    reason=reason,
+                    ref_aggregate_id=aggregate_id,
+                    watchdog_phase=self.normalize_watchdog_phase(wd),
+                )
 
     def turn_id_mismatch_expiry_deadline(self, context: dict) -> float | None:
         try:
@@ -2784,6 +2910,8 @@ class BridgeDaemon:
         post_watchdog_grace = max(0.0, float(self.turn_id_mismatch_post_watchdog_grace_seconds))
         for wd in self.watchdogs.values():
             if not wd or wd.get("is_alarm"):
+                continue
+            if self.normalize_watchdog_phase(wd) != WATCHDOG_PHASE_RESPONSE:
                 continue
             matches_message = bool(message_id and wd.get("ref_message_id") == message_id)
             matches_aggregate = bool(aggregate_id and wd.get("ref_aggregate_id") == aggregate_id)
@@ -2907,11 +3035,13 @@ class BridgeDaemon:
 
         for item in self.queue.update(mutator):
             target = str(item.get("to"))
+            message_id = str(item.get("id") or "")
             stale_targets.add(target)
             self.discard_nonce(str(item.get("nonce") or ""))
             if self.reserved.get(target) == item.get("id"):
                 self.reserved[target] = None
-            self.last_enter_ts.pop(str(item.get("id") or ""), None)
+            self.last_enter_ts.pop(message_id, None)
+            self.cancel_watchdogs_for_message(message_id, reason="prompt_submit_timeout", phase=WATCHDOG_PHASE_DELIVERY)
             self.log(
                 "message_requeued",
                 message_id=item.get("id"),

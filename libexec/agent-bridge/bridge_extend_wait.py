@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Re-arm the watchdog for a still-pending request.
+"""Re-arm the watchdog for a still-active request.
 
-Used after a watchdog wake when the sender decides to keep waiting on the
-same request rather than interrupting. Only the original sender of the
-request can extend it; aggregate-member messages are not supported in v1.5.
+Used after a delivery or response watchdog wake when the sender decides
+to keep waiting on the same request rather than interrupting. Only the
+original sender of the request can extend it; delivered aggregate-member
+responses are not supported in v1.5.
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ def request_extend(bridge_session: str, sender: str, message_id: str, seconds: f
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="agent_extend_wait",
-        description="Re-arm the watchdog for a request that was previously sent and is still pending; takes effect from now + <sec>.",
+        description="Re-arm the watchdog for a request that was previously sent and is still active in delivery or response; takes effect from now + <sec>.",
     )
     parser.add_argument("message_id", help="message id of the request to extend (printed in watchdog wake notice)")
     parser.add_argument("seconds", type=float, help="additional seconds to wait before the next watchdog wake")
@@ -120,9 +121,9 @@ def main() -> int:
         elif error == "not_owner":
             msg = f"agent_extend_wait: message {args.message_id!r} was not sent by you; only the original sender can extend its watchdog."
         elif error == "aggregate_extend_not_supported":
-            msg = f"agent_extend_wait: message {args.message_id!r} is part of an aggregate broadcast; per-message extend is not supported in v1.5."
-        elif error == "message_not_in_delivered_state":
-            msg = f"agent_extend_wait: message {args.message_id!r} has not been delivered to the peer yet (still pending/inflight). Watchdogs only count down after delivery; use agent_interrupt_peer --status to inspect the target, or interrupt a stuck hold."
+            msg = f"agent_extend_wait: message {args.message_id!r} is a delivered aggregate broadcast member; per-message response extend is not supported in v1.5."
+        elif error in {"message_not_in_delivered_state", "message_not_extendable_state"}:
+            msg = f"agent_extend_wait: message {args.message_id!r} is not in an extendable watchdog state. Pending messages have no active delivery attempt yet; inflight/submitted delivery and delivered response waits can be extended."
         else:
             msg = f"agent_extend_wait: {error}"
         print(msg, file=sys.stderr)

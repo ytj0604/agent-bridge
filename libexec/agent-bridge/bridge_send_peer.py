@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--watchdog",
         type=float,
         metavar="SEC",
-        help="schedule a watchdog wake after SEC seconds since the prompt is delivered to the peer. Request only. Use 0 to explicitly disable the default watchdog.",
+        help="schedule watchdog wakes after SEC seconds per phase: delivery/submission first, then response after prompt delivery. Request only. Use 0 to explicitly disable the default watchdog.",
     )
     parser.add_argument("--stdin", dest="stdin_body", action="store_true", help="read the message body from stdin")
     parser.add_argument("--allow-spoof", action="store_true", help="allow --from/--session to differ from the caller tmux pane lock")
