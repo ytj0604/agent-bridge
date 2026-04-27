@@ -92,7 +92,8 @@ if [[ "$remove_shims" == "1" ]]; then
     agent_view_peer \
     agent_alarm \
     agent_interrupt_peer \
-    agent_extend_wait
+    agent_extend_wait \
+    agent_cancel_message
   do
     path="$bin_dir/$name"
     if [[ -e "$path" || -L "$path" ]]; then

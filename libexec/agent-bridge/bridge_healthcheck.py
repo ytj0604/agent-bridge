@@ -121,6 +121,7 @@ def main() -> int:
     add("agent_alarm_on_path", shutil.which("agent_alarm") is not None, shutil.which("agent_alarm") or "not found")
     add("agent_interrupt_peer_on_path", shutil.which("agent_interrupt_peer") is not None, shutil.which("agent_interrupt_peer") or "not found")
     add("agent_extend_wait_on_path", shutil.which("agent_extend_wait") is not None, shutil.which("agent_extend_wait") or "not found")
+    add("agent_cancel_message_on_path", shutil.which("agent_cancel_message") is not None, shutil.which("agent_cancel_message") or "not found")
     add("bridge_peer_not_on_path", shutil.which("bridge_peer") is None, shutil.which("bridge_peer") or "not found")
     add("list_peer_not_on_path", shutil.which("list_peer") is None, shutil.which("list_peer") or "not found")
     executable_targets = [
@@ -133,6 +134,7 @@ def main() -> int:
         ("agent_alarm_model_tool", model_bin_dir() / "agent_alarm"),
         ("agent_interrupt_peer_model_tool", model_bin_dir() / "agent_interrupt_peer"),
         ("agent_extend_wait_model_tool", model_bin_dir() / "agent_extend_wait"),
+        ("agent_cancel_message_model_tool", model_bin_dir() / "agent_cancel_message"),
         ("bridge_hook_entrypoint", hook_dir() / "bridge-hook"),
     ]
     for label, path in executable_targets:
@@ -168,6 +170,7 @@ def main() -> int:
         "agent_alarm_on_path",
         "agent_interrupt_peer_on_path",
         "agent_extend_wait_on_path",
+        "agent_cancel_message_on_path",
         "bridge_peer_not_on_path",
         "list_peer_not_on_path",
         "bridge_run_target",
@@ -179,6 +182,7 @@ def main() -> int:
         "agent_alarm_model_tool",
         "agent_interrupt_peer_model_tool",
         "agent_extend_wait_model_tool",
+        "agent_cancel_message_model_tool",
         "bridge_hook_entrypoint",
     }
     return 1 if any((not c["ok"]) and c["name"] in hard_failures for c in checks) else 0

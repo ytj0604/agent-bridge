@@ -706,6 +706,21 @@ class BridgeDaemon:
             if not ok:
                 return {"ok": False, "error": err or "extend_failed"}
             return {"ok": True, "new_deadline": deadline, "message_id": message_id}
+        if op == "cancel_message":
+            self.reload_participants()
+            sender = str(request.get("from") or "")
+            message_id = str(request.get("message_id") or "")
+            if sender and sender != "bridge" and sender not in self.participants:
+                return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
+            if not message_id:
+                return {"ok": False, "error": "message_id required"}
+            result = self.cancel_message(sender, message_id)
+            if not result.get("ok"):
+                return result
+            target = str(result.get("target") or "")
+            if result.get("cancelled") and target:
+                self.try_deliver(target)
+            return result
         if op == "status":
             self.reload_participants()
             target = str(request.get("target") or "")
@@ -1771,6 +1786,149 @@ class BridgeDaemon:
             )
             return True, None, new_deadline_iso
 
+    def _message_is_active_inflight_for_cancel(self, item: dict) -> bool:
+        message_id = str(item.get("id") or "")
+        if str(item.get("status") or "") != "inflight":
+            return False
+        if item.get("pane_mode_enter_deferred_since_ts"):
+            # Enter was intentionally held because the pane is in a tmux mode;
+            # this is still cancellable without touching the peer pane.
+            return False
+        return bool(message_id and self.last_enter_ts.get(message_id) is not None)
+
+    def _remove_queue_message_by_id(self, message_id: str) -> dict | None:
+        def mutator(queue: list[dict]) -> dict | None:
+            found = None
+            kept = []
+            for item in queue:
+                if item.get("id") == message_id:
+                    found = dict(item)
+                    continue
+                kept.append(item)
+            queue[:] = kept
+            return found
+
+        return self.queue.update(mutator)
+
+    def cancel_message(self, sender: str, message_id: str) -> dict:
+        """Cancel one sender-owned message before it becomes an active turn.
+
+        State-lock serialization is the safety boundary: delivery and cancel
+        both hold state_lock through reservation, tmux paste, and enter, so a
+        mid-delivery cancel waits until the delivery attempt reaches a stable
+        queue sub-state before deciding whether to remove or reject.
+        """
+        if not sender or sender == "bridge":
+            return {"ok": False, "error": "invalid_sender"}
+        with self.state_lock:
+            self._prune_interrupted_turns_for_all()
+            item = next((dict(it) for it in self.queue.read() if it.get("id") == message_id), None)
+            if not item:
+                tombstone = self._find_message_tombstone(message_id)
+                if tombstone:
+                    owner = str(tombstone.get("prior_sender") or "")
+                    if owner and owner != sender:
+                        return {
+                            "ok": False,
+                            "error": "not_owner",
+                            "message_id": message_id,
+                            "owner": owner,
+                        }
+                    return {
+                        "ok": True,
+                        "message_id": message_id,
+                        "cancelled": False,
+                        "already_terminal": True,
+                        "terminal_reason": tombstone.get("reason") or "terminal",
+                        "target": tombstone.get("target") or "",
+                    }
+                return {"ok": False, "error": "message_not_found", "message_id": message_id}
+
+            owner = str(item.get("from") or "")
+            if owner != sender:
+                return {
+                    "ok": False,
+                    "error": "not_owner",
+                    "message_id": message_id,
+                    "owner": owner,
+                }
+
+            status = str(item.get("status") or "")
+            target = str(item.get("to") or "")
+            if status in {"submitted", "delivered"}:
+                return {
+                    "ok": False,
+                    "error": "message_active_use_interrupt",
+                    "message_id": message_id,
+                    "target": target,
+                    "status": status,
+                }
+            if self._message_is_active_inflight_for_cancel(item):
+                return {
+                    "ok": False,
+                    "error": "message_active_use_interrupt",
+                    "message_id": message_id,
+                    "target": target,
+                    "status": "inflight",
+                }
+            if status not in {"pending", "inflight"}:
+                return {
+                    "ok": False,
+                    "error": "message_not_cancellable_state",
+                    "message_id": message_id,
+                    "status": status,
+                }
+
+            removed = self._remove_queue_message_by_id(message_id) or item
+            nonce = str(removed.get("nonce") or "")
+            if nonce:
+                self.discard_nonce(nonce)
+            if self.reserved.get(target) == message_id:
+                self.reserved[target] = None
+            self.last_enter_ts.pop(message_id, None)
+            active_context = self.current_prompt_by_agent.get(target) or {}
+            if str(active_context.get("id") or "") == message_id:
+                self.current_prompt_by_agent.pop(target, None)
+                self.busy[target] = False
+            if removed.get("aggregate_id"):
+                self.cancel_watchdogs_for_message(message_id, reason="cancelled_by_sender", phase=WATCHDOG_PHASE_DELIVERY)
+            else:
+                self.cancel_watchdogs_for_message(message_id, reason="cancelled_by_sender")
+
+            suppress_late_hooks = bool(status == "inflight" and nonce)
+            self._record_message_tombstone(
+                target,
+                removed,
+                by_sender=sender,
+                reason="cancelled_by_sender",
+                suppress_late_hooks=suppress_late_hooks,
+                prompt_submitted_seen=False,
+            )
+            if removed.get("aggregate_id"):
+                self._record_aggregate_interrupted_reply(removed, by_sender=sender, reason="cancelled_by_sender")
+            self.log(
+                "message_cancelled",
+                message_id=message_id,
+                from_agent=owner,
+                to=target,
+                status=status,
+                aggregate_id=removed.get("aggregate_id"),
+                by_sender=sender,
+            )
+            return {
+                "ok": True,
+                "message_id": message_id,
+                "cancelled": True,
+                "already_terminal": False,
+                "status_before": status,
+                "target": target,
+                "aggregate_id": removed.get("aggregate_id"),
+                "input_clear_required": False,
+                "input_clear_attempted": False,
+                "input_clear_ok": None,
+                "input_clear_error": "",
+            }
+
     def remove_delivered_message(self, target: str, message_id: str) -> dict | None:
         def mutator(queue: list[dict]) -> dict | None:
             found = None
@@ -2398,6 +2556,77 @@ class BridgeDaemon:
         else:
             self.interrupted_turns.pop(agent, None)
 
+    def _prune_interrupted_turns_for_all(self) -> None:
+        now = time.time()
+        for agent in list(self.interrupted_turns.keys()):
+            self._prune_interrupted_turns(agent, now)
+
+    def _find_message_tombstone(self, message_id: str) -> dict | None:
+        if not message_id:
+            return None
+        self._prune_interrupted_turns_for_all()
+        for target, rows in self.interrupted_turns.items():
+            for row in rows or []:
+                if str(row.get("message_id") or "") == message_id:
+                    found = dict(row)
+                    found.setdefault("target", target)
+                    return found
+        return None
+
+    def _record_message_tombstone(
+        self,
+        target: str,
+        message: dict,
+        *,
+        by_sender: str,
+        reason: str,
+        suppress_late_hooks: bool,
+        prompt_submitted_seen: bool,
+    ) -> dict | None:
+        message_id = str(message.get("id") or "")
+        if not message_id:
+            return None
+        now = time.time()
+        self._prune_interrupted_turns(target, now)
+        rows = self.interrupted_turns.setdefault(target, [])
+        for row in rows:
+            if str(row.get("message_id") or "") != message_id:
+                continue
+            row["reason"] = row.get("reason") or reason
+            row["prior_sender"] = row.get("prior_sender") or str(message.get("from") or "")
+            row["by_sender"] = row.get("by_sender") or by_sender
+            row["target"] = row.get("target") or target
+            row["suppress_late_hooks"] = bool(row.get("suppress_late_hooks", True) or suppress_late_hooks)
+            row["prompt_submitted_seen"] = bool(row.get("prompt_submitted_seen") or prompt_submitted_seen)
+            return row
+        tombstone = {
+            "message_id": message_id,
+            "turn_id": str(message.get("turn_id") or ""),
+            "nonce": str(message.get("nonce") or ""),
+            "prior_sender": str(message.get("from") or ""),
+            "by_sender": by_sender,
+            "target": target,
+            "cancelled_message_ids": [message_id] if reason == "cancelled_by_sender" else [],
+            "interrupted_ts": now,
+            "prompt_submitted_seen": bool(prompt_submitted_seen),
+            "superseded_by_prompt": False,
+            "reason": reason,
+            "suppress_late_hooks": bool(suppress_late_hooks),
+        }
+        rows.append(tombstone)
+        self._prune_interrupted_turns(target, now)
+        self.log(
+            "message_tombstone_recorded",
+            target=target,
+            message_id=message_id,
+            nonce=tombstone.get("nonce"),
+            prompt_submitted_seen=tombstone.get("prompt_submitted_seen"),
+            by_sender=by_sender,
+            reason=reason,
+            suppress_late_hooks=suppress_late_hooks,
+        )
+        return tombstone
+
     def _record_interrupted_turns(self, target: str, active_context: dict, cancelled: list[dict], by_sender: str) -> list[dict]:
         now = time.time()
         cancelled_ids = [str(cm.get("id") or "") for cm in cancelled if cm.get("id")]
@@ -2422,6 +2651,9 @@ class BridgeDaemon:
                 "interrupted_ts": now,
                 "prompt_submitted_seen": prompt_submitted_seen,
                 "superseded_by_prompt": False,
+                "reason": "interrupted",
+                "target": target,
+                "suppress_late_hooks": True,
             }
             recorded.append(tombstone)
         if not recorded and active_context.get("id"):
@@ -2435,6 +2667,9 @@ class BridgeDaemon:
                 "interrupted_ts": now,
                 "prompt_submitted_seen": True,
                 "superseded_by_prompt": False,
+                "reason": "interrupted",
+                "target": target,
+                "suppress_late_hooks": True,
             })
         if recorded:
             self.interrupted_turns.setdefault(target, []).extend(recorded)
@@ -2458,6 +2693,8 @@ class BridgeDaemon:
         if not nonce and not turn_id:
             return None
         for row in self.interrupted_turns.get(agent) or []:
+            if not bool(row.get("suppress_late_hooks", True)):
+                continue
             row_nonce = str(row.get("nonce") or "")
             row_turn_id = str(row.get("turn_id") or "")
             if (nonce and row_nonce and nonce == row_nonce) or (turn_id and row_turn_id and turn_id == row_turn_id):
@@ -2468,7 +2705,7 @@ class BridgeDaemon:
         rows = self.interrupted_turns.get(agent) or []
         changed = 0
         for row in rows:
-            if not row.get("superseded_by_prompt"):
+            if bool(row.get("suppress_late_hooks", True)) and not row.get("superseded_by_prompt"):
                 row["superseded_by_prompt"] = True
                 changed += 1
         if changed:
@@ -2490,7 +2727,7 @@ class BridgeDaemon:
 
     def _match_interrupted_response(self, agent: str, response_turn_id: object, has_current_context: bool) -> tuple[dict | None, str]:
         self._prune_interrupted_turns(agent)
-        rows = list(self.interrupted_turns.get(agent) or [])
+        rows = [row for row in list(self.interrupted_turns.get(agent) or []) if bool(row.get("suppress_late_hooks", True))]
         turn_id = str(response_turn_id or "")
         if turn_id:
             for row in rows:
@@ -2790,6 +3027,10 @@ class BridgeDaemon:
             synthetic_text = (
                 "[intercepted by user prompt: peer accepted a new prompt before this aggregate request finished]"
             )
+        elif reason == "cancelled_by_sender":
+            synthetic_text = (
+                f"[cancelled by {by_sender or 'original sender'}: sender retracted this aggregate request leg before it became active]"
+            )
         elif reason == "endpoint_lost":
             synthetic_text = (
                 "[bridge:undeliverable] peer endpoint was lost before this aggregate request could complete"
@@ -3068,6 +3309,8 @@ class BridgeDaemon:
             interrupted_prompt = self._match_interrupted_prompt(agent, observed_nonce, record_turn_id)
             if interrupted_prompt:
                 interrupted_prompt["prompt_submitted_seen"] = True
+                if record_turn_id and not interrupted_prompt.get("turn_id"):
+                    interrupted_prompt["turn_id"] = str(record_turn_id)
                 suppressed_interrupted_prompt = True
                 self.log(
                     "interrupted_prompt_submitted_suppressed",
@@ -3472,6 +3715,20 @@ class BridgeDaemon:
             # watchdog here for non-aggregate messages.
             if not context.get("aggregate_id"):
                 self.cancel_watchdogs_for_message(str(msg_id), reason=watchdog_reason)
+            if watchdog_reason != "interrupted_tombstone_terminal":
+                self._record_message_tombstone(
+                    sender,
+                    {
+                        "id": msg_id,
+                        "from": context.get("from"),
+                        "nonce": context.get("nonce"),
+                        "turn_id": context.get("turn_id"),
+                    },
+                    by_sender="bridge",
+                    reason=watchdog_reason,
+                    suppress_late_hooks=False,
+                    prompt_submitted_seen=True,
+                )
         ctx_nonce = context.get("nonce")
         if ctx_nonce:
             self.discard_nonce(str(ctx_nonce))
