@@ -77,6 +77,7 @@ WATCHDOG_PHASE_DELIVERY = "delivery"
 WATCHDOG_PHASE_RESPONSE = "response"
 WATCHDOG_PHASE_ALARM = "alarm"
 WAIT_STATUS_SECTION_LIMIT = 50
+AGGREGATE_STATUS_LEG_LIMIT = 100
 RESPONSE_LIKE_TOMBSTONE_REASONS = {
     # Tombstone reasons emitted today include terminal_response,
     # reply_received, interrupted_tombstone_terminal, aggregate_complete,
@@ -765,6 +766,17 @@ class BridgeDaemon:
             if sender == "bridge" or sender not in self.participants:
                 return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
             return self.build_wait_status(sender)
+        if op == "aggregate_status":
+            self.reload_participants()
+            sender = str(request.get("from") or "")
+            aggregate_id = str(request.get("aggregate_id") or "")
+            if not sender:
+                return {"ok": False, "error": "sender required"}
+            if sender == "bridge" or sender not in self.participants:
+                return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
+            if not aggregate_id:
+                return {"ok": False, "error": "aggregate_id_required"}
+            return self.build_aggregate_status(sender, aggregate_id)
         if op == "status":
             self.reload_participants()
             target = str(request.get("target") or "")
@@ -1765,6 +1777,315 @@ class BridgeDaemon:
             "limits": {"per_section": WAIT_STATUS_SECTION_LIMIT},
             "summary": self._wait_status_counts(sections),
             **sections,
+        }
+
+    def _aggregate_status_not_found(self, caller: str, aggregate_id: str, reason: str, **details) -> dict:
+        self.safe_log(
+            "aggregate_status_not_found",
+            caller=caller,
+            aggregate_id=aggregate_id,
+            reason=reason,
+            **details,
+        )
+        return {"ok": False, "error": "aggregate_not_found", "aggregate_id": aggregate_id}
+
+    def _aggregate_status_legacy_min_ts(self, values: list[object]) -> str:
+        candidates: list[tuple[float, str]] = []
+        for raw in values:
+            text = str(raw or "")
+            if not text:
+                continue
+            try:
+                ts = datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            candidates.append((ts, text))
+        if not candidates:
+            return ""
+        return min(candidates, key=lambda item: item[0])[1]
+
+    def _aggregate_status_section(self, legs: list[dict]) -> dict:
+        limited = legs[:AGGREGATE_STATUS_LEG_LIMIT]
+        return {
+            "total_count": len(legs),
+            "returned_count": len(limited),
+            "truncated": len(legs) > len(limited),
+            "items": limited,
+        }
+
+    def _aggregate_status_alias_list(self, raw: object) -> list[str]:
+        if not isinstance(raw, list):
+            return []
+        return [str(alias) for alias in raw if str(alias or "")]
+
+    def _aggregate_status_tombstone_for_message(
+        self,
+        tombstones: dict[str, list[dict]],
+        message_id: str,
+        caller: str,
+    ) -> dict | None:
+        if not message_id:
+            return None
+        for entries in tombstones.values():
+            for tombstone in entries:
+                if str(tombstone.get("message_id") or "") != message_id:
+                    continue
+                if str(tombstone.get("prior_sender") or "") != caller:
+                    continue
+                return tombstone
+        return None
+
+    def _aggregate_terminal_status_from_reason(self, reason: str) -> str:
+        if reason in {"cancelled_by_sender", "prompt_intercepted", "interrupted"}:
+            return "cancelled"
+        if reason in {"endpoint_lost", "turn_id_mismatch_expired", "daemon_restart_lost_routing_ctx"}:
+            return "timeout"
+        return "timeout"
+
+    def _aggregate_status_response_watchdog(
+        self,
+        caller: str,
+        aggregate_id: str,
+        watchdogs: dict[str, dict],
+    ) -> dict | None:
+        matches: list[tuple[float, str, dict]] = []
+        for wake_id, wd in watchdogs.items():
+            if wd.get("is_alarm"):
+                continue
+            if str(wd.get("sender") or "") != caller:
+                continue
+            if str(wd.get("ref_aggregate_id") or "") != aggregate_id:
+                continue
+            if self.normalize_watchdog_phase(wd) != WATCHDOG_PHASE_RESPONSE:
+                continue
+            try:
+                deadline = float(wd.get("deadline"))
+            except (TypeError, ValueError):
+                deadline = 0.0
+            matches.append((deadline, wake_id, wd))
+        if not matches:
+            return None
+        _deadline, wake_id, wd = sorted(matches, key=lambda item: (item[0], item[1]))[0]
+        return {
+            "wake_id": wake_id,
+            "phase": WATCHDOG_PHASE_RESPONSE,
+            "deadline": self._wait_status_deadline_iso(wd.get("deadline")),
+        }
+
+    def _aggregate_status_reply_leg(self, alias: str, message_id: str, reply: dict, tombstone: dict | None = None) -> dict:
+        body = str(reply.get("body") or "")
+        synthetic = bool(reply.get("synthetic"))
+        reason = str(reply.get("synthetic_reason") or "")
+        if not synthetic and tombstone:
+            tombstone_reason = str(tombstone.get("reason") or "")
+            if tombstone_reason and tombstone_reason not in RESPONSE_LIKE_TOMBSTONE_REASONS:
+                synthetic = True
+                reason = tombstone_reason
+        status = self._aggregate_terminal_status_from_reason(reason) if synthetic else "responded"
+        leg = {
+            "target": alias,
+            "msg_id": message_id,
+            "status": status,
+            "response_received": not synthetic,
+            "response_chars": len(body),
+            "received_ts": reply.get("received_ts") or "",
+            "synthetic": synthetic,
+            "terminal_reason": reason,
+            "status_source": "aggregate_reply",
+        }
+        return leg
+
+    def _aggregate_status_build_legs(
+        self,
+        caller: str,
+        expected: list[str],
+        message_ids: dict[str, str],
+        replies: dict,
+        rows_by_alias: dict[str, dict],
+        tombstones: dict[str, list[dict]],
+    ) -> list[dict]:
+        legs: list[dict] = []
+        for alias in expected:
+            message_id = str(message_ids.get(alias) or (rows_by_alias.get(alias) or {}).get("id") or "")
+            reply = replies.get(alias)
+            tombstone = self._aggregate_status_tombstone_for_message(tombstones, message_id, caller)
+            if isinstance(reply, dict):
+                legs.append(self._aggregate_status_reply_leg(alias, message_id, reply, tombstone))
+                continue
+            row = rows_by_alias.get(alias)
+            if row:
+                legs.append({
+                    "target": alias,
+                    "msg_id": message_id,
+                    "status": str(row.get("status") or "pending"),
+                    "response_received": False,
+                    "response_chars": 0,
+                    "received_ts": "",
+                    "synthetic": False,
+                    "terminal_reason": "",
+                    "status_source": "queue",
+                })
+                continue
+            if tombstone:
+                reason = str(tombstone.get("reason") or "")
+                legs.append({
+                    "target": alias,
+                    "msg_id": message_id,
+                    "status": self._aggregate_terminal_status_from_reason(reason),
+                    "response_received": False,
+                    "response_chars": 0,
+                    "received_ts": "",
+                    "synthetic": True,
+                    "terminal_reason": reason,
+                    "status_source": "tombstone",
+                })
+                continue
+            legs.append({
+                "target": alias,
+                "msg_id": message_id,
+                "status": "pending",
+                "response_received": False,
+                "response_chars": 0,
+                "received_ts": "",
+                "synthetic": False,
+                "terminal_reason": "",
+                "status_source": "fallback",
+            })
+        return legs
+
+    def build_aggregate_status(self, caller: str, aggregate_id: str) -> dict:
+        # Best-effort debug snapshot: queue/watchdogs/tombstones are atomic
+        # together; aggregate JSON is read afterwards to preserve lock order.
+        with self.state_lock:
+            queue_snapshot = list(self.queue.read())
+            watchdog_snapshot = {wake_id: dict(wd) for wake_id, wd in self.watchdogs.items()}
+            tombstone_snapshot = {
+                alias: [dict(entry) for entry in entries]
+                for alias, entries in self.interrupted_turns.items()
+            }
+        try:
+            aggregate_data = read_json(self.aggregate_file, {"aggregates": {}})
+            aggregate = (aggregate_data.get("aggregates") or {}).get(aggregate_id) or {}
+        except Exception:
+            aggregate = {}
+
+        matching_rows = [
+            dict(item)
+            for item in queue_snapshot
+            if str(item.get("aggregate_id") or "") == aggregate_id
+            and normalize_kind(item.get("kind"), "notice") == "request"
+            and bool(item.get("auto_return"))
+        ]
+        json_owner = str(aggregate.get("requester") or "")
+        queue_owners = sorted({str(item.get("from") or "") for item in matching_rows if str(item.get("from") or "")})
+        caller_watchdogs = [
+            wd for wd in watchdog_snapshot.values()
+            if str(wd.get("sender") or "") == caller
+            and str(wd.get("ref_aggregate_id") or "") == aggregate_id
+            and self.normalize_watchdog_phase(wd) == WATCHDOG_PHASE_RESPONSE
+            and not wd.get("is_alarm")
+        ]
+        watchdog_owner = caller if caller_watchdogs else ""
+        conflict = False
+        if len(queue_owners) > 1:
+            conflict = True
+        if json_owner and queue_owners and any(owner != json_owner for owner in queue_owners):
+            conflict = True
+        if json_owner and watchdog_owner and watchdog_owner != json_owner:
+            conflict = True
+        if not json_owner and queue_owners and watchdog_owner and queue_owners[0] != watchdog_owner:
+            conflict = True
+        if conflict:
+            return self._aggregate_status_not_found(
+                caller,
+                aggregate_id,
+                "source_owner_conflict",
+                json_owner=json_owner,
+                queue_owners=queue_owners,
+                watchdog_owner=watchdog_owner,
+            )
+
+        owner = json_owner or (queue_owners[0] if queue_owners else "") or watchdog_owner
+        if not owner:
+            return self._aggregate_status_not_found(caller, aggregate_id, "missing")
+        if owner != caller:
+            return self._aggregate_status_not_found(caller, aggregate_id, "foreign_owner")
+
+        owned_rows = [item for item in matching_rows if str(item.get("from") or "") == owner]
+        rows_by_alias = {
+            str(item.get("to") or ""): item
+            for item in owned_rows
+            if str(item.get("to") or "")
+        }
+        expected: list[str] = []
+        expected = self.merge_ordered_aliases(expected, self._aggregate_status_alias_list(aggregate.get("expected")))
+        for item in owned_rows:
+            expected = self.merge_ordered_aliases(expected, self._aggregate_status_alias_list(item.get("aggregate_expected")))
+        for wd in caller_watchdogs:
+            expected = self.merge_ordered_aliases(expected, self._aggregate_status_alias_list(wd.get("ref_aggregate_expected")))
+
+        message_ids: dict[str, str] = {}
+        raw_message_ids = aggregate.get("message_ids") or {}
+        if isinstance(raw_message_ids, dict):
+            message_ids.update({str(alias): str(message_id) for alias, message_id in raw_message_ids.items() if alias and message_id})
+        for item in owned_rows:
+            raw = item.get("aggregate_message_ids") or {}
+            if isinstance(raw, dict):
+                message_ids.update({str(alias): str(message_id) for alias, message_id in raw.items() if alias and message_id})
+            alias = str(item.get("to") or "")
+            if alias:
+                message_ids.setdefault(alias, str(item.get("id") or ""))
+        if not expected:
+            expected = self.merge_ordered_aliases(expected, list(message_ids.keys()))
+            expected = self.merge_ordered_aliases(expected, list(rows_by_alias.keys()))
+            replies_for_expected = aggregate.get("replies") or {}
+            if isinstance(replies_for_expected, dict):
+                expected = self.merge_ordered_aliases(expected, list(replies_for_expected.keys()))
+
+        replies = aggregate.get("replies") or {}
+        if not isinstance(replies, dict):
+            replies = {}
+        mode = str(aggregate.get("mode") or "")
+        if mode not in {"all", "partial"}:
+            row_modes = sorted({str(item.get("aggregate_mode") or "") for item in owned_rows if str(item.get("aggregate_mode") or "") in {"all", "partial"}})
+            mode = row_modes[0] if len(row_modes) == 1 else "unknown"
+        started_ts = str(aggregate.get("started_ts") or "")
+        if not started_ts:
+            started_ts = self._aggregate_status_legacy_min_ts(
+                [item.get("aggregate_started_ts") for item in owned_rows]
+                + [item.get("created_ts") for item in owned_rows]
+                + [aggregate.get("created_ts")]
+            )
+        legs = self._aggregate_status_build_legs(caller, expected, message_ids, replies, rows_by_alias, tombstone_snapshot)
+        replied_count = len([alias for alias in expected if alias in replies])
+        total_count = len(expected)
+        missing_count = max(0, total_count - replied_count)
+        status = str(aggregate.get("status") or "")
+        if aggregate.get("delivered") or status == "complete" or (total_count > 0 and replied_count >= total_count):
+            status = "complete"
+        else:
+            status = "collecting"
+
+        return {
+            "ok": True,
+            "bridge_session": self.bridge_session,
+            "caller": caller,
+            "aggregate_id": aggregate_id,
+            "generated_ts": utc_now(),
+            "status": status,
+            "mode": mode,
+            "started_ts": started_ts,
+            "completed_ts": aggregate.get("delivered_at") or "",
+            "replied_count": replied_count,
+            "total_count": total_count,
+            "missing_count": missing_count,
+            "limits": {"legs": AGGREGATE_STATUS_LEG_LIMIT},
+            "legs": self._aggregate_status_section(legs),
+            "aggregate_response_watchdog": self._aggregate_status_response_watchdog(
+                caller,
+                aggregate_id,
+                watchdog_snapshot,
+            ),
         }
 
     def reserve_next(self, target: str) -> dict | None:
@@ -3350,6 +3671,10 @@ class BridgeDaemon:
             "from": cancelled_msg.get("from"),
             "aggregate_expected": cancelled_msg.get("aggregate_expected"),
             "aggregate_message_ids": cancelled_msg.get("aggregate_message_ids"),
+            "aggregate_mode": cancelled_msg.get("aggregate_mode"),
+            "aggregate_started_ts": cancelled_msg.get("aggregate_started_ts"),
+            "aggregate_synthetic": True,
+            "aggregate_synthetic_reason": reason,
             "causal_id": cancelled_msg.get("causal_id"),
             "intent": cancelled_msg.get("intent"),
             "hop_count": cancelled_msg.get("hop_count"),
@@ -3813,6 +4138,8 @@ class BridgeDaemon:
                     "aggregate_id": message.get("aggregate_id"),
                     "aggregate_expected": message.get("aggregate_expected"),
                     "aggregate_message_ids": message.get("aggregate_message_ids"),
+                    "aggregate_mode": message.get("aggregate_mode"),
+                    "aggregate_started_ts": message.get("aggregate_started_ts"),
                     "turn_id": record.get("turn_id"),
                 }
 
@@ -3921,6 +4248,12 @@ class BridgeDaemon:
         message_ids = self.aggregate_message_ids_from_context(context)
         causal_id = str(context.get("causal_id") or short_id("causal"))
         original_intent = str(context.get("intent") or "message")
+        aggregate_mode = str(context.get("aggregate_mode") or "")
+        if aggregate_mode not in {"all", "partial"}:
+            aggregate_mode = ""
+        aggregate_started_ts = str(context.get("aggregate_started_ts") or "")
+        aggregate_synthetic = bool(context.get("aggregate_synthetic"))
+        aggregate_synthetic_reason = str(context.get("aggregate_synthetic_reason") or "")
         hop_count = int(context.get("hop_count") or 0)
         reply_to = str(context.get("id") or message_ids.get(sender) or "")
         completed: dict | None = None
@@ -3936,6 +4269,8 @@ class BridgeDaemon:
                     "requester": requester,
                     "causal_id": causal_id,
                     "intent": original_intent,
+                    "mode": aggregate_mode or "unknown",
+                    "started_ts": aggregate_started_ts,
                     "hop_count": hop_count,
                     "expected": expected,
                     "message_ids": message_ids,
@@ -3948,16 +4283,23 @@ class BridgeDaemon:
             aggregate["requester"] = aggregate.get("requester") or requester
             aggregate["causal_id"] = aggregate.get("causal_id") or causal_id
             aggregate["intent"] = aggregate.get("intent") or original_intent
+            aggregate["mode"] = aggregate.get("mode") or aggregate_mode or "unknown"
+            if aggregate_started_ts and not aggregate.get("started_ts"):
+                aggregate["started_ts"] = aggregate_started_ts
             aggregate["hop_count"] = int(aggregate.get("hop_count") or hop_count)
             aggregate["expected"] = self.merge_ordered_aliases(list(aggregate.get("expected") or []), expected)
             aggregate.setdefault("message_ids", {}).update(message_ids)
             replies = aggregate.setdefault("replies", {})
-            replies[sender] = {
+            reply_record = {
                 "from": sender,
                 "body": str(text),
                 "reply_to": reply_to,
                 "received_ts": utc_now(),
             }
+            if aggregate_synthetic:
+                reply_record["synthetic"] = True
+                reply_record["synthetic_reason"] = aggregate_synthetic_reason
+            replies[sender] = reply_record
             complete = bool(aggregate.get("expected")) and all(alias in replies for alias in aggregate.get("expected") or [])
             if complete and not aggregate.get("delivered"):
                 aggregate["status"] = "complete"

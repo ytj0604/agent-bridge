@@ -251,6 +251,8 @@ def main() -> int:
     aggregate_id = ""
     if should_create_aggregate(kind, args.sender, args.no_auto_return, targets):
         aggregate_id = short_id("agg")
+    aggregate_started_ts = utc_now() if aggregate_id else ""
+    aggregate_mode = "all" if args.target_all else "partial"
 
     # v1.5 watchdog: enforce request-only at the enqueue boundary as well
     # (defense-in-depth; bridge_send_peer also rejects). Resolve the delay
@@ -312,6 +314,8 @@ def main() -> int:
         if aggregate_id and auto_return:
             message["aggregate_id"] = aggregate_id
             message["aggregate_expected"] = list(targets)
+            message["aggregate_started_ts"] = aggregate_started_ts
+            message["aggregate_mode"] = aggregate_mode
         if watchdog_delay_sec is not None:
             message["watchdog_delay_sec"] = watchdog_delay_sec
 
@@ -334,6 +338,8 @@ def main() -> int:
         if aggregate_id and auto_return:
             record["aggregate_id"] = aggregate_id
             record["aggregate_expected"] = list(targets)
+            record["aggregate_started_ts"] = aggregate_started_ts
+            record["aggregate_mode"] = aggregate_mode
 
         messages_and_records.append((message, record))
 
