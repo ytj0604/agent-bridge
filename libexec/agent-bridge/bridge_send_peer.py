@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import math
 import os
+import select
 import subprocess
 import sys
 
 from bridge_identity import read_attached_mapping, read_live_by_pane, read_pane_lock, resolve_caller_from_pane
 from bridge_participants import active_participants, load_session
 from bridge_paths import libexec_dir, python_exe
-from bridge_util import read_limited_text, validate_peer_body_size
+from bridge_util import MAX_INLINE_SEND_BODY_CHARS, read_limited_text, validate_peer_body_size
 
 # Agents may only originate "request" or "notice"; "result" is system-only
 # (set by the daemon when auto-returning a single reply or when an aggregate
@@ -29,6 +31,7 @@ FOLLOW_UP_WAIT_HINT = (
     "Waiting for a bridge follow-up? Do not sleep or poll; "
     "continue independent local work or end your turn."
 )
+AMBIENT_STDIN_READ_BYTES = (MAX_INLINE_SEND_BODY_CHARS + 1) * 4 + 4
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -270,6 +273,70 @@ def validate_caller_identity(args: argparse.Namespace, session: str, sender: str
     return session or resolution.session, sender or resolution.alias
 
 
+def read_available_ambient_stdin_text(stream, limit: int = MAX_INLINE_SEND_BODY_CHARS) -> str:
+    """Read only stdin bytes that are available immediately.
+
+    Ambient stdin is used for pipe-only body inference and for detecting a
+    pipe+inline-body collision. Unlike explicit --stdin, it must not wait for a
+    future writer: model harnesses can attach fd 0 to an open idle socket.
+    """
+    if stream.isatty():
+        return ""
+    try:
+        fd = stream.fileno()
+    except Exception:
+        try:
+            return read_limited_text(stream, limit)
+        except Exception:
+            return ""
+
+    try:
+        old_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    except OSError:
+        return ""
+
+    chunks: list[bytes] = []
+    remaining = max(0, min(AMBIENT_STDIN_READ_BYTES, (int(limit) + 1) * 4 + 4))
+    try:
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
+        except (OSError, ValueError):
+            return ""
+        while remaining > 0:
+            try:
+                ready, _, _ = select.select([fd], [], [], 0)
+            except (OSError, ValueError):
+                return ""
+            if not ready:
+                break
+            try:
+                chunk = os.read(fd, min(remaining, 65536))
+            except BlockingIOError:
+                break
+            except InterruptedError:
+                continue
+            except OSError:
+                return ""
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETFL, old_flags)
+        except OSError:
+            pass
+
+    if not chunks:
+        return ""
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        return b"".join(chunks).decode(encoding)[: max(0, int(limit)) + 1]
+    except UnicodeDecodeError:
+        # Ambient stdin is advisory; skip uncertain partial text rather than blocking or crashing.
+        return ""
+
+
 def parse_body_and_target(args: argparse.Namespace, session: str) -> tuple[str | None, str]:
     target = args.target
     target_all = args.target_all
@@ -280,10 +347,8 @@ def parse_body_and_target(args: argparse.Namespace, session: str) -> tuple[str |
 
     def non_tty_stdin_text() -> str:
         nonlocal stdin_cache
-        if sys.stdin.isatty():
-            return ""
         if stdin_cache is None:
-            stdin_cache = read_limited_text(sys.stdin)
+            stdin_cache = read_available_ambient_stdin_text(sys.stdin)
         return stdin_cache
 
     if target and target_all:

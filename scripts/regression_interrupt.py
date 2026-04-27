@@ -8370,6 +8370,59 @@ def scenario_send_peer_subprocess_failure_prints_no_success_hint(label: str, tmp
     print(f"  PASS  {label}")
 
 
+def scenario_send_peer_ambient_socket_stdin_does_not_block(label: str, tmpdir: Path) -> None:
+    script = f"""
+import argparse
+import json
+import os
+import socket
+import sys
+sys.path.insert(0, {str(LIBEXEC)!r})
+import bridge_send_peer as bs
+
+case = sys.argv[1]
+left, right = socket.socketpair()
+if case == "partial-inline":
+    right.sendall(b"x")
+sys.stdin = os.fdopen(left.detach(), "r", encoding="utf-8", buffering=1)
+try:
+    if case == "idle-empty":
+        args = argparse.Namespace(target="bob", target_all=False, message=[], stdin_body=False)
+    else:
+        args = argparse.Namespace(target="bob", target_all=False, message=["hello"], stdin_body=False)
+    target, body = bs.parse_body_and_target(args, "")
+    print(json.dumps({{"ok": True, "target": target, "body": body, "target_all": args.target_all}}, ensure_ascii=True))
+except Exception as exc:
+    print(json.dumps({{"ok": False, "type": type(exc).__name__, "error": str(exc)}}, ensure_ascii=True))
+"""
+    cases = {
+        "idle-inline": {"ok": True, "target": "bob", "body": "hello"},
+        "idle-empty": {"ok": True, "target": "bob", "body": ""},
+        "partial-inline": {"ok": False, "error_contains": "cannot combine piped stdin"},
+    }
+    for case, expected in cases.items():
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", script, case],
+                cwd=str(ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise AssertionError(f"{label}: {case} must not block on ambient socket stdin") from exc
+        assert_true(proc.returncode == 0, f"{label}: {case} child exited {proc.returncode}, stderr={proc.stderr!r}")
+        result = json.loads(proc.stdout.strip())
+        assert_true(result.get("ok") is expected["ok"], f"{label}: {case} ok mismatch: {result}")
+        if expected["ok"]:
+            assert_true(result.get("target") == expected["target"], f"{label}: {case} target mismatch: {result}")
+            assert_true(result.get("body") == expected["body"], f"{label}: {case} body mismatch: {result}")
+        else:
+            assert_true(expected["error_contains"] in str(result.get("error") or ""), f"{label}: {case} expected pipe collision error: {result}")
+    print(f"  PASS  {label}")
+
+
 def scenario_send_peer_inline_body_accepts_empty_non_tty_stdin(label: str, tmpdir: Path) -> None:
     bs = _import_send_peer_module()
     _patch_send_peer_for_unit(bs)
@@ -9517,6 +9570,7 @@ def main() -> int:
             ("send_peer_request_success_prints_anti_wait_hint", scenario_send_peer_request_success_prints_anti_wait_hint),
             ("send_peer_notice_success_prints_alarm_and_anti_wait_hints", scenario_send_peer_notice_success_prints_alarm_and_anti_wait_hints),
             ("send_peer_subprocess_failure_prints_no_success_hint", scenario_send_peer_subprocess_failure_prints_no_success_hint),
+            ("send_peer_ambient_socket_stdin_does_not_block", scenario_send_peer_ambient_socket_stdin_does_not_block),
             ("send_peer_inline_body_accepts_empty_non_tty_stdin", scenario_send_peer_inline_body_accepts_empty_non_tty_stdin),
             ("send_peer_explicit_stdin_multibyte_body", scenario_send_peer_explicit_stdin_multibyte_body),
             ("send_peer_implicit_target_allows_stdin", scenario_send_peer_implicit_target_allows_stdin),
