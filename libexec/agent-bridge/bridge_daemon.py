@@ -1816,7 +1816,9 @@ class BridgeDaemon:
             body = (
                 f"[bridge:undeliverable] Message {message_id} to {target} could not be delivered because "
                 f"the target has no verified live endpoint ({reason}). The target may have exited, been killed, "
-                "or the tmux pane may have been reused. Ask the human to reattach/join the target, or remove it from the room."
+                "or the tmux pane may have been reused. If the agent was resumed in another pane, ask the human "
+                "to submit any short prompt there so the bridge hook can re-attach it. Otherwise reattach/join "
+                "the target, or remove it from the room."
             )
             result = make_message(
                 sender="bridge",

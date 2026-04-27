@@ -73,6 +73,14 @@ bridge_run
 
 If the daemon restarts while a target pane is in copy/view mode, avoid editing that pane's prompt buffer until the bridge submits or recovers the deferred message.
 
+### Unscoped hook canonicalization
+
+Hook payload session ids are treated as advisory when an unscoped hook disagrees with an attached pane's locked identity. If the bridge can prove the pane still hosts the same verified process, it preserves the locked routing identity and records `unscoped_hook_canonicalized` in the room's raw event log; no operator action is needed. If proof fails, `unscoped_hook_canonicalize_blocked` means the pane may have been reused or the process changed, so manual inspection or rejoin is required.
+
+### Target Recovery
+
+If a tmux pane id disappears but the attached target (for example `0:1.2`) now points at a resumed Codex pane, the resolver may reconnect the alias after proving the Codex process has the expected rollout transcript open. Successful recovery records `target_recovery_reconnected`; `target_recovery_blocked` means the target changed, the transcript did not match the locked session id, or proof was unavailable. Set `AGENT_BRIDGE_NO_TARGET_RECOVERY=1` to disable this fallback.
+
 ## Model Commands
 
 These shell tools are installed on `PATH` for the agents themselves:

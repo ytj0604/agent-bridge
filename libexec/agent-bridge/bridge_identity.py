@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 
 from bridge_participants import active_participants, load_session, participants_from_state, save_session_state
-from bridge_pane_probe import probe_agent_process
+from bridge_pane_probe import probe_agent_process, tmux_display_pane, transcript_owners_for_session, transcript_session_id_for_pid
 from bridge_paths import state_root
 from bridge_util import append_jsonl, locked_json, locked_json_read, utc_now
 
@@ -99,8 +99,26 @@ def verified_process_identity(record: dict) -> dict:
     return {}
 
 
+def verified_identity_has_pid_start(identity: dict) -> bool:
+    if str(identity.get("status") or "") != "verified":
+        return False
+    processes = identity.get("processes")
+    if not isinstance(processes, list):
+        return False
+    for proc in processes:
+        if not isinstance(proc, dict):
+            continue
+        if str(proc.get("pid") or "") and str(proc.get("start_time") or ""):
+            return True
+    return False
+
+
 def resume_from_unknown_disabled() -> bool:
     return os.environ.get("AGENT_BRIDGE_NO_RESUME_FROM_UNKNOWN") == "1"
+
+
+def target_recovery_disabled() -> bool:
+    return os.environ.get("AGENT_BRIDGE_NO_TARGET_RECOVERY") == "1"
 
 
 def probe_live_record_current(record: dict, agent_type: str = "", session_id: str = "") -> dict:
@@ -205,6 +223,19 @@ def tmux_target_for_pane(pane: str) -> str:
     if proc.returncode == 0 and proc.stdout.strip():
         return proc.stdout.strip()
     return pane
+
+
+def tmux_pane_for_target(target: str) -> str:
+    if not target:
+        return ""
+    proc = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", target, "#{pane_id}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    pane = proc.stdout.strip() if proc.returncode == 0 else ""
+    return pane if pane.startswith("%") else ""
 
 
 def mapping_matches_lock(mapping: dict, lock: dict) -> bool:
@@ -398,6 +429,308 @@ def log_endpoint_auto_reconnected(
     return note
 
 
+def log_target_recovery(
+    event_name: str,
+    *,
+    bridge_session: str,
+    alias: str,
+    agent_type: str,
+    locked_session_id: str,
+    old_pane: str,
+    new_pane: str = "",
+    target: str = "",
+    transcript_path: str = "",
+    reason: str = "",
+) -> None:
+    if not bridge_session:
+        return
+    state = load_session(bridge_session)
+    state_dir = Path(state.get("state_dir") or state_root() / bridge_session)
+    bus_file = state.get("bus_file") or state_dir / "events.raw.jsonl"
+    event = {
+        "ts": utc_now(),
+        "agent": "bridge",
+        "event": event_name,
+        "bridge_session": bridge_session,
+        "alias": alias,
+        "agent_type": agent_type,
+        "locked_session_id": locked_session_id,
+        "old_pane": old_pane,
+        "new_pane": new_pane,
+        "target": target,
+    }
+    if transcript_path:
+        event["transcript_path"] = transcript_path
+    if reason:
+        event["reason"] = reason
+    try:
+        append_jsonl(Path(bus_file), event)
+    except OSError:
+        pass
+
+
+def log_unscoped_hook_canonicalization(
+    event_name: str,
+    *,
+    bridge_session: str,
+    alias: str,
+    agent_type: str,
+    pane: str,
+    locked_session_id: str,
+    payload_session_id: str,
+    incoming_event: str,
+    canonicalized_from: str = "",
+    reason: str = "",
+) -> None:
+    if not bridge_session:
+        return
+    state = load_session(bridge_session)
+    state_dir = Path(state.get("state_dir") or state_root() / bridge_session)
+    bus_file = state.get("bus_file") or state_dir / "events.raw.jsonl"
+    event = {
+        "ts": utc_now(),
+        "agent": "bridge",
+        "event": event_name,
+        "bridge_session": bridge_session,
+        "alias": alias,
+        "agent_type": agent_type,
+        "pane": pane,
+        "locked_session_id": locked_session_id,
+        "payload_session_id": payload_session_id,
+        "incoming_event": incoming_event,
+    }
+    if canonicalized_from:
+        event["canonicalized_from"] = canonicalized_from
+    if reason:
+        event["reason"] = reason
+    try:
+        append_jsonl(Path(bus_file), event)
+    except OSError:
+        pass
+
+
+def attached_mappings_for_pane(agent_type: str, pane: str) -> list[dict]:
+    if not agent_type or not pane:
+        return []
+    data = locked_json_read(attached_sessions_file(), {"version": 1, "sessions": {}})
+    out: list[dict] = []
+    for mapping in (data.get("sessions") or {}).values():
+        if not isinstance(mapping, dict):
+            continue
+        if str(mapping.get("agent") or "") != agent_type:
+            continue
+        if str(mapping.get("pane") or "") != pane:
+            continue
+        if not str(mapping.get("session_id") or ""):
+            continue
+        out.append(dict(mapping))
+    out.sort(key=lambda item: str(item.get("last_seen_at") or item.get("attached_at") or ""))
+    return out
+
+
+def _same_live_snapshot(current: dict, snapshot: dict) -> bool:
+    return (
+        live_record_matches(
+            current,
+            str(snapshot.get("agent") or ""),
+            str(snapshot.get("session_id") or ""),
+        )
+        and verified_process_identity(current) == verified_process_identity(snapshot)
+        and str(current.get("bridge_session") or "") == str(snapshot.get("bridge_session") or "")
+        and str(current.get("alias") or "") == str(snapshot.get("alias") or "")
+    )
+
+
+def _canonicalization_authority(agent_type: str, payload_session_id: str, pane: str, prior_live: dict) -> dict:
+    prior_session = str(prior_live.get("session_id") or "")
+    if not prior_live or str(prior_live.get("agent") or "") != agent_type or prior_session == payload_session_id:
+        return {}
+
+    def candidate(source: str, locked_session_id: str, bridge_session: str, alias: str) -> dict:
+        if not (
+            locked_session_id
+            and locked_session_id != payload_session_id
+            and bridge_session
+            and alias
+            and live_record_matches(prior_live, agent_type, locked_session_id)
+        ):
+            return {}
+        prior_identity = verified_process_identity(prior_live)
+        return {
+            "source": source,
+            "locked_session_id": locked_session_id,
+            "bridge_session": bridge_session,
+            "alias": alias,
+            "prior_identity": prior_identity,
+        }
+
+    lock = read_pane_lock(pane)
+    if str(lock.get("agent") or "") == agent_type:
+        found = candidate(
+            "pane_lock",
+            str(lock.get("hook_session_id") or ""),
+            str(lock.get("bridge_session") or ""),
+            str(lock.get("alias") or ""),
+        )
+        if found:
+            return found
+
+    for mapping in reversed(attached_mappings_for_pane(agent_type, pane)):
+        found = candidate(
+            "attached_registry",
+            str(mapping.get("session_id") or ""),
+            str(mapping.get("bridge_session") or ""),
+            str(mapping.get("alias") or ""),
+        )
+        if found:
+            return found
+
+    if str(prior_live.get("bridge_session") or "") and str(prior_live.get("alias") or ""):
+        found = candidate(
+            "scoped_live_prior",
+            prior_session,
+            str(prior_live.get("bridge_session") or ""),
+            str(prior_live.get("alias") or ""),
+        )
+        if found:
+            return found
+    return {}
+
+
+def canonicalize_unscoped_hook_record(
+    *,
+    agent_type: str,
+    payload_session_id: str,
+    pane: str,
+    target: str,
+    event: str,
+    cwd: str,
+    model: str,
+) -> dict:
+    if event == "session_ended":
+        return {}
+
+    live_data = locked_json_read(live_sessions_file(), {"version": 1, "panes": {}, "sessions": {}})
+    prior_live = dict(((live_data.get("panes") or {}).get(pane) or {}))
+
+    authority = _canonicalization_authority(agent_type, payload_session_id, pane, prior_live)
+    if not authority:
+        lock = read_pane_lock(pane)
+        if lock and str(lock.get("hook_session_id") or "") != payload_session_id:
+            log_unscoped_hook_canonicalization(
+                "unscoped_hook_canonicalize_blocked",
+                bridge_session=str(lock.get("bridge_session") or ""),
+                alias=str(lock.get("alias") or ""),
+                agent_type=agent_type,
+                pane=pane,
+                locked_session_id=str(lock.get("hook_session_id") or ""),
+                payload_session_id=payload_session_id,
+                incoming_event=event,
+                reason="no_coherent_authority",
+            )
+        return {}
+
+    locked_session_id = str(authority.get("locked_session_id") or "")
+    bridge_session = str(authority.get("bridge_session") or "")
+    alias = str(authority.get("alias") or "")
+    prior_identity = authority.get("prior_identity") if isinstance(authority.get("prior_identity"), dict) else {}
+    if not verified_identity_has_pid_start(prior_identity):
+        log_unscoped_hook_canonicalization(
+            "unscoped_hook_canonicalize_blocked",
+            bridge_session=bridge_session,
+            alias=alias,
+            agent_type=agent_type,
+            pane=pane,
+            locked_session_id=locked_session_id,
+            payload_session_id=payload_session_id,
+            incoming_event=event,
+            canonicalized_from=str(authority.get("source") or ""),
+            reason="missing_prior_verified_fingerprint",
+        )
+        return {}
+
+    try:
+        compare = probe_agent_process(pane, agent_type, prior_identity)
+    except Exception as exc:
+        compare = {
+            "status": "unknown",
+            "reason": "probe_exception",
+            "detail": str(exc),
+            "pane": pane,
+            "agent": agent_type,
+            "processes": [],
+        }
+    if str(compare.get("status") or "") != "verified":
+        log_unscoped_hook_canonicalization(
+            "unscoped_hook_canonicalize_blocked",
+            bridge_session=bridge_session,
+            alias=alias,
+            agent_type=agent_type,
+            pane=pane,
+            locked_session_id=locked_session_id,
+            payload_session_id=payload_session_id,
+            incoming_event=event,
+            canonicalized_from=str(authority.get("source") or ""),
+            reason=str(compare.get("reason") or "probe_not_verified"),
+        )
+        return {}
+
+    record = {
+        "agent": agent_type,
+        "session_id": locked_session_id,
+        "hook_payload_session_id": payload_session_id,
+        "canonicalized_from": str(authority.get("source") or ""),
+        "pane": pane,
+        "target": target,
+        "bridge_session": bridge_session,
+        "alias": alias,
+        "event": event,
+        "last_seen_at": utc_now(),
+        "process_identity": compare,
+    }
+    if cwd:
+        record["cwd"] = cwd
+    if model:
+        record["model"] = model
+
+    with locked_json(live_sessions_file(), {"version": 1, "panes": {}, "sessions": {}}) as data:
+        panes = data.setdefault("panes", {})
+        sessions = data.setdefault("sessions", {})
+        latest = dict(panes.get(pane) or {})
+        if not _same_live_snapshot(latest, prior_live):
+            log_unscoped_hook_canonicalization(
+                "unscoped_hook_canonicalize_blocked",
+                bridge_session=bridge_session,
+                alias=alias,
+                agent_type=agent_type,
+                pane=pane,
+                locked_session_id=locked_session_id,
+                payload_session_id=payload_session_id,
+                incoming_event=event,
+                canonicalized_from=str(authority.get("source") or ""),
+                reason="live_snapshot_changed",
+            )
+            return {"suppressed": True}
+        payload_key = identity_key(agent_type, payload_session_id)
+        if payload_key in sessions and sessions[payload_key].get("pane") == pane:
+            del sessions[payload_key]
+        panes[pane] = record
+        sessions[identity_key(agent_type, locked_session_id)] = record
+
+    log_unscoped_hook_canonicalization(
+        "unscoped_hook_canonicalized",
+        bridge_session=bridge_session,
+        alias=alias,
+        agent_type=agent_type,
+        pane=pane,
+        locked_session_id=locked_session_id,
+        payload_session_id=payload_session_id,
+        incoming_event=event,
+        canonicalized_from=str(authority.get("source") or ""),
+    )
+    return {"record": record}
+
+
 def auto_reconnect_attached_endpoint(
     mapping: dict,
     live_record: dict,
@@ -519,6 +852,208 @@ def _auto_reconnect_endpoint_detail(
     )
 
 
+def _target_recovery_block(
+    *,
+    bridge_session: str,
+    alias: str,
+    agent_type: str,
+    session_id: str,
+    old_pane: str,
+    new_pane: str = "",
+    target: str = "",
+    reason: str,
+) -> None:
+    log_target_recovery(
+        "target_recovery_blocked",
+        bridge_session=bridge_session,
+        alias=alias,
+        agent_type=agent_type,
+        locked_session_id=session_id,
+        old_pane=old_pane,
+        new_pane=new_pane,
+        target=target,
+        reason=reason,
+    )
+
+
+def _transcript_proof_for_probe(agent_type: str, session_id: str, probe: dict) -> tuple[dict, str]:
+    allowed_pids = {
+        int(str(proc.get("pid") or "0"))
+        for proc in (probe.get("processes") or [])
+        if isinstance(proc, dict) and str(proc.get("pid") or "").isdigit()
+    }
+    mismatched = False
+    for pid in sorted(allowed_pids):
+        proof = transcript_session_id_for_pid(agent_type, pid)
+        proof_session = str(proof.get("session_id") or "")
+        if not proof_session:
+            continue
+        if proof_session == session_id:
+            return proof, ""
+        mismatched = True
+    if mismatched:
+        return {}, "transcript_session_mismatch"
+    for owner in transcript_owners_for_session(agent_type, session_id):
+        try:
+            owner_pid = int(str(owner.get("pid") or "0"))
+        except ValueError:
+            owner_pid = 0
+        if owner_pid and owner_pid not in allowed_pids:
+            return {}, "wrong_pid_owns_transcript"
+    return {}, "transcript_proof_missing"
+
+
+def recover_via_target_and_session_proof(
+    mapping: dict,
+    *,
+    reason: str,
+    purpose: str,
+    old_pane: str,
+    old_status: str,
+    clear_old_locks: bool,
+) -> dict | None:
+    if target_recovery_disabled() or purpose == "read":
+        return None
+    agent_type = str(mapping.get("agent") or "")
+    session_id = str(mapping.get("session_id") or "")
+    bridge_session = str(mapping.get("bridge_session") or "")
+    alias = str(mapping.get("alias") or "")
+    target = str(mapping.get("target") or "")
+    if not (agent_type and session_id and bridge_session and alias and target):
+        return None
+
+    new_pane = tmux_pane_for_target(target)
+    if not new_pane:
+        _target_recovery_block(
+            bridge_session=bridge_session,
+            alias=alias,
+            agent_type=agent_type,
+            session_id=session_id,
+            old_pane=old_pane,
+            target=target,
+            reason="target_unresolvable",
+        )
+        return None
+    if new_pane == old_pane:
+        _target_recovery_block(
+            bridge_session=bridge_session,
+            alias=alias,
+            agent_type=agent_type,
+            session_id=session_id,
+            old_pane=old_pane,
+            new_pane=new_pane,
+            target=target,
+            reason="target_resolves_same_pane",
+        )
+        return None
+
+    pane_meta = tmux_display_pane(new_pane)
+    if pane_meta.get("error") or not str(pane_meta.get("pane_id") or "") or not str(pane_meta.get("pane_pid") or ""):
+        _target_recovery_block(
+            bridge_session=bridge_session,
+            alias=alias,
+            agent_type=agent_type,
+            session_id=session_id,
+            old_pane=old_pane,
+            new_pane=new_pane,
+            target=target,
+            reason="target_unresolvable",
+        )
+        return None
+
+    try:
+        probe = probe_agent_process(new_pane, agent_type)
+    except Exception:
+        probe = {"status": "unknown", "reason": "probe_exception", "processes": []}
+    if str(probe.get("status") or "") != "verified":
+        _target_recovery_block(
+            bridge_session=bridge_session,
+            alias=alias,
+            agent_type=agent_type,
+            session_id=session_id,
+            old_pane=old_pane,
+            new_pane=new_pane,
+            target=target,
+            reason="probe_not_verified",
+        )
+        return None
+
+    proof, proof_error = _transcript_proof_for_probe(agent_type, session_id, probe)
+    if not proof:
+        _target_recovery_block(
+            bridge_session=bridge_session,
+            alias=alias,
+            agent_type=agent_type,
+            session_id=session_id,
+            old_pane=old_pane,
+            new_pane=new_pane,
+            target=target,
+            reason=proof_error or "transcript_proof_missing",
+        )
+        return None
+
+    current_mapping = read_attached_mapping(agent_type, session_id) or recover_mapping_from_session_state(agent_type, session_id)
+    current_state = load_session(bridge_session)
+    current_participant = active_participants(current_state).get(alias) or {}
+    if (
+        not current_mapping
+        or str(current_mapping.get("bridge_session") or "") != bridge_session
+        or str(current_mapping.get("alias") or "") != alias
+        or str(current_mapping.get("pane") or "") != str(mapping.get("pane") or "")
+        or str(current_participant.get("hook_session_id") or "") != session_id
+        or str(current_participant.get("pane") or "") != old_pane
+    ):
+        return None
+
+    record = {
+        "agent": agent_type,
+        "session_id": session_id,
+        "pane": new_pane,
+        "target": str(pane_meta.get("target") or target),
+        "bridge_session": bridge_session,
+        "alias": alias,
+        "event": "target_recovery",
+        "last_seen_at": utc_now(),
+        "cwd": str(pane_meta.get("cwd") or current_participant.get("cwd") or ""),
+        "model": str(current_participant.get("model") or ""),
+        "process_identity": probe,
+        "transcript_path": str(proof.get("path") or ""),
+    }
+    if not _write_live_record(record, allow_create=True):
+        return None
+    updated = auto_reconnect_attached_endpoint(
+        current_mapping,
+        record,
+        reason,
+        purpose=purpose,
+        old_pane=old_pane,
+        old_status=old_status,
+        clear_old_locks=clear_old_locks,
+    )
+    if not updated:
+        return None
+    log_target_recovery(
+        "target_recovery_reconnected",
+        bridge_session=bridge_session,
+        alias=alias,
+        agent_type=agent_type,
+        locked_session_id=session_id,
+        old_pane=old_pane,
+        new_pane=new_pane,
+        target=target,
+        transcript_path=str(proof.get("path") or ""),
+    )
+    pane = str(updated.get("pane") or new_pane)
+    return _endpoint_detail(
+        True,
+        pane=pane,
+        reason=reason,
+        probe_status="verified",
+        detail="endpoint recovered via target transcript proof",
+        reconnected=updated.get("_endpoint_auto_reconnected") or {},
+    )
+
+
 def update_live_session(
     *,
     agent_type: str,
@@ -531,6 +1066,24 @@ def update_live_session(
     cwd: str = "",
     model: str = "",
 ) -> dict | None:
+    """Record a hook-observed live endpoint and reconcile attached routing.
+
+    Hook payload session ids are authoritative when they match an attached
+    mapping or arrive in a scoped bridge environment. For unscoped hooks whose
+    payload session id disagrees with an already attached identity, the payload
+    id is advisory: update_live_session preserves the locked routing identity
+    only when a coherent authority exists (pane_lock, scoped verified prior live
+    record, or attached_sessions registry) and probe_agent_process(...,
+    stored_identity=prior) returns literal status "verified". The prior
+    fingerprint must itself be verified and include a pid/start_time pair. If
+    any gate fails, existing pane-reuse behavior runs and the old alias is
+    marked endpoint_lost rather than routing to a possible takeover process.
+
+    Same-session cross-pane movement remains separate: a verified live record
+    with the same stable session id may reconnect the participant to a new pane.
+    This canonicalization applies to all agent types and never mutates
+    participant.hook_session_id to a different payload session id.
+    """
     if not (agent_type and session_id and pane):
         return None
     now = utc_now()
@@ -599,40 +1152,61 @@ def update_live_session(
         process_identity_diagnostics = dict(process_identity)
         process_identity = prior_identity
 
-    record = {
-        "agent": agent_type,
-        "session_id": session_id,
-        "pane": pane,
-        "target": target,
-        "bridge_session": bridge_session,
-        "alias": alias,
-        "event": event,
-        "last_seen_at": now,
-        "process_identity": process_identity,
-    }
-    if process_identity_diagnostics:
-        record["process_identity_diagnostics"] = process_identity_diagnostics
-    if cwd:
-        record["cwd"] = cwd
-    if model:
-        record["model"] = model
-    new_process_verified = str(process_identity.get("status") or "") == "verified"
+    canonicalized = {}
+    if (not bridge_session or not alias) and prior_live and not live_record_matches(prior_live, agent_type, session_id):
+        canonicalized = canonicalize_unscoped_hook_record(
+            agent_type=agent_type,
+            payload_session_id=session_id,
+            pane=pane,
+            target=target,
+            event=event,
+            cwd=cwd,
+            model=model,
+        )
+        if canonicalized.get("suppressed"):
+            return None
 
-    old_pane_record: dict = {}
-    with locked_json(live_sessions_file(), {"version": 1, "panes": {}, "sessions": {}}) as data:
-        panes = data.setdefault("panes", {})
-        sessions = data.setdefault("sessions", {})
-        old_pane_record = dict(panes.get(pane) or {})
-        old_key = identity_key(str(old_pane_record.get("agent") or ""), str(old_pane_record.get("session_id") or ""))
-        if old_pane_record and old_key in sessions and sessions[old_key].get("pane") == pane:
-            del sessions[old_key]
-        panes[pane] = record
-        key = identity_key(agent_type, session_id)
-        current_index = sessions.get(key) or {}
-        current_index_pane = str(current_index.get("pane") or "")
-        current_index_live = bool(current_index_pane and live_record_matches(panes.get(current_index_pane) or {}, agent_type, session_id))
-        if current_index_pane == pane or not current_index_live:
-            sessions[key] = record
+    if canonicalized.get("record"):
+        record = dict(canonicalized["record"])
+        session_id = str(record.get("session_id") or session_id)
+        bridge_session = str(record.get("bridge_session") or bridge_session)
+        alias = str(record.get("alias") or alias)
+        process_identity = dict(record.get("process_identity") or process_identity)
+    else:
+        record = {
+            "agent": agent_type,
+            "session_id": session_id,
+            "pane": pane,
+            "target": target,
+            "bridge_session": bridge_session,
+            "alias": alias,
+            "event": event,
+            "last_seen_at": now,
+            "process_identity": process_identity,
+        }
+        if process_identity_diagnostics:
+            record["process_identity_diagnostics"] = process_identity_diagnostics
+        if cwd:
+            record["cwd"] = cwd
+        if model:
+            record["model"] = model
+
+        old_pane_record: dict = {}
+        with locked_json(live_sessions_file(), {"version": 1, "panes": {}, "sessions": {}}) as data:
+            panes = data.setdefault("panes", {})
+            sessions = data.setdefault("sessions", {})
+            old_pane_record = dict(panes.get(pane) or {})
+            old_key = identity_key(str(old_pane_record.get("agent") or ""), str(old_pane_record.get("session_id") or ""))
+            if old_pane_record and old_key in sessions and sessions[old_key].get("pane") == pane:
+                del sessions[old_key]
+            panes[pane] = record
+            key = identity_key(agent_type, session_id)
+            current_index = sessions.get(key) or {}
+            current_index_pane = str(current_index.get("pane") or "")
+            current_index_live = bool(current_index_pane and live_record_matches(panes.get(current_index_pane) or {}, agent_type, session_id))
+            if current_index_pane == pane or not current_index_live:
+                sessions[key] = record
+    new_process_verified = str(process_identity.get("status") or "") == "verified"
 
     if new_process_verified:
         live_index = locked_json_read(live_sessions_file(), {"version": 1, "panes": {}, "sessions": {}})
@@ -878,6 +1452,9 @@ def _write_live_record(record: dict, *, allow_create: bool = False) -> bool:
                 return False
             if not live_record_matches(existing_pane, agent_type, session_id) and not live_record_matches(existing_index, agent_type, session_id):
                 return False
+        old_key = identity_key(str(existing_pane.get("agent") or ""), str(existing_pane.get("session_id") or ""))
+        if old_key != identity_key(agent_type, session_id) and old_key in sessions and sessions[old_key].get("pane") == pane:
+            del sessions[old_key]
         panes[pane] = dict(record)
         sessions[identity_key(agent_type, session_id)] = dict(record)
     return True
@@ -919,8 +1496,15 @@ def backfill_session_process_identities(
     process. It cannot prove that an operator-supplied hook_session_id is
     semantically correct; normal attach probes remain the authoritative path for
     session-id discovery. By default this only refreshes a previously verified
-    live endpoint. Callers may pass allow_create_from_hook=True only while
-    handling a fresh normal attach/join hook proof for the same session id.
+    live endpoint and refuses live_record_mismatch. Callers may pass
+    allow_create_from_hook=True only while handling a fresh normal attach/join
+    hook proof for the same stable session id; that path may replace an
+    unscoped mismatch live record after re-probing the pane process.
+
+    Unscoped hook canonicalization is deliberately not performed here. The
+    update_live_session gate is the only path that treats hook payload
+    session_id as advisory, and only with a pane_lock / scoped-live-prior /
+    attached-registry authority plus a literal verified fingerprint comparison.
     """
     state = state or load_session(session)
     participants = active_participants(state)
@@ -936,7 +1520,7 @@ def backfill_session_process_identities(
             summary[alias] = {"status": "unknown", "reason": "missing_identity", "pane": pane}
             continue
         live = read_live_by_pane(pane)
-        if live and not live_record_matches(live, agent_type, session_id):
+        if live and not live_record_matches(live, agent_type, session_id) and not allow_create_from_hook:
             summary[alias] = {
                 "status": "mismatch",
                 "reason": "live_record_mismatch",
@@ -945,7 +1529,7 @@ def backfill_session_process_identities(
                 "hook_session_id": session_id,
             }
             continue
-        if live and verified_process_identity(live):
+        if live and live_record_matches(live, agent_type, session_id) and verified_process_identity(live):
             process_identity = verify_existing_live_process_identity(agent_type, session_id, pane)
         elif allow_create_from_hook:
             try:
@@ -1041,14 +1625,30 @@ def resolve_participant_endpoint_detail(bridge_session: str, alias: str, partici
         return _endpoint_detail(False, reason="mapping_missing", detail="no attached mapping for participant identity")
 
     mapped_pane = str(mapping.get("pane") or "")
+    live_candidate_found = False
     def reconnect_to_verified_candidate(reason: str, old_pane: str, old_status: str, *, clear_old_locks: bool) -> dict | None:
+        nonlocal live_candidate_found
+        live_candidate_found = False
         candidate = find_verified_live_record_for_identity(agent_type, session_id, prefer_pane=mapped_pane)
         if not candidate:
             return None
+        live_candidate_found = True
         return _auto_reconnect_endpoint_detail(
             mapping,
             candidate,
             reason,
+            purpose=purpose,
+            old_pane=old_pane,
+            old_status=old_status,
+            clear_old_locks=clear_old_locks and purpose != "read",
+        )
+
+    def recover_to_target(reason: str, old_pane: str, old_status: str, *, clear_old_locks: bool) -> dict | None:
+        if live_candidate_found:
+            return None
+        return recover_via_target_and_session_proof(
+            mapping,
+            reason=reason,
             purpose=purpose,
             old_pane=old_pane,
             old_status=old_status,
@@ -1079,6 +1679,14 @@ def resolve_participant_endpoint_detail(bridge_session: str, alias: str, partici
         )
         if reconnect:
             return reconnect
+        recovered = recover_to_target(
+            "mapped_endpoint_mismatch" if mapped_status == "mismatch" else "mapped_endpoint_unknown",
+            mapped_pane,
+            mapped_status,
+            clear_old_locks=mapped_status != "unknown",
+        )
+        if recovered:
+            return recovered
         return _endpoint_detail(False, reason="pane_mismatch", detail=f"mapping pane {mapped_pane} differs from participant pane {pane}")
 
     live_pane = read_live_by_pane(pane)
@@ -1086,6 +1694,9 @@ def resolve_participant_endpoint_detail(bridge_session: str, alias: str, partici
         reconnect = reconnect_to_verified_candidate("participant_endpoint_mismatch", pane, "mismatch", clear_old_locks=True)
         if reconnect:
             return reconnect
+        recovered = recover_to_target("participant_endpoint_mismatch", pane, "mismatch", clear_old_locks=True)
+        if recovered:
+            return recovered
         if purpose != "read":
             mark_endpoint_lost_for_pane_lock(pane, f"pane now hosts {live_pane.get('agent')}:{live_pane.get('session_id')}")
         return _endpoint_detail(
@@ -1099,6 +1710,9 @@ def resolve_participant_endpoint_detail(bridge_session: str, alias: str, partici
         reconnect = reconnect_to_verified_candidate("participant_endpoint_unknown", pane, "unknown", clear_old_locks=False)
         if reconnect:
             return reconnect
+        recovered = recover_to_target("participant_endpoint_unknown", pane, "unknown", clear_old_locks=False)
+        if recovered:
+            return recovered
         return _endpoint_detail(False, reason="live_record_missing", detail="no live hook/backfill record for participant pane")
 
     stored_identity = live_pane.get("process_identity") or {}
@@ -1106,6 +1720,9 @@ def resolve_participant_endpoint_detail(bridge_session: str, alias: str, partici
         reconnect = reconnect_to_verified_candidate("participant_endpoint_unknown", pane, "unknown", clear_old_locks=False)
         if reconnect:
             return reconnect
+        recovered = recover_to_target("participant_endpoint_unknown", pane, "unknown", clear_old_locks=False)
+        if recovered:
+            return recovered
         return _endpoint_detail(
             False,
             reason="missing_process_fingerprint",
@@ -1125,6 +1742,9 @@ def resolve_participant_endpoint_detail(bridge_session: str, alias: str, partici
         reconnect = reconnect_to_verified_candidate("process_mismatch", pane, "mismatch", clear_old_locks=True)
         if reconnect:
             return reconnect
+        recovered = recover_to_target("process_mismatch", pane, "mismatch", clear_old_locks=True)
+        if recovered:
+            return recovered
         if purpose != "read":
             mark_endpoint_lost_for_pane_lock(pane, f"process mismatch for {agent_type}:{session_id}: {reason}")
         return _endpoint_detail(
@@ -1137,6 +1757,9 @@ def resolve_participant_endpoint_detail(bridge_session: str, alias: str, partici
     reconnect = reconnect_to_verified_candidate("probe_unknown", pane, "unknown", clear_old_locks=False)
     if reconnect:
         return reconnect
+    recovered = recover_to_target("probe_unknown", pane, "unknown", clear_old_locks=False)
+    if recovered:
+        return recovered
     return _endpoint_detail(False, reason="probe_unknown", probe_status="unknown", detail=reason)
 
 

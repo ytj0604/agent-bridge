@@ -8,6 +8,11 @@ import subprocess
 
 
 VALID_AGENTS = {"claude", "codex"}
+UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+CODEX_ROLLOUT_PATH_RE = re.compile(
+    rf"(^|/)\.codex/sessions/\d{{4}}/\d{{2}}/\d{{2}}/"
+    rf"rollout-\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}-\d{{2}}-\d{{2}}-(?P<session_id>{UUID_RE})\.jsonl$"
+)
 
 
 def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -41,6 +46,8 @@ def tmux_display_pane(pane: str) -> dict:
     if len(parts) != 5:
         return {"error": "pane_metadata_unparseable"}
     pane_id, pane_pid, target, command, cwd = parts
+    if not pane_id:
+        return {"error": "pane_unavailable", "detail": "tmux returned empty pane metadata"}
     return {
         "pane_id": pane_id,
         "pane_pid": pane_pid,
@@ -48,6 +55,53 @@ def tmux_display_pane(pane: str) -> dict:
         "command": command,
         "cwd": cwd,
     }
+
+
+def transcript_session_id_for_pid(agent_type: str, pid: int | str) -> dict:
+    if str(agent_type or "") != "codex":
+        return {}
+    try:
+        pid_int = int(str(pid))
+    except ValueError:
+        return {}
+    fd_dir = Path(f"/proc/{pid_int}/fd")
+    try:
+        entries = list(fd_dir.iterdir())
+    except OSError:
+        return {}
+    for entry in entries:
+        try:
+            path = str(entry.readlink())
+        except OSError:
+            continue
+        session_id = codex_session_id_from_rollout_path(path)
+        if not session_id:
+            continue
+        return {"session_id": session_id, "path": path, "pid": pid_int}
+    return {}
+
+
+def codex_session_id_from_rollout_path(path: str) -> str:
+    match = CODEX_ROLLOUT_PATH_RE.search(str(path or ""))
+    return match.group("session_id") if match else ""
+
+
+def transcript_owners_for_session(agent_type: str, session_id: str) -> list[dict]:
+    expected = str(session_id or "")
+    if not expected:
+        return []
+    owners: list[dict] = []
+    try:
+        proc_dirs = list(Path("/proc").iterdir())
+    except OSError:
+        return []
+    for proc_dir in proc_dirs:
+        if not proc_dir.name.isdigit():
+            continue
+        proof = transcript_session_id_for_pid(agent_type, proc_dir.name)
+        if str(proof.get("session_id") or "") == expected:
+            owners.append(proof)
+    return owners
 
 
 def load_process_table() -> dict:
