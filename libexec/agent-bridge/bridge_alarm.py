@@ -20,6 +20,11 @@ from bridge_identity import resolve_caller_from_pane
 from bridge_participants import active_participants, load_session, room_status
 from bridge_paths import run_root
 
+ALARM_SET_HINT = (
+    "ALARM_SET: wake arrives later as a new [bridge:*] notice prompt unless cancelled by an incoming peer request/notice; "
+    "do not sleep/poll or keep this turn open waiting."
+)
+
 
 def request_alarm(bridge_session: str, sender: str, delay_seconds: float, body: str | None) -> tuple[bool, str, str]:
     socket_path = run_root() / f"{bridge_session}.sock"
@@ -115,6 +120,7 @@ def main() -> int:
         print(f"agent_alarm: {error}", file=sys.stderr)
         return 1
     print(wake_id)
+    print(ALARM_SET_HINT, file=sys.stderr)
     return 0
 
 

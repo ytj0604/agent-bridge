@@ -27,8 +27,13 @@ SHELL_BODY_HINT = (
     "or any body that may be split by shell quoting, use: "
     "agent_send_peer --to <alias> --stdin <<'EOF' ... EOF"
 )
-FOLLOW_UP_WAIT_HINT = (
-    "End your turn; sleep/polling blocks the wake you await."
+REQUEST_SENT_HINT = (
+    "REQUEST_SENT: result arrives later as a new [bridge:*] prompt. "
+    "Do independent work only; do not sleep/poll or keep this turn open waiting."
+)
+NOTICE_SENT_HINT = (
+    "NOTICE_SENT: no reply auto-routes. "
+    "Do not wait for one; set agent_alarm only if a follow-up matters."
 )
 AMBIENT_STDIN_READ_BYTES = (MAX_INLINE_SEND_BODY_CHARS + 1) * 4 + 4
 
@@ -474,15 +479,8 @@ def main() -> int:
         cmd += ["--to", target]
 
     proc = subprocess.run(cmd, input=body.encode("utf-8"))
-    if proc.returncode == 0 and args.kind == "notice":
-        # Notices have no auto-routed reply. Hint the model to set an alarm
-        # so they have a safety wake if the follow-up never comes.
-        print(
-            "notice sent. Safety wake: agent_alarm <sec> --note '<desc>'.",
-            file=sys.stderr,
-        )
     if proc.returncode == 0:
-        print(FOLLOW_UP_WAIT_HINT, file=sys.stderr)
+        print(REQUEST_SENT_HINT if args.kind == "request" else NOTICE_SENT_HINT, file=sys.stderr)
     return proc.returncode
 
 

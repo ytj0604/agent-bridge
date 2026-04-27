@@ -6,14 +6,14 @@ def model_cheat_sheet() -> list[str]:
     return [
         "Commands:",
         "- agent_list_peers : list aliases and show this cheat sheet.",
-        "- agent_send_peer --to <alias> 'request' : ask one peer; keep working while the bridge auto-routes the peer's reply back to you as a [bridge:*] result. Inline body must be one shell argument.",
+        "- agent_send_peer --to <alias> 'request' : ask one peer; result arrives later as a new [bridge:*] prompt. Do independent work only; do not sleep/poll or keep this turn open waiting. Inline body must be one shell argument.",
         "- agent_send_peer <alias> 'request' : shorthand for --to <alias>; put all options before the alias.",
-        "- agent_send_peer --to <a>,<b>[,...] 'request' : partial broadcast to the listed peers; same aggregate UX as --all, one merged result returns once all listed peers reply.",
-        "- agent_send_peer --all 'message' : broadcast one request to every other peer; one aggregated result returns after all peers reply. Do not put an alias before the body.",
-        "- agent_send_peer --kind notice --to <alias> 'FYI' : send info without expecting a reply. The bridge does NOT route any peer reply back; if you want a safety wake set agent_alarm separately.",
+        "- agent_send_peer --to <a>,<b>[,...] 'request' : partial broadcast to the listed peers; same aggregate UX as --all, one merged result arrives later as a new [bridge:*] prompt once all listed peers reply.",
+        "- agent_send_peer --all 'message' : broadcast one request to every other peer; one aggregated result arrives later as a new [bridge:*] prompt after all peers reply. Do not put an alias before the body.",
+        "- agent_send_peer --kind notice --to <alias> 'FYI' : send info without expecting a reply. No reply auto-routes; do not wait for one. Set agent_alarm only if a follow-up matters.",
         "- agent_send_peer --watchdog <sec> [--to <alias>|--to <a>,<b>|--all] 'request' : add a watchdog that wakes you with a [bridge:watchdog] notice if the request has not been answered <sec> seconds after the prompt is delivered to the peer. Put options before the destination. Request only. --watchdog 0 disables the default. Default delay is set via env AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC (300).",
         "- For apostrophes, newlines, text beginning with '-', or any complex body, use stdin: agent_send_peer --to <alias> --stdin <<'EOF' ... EOF, or shorthand agent_send_peer <alias> --stdin <<'EOF' ... EOF. Quote the heredoc delimiter as <<'EOF' when the body must be literal.",
-        "- agent_alarm <sec> [--note 'text'] : schedule a self-addressed wake notice. The alarm is automatically cancelled when ANY incoming peer message (kind != result, from != you, from != bridge) arrives at you; that triggering message is prepended with a [bridge:alarm_cancelled] notice telling you to re-arm if it is not what you were waiting for.",
+        "- agent_alarm <sec> [--note 'text'] : schedule a self-addressed wake notice. The wake arrives later as a new [bridge:*] notice prompt unless automatically cancelled when ANY incoming peer message (kind != result, from != you, from != bridge) arrives at you. A cancelled alarm prepends a [bridge:alarm_cancelled] notice with re-arm guidance. Do not sleep/poll or keep this turn open waiting.",
         "- agent_extend_wait <message_id> <sec> : after a watchdog wake, keep waiting on the SAME request for <sec> more seconds. Only the original sender can extend; aggregate broadcasts cannot be per-message extended.",
         "- agent_interrupt_peer <alias> : use when you sent the wrong prompt or a peer is stuck. Sends model-specific interrupt keys (Codex: Escape; Claude: Escape then one Ctrl-C when active work exists) and cancels the active message; it is removed, not requeued. No default hold: queued or newly sent corrections may deliver after the full key sequence succeeds. If the peer is already past the inflight phase, interrupt can be a no-op: the response and queued follow-ups still flow. Identifiable late output from the cancelled turn is ignored.",
         "- agent_interrupt_peer <alias> --clear-hold : clear legacy held_interrupt residue or a partial interrupt-failure delivery gate without sending keys. Normally unnecessary post-v1.5 because queued/new corrections deliver without --clear-hold after a successful interrupt. UNSAFE if the peer might still be running a turn or has dirty input — late Stop events may be ignored and queued prompts may paste into residue. Inspect with --status first.",
@@ -27,9 +27,9 @@ def model_cheat_sheet() -> list[str]:
         "- notice: the bridge does NOT route any reply back. Even if the peer writes a response, it stays in the peer's pane — observe via agent_view_peer. If you need an answer, use request, not notice. The kind on the wire beats any 'please reply' hint in the body.",
         "- result: internal kind for auto-returned replies. Cannot be sent directly by agents.",
         "Waking and timing:",
-        "- After sending a request, continue independent local work if useful. End your turn; sleep/polling blocks the wake you await. The peer's reply arrives automatically as a [bridge:*] result. With the default watchdog enabled you also get a [bridge:watchdog] notice if the peer takes too long.",
+        "- After sending a request, the result arrives later as a new [bridge:*] prompt. Do independent work only; do not sleep/poll or keep this turn open waiting. With the default watchdog enabled you also get a [bridge:watchdog] notice if the peer takes too long.",
         "- A watchdog wake explicitly tells you to choose ONE of: agent_extend_wait <msg_id> <sec>, agent_interrupt_peer <alias>, or just agent_view_peer <alias> first to inspect. Pick one — it's not a polling primitive.",
-        "- agent_alarm is for 'I delegated work via notice and want a safety wake if no follow-up arrives'. It is NOT for waiting on auto-routed reply results — for that use --watchdog / agent_extend_wait.",
+        "- agent_alarm is for 'I delegated work via notice and want a safety wake if no follow-up arrives'; do not sleep/poll or keep this turn open waiting for the wake. It is NOT for auto-routed request results — for that use --watchdog / agent_extend_wait.",
         "- Do not poll with agent_view_peer or schedule a wakeup to check progress; use agent_view_peer only when you suspect the peer is stuck or need to debug the bridge.",
         "- If a human types into a pane while a bridge prompt is delivered but unsubmitted, the bridge cancels that delivered message, emits [bridge:interrupted] prompt_intercepted to the original sender, and drops that turn; expect model-driven retries.",
         "- Never read bridge state files directly. Replies arrive as [bridge:*] prompts; use the bridge commands above for everything else.",
@@ -54,17 +54,17 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "use shell commands for peer messaging.\n"
         "\n"
         "Sending:\n"
-        "  agent_send_peer --to <alias> 'body'                  - request (default). Inline body must be one shell argument. Peer's next reply auto-routes back as [bridge:*] result. End your turn; sleep/polling blocks the wake you await.\n"
+        "  agent_send_peer --to <alias> 'body'                  - request (default). Inline body must be one shell argument. Result arrives later as a new [bridge:*] prompt; do independent work only; do not sleep/poll or keep this turn open waiting.\n"
         "  agent_send_peer <alias> 'body'                       - shorthand for --to <alias>; put options before the alias.\n"
-        "  agent_send_peer --to <a>,<b>[,...] 'body'            - partial broadcast to listed peers; one aggregated result after all listed peers reply.\n"
-        "  agent_send_peer --kind notice --to <alias> 'body'    - fire-and-forget. Bridge will NOT route any reply back even if peer answers. Use request when you need an answer.\n"
-        "  agent_send_peer --all 'body'                         - broadcast request; one aggregated result returns after all peers reply.\n"
+        "  agent_send_peer --to <a>,<b>[,...] 'body'            - partial broadcast to listed peers; one aggregated result arrives later as a new [bridge:*] prompt after all listed peers reply.\n"
+        "  agent_send_peer --kind notice --to <alias> 'body'    - fire-and-forget. No reply auto-routes; do not wait for one. Use request when you need an answer.\n"
+        "  agent_send_peer --all 'body'                         - broadcast request; one aggregated result arrives later as a new [bridge:*] prompt after all peers reply.\n"
         "  agent_send_peer --to <alias> --stdin <<'EOF'          - robust body input for apostrophes, newlines, text beginning with '-', or option-like text. Shorthand: agent_send_peer <alias> --stdin <<'EOF'. Put literal body lines next, then EOF on its own line.\n"
         "\n"
         "Waiting / self-wake:\n"
         "  --watchdog <sec> (on a request)                      - wake yourself if no reply after <sec>s since prompt delivery. Requests get a default 300s watchdog unless disabled with --watchdog 0.\n"
         "  agent_extend_wait <msg_id> <sec>                     - after a watchdog wake, keep waiting on the SAME request.\n"
-        "  agent_alarm <sec> [--note 'text']                    - schedule a self-wake notice; auto-cancelled by an incoming peer request/notice from another agent (NOT by system result messages or bridge-synthetic notices).\n"
+        "  agent_alarm <sec> [--note 'text']                    - schedule a self-wake notice; wake arrives later as a new [bridge:*] notice prompt unless auto-cancelled by an incoming peer request/notice from another agent (NOT by system result messages or bridge-synthetic notices). A cancelled alarm prepends [bridge:alarm_cancelled] with re-arm guidance. Do not sleep/poll or keep this turn open waiting.\n"
         "\n"
         "Inspecting / interrupting:\n"
         "  agent_view_peer <alias> --onboard                    - snapshot peer's pane (debug only — do NOT poll for progress).\n"
@@ -73,11 +73,11 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "  agent_interrupt_peer [<alias>] --status              - show busy/held/queue state for one or all peers.\n"
         "\n"
         "Behavior rules:\n"
-        "  - After sending a request, continue independent local work if useful. End your turn; sleep/polling blocks the wake you await. The reply arrives later as a [bridge:*] result.\n"
+        "  - After sending a request, the result arrives later as a new [bridge:*] prompt. Do independent work only; do not sleep/poll or keep this turn open waiting.\n"
         "  - Body text CANNOT override the kind on the wire. Writing 'please reply' inside a notice does nothing — the bridge will not route any response.\n"
         "  - Put all agent_send_peer options before --to/--all or before an implicit leading alias, except --stdin may appear after the destination. If an inline body is split into multiple shell arguments, the command fails closed.\n"
         "  - A watchdog wake means: pick ONE of agent_extend_wait, agent_interrupt_peer, or agent_view_peer (to inspect first). It is not a polling primitive.\n"
-        "  - agent_alarm is for 'I delegated via notice and want a safety wake if no follow-up arrives'. It is NOT for waiting on auto-routed reply results — for that use --watchdog / agent_extend_wait.\n"
+        "  - agent_alarm is for 'I delegated via notice and want a safety wake if no follow-up arrives'; do not sleep/poll or keep this turn open waiting for the wake. It is NOT for auto-routed request results — for that use --watchdog / agent_extend_wait.\n"
         "  - If a human types into a pane while a bridge prompt is delivered but unsubmitted, the bridge cancels that delivered message, emits [bridge:interrupted] prompt_intercepted to the original sender, and drops that turn; expect model-driven retries.\n"
         "  - Inline message bodies are limited to 11000 chars. For larger bodies (design docs, code, long plans), write to /tmp/agent-bridge-share/<file> and send only the path + brief description. Inlining big content is slow and can break paste-burst submit.\n"
         "  - Never read bridge state files directly; use the commands above.\n"

@@ -6457,15 +6457,25 @@ def scenario_prompt_intercepted_doc_surfaces_disclose_user_typing_collision(labe
 
 
 def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, tmpdir: Path) -> None:
-    phrase = "End your turn; sleep/polling blocks the wake you await."
-    old_fragments = ["do not sleep or poll", "Do not sleep/poll"]
+    request_tokens = ["result arrives later as a new [bridge:*] prompt", "Do independent work only", "do not sleep/poll"]
+    alarm_tokens = ["[bridge:*] notice prompt", "do not sleep/poll"]
+    forbidden_fragments = ["End your turn; sleep/polling blocks the wake you await.", "do not sleep or poll"]
 
     cheat_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- After sending a request,")]
     assert_true(len(cheat_lines) == 1, f"{label}: expected one cheat-sheet request-wait rule, got {cheat_lines!r}")
     cheat_line = cheat_lines[0]
-    assert_true(phrase in cheat_line, f"{label}: cheat-sheet request-wait rule must name blocking consequence: {cheat_line!r}")
-    for old in old_fragments:
-        assert_true(old not in cheat_line, f"{label}: cheat-sheet request-wait rule should drop old wording {old!r}: {cheat_line!r}")
+    for token in request_tokens:
+        assert_true(token in cheat_line, f"{label}: cheat-sheet request-wait rule missing token {token!r}: {cheat_line!r}")
+    for forbidden in forbidden_fragments:
+        assert_true(forbidden not in cheat_line, f"{label}: cheat-sheet request-wait rule should drop old wording {forbidden!r}: {cheat_line!r}")
+    notice_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_send_peer --kind notice")]
+    assert_true(len(notice_lines) == 1, f"{label}: expected one cheat-sheet notice rule, got {notice_lines!r}")
+    assert_true("no reply auto-routes" in notice_lines[0].lower(), f"{label}: notice rule must mention no auto-route: {notice_lines[0]!r}")
+    alarm_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_alarm <sec>")]
+    assert_true(len(alarm_lines) == 1, f"{label}: expected one cheat-sheet alarm rule, got {alarm_lines!r}")
+    for token in alarm_tokens:
+        assert_true(token.lower() in alarm_lines[0].lower(), f"{label}: alarm rule missing token {token!r}: {alarm_lines[0]!r}")
+    assert_true("[bridge:alarm_cancelled]" in alarm_lines[0] and "re-arm" in alarm_lines[0].lower(), f"{label}: alarm rule must mention cancellation marker and re-arm guidance: {alarm_lines[0]!r}")
 
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
     probe_lines = [line.strip() for line in probe.splitlines()]
@@ -6474,13 +6484,21 @@ def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, t
         if line.startswith("agent_send_peer --to <alias> 'body'") and "request (default)" in line
     ]
     behavior_lines = [line for line in probe_lines if line.startswith("- After sending a request,")]
+    notice_probe_lines = [line for line in probe_lines if line.startswith("agent_send_peer --kind notice")]
+    alarm_probe_lines = [line for line in probe_lines if line.startswith("agent_alarm <sec>")]
     assert_true(len(sending_lines) == 1, f"{label}: expected one probe request sending line, got {sending_lines!r}")
     assert_true(len(behavior_lines) == 1, f"{label}: expected one probe request behavior rule, got {behavior_lines!r}")
+    assert_true(len(notice_probe_lines) == 1, f"{label}: expected one probe notice line, got {notice_probe_lines!r}")
+    assert_true(len(alarm_probe_lines) == 1, f"{label}: expected one probe alarm line, got {alarm_probe_lines!r}")
     for surface, line in (("probe sending line", sending_lines[0]), ("probe behavior rule", behavior_lines[0])):
-        assert_true(phrase in line, f"{label}: {surface} must name blocking consequence: {line!r}")
-        assert_true("[bridge:*] result" in line, f"{label}: {surface} must preserve auto-route mention: {line!r}")
-        for old in old_fragments:
-            assert_true(old not in line, f"{label}: {surface} should drop old wording {old!r}: {line!r}")
+        for token in request_tokens:
+            assert_true(token.lower() in line.lower(), f"{label}: {surface} missing token {token!r}: {line!r}")
+        for forbidden in forbidden_fragments:
+            assert_true(forbidden not in line, f"{label}: {surface} should drop old wording {forbidden!r}: {line!r}")
+    assert_true("no reply auto-routes" in notice_probe_lines[0].lower(), f"{label}: probe notice line must mention no auto-route: {notice_probe_lines[0]!r}")
+    for token in alarm_tokens:
+        assert_true(token.lower() in alarm_probe_lines[0].lower(), f"{label}: probe alarm line missing token {token!r}: {alarm_probe_lines[0]!r}")
+    assert_true("[bridge:alarm_cancelled]" in alarm_probe_lines[0] and "re-arm" in alarm_probe_lines[0].lower(), f"{label}: probe alarm line must mention cancellation marker and re-arm guidance: {alarm_probe_lines[0]!r}")
     print(f"  PASS  {label}")
 
 
@@ -8413,9 +8431,28 @@ def scenario_alarm_zero_and_finite_positive_call_request_alarm(label: str, tmpdi
     ba.request_alarm = request_alarm
     code0, out0, err0 = _run_alarm_main(ba, ["0", "--note", "now", "--session", "test-session", "--from", "alice", "--allow-spoof"])
     code1, out1, err1 = _run_alarm_main(ba, ["2.5", "--session", "test-session", "--from", "alice", "--allow-spoof"])
-    assert_true(code0 == 0 and out0.strip() == "wake-0", f"{label}: zero alarm should succeed: code={code0} out={out0!r} err={err0!r}")
-    assert_true(code1 == 0 and out1.strip() == "wake-2.5", f"{label}: positive alarm should succeed: code={code1} out={out1!r} err={err1!r}")
+    assert_true(code0 == 0 and out0 == "wake-0\n", f"{label}: zero alarm should print wake id only to stdout: code={code0} out={out0!r} err={err0!r}")
+    assert_true(code1 == 0 and out1 == "wake-2.5\n", f"{label}: positive alarm should print wake id only to stdout: code={code1} out={out1!r} err={err1!r}")
+    for wake_id, err in (("wake-0", err0), ("wake-2.5", err1)):
+        for token in ("ALARM_SET", "[bridge:*]", "do not sleep/poll"):
+            assert_true(token in err, f"{label}: alarm success hint missing token {token!r}: {err!r}")
+        assert_true(wake_id not in err, f"{label}: wake id must remain stdout-only: {err!r}")
     assert_true(calls == [("test-session", "alice", 0.0, "now"), ("test-session", "alice", 2.5, None)], f"{label}: request_alarm calls mismatch: {calls}")
+    print(f"  PASS  {label}")
+
+
+def scenario_alarm_request_failure_prints_no_success_hint(label: str, tmpdir: Path) -> None:
+    ba = _import_alarm_module()
+    ba.resolve_caller_from_pane = lambda **kwargs: bridge_identity.CallerResolution(True, "test-session", "alice")  # type: ignore[assignment]
+    ba.ensure_daemon_running = lambda session: ""
+    ba.room_status = lambda session: argparse.Namespace(active_enough_for_enqueue=True, reason="ok")
+    ba.load_session = lambda session: _participants_state(["alice", "bob"])
+    ba.request_alarm = lambda *args, **kwargs: (False, "", "daemon rejected alarm")
+    code, out, err = _run_alarm_main(ba, ["3", "--session", "test-session", "--from", "alice", "--allow-spoof"])
+    assert_true(code == 1, f"{label}: daemon rejection should return 1, got {code}")
+    assert_true(out == "", f"{label}: failed alarm must not print stdout wake id: {out!r}")
+    assert_true("daemon rejected alarm" in err, f"{label}: failure stderr should explain daemon error: {err!r}")
+    assert_true("ALARM_SET" not in err and "do not sleep/poll" not in err, f"{label}: alarm success hint must not print on failure: {err!r}")
     print(f"  PASS  {label}")
 
 
@@ -8749,7 +8786,6 @@ def scenario_send_peer_single_inline_body_uses_stdin_handoff(label: str, tmpdir:
 def scenario_send_peer_request_success_prints_anti_wait_hint(label: str, tmpdir: Path) -> None:
     bs = _import_send_peer_module()
     _patch_send_peer_for_unit(bs)
-    consequence = "End your turn; sleep/polling blocks the wake you await."
     code, out, err, calls = _run_send_peer_with_fake_subprocess(
         bs,
         ["--session", "test-session", "--from", "alice", "--to", "bob", "hello world"],
@@ -8758,16 +8794,15 @@ def scenario_send_peer_request_success_prints_anti_wait_hint(label: str, tmpdir:
     )
     assert_true(code == 0 and len(calls) == 1, f"{label}: request should succeed: code={code} err={err!r}")
     assert_true(out == "msg-test123\n", f"{label}: enqueue stdout must be preserved exactly: {out!r}")
-    assert_true(consequence in err, f"{label}: common consequence hint missing: {err!r}")
-    assert_true("notice sent" not in err and "Safety wake" not in err, f"{label}: request must not print notice alarm hint: {err!r}")
+    for token in ("REQUEST_SENT", "[bridge:*]", "do not sleep/poll"):
+        assert_true(token in err, f"{label}: request hint missing token {token!r}: {err!r}")
+    assert_true("notice sent" not in err and "Safety wake" not in err and "NOTICE_SENT" not in err, f"{label}: request must not print notice hint: {err!r}")
     print(f"  PASS  {label}")
 
 
 def scenario_send_peer_notice_success_prints_alarm_and_anti_wait_hints(label: str, tmpdir: Path) -> None:
     bs = _import_send_peer_module()
     _patch_send_peer_for_unit(bs)
-    safety = "notice sent. Safety wake: agent_alarm <sec> --note '<desc>'."
-    consequence = "End your turn; sleep/polling blocks the wake you await."
     code, out, err, calls = _run_send_peer_with_fake_subprocess(
         bs,
         ["--session", "test-session", "--from", "alice", "--kind", "notice", "--to", "bob", "hello world"],
@@ -8776,9 +8811,31 @@ def scenario_send_peer_notice_success_prints_alarm_and_anti_wait_hints(label: st
     )
     assert_true(code == 0 and len(calls) == 1, f"{label}: notice should succeed: code={code} err={err!r}")
     assert_true(out == "msg-notice123\n", f"{label}: enqueue stdout must be preserved exactly: {out!r}")
-    assert_true(safety in err, f"{label}: notice alarm hint missing: {err!r}")
-    assert_true(consequence in err, f"{label}: common consequence hint missing: {err!r}")
-    assert_true(err.index(safety) < err.index(consequence), f"{label}: notice-specific hint should come first: {err!r}")
+    for token in ("NOTICE_SENT", "no reply auto-routes"):
+        assert_true(token in err, f"{label}: notice hint missing token {token!r}: {err!r}")
+    assert_true("notice sent. Safety wake" not in err, f"{label}: legacy notice safety line must stay absent: {err!r}")
+    assert_true("REQUEST_SENT" not in err and "sleep/polling blocks" not in err, f"{label}: notice must not print request/legacy hint: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_aggregate_request_success_prints_result_hint(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    for argv, stdout_text in (
+        (["--session", "test-session", "--from", "alice", "--to", "bob,carol", "hello world"], "msg-bob\nmsg-carol\n"),
+        (["--session", "test-session", "--from", "alice", "--all", "hello world"], "msg-bob\nmsg-carol\n"),
+    ):
+        code, out, err, calls = _run_send_peer_with_fake_subprocess(
+            bs,
+            argv,
+            stdin_isatty=True,
+            stdout_text=stdout_text,
+        )
+        assert_true(code == 0 and len(calls) == 1, f"{label}: aggregate request should succeed for {argv}: code={code} err={err!r}")
+        assert_true(out == stdout_text, f"{label}: enqueue stdout must be preserved exactly for {argv}: {out!r}")
+        for token in ("REQUEST_SENT", "result arrives later", "[bridge:*]", "do not sleep/poll"):
+            assert_true(token in err, f"{label}: aggregate request hint missing token {token!r} for {argv}: {err!r}")
+        assert_true("reply arrives later" not in err, f"{label}: aggregate hint must say result, not reply: {err!r}")
     print(f"  PASS  {label}")
 
 
@@ -8794,7 +8851,8 @@ def scenario_send_peer_subprocess_failure_prints_no_success_hint(label: str, tmp
     )
     assert_true(code == 1 and len(calls) == 1, f"{label}: subprocess failure should propagate: code={code}")
     assert_true(out == "enqueue failed details\n", f"{label}: failure stdout still comes from subprocess: {out!r}")
-    assert_true("notice sent" not in err and "Safety wake" not in err and "sleep/polling blocks" not in err, f"{label}: success hints must not print on failure: {err!r}")
+    assert_true("notice sent" not in err and "Safety wake" not in err and "sleep/polling blocks" not in err, f"{label}: legacy success hints must not print on failure: {err!r}")
+    assert_true("REQUEST_SENT" not in err and "NOTICE_SENT" not in err, f"{label}: success hints must not print on failure: {err!r}")
     print(f"  PASS  {label}")
 
 
@@ -9748,6 +9806,7 @@ def main() -> int:
             ("extend_wait_finite_positive_calls_request_extend", scenario_extend_wait_finite_positive_calls_request_extend),
             ("alarm_negative_nan_inf_minus_inf_rejected", scenario_alarm_negative_nan_inf_minus_inf_rejected),
             ("alarm_zero_and_finite_positive_call_request_alarm", scenario_alarm_zero_and_finite_positive_call_request_alarm),
+            ("alarm_request_failure_prints_no_success_hint", scenario_alarm_request_failure_prints_no_success_hint),
             ("resolve_default_watchdog_seconds_env_table", scenario_resolve_default_watchdog_seconds_env_table),
             ("daemon_socket_alarm_op_rejects_non_finite", scenario_daemon_socket_alarm_op_rejects_non_finite),
             ("daemon_socket_extend_watchdog_op_rejects_non_finite", scenario_daemon_socket_extend_watchdog_op_rejects_non_finite),
@@ -10016,6 +10075,7 @@ def main() -> int:
             ("send_peer_single_inline_body_uses_stdin_handoff", scenario_send_peer_single_inline_body_uses_stdin_handoff),
             ("send_peer_request_success_prints_anti_wait_hint", scenario_send_peer_request_success_prints_anti_wait_hint),
             ("send_peer_notice_success_prints_alarm_and_anti_wait_hints", scenario_send_peer_notice_success_prints_alarm_and_anti_wait_hints),
+            ("send_peer_aggregate_request_success_prints_result_hint", scenario_send_peer_aggregate_request_success_prints_result_hint),
             ("send_peer_subprocess_failure_prints_no_success_hint", scenario_send_peer_subprocess_failure_prints_no_success_hint),
             ("send_peer_ambient_socket_stdin_does_not_block", scenario_send_peer_ambient_socket_stdin_does_not_block),
             ("send_peer_inline_body_accepts_empty_non_tty_stdin", scenario_send_peer_inline_body_accepts_empty_non_tty_stdin),
