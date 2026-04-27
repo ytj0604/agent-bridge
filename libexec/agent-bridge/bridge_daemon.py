@@ -49,6 +49,11 @@ TURN_ID_MISMATCH_GRACE_DEFAULT_SECONDS = 300.0
 TURN_ID_MISMATCH_POST_WATCHDOG_GRACE_DEFAULT_SECONDS = 1.0
 PANE_MODE_PROBE_TIMEOUT_SECONDS = 0.3
 PANE_MODE_FORCE_CANCEL_MODES = {"copy-mode", "copy-mode-vi", "view-mode"}
+INTERRUPT_KEY_DELAY_DEFAULT_SECONDS = 0.15
+INTERRUPT_KEY_DELAY_MIN_SECONDS = 0.05
+INTERRUPT_KEY_DELAY_MAX_SECONDS = 1.0
+INTERRUPT_SEND_KEY_TIMEOUT_SECONDS = 1.0
+CLAUDE_INTERRUPT_KEYS_DEFAULT = ("Escape", "C-c")
 PANE_MODE_METADATA_KEYS = (
     "pane_mode_blocked_since",
     "pane_mode_blocked_since_ts",
@@ -251,6 +256,66 @@ def resolve_non_negative_env_seconds(env_name: str, default: float) -> tuple[flo
     return value, None
 
 
+def resolve_interrupt_key_delay_seconds() -> tuple[float, str | None]:
+    value, warning = resolve_non_negative_env_seconds(
+        "AGENT_BRIDGE_INTERRUPT_KEY_DELAY_SEC",
+        INTERRUPT_KEY_DELAY_DEFAULT_SECONDS,
+    )
+    if not math.isfinite(value):
+        nonfinite_warning = (
+            f"AGENT_BRIDGE_INTERRUPT_KEY_DELAY_SEC={value!r} is non-finite; "
+            f"using {INTERRUPT_KEY_DELAY_DEFAULT_SECONDS:g}"
+        )
+        warning = f"{warning}; {nonfinite_warning}" if warning else nonfinite_warning
+        value = INTERRUPT_KEY_DELAY_DEFAULT_SECONDS
+    clamped = min(max(value, INTERRUPT_KEY_DELAY_MIN_SECONDS), INTERRUPT_KEY_DELAY_MAX_SECONDS)
+    if clamped != value:
+        clamp_warning = (
+            f"AGENT_BRIDGE_INTERRUPT_KEY_DELAY_SEC={value:g} outside "
+            f"[{INTERRUPT_KEY_DELAY_MIN_SECONDS:g}, {INTERRUPT_KEY_DELAY_MAX_SECONDS:g}]; using {clamped:g}"
+        )
+        warning = f"{warning}; {clamp_warning}" if warning else clamp_warning
+    return clamped, warning
+
+
+def resolve_claude_interrupt_keys() -> tuple[tuple[str, ...], str | None]:
+    raw = os.environ.get("AGENT_BRIDGE_CLAUDE_INTERRUPT_KEYS")
+    if raw is None or str(raw).strip() == "":
+        return CLAUDE_INTERRUPT_KEYS_DEFAULT, None
+    aliases = {
+        "esc": "Escape",
+        "escape": "Escape",
+        "c-c": "C-c",
+        "ctrl-c": "C-c",
+        "ctrl+c": "C-c",
+        "control-c": "C-c",
+    }
+    keys: list[str] = []
+    for part in str(raw).split(","):
+        token = part.strip().lower()
+        if not token:
+            continue
+        key = aliases.get(token)
+        if not key:
+            return (
+                CLAUDE_INTERRUPT_KEYS_DEFAULT,
+                f"invalid AGENT_BRIDGE_CLAUDE_INTERRUPT_KEYS={raw!r}; using esc,c-c",
+            )
+        if key not in keys:
+            keys.append(key)
+    if not keys:
+        return (
+            CLAUDE_INTERRUPT_KEYS_DEFAULT,
+            f"AGENT_BRIDGE_CLAUDE_INTERRUPT_KEYS={raw!r} has no keys; using esc,c-c",
+        )
+    if keys[0] != "Escape":
+        return (
+            CLAUDE_INTERRUPT_KEYS_DEFAULT,
+            f"AGENT_BRIDGE_CLAUDE_INTERRUPT_KEYS={raw!r} must include esc first; using esc,c-c",
+        )
+    return tuple(keys), None
+
+
 def pane_mode_block_since_ts(item: dict) -> float | None:
     raw_ts = item.get("pane_mode_blocked_since_ts")
     try:
@@ -364,9 +429,19 @@ class BridgeDaemon:
             "AGENT_BRIDGE_TURN_ID_MISMATCH_POST_WATCHDOG_GRACE_SEC",
             TURN_ID_MISMATCH_POST_WATCHDOG_GRACE_DEFAULT_SECONDS,
         )
+        self.interrupt_key_delay_seconds, interrupt_key_delay_warning = resolve_interrupt_key_delay_seconds()
+        self.claude_interrupt_keys, claude_interrupt_keys_warning = resolve_claude_interrupt_keys()
         self.turn_id_mismatch_grace_warnings = [
             warning
-            for warning in (turn_id_mismatch_grace_warning, turn_id_mismatch_post_watchdog_grace_warning)
+            for warning in (
+                turn_id_mismatch_grace_warning,
+                turn_id_mismatch_post_watchdog_grace_warning,
+            )
+            if warning
+        ]
+        self.interrupt_config_warnings = [
+            warning
+            for warning in (interrupt_key_delay_warning, claude_interrupt_keys_warning)
             if warning
         ]
         self.from_start = args.from_start
@@ -395,6 +470,11 @@ class BridgeDaemon:
         # or manually planted holds. It is informational for delivery: queued
         # corrections are allowed to flow without waiting for --clear-hold.
         self.held_interrupt: dict[str, dict] = {}
+        # A partial Claude interrupt (ESC succeeded but follow-up C-c failed)
+        # leaves the pane input potentially dirty. This gate blocks all later
+        # delivery to that target until another interrupt completes the full
+        # configured key sequence, or an operator manually clears it.
+        self.interrupt_partial_failure_blocks: dict[str, dict] = {}
         # interrupted_turns[alias] stores tombstones for interrupted prompts.
         # These do not block delivery; they suppress identifiable late
         # prompt_submitted / response_finished events from the cancelled turn
@@ -402,6 +482,7 @@ class BridgeDaemon:
         self.interrupted_turns: dict[str, list[dict]] = {}
         # Coarse RLock that serializes mutations to in-memory routing state
         # (busy, reserved, current_prompt_by_agent, held_interrupt,
+        # interrupt_partial_failure_blocks,
         # interrupted_turns, last_enter_ts, watchdogs, panes, participants caches) and gates
         # event-handler / command-socket / maintenance interleaving.
         # Lock ordering rule: state_lock is ALWAYS acquired before
@@ -409,6 +490,9 @@ class BridgeDaemon:
         # call back into self.* methods or invoke logging — they should
         # only manipulate the queue list and return data for callers to
         # process outside the mutator.
+        # Interrupt handling also dispatches its tmux key sequence while
+        # holding this lock, including Claude's short ESC -> C-c delay, so
+        # hook events and replacement delivery cannot interleave between keys.
         self.state_lock = threading.RLock()
         self.last_delivery_tick = 0.0
         self.startup_backfill_summary: dict[str, dict] = {}
@@ -594,7 +678,9 @@ class BridgeDaemon:
                 "info": info or {},
                 "warning": (
                     "Forcing hold release before the peer's Stop event arrives can cause "
-                    "late responses to misroute. Verify with --status that the peer is idle "
+                    "late responses to misroute, and clearing a partial interrupt gate can "
+                    "paste queued prompts into dirty input. Verify with --status that the peer "
+                    "is idle, then use agent_view_peer to confirm the input buffer is clear "
                     "before clearing."
                 ),
             }
@@ -630,6 +716,7 @@ class BridgeDaemon:
                         continue
                     participant = self.participants.get(alias) or {}
                     held = self.held_interrupt.get(alias)
+                    partial_interrupt = self.interrupt_partial_failure_blocks.get(alias)
                     cur = self.current_prompt_by_agent.get(alias) or {}
                     pane = str(participant.get("pane") or self.panes.get(alias) or "")
                     first_pending = next(
@@ -661,6 +748,8 @@ class BridgeDaemon:
                         "current_prompt_turn_id": cur.get("turn_id"),
                         "held": held is not None,
                         "held_info": held or {},
+                        "interrupt_partial_failure_blocked": partial_interrupt is not None,
+                        "interrupt_partial_failure_info": partial_interrupt or {},
                         "_pane": pane,
                         "pane_mode_blocked_since": first_pending.get("pane_mode_blocked_since"),
                         "pane_mode_blocked_mode": first_pending.get("pane_mode_blocked_mode"),
@@ -1024,7 +1113,11 @@ class BridgeDaemon:
         return str(detail.get("pane") or "") if detail.get("ok") else ""
 
     def next_pending_candidate(self, target: str) -> dict | None:
-        if self.busy.get(target) or self.reserved.get(target):
+        if (
+            self.busy.get(target)
+            or self.reserved.get(target)
+            or self.interrupt_partial_failure_blocks.get(target)
+        ):
             return None
 
         def mutator(queue: list[dict]) -> dict | None:
@@ -1371,7 +1464,11 @@ class BridgeDaemon:
         self.try_deliver(str(message["to"]))
 
     def reserve_next(self, target: str) -> dict | None:
-        if self.busy.get(target) or self.reserved.get(target):
+        if (
+            self.busy.get(target)
+            or self.reserved.get(target)
+            or self.interrupt_partial_failure_blocks.get(target)
+        ):
             return None
 
         def mutator(queue: list[dict]) -> dict | None:
@@ -2313,13 +2410,41 @@ class BridgeDaemon:
                 return row, "interrupted_drain_no_turn_after_prompt_submit"
         return None, "interrupted_drain_ambiguous_no_turn"
 
+    def send_interrupt_key(self, pane: str, key: str) -> tuple[bool, str]:
+        if self.dry_run:
+            return True, ""
+        try:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", pane, key],
+                check=True,
+                timeout=INTERRUPT_SEND_KEY_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "timeout"
+        except Exception as exc:
+            return False, str(exc)
+        return True, ""
+
+    def target_has_active_interrupt_work(self, target: str, active_context: dict | None = None) -> bool:
+        if active_context and active_context.get("id"):
+            return True
+        if self.interrupt_partial_failure_blocks.get(target):
+            return True
+        if self.reserved.get(target):
+            return True
+        active_statuses = {"inflight", "submitted", "delivered"}
+        for item in self.queue.read():
+            if item.get("to") == target and item.get("status") in active_statuses:
+                return True
+        return False
+
     def handle_interrupt(self, sender: str, target: str) -> dict:
         # Interrupt semantics:
         #   1. ESC fail-closed: if tmux send-keys fails, no state mutation.
         #   2. Cancel (not requeue) the active in-flight message and any
         #      delivered/inflight/submitted messages for this target.
-        #      Pending replacement messages are allowed to deliver as soon
-        #      as ESC succeeds.
+        #      Pending replacement messages are allowed to deliver once the
+        #      configured interrupt key sequence succeeds.
         #   3. Record interrupted-turn tombstones so identifiable late
         #      prompt_submitted / response_finished events from the
         #      cancelled turn are suppressed without blocking replacements.
@@ -2327,13 +2452,13 @@ class BridgeDaemon:
         #      "[interrupted]" reply recorded into the aggregate, so the
         #      aggregate can still complete from the remaining peers'
         #      replies (and so the aggregate watchdog isn't dropped).
-        # IMPORTANT: pane resolve, ESC send, and state mutation all run
+        # IMPORTANT: pane resolve, key dispatch, and state mutation all run
         # inside state_lock. Otherwise a prompt_submitted/response_finished
-        # event could fire between ESC and the lock-protected mutation,
-        # causing the interrupt to mis-cancel a turn it never targeted.
-        # The ESC subprocess holds the lock for a few ms; that is the
-        # v1 correctness/perf trade-off and is documented in the lock
-        # ordering comment in __init__.
+        # event or queued replacement delivery could interleave between ESC
+        # and Claude's follow-up C-c, causing stale ctx mutation or clearing
+        # a fresh replacement prompt. The bounded key delay is the v1
+        # correctness/perf trade-off and is documented in the lock ordering
+        # comment in __init__.
         self.reload_participants()
         with self.state_lock:
             endpoint_detail = self.resolve_endpoint_detail(target, purpose="write")
@@ -2360,15 +2485,35 @@ class BridgeDaemon:
                 return {
                     "esc_sent": False,
                     "esc_error": reason,
+                    "interrupt_ok": False,
+                    "interrupt_keys": [],
+                    "cc_sent": None,
+                    "cc_error": None,
                     "held": False,
                     "cancelled_message_ids": [item.get("id") for item in finalized],
                 }
-            if not self.dry_run:
-                try:
-                    subprocess.run(["tmux", "send-keys", "-t", pane, "Escape"], check=True)
-                except Exception as exc:
-                    self.log("esc_failed", target=target, by_sender=sender, error=str(exc))
-                    return {"esc_sent": False, "esc_error": str(exc), "held": False, "cancelled_message_ids": []}
+            participant = self.participants.get(target) or {}
+            agent_type = str(participant.get("agent_type") or "")
+            if agent_type not in PHYSICAL_AGENT_TYPES:
+                self.safe_log("interrupt_unknown_agent_type", target=target, agent_type=agent_type)
+
+            active_context_before = self.current_prompt_by_agent.get(target) or {}
+            had_active = self.target_has_active_interrupt_work(target, active_context_before)
+
+            interrupt_keys: list[str] = ["Escape"]
+            esc_ok, esc_error = self.send_interrupt_key(pane, "Escape")
+            if not esc_ok:
+                self.log("esc_failed", target=target, by_sender=sender, error=esc_error)
+                return {
+                    "esc_sent": False,
+                    "esc_error": esc_error,
+                    "interrupt_ok": False,
+                    "interrupt_keys": interrupt_keys,
+                    "cc_sent": None,
+                    "cc_error": None,
+                    "held": False,
+                    "cancelled_message_ids": [],
+                }
 
             active_context = self.current_prompt_by_agent.pop(target, {}) or {}
             cancelled = self._cancel_active_messages_for_target(
@@ -2380,28 +2525,100 @@ class BridgeDaemon:
                 notify_sources=True,
             )
 
+            tombstones = self._record_interrupted_turns(target, active_context, cancelled, sender)
+            prior_active_message_id = active_context.get("id")
+            should_send_cc = (
+                agent_type == "claude"
+                and "C-c" in self.claude_interrupt_keys
+                and had_active
+            )
+            cc_sent: bool | None = None
+            cc_error: str | None = None
+            if should_send_cc:
+                if not self.dry_run and self.interrupt_key_delay_seconds > 0:
+                    time.sleep(self.interrupt_key_delay_seconds)
+                interrupt_keys.append("C-c")
+                cc_ok, cc_error_text = self.send_interrupt_key(pane, "C-c")
+                cc_sent = cc_ok
+                if not cc_ok:
+                    cc_error = cc_error_text
+                    self.log("cc_send_failed", target=target, by_sender=sender, error=cc_error)
+            interrupt_ok = cc_sent is not False
             self.busy[target] = False
             self.reserved[target] = None
-            tombstones = self._record_interrupted_turns(target, active_context, cancelled, sender)
+            if interrupt_ok:
+                prior_block = self.interrupt_partial_failure_blocks.pop(target, None)
+                if prior_block:
+                    self.log(
+                        "interrupt_partial_failure_block_cleared",
+                        target=target,
+                        by_sender=sender,
+                        reason="interrupt_completed",
+                        prior_error=prior_block.get("cc_error"),
+                    )
+            else:
+                block_info = {
+                    "since": utc_now(),
+                    "since_ts": time.time(),
+                    "by_sender": sender,
+                    "agent_type": agent_type,
+                    "prior_message_id": prior_active_message_id,
+                    "cancelled_message_ids": [cm.get("id") for cm in cancelled],
+                    "cc_error": cc_error,
+                    "reason": "interrupt_key_sequence_failed",
+                }
+                self.interrupt_partial_failure_blocks[target] = block_info
+                self.log(
+                    "interrupt_partial_failure_blocked",
+                    target=target,
+                    by_sender=sender,
+                    prior_message_id=prior_active_message_id,
+                    cc_error=cc_error,
+                )
             self.log(
-                "interrupt_replacement_unblocked",
+                "interrupt_replacement_unblocked" if interrupt_ok else "interrupt_replacement_blocked",
                 target=target,
                 by_sender=sender,
-                prior_message_id=active_context.get("id"),
+                prior_message_id=prior_active_message_id,
                 prior_sender=active_context.get("from"),
                 cancelled_count=len(cancelled),
                 cancelled_message_ids=[cm.get("id") for cm in cancelled],
                 tombstone_count=len(tombstones),
             )
+            self.log(
+                "interrupt_keys_sent",
+                target=target,
+                by_sender=sender,
+                agent_type=agent_type,
+                keys=interrupt_keys,
+                delay_sec=self.interrupt_key_delay_seconds if should_send_cc else 0.0,
+                had_active=had_active,
+                interrupt_ok=interrupt_ok,
+                cc_sent=cc_sent,
+            )
 
         # Kick delivery to the interrupted target so queued corrections run
-        # promptly. Other targets were not affected by this interrupt.
-        self.try_deliver(target)
+        # promptly. If the configured key sequence only partially completed,
+        # leave queued work pending rather than appending to a possibly dirty
+        # prompt buffer.
+        if interrupt_ok:
+            self.try_deliver(target)
+        else:
+            self.log(
+                "interrupt_delivery_skipped",
+                target=target,
+                by_sender=sender,
+                reason="interrupt_key_sequence_failed",
+            )
         return {
             "esc_sent": True,
             "esc_error": None,
+            "interrupt_ok": interrupt_ok,
+            "interrupt_keys": interrupt_keys,
+            "cc_sent": cc_sent,
+            "cc_error": cc_error,
             "cancelled_message_ids": [cm.get("id") for cm in cancelled],
-            "prior_active_message_id": active_context.get("id"),
+            "prior_active_message_id": prior_active_message_id,
             "held": False,
         }
 
@@ -2494,19 +2711,36 @@ class BridgeDaemon:
     def release_hold(self, target: str, reason: str, by_sender: str | None = None) -> dict | None:
         with self.state_lock:
             info = self.held_interrupt.pop(target, None)
-        if not info:
+            partial_block = self.interrupt_partial_failure_blocks.pop(target, None)
+        had_held = info is not None
+        if not info and not partial_block:
             return None
+        if partial_block:
+            if info:
+                info = {**info, "interrupt_partial_failure": partial_block}
+            else:
+                info = {
+                    "reason": "interrupt_partial_failure",
+                    "target": target,
+                    "prior_message_id": partial_block.get("prior_message_id"),
+                    "since_ts": partial_block.get("since_ts"),
+                    "interrupt_partial_failure": partial_block,
+                }
         hold_duration_ms = None
         since_ts = info.get("since_ts")
         if isinstance(since_ts, (int, float)):
             hold_duration_ms = int(max(0.0, time.time() - float(since_ts)) * 1000)
-        event_name = "hold_force_resumed" if reason.startswith("manual_clear") else "hold_released"
+        if partial_block and not had_held and reason.startswith("manual_clear"):
+            event_name = "interrupt_partial_failure_block_cleared"
+        else:
+            event_name = "hold_force_resumed" if reason.startswith("manual_clear") else "hold_released"
         self.log(
             event_name,
             target=target,
             reason=reason,
             by_sender=by_sender,
             prior_message_id=info.get("prior_message_id"),
+            partial_cc_error=(partial_block or {}).get("cc_error"),
             hold_duration_ms=hold_duration_ms,
         )
         self.try_deliver(target)
@@ -3706,11 +3940,15 @@ class BridgeDaemon:
                     pane_mode_grace_seconds=self.pane_mode_grace_seconds,
                     turn_id_mismatch_grace_seconds=self.turn_id_mismatch_grace_seconds,
                     turn_id_mismatch_post_watchdog_grace_seconds=self.turn_id_mismatch_post_watchdog_grace_seconds,
+                    interrupt_key_delay_seconds=self.interrupt_key_delay_seconds,
+                    claude_interrupt_keys=list(self.claude_interrupt_keys),
                 )
                 if self.pane_mode_grace_warning:
                     self.log("pane_mode_grace_config_warning", warning=self.pane_mode_grace_warning)
                 for warning in self.turn_id_mismatch_grace_warnings:
                     self.log("turn_id_mismatch_grace_config_warning", warning=warning)
+                for warning in self.interrupt_config_warnings:
+                    self.log("interrupt_config_warning", warning=warning)
                 if self.startup_backfill_summary:
                     unknown = [
                         alias for alias, item in self.startup_backfill_summary.items()

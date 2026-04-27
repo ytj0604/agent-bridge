@@ -53,6 +53,7 @@ import bridge_attach  # noqa: E402
 import bridge_hook_logger  # noqa: E402
 import bridge_identity  # noqa: E402
 import bridge_instructions  # noqa: E402
+import bridge_interrupt_peer  # noqa: E402
 import bridge_join  # noqa: E402
 import bridge_pane_probe  # noqa: E402
 import bridge_response_guard  # noqa: E402
@@ -547,6 +548,347 @@ def scenario_interrupt_new_replacement_after_interrupt_delivers(label: str, tmpd
 
     new_item = _queue_item(d, "msg-new")
     assert_true(new_item is not None and new_item.get("status") == "inflight", f"{label}: post-interrupt replacement should deliver immediately, got {new_item}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_claude_with_active_sends_esc_then_cc(label: str, tmpdir: Path) -> None:
+    d = _make_interrupt_key_daemon(tmpdir, "claude")
+    records: list[dict] = []
+    _record_interrupt_keys(d, records)
+    _make_delivered_context(d, "msg-old", "alice", "bob", "n-old", turn_id="turn-old")
+
+    result = d.handle_interrupt(sender="alice", target="bob")
+
+    assert_true([record["key"] for record in records] == ["Escape", "C-c"], f"{label}: expected ESC then C-c, got {records}")
+    assert_true(result.get("interrupt_ok") is True, f"{label}: interrupt should complete: {result}")
+    assert_true(result.get("cc_sent") is True, f"{label}: C-c should be reported as sent: {result}")
+    assert_true(result.get("interrupt_keys") == ["Escape", "C-c"], f"{label}: response should list actual keys: {result}")
+    assert_true(result.get("cancelled_message_ids") == ["msg-old"], f"{label}: active message should be cancelled: {result}")
+    assert_true(_queue_item(d, "msg-old") is None, f"{label}: old message should be removed")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_codex_sends_only_esc(label: str, tmpdir: Path) -> None:
+    d = _make_interrupt_key_daemon(tmpdir, "codex")
+    records: list[dict] = []
+    _record_interrupt_keys(d, records)
+    _make_delivered_context(d, "msg-old", "alice", "bob", "n-old", turn_id="turn-old")
+
+    result = d.handle_interrupt(sender="alice", target="bob")
+
+    assert_true([record["key"] for record in records] == ["Escape"], f"{label}: codex should only receive ESC, got {records}")
+    assert_true(result.get("interrupt_ok") is True, f"{label}: ESC-only interrupt should complete: {result}")
+    assert_true(result.get("cc_sent") is None, f"{label}: codex interrupt should not report C-c: {result}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_unknown_type_falls_back_to_esc(label: str, tmpdir: Path) -> None:
+    d = _make_interrupt_key_daemon(tmpdir, "codex")
+    d.reload_participants = lambda: None  # type: ignore[method-assign]
+    d.participants["bob"]["agent_type"] = "other"
+    records: list[dict] = []
+    _record_interrupt_keys(d, records)
+    _make_delivered_context(d, "msg-old", "alice", "bob", "n-old", turn_id="turn-old")
+
+    result = d.handle_interrupt(sender="alice", target="bob")
+
+    assert_true([record["key"] for record in records] == ["Escape"], f"{label}: unknown type should fall back to ESC, got {records}")
+    assert_true(result.get("interrupt_ok") is True, f"{label}: ESC fallback should complete: {result}")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(any(e.get("event") == "interrupt_unknown_agent_type" and e.get("target") == "bob" for e in events), f"{label}: unknown type should be logged")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_claude_idle_skips_cc(label: str, tmpdir: Path) -> None:
+    d = _make_interrupt_key_daemon(tmpdir, "claude")
+    records: list[dict] = []
+    _record_interrupt_keys(d, records)
+
+    result = d.handle_interrupt(sender="alice", target="bob")
+
+    assert_true([record["key"] for record in records] == ["Escape"], f"{label}: idle claude should not receive C-c, got {records}")
+    assert_true(result.get("interrupt_ok") is True, f"{label}: idle ESC should complete: {result}")
+    assert_true(result.get("cc_sent") is None, f"{label}: idle claude should not report C-c: {result}")
+    assert_true(result.get("cancelled_message_ids") == [], f"{label}: idle interrupt should not cancel rows: {result}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_claude_cc_failure_does_not_revert_state(label: str, tmpdir: Path) -> None:
+    d = _make_interrupt_key_daemon(tmpdir, "claude")
+    records: list[dict] = []
+    _record_interrupt_keys(d, records, fail_key="C-c")
+    _make_delivered_context(d, "msg-old", "alice", "bob", "n-old", turn_id="turn-old")
+
+    result = d.handle_interrupt(sender="alice", target="bob")
+
+    assert_true([record["key"] for record in records] == ["Escape", "C-c"], f"{label}: C-c should be attempted after ESC, got {records}")
+    assert_true(result.get("esc_sent") is True, f"{label}: ESC should still be successful: {result}")
+    assert_true(result.get("interrupt_ok") is False, f"{label}: partial key failure should be visible: {result}")
+    assert_true(result.get("cc_sent") is False, f"{label}: failed C-c should be reported: {result}")
+    assert_true("C-c failed" in str(result.get("cc_error") or ""), f"{label}: C-c error should be surfaced: {result}")
+    assert_true(_queue_item(d, "msg-old") is None, f"{label}: cancelled queue row should not be restored")
+    assert_true("bob" not in d.current_prompt_by_agent, f"{label}: active context should stay cleared")
+    assert_true("bob" in d.interrupt_partial_failure_blocks, f"{label}: partial C-c failure should gate future delivery")
+
+    replacement = test_message("msg-after-partial", frm="alice", to="bob", status="pending")
+    d.queue.update(lambda queue: (queue.append(replacement), None)[1])
+    delivered: list[dict] = []
+    d.deliver_reserved = lambda message: delivered.append(dict(message))  # type: ignore[method-assign]
+    d.try_deliver("bob")
+    replacement_after = _queue_item(d, "msg-after-partial")
+    assert_true(delivered == [], f"{label}: periodic try_deliver must not deliver through partial-failure gate: {delivered}")
+    assert_true(replacement_after is not None and replacement_after.get("status") == "pending", f"{label}: replacement should stay pending behind gate: {replacement_after}")
+
+    _record_interrupt_keys(d, records)
+    recovery = d.handle_interrupt(sender="alice", target="bob")
+    assert_true(recovery.get("interrupt_ok") is True and recovery.get("cc_sent") is True, f"{label}: follow-up interrupt should clear dirty-buffer gate: {recovery}")
+    assert_true("bob" not in d.interrupt_partial_failure_blocks, f"{label}: successful follow-up interrupt should clear partial gate")
+    assert_true(delivered and delivered[-1].get("id") == "msg-after-partial", f"{label}: pending replacement should deliver after successful recovery interrupt: {delivered}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_holds_state_lock_through_sequence(label: str, tmpdir: Path) -> None:
+    d = _make_interrupt_key_daemon(tmpdir, "claude")
+    records: list[dict] = []
+    _record_interrupt_keys(d, records)
+    _make_delivered_context(d, "msg-old", "alice", "bob", "n-old", turn_id="turn-old")
+
+    d.handle_interrupt(sender="alice", target="bob")
+
+    cc_records = [record for record in records if record.get("key") == "C-c"]
+    assert_true(cc_records, f"{label}: C-c should be sent for active claude interrupt")
+    assert_true(all(record.get("lock_held") is True for record in records), f"{label}: key dispatch must stay under state_lock: {records}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_no_try_deliver_between_keys(label: str, tmpdir: Path) -> None:
+    d = _make_interrupt_key_daemon(tmpdir, "claude")
+    calls: list[str] = []
+
+    def recorder(_pane: str, key: str) -> tuple[bool, str]:
+        calls.append(f"key:{key}")
+        return True, ""
+
+    d.send_interrupt_key = recorder  # type: ignore[method-assign]
+    d.try_deliver = lambda target=None: calls.append(f"try_deliver:{target}")  # type: ignore[method-assign]
+    _make_delivered_context(d, "msg-old", "alice", "bob", "n-old", turn_id="turn-old")
+
+    d.handle_interrupt(sender="alice", target="bob")
+
+    assert_true(calls == ["key:Escape", "key:C-c", "try_deliver:bob"], f"{label}: try_deliver must not interleave between keys: {calls}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_env_override_disables_cc(label: str, tmpdir: Path) -> None:
+    with patched_environ(AGENT_BRIDGE_CLAUDE_INTERRUPT_KEYS="esc"):
+        d = _make_interrupt_key_daemon(tmpdir, "claude")
+    records: list[dict] = []
+    _record_interrupt_keys(d, records)
+    _make_delivered_context(d, "msg-old", "alice", "bob", "n-old", turn_id="turn-old")
+
+    result = d.handle_interrupt(sender="alice", target="bob")
+
+    assert_true(d.claude_interrupt_keys == ("Escape",), f"{label}: env override should configure ESC-only: {d.claude_interrupt_keys}")
+    assert_true([record["key"] for record in records] == ["Escape"], f"{label}: env override should disable C-c, got {records}")
+    assert_true(result.get("cc_sent") is None, f"{label}: disabled C-c should not be reported: {result}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_key_delay_env_nonfinite_uses_default(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "claude", "pane": "%92"},
+    }
+    with patched_environ(AGENT_BRIDGE_INTERRUPT_KEY_DELAY_SEC="nan"):
+        d = make_daemon(tmpdir, participants)
+
+    assert_true(
+        d.interrupt_key_delay_seconds == bridge_daemon.INTERRUPT_KEY_DELAY_DEFAULT_SECONDS,
+        f"{label}: non-finite delay should use default, got {d.interrupt_key_delay_seconds}",
+    )
+    assert_true(
+        any("non-finite" in warning for warning in d.interrupt_config_warnings),
+        f"{label}: non-finite delay should produce warning: {d.interrupt_config_warnings}",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_key_delay_env_clamps_out_of_range(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "claude", "pane": "%92"},
+    }
+    with patched_environ(AGENT_BRIDGE_INTERRUPT_KEY_DELAY_SEC="2.0"):
+        d = make_daemon(tmpdir, participants)
+
+    assert_true(
+        d.interrupt_key_delay_seconds == bridge_daemon.INTERRUPT_KEY_DELAY_MAX_SECONDS,
+        f"{label}: out-of-range delay should clamp to max, got {d.interrupt_key_delay_seconds}",
+    )
+    assert_true(
+        any("outside" in warning and "using 1" in warning for warning in d.interrupt_config_warnings),
+        f"{label}: clamped delay should produce warning: {d.interrupt_config_warnings}",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_claude_interrupt_keys_invalid_uses_default(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "claude", "pane": "%92"},
+    }
+    with patched_environ(AGENT_BRIDGE_CLAUDE_INTERRUPT_KEYS="bogus"):
+        d = make_daemon(tmpdir, participants)
+
+    assert_true(
+        d.claude_interrupt_keys == bridge_daemon.CLAUDE_INTERRUPT_KEYS_DEFAULT,
+        f"{label}: invalid keys should use default, got {d.claude_interrupt_keys}",
+    )
+    assert_true(
+        any("invalid AGENT_BRIDGE_CLAUDE_INTERRUPT_KEYS" in warning for warning in d.interrupt_config_warnings),
+        f"{label}: invalid keys should produce warning: {d.interrupt_config_warnings}",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_claude_interrupt_keys_empty_uses_default(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "claude", "pane": "%92"},
+    }
+    with patched_environ(AGENT_BRIDGE_CLAUDE_INTERRUPT_KEYS=", ,"):
+        d = make_daemon(tmpdir, participants)
+
+    assert_true(
+        d.claude_interrupt_keys == bridge_daemon.CLAUDE_INTERRUPT_KEYS_DEFAULT,
+        f"{label}: empty key list should use default, got {d.claude_interrupt_keys}",
+    )
+    assert_true(
+        any("has no keys" in warning for warning in d.interrupt_config_warnings),
+        f"{label}: empty key list should produce specific warning: {d.interrupt_config_warnings}",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_send_interrupt_key_timeout_returns_false(label: str, tmpdir: Path) -> None:
+    d = _make_interrupt_key_daemon(tmpdir, "claude")
+    old_run = bridge_daemon.subprocess.run
+    calls: list[dict] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append({"argv": argv, **kwargs})
+        raise subprocess.TimeoutExpired(argv, timeout=kwargs.get("timeout"))
+
+    try:
+        bridge_daemon.subprocess.run = fake_run  # type: ignore[assignment]
+        ok, error = d.send_interrupt_key("%92", "Escape")
+    finally:
+        bridge_daemon.subprocess.run = old_run  # type: ignore[assignment]
+
+    assert_true(ok is False and error == "timeout", f"{label}: timeout should return false/timeout, got {(ok, error)!r}")
+    assert_true(calls and calls[0].get("timeout") == bridge_daemon.INTERRUPT_SEND_KEY_TIMEOUT_SECONDS, f"{label}: send-keys should use timeout: {calls}")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_hold_clears_interrupt_partial_failure_gate(label: str, tmpdir: Path) -> None:
+    d = _make_interrupt_key_daemon(tmpdir, "claude")
+    d.interrupt_partial_failure_blocks["bob"] = {
+        "since": utc_now(),
+        "since_ts": time.time(),
+        "by_sender": "alice",
+        "prior_message_id": "msg-old",
+        "cc_error": "timeout",
+    }
+    info = d.release_hold("bob", reason="manual_clear_by_alice", by_sender="alice")
+
+    assert_true(info is not None and "interrupt_partial_failure" in info, f"{label}: clear_hold should return partial-failure info: {info}")
+    assert_true("bob" not in d.interrupt_partial_failure_blocks, f"{label}: clear_hold should clear partial-failure gate")
+    events = read_events(Path(d.state_file))
+    assert_true(any(e.get("event") == "interrupt_partial_failure_block_cleared" for e in events), f"{label}: clear event should be logged")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_double_within_no_active_skips_cc(label: str, tmpdir: Path) -> None:
+    d = _make_interrupt_key_daemon(tmpdir, "claude")
+    records: list[dict] = []
+    _record_interrupt_keys(d, records)
+    _make_delivered_context(d, "msg-old", "alice", "bob", "n-old", turn_id="turn-old")
+
+    first = d.handle_interrupt(sender="alice", target="bob")
+    second = d.handle_interrupt(sender="alice", target="bob")
+
+    assert_true(first.get("cc_sent") is True, f"{label}: first active interrupt should send C-c: {first}")
+    assert_true(second.get("cc_sent") is None, f"{label}: second idle interrupt should skip C-c: {second}")
+    assert_true([record["key"] for record in records] == ["Escape", "C-c", "Escape"], f"{label}: second interrupt should be ESC-only: {records}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_double_with_fresh_delivery_sends_cc_again(label: str, tmpdir: Path) -> None:
+    d = _make_interrupt_key_daemon(tmpdir, "claude")
+    records: list[dict] = []
+    _record_interrupt_keys(d, records)
+    _make_delivered_context(d, "msg-old", "alice", "bob", "n-old", turn_id="turn-old")
+
+    first = d.handle_interrupt(sender="alice", target="bob")
+    _make_delivered_context(d, "msg-new", "alice", "bob", "n-new", turn_id="turn-new")
+    second = d.handle_interrupt(sender="alice", target="bob")
+
+    assert_true(first.get("cc_sent") is True and second.get("cc_sent") is True, f"{label}: fresh active delivery should send C-c again: {first} / {second}")
+    assert_true([record["key"] for record in records] == ["Escape", "C-c", "Escape", "C-c"], f"{label}: fresh delivery should reset natural dedup: {records}")
+    assert_true(second.get("cancelled_message_ids") == ["msg-new"], f"{label}: second interrupt should cancel fresh delivery: {second}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_peer_cli_exit_nonzero_on_partial_key_failure(label: str, tmpdir: Path) -> None:
+    import contextlib
+    import io
+
+    state = {
+        "session": "test-session",
+        "participants": {
+            "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91"},
+            "bob": {"alias": "bob", "agent_type": "claude", "pane": "%92"},
+        },
+    }
+    old_argv = sys.argv[:]
+    old_resolve = bridge_interrupt_peer.resolve_caller_from_pane
+    old_ensure = bridge_interrupt_peer.ensure_daemon_running
+    old_room_status = bridge_interrupt_peer.room_status
+    old_load_session = bridge_interrupt_peer.load_session
+    old_send_command = bridge_interrupt_peer.send_command
+    out = io.StringIO()
+    err = io.StringIO()
+    try:
+        sys.argv = ["agent_interrupt_peer", "bob", "--session", "test-session", "--from", "alice", "--allow-spoof"]
+        bridge_interrupt_peer.resolve_caller_from_pane = lambda **_kwargs: argparse.Namespace(ok=True, session="test-session", alias="alice", error="")  # type: ignore[assignment]
+        bridge_interrupt_peer.ensure_daemon_running = lambda _session: ""  # type: ignore[assignment]
+        bridge_interrupt_peer.room_status = lambda _session: argparse.Namespace(active_enough_for_enqueue=True, reason="ok")  # type: ignore[assignment]
+        bridge_interrupt_peer.load_session = lambda _session: state  # type: ignore[assignment]
+        bridge_interrupt_peer.send_command = lambda _session, _payload: (True, {  # type: ignore[assignment]
+            "ok": True,
+            "esc_sent": True,
+            "interrupt_ok": False,
+            "interrupt_keys": ["Escape", "C-c"],
+            "cc_sent": False,
+            "cc_error": "C-c failed",
+            "held": False,
+            "cancelled_message_ids": ["msg-old"],
+        }, "")
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = bridge_interrupt_peer.main()
+    finally:
+        sys.argv = old_argv
+        bridge_interrupt_peer.resolve_caller_from_pane = old_resolve  # type: ignore[assignment]
+        bridge_interrupt_peer.ensure_daemon_running = old_ensure  # type: ignore[assignment]
+        bridge_interrupt_peer.room_status = old_room_status  # type: ignore[assignment]
+        bridge_interrupt_peer.load_session = old_load_session  # type: ignore[assignment]
+        bridge_interrupt_peer.send_command = old_send_command  # type: ignore[assignment]
+
+    summary = json.loads(out.getvalue())
+    assert_true(code == 1, f"{label}: CLI should exit non-zero on partial interrupt failure, got {code}, stderr={err.getvalue()!r}")
+    assert_true(summary.get("interrupt_ok") is False, f"{label}: summary should expose interrupt_ok=false: {summary}")
+    assert_true(summary.get("cc_sent") is False, f"{label}: summary should expose cc_sent=false: {summary}")
+    assert_true(summary.get("cc_error") == "C-c failed", f"{label}: summary should expose cc_error: {summary}")
     print(f"  PASS  {label}")
 
 
@@ -2434,6 +2776,40 @@ def _make_delivered_context(
 
 def _queue_item(d, message_id: str) -> dict | None:
     return next((item for item in d.queue.read() if item.get("id") == message_id), None)
+
+
+def _make_interrupt_key_daemon(tmpdir: Path, target_agent_type: str = "claude"):
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": target_agent_type, "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.dry_run = False
+    d.interrupt_key_delay_seconds = 0.0
+
+    def fake_resolve(target: str, purpose: str = "write") -> dict:
+        pane = str((d.participants.get(target) or {}).get("pane") or "")
+        return {
+            "ok": bool(pane),
+            "pane": pane,
+            "reason": "" if pane else "no_pane",
+            "probe_status": "verified" if pane else "",
+            "detail": "",
+            "should_detach": False,
+        }
+
+    d.resolve_endpoint_detail = fake_resolve  # type: ignore[method-assign]
+    return d
+
+
+def _record_interrupt_keys(d, records: list[dict], *, fail_key: str = "") -> None:
+    def recorder(pane: str, key: str) -> tuple[bool, str]:
+        records.append({"pane": pane, "key": key, "lock_held": d.state_lock._is_owned()})
+        if fail_key and key == fail_key:
+            return False, f"{key} failed"
+        return True, ""
+
+    d.send_interrupt_key = recorder  # type: ignore[method-assign]
 
 
 def _active_turn(
@@ -6016,16 +6392,20 @@ def scenario_view_peer_doc_surfaces_disclose_search_semantics(label: str, tmpdir
 
 def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir: Path) -> None:
     phrase = "interrupt can be a no-op: the response and queued follow-ups still flow"
+    key_sequence_phrase = "Claude"
+    ctrl_c_phrase = "Ctrl-C"
     command_shape = "agent_interrupt_peer <alias>"
 
     interrupt_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith(f"- {command_shape} :")]
     assert_true(len(interrupt_lines) == 1, f"{label}: expected one default interrupt cheat-sheet line, got {interrupt_lines!r}")
     assert_true(phrase in interrupt_lines[0], f"{label}: cheat-sheet interrupt line must disclose no-op race: {interrupt_lines[0]!r}")
+    assert_true(key_sequence_phrase in interrupt_lines[0] and ctrl_c_phrase in interrupt_lines[0], f"{label}: cheat-sheet interrupt line must disclose Claude C-c sequence: {interrupt_lines[0]!r}")
     assert_true("force-cancel" not in interrupt_lines[0], f"{label}: default interrupt line must not imply force-cancel: {interrupt_lines[0]!r}")
 
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
     assert_true(command_shape in probe, f"{label}: probe prompt must keep the interrupt command shape")
     assert_true(phrase in probe, f"{label}: probe prompt must disclose no-op race")
+    assert_true(key_sequence_phrase in probe and ctrl_c_phrase in probe, f"{label}: probe prompt must disclose Claude C-c sequence")
     assert_true("force-cancel" not in probe, f"{label}: probe prompt must not imply force-cancel")
 
     help_result = subprocess.run(
@@ -6037,9 +6417,11 @@ def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir:
     )
     help_text = help_result.stdout + help_result.stderr
     normalized_help = " ".join(help_text.split())
+    normalized_help_noop_ok = phrase in normalized_help or phrase.replace("no-op", "no- op") in normalized_help
     assert_true(help_result.returncode == 0, f"{label}: agent_interrupt_peer --help should exit 0, got {help_result.returncode}: {help_text!r}")
     assert_true("--clear-hold" in help_text, f"{label}: --help output must include interrupt-specific options")
-    assert_true(phrase in normalized_help, f"{label}: --help output must disclose no-op race: {help_text!r}")
+    assert_true(normalized_help_noop_ok, f"{label}: --help output must disclose no-op race: {help_text!r}")
+    assert_true(key_sequence_phrase in normalized_help and ctrl_c_phrase in normalized_help, f"{label}: --help output must disclose Claude C-c sequence: {help_text!r}")
     assert_true("force-cancel" not in normalized_help, f"{label}: --help output must not imply force-cancel: {help_text!r}")
     print(f"  PASS  {label}")
 
@@ -9295,6 +9677,23 @@ def main() -> int:
             ("aggregate_interrupt_synthetic_reply", scenario_aggregate_interrupt_synthetic),
             ("interrupt_pending_replacement_delivers", scenario_interrupt_pending_replacement_delivers),
             ("interrupt_new_replacement_after_interrupt_delivers", scenario_interrupt_new_replacement_after_interrupt_delivers),
+            ("interrupt_claude_with_active_sends_esc_then_cc", scenario_interrupt_claude_with_active_sends_esc_then_cc),
+            ("interrupt_codex_sends_only_esc", scenario_interrupt_codex_sends_only_esc),
+            ("interrupt_unknown_type_falls_back_to_esc", scenario_interrupt_unknown_type_falls_back_to_esc),
+            ("interrupt_claude_idle_skips_cc", scenario_interrupt_claude_idle_skips_cc),
+            ("interrupt_claude_cc_failure_does_not_revert_state", scenario_interrupt_claude_cc_failure_does_not_revert_state),
+            ("interrupt_holds_state_lock_through_sequence", scenario_interrupt_holds_state_lock_through_sequence),
+            ("interrupt_no_try_deliver_between_keys", scenario_interrupt_no_try_deliver_between_keys),
+            ("interrupt_env_override_disables_cc", scenario_interrupt_env_override_disables_cc),
+            ("interrupt_key_delay_env_nonfinite_uses_default", scenario_interrupt_key_delay_env_nonfinite_uses_default),
+            ("interrupt_key_delay_env_clamps_out_of_range", scenario_interrupt_key_delay_env_clamps_out_of_range),
+            ("claude_interrupt_keys_invalid_uses_default", scenario_claude_interrupt_keys_invalid_uses_default),
+            ("claude_interrupt_keys_empty_uses_default", scenario_claude_interrupt_keys_empty_uses_default),
+            ("send_interrupt_key_timeout_returns_false", scenario_send_interrupt_key_timeout_returns_false),
+            ("clear_hold_clears_interrupt_partial_failure_gate", scenario_clear_hold_clears_interrupt_partial_failure_gate),
+            ("interrupt_double_within_no_active_skips_cc", scenario_interrupt_double_within_no_active_skips_cc),
+            ("interrupt_double_with_fresh_delivery_sends_cc_again", scenario_interrupt_double_with_fresh_delivery_sends_cc_again),
+            ("interrupt_peer_cli_exit_nonzero_on_partial_key_failure", scenario_interrupt_peer_cli_exit_nonzero_on_partial_key_failure),
             ("interrupted_late_prompt_submitted_before_replacement", scenario_interrupted_late_prompt_submitted_before_replacement),
             ("interrupted_late_prompt_submitted_after_replacement", scenario_interrupted_late_prompt_submitted_after_replacement),
             ("interrupted_late_turn_stop_preserves_replacement", scenario_interrupted_late_turn_stop_preserves_replacement),

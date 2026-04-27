@@ -373,3 +373,72 @@ directly.
   Fresh normal attach/join hook probes may create the initial
   fingerprint; `--no-probe` requires an existing verified live endpoint
   before it publishes room state.
+
+---
+
+## I-07: Claude submitted-prompt input residue after interrupt (fixed)
+
+**Status**: fixed after v1.5.2.
+
+### Symptom
+
+`agent_interrupt_peer <alias>` sent `Escape` and cancelled bridge state,
+but Claude Code could leave the interrupted submitted prompt restored in
+the input buffer. The next bridge delivery could then append to that
+residual text, preventing clean nonce recognition and leaving the new
+message stuck in `inflight`.
+
+Direct tmux key tests showed different model TUI behavior:
+
+- Codex clears a submitted task with `Escape`; its input returns to an
+  empty prompt.
+- Claude Code restores the submitted prompt into the input field after
+  `Escape`; one following `Ctrl-C` clears it and prints Claude's normal
+  "press Ctrl-C again to exit" warning without exiting.
+
+### Root cause
+
+The daemon treated `Escape` success as both "turn cancelled" and
+"prompt buffer clean". That was true for Codex in testing, but not for
+Claude Code. Because delivery resumed immediately after state mutation,
+queued replacements could be pasted before Claude's input buffer had
+been drained.
+
+### Fix
+
+- Interrupt dispatch is agent-type-specific:
+  - Codex targets receive `Escape`.
+  - Claude targets receive `Escape`, then one `C-c` when the daemon saw
+    active interrupt work.
+- The `C-c` is gated on active work computed under `state_lock`, so an
+  idle/no-op Claude interrupt does not send the first key of Claude's
+  double-`Ctrl-C` exit sequence.
+- The daemon keeps `state_lock` held through `Escape`, the short delay,
+  `C-c`, and state mutation. This prevents hook events or replacement
+  delivery from interleaving between the two keys.
+- `AGENT_BRIDGE_CLAUDE_INTERRUPT_KEYS=esc` restores the legacy
+  ESC-only behavior if a future Claude Code release changes key
+  semantics.
+- `AGENT_BRIDGE_INTERRUPT_KEY_DELAY_SEC` tunes the inter-key delay
+  (default 0.15s, clamped to 0.05s..1.0s).
+- Interrupt responses now include `interrupt_ok`, `interrupt_keys`,
+  `cc_sent`, and `cc_error`. `interrupt_keys` is the attempted sequence;
+  `cc_sent` / `cc_error` report whether Claude's follow-up key actually
+  completed. `agent_interrupt_peer` exits non-zero when the configured
+  key sequence only partially completes.
+
+### Residual risk
+
+If `Escape` succeeds but Claude's follow-up `C-c` fails, the daemon does
+not roll back the already-committed cancellation. It reports
+`interrupt_ok=false`, installs a per-target delivery gate so queued
+replacements stay pending across both immediate and periodic delivery
+ticks, and logs the partial failure for operator inspection. A later
+successful `agent_interrupt_peer <alias>` clears the gate and resumes
+delivery. `agent_interrupt_peer <alias> --clear-hold` can also clear the
+gate manually, but that is unsafe unless the pane input is known clean.
+
+The partial-failure gate is daemon-memory only. A daemon restart, crash,
+or leave/rejoin under the same alias can lose or stale that gate; after
+such recovery, operators should verify with `agent_view_peer <alias>`
+that the pane input is clear before allowing queued prompts to continue.

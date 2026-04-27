@@ -2,7 +2,9 @@
 """Interrupt a peer or manage legacy interrupt hold state.
 
 Modes:
-- (default) ESC + cancel active peer turn; pending corrections may continue:
+- (default) interrupt key sequence + cancel active peer turn; pending
+  corrections may continue after a complete sequence. Claude targets may
+  receive one Ctrl-C after ESC to clear submitted-prompt input residue:
     agent_interrupt_peer <alias>
 - Clear legacy hold residue without sending ESC. Normally unnecessary for
   post-v1.5 corrections (UNSAFE if peer might still be running — see warning
@@ -57,14 +59,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         prog="agent_interrupt_peer",
         description=(
-            "Send ESC and cancel the active peer message (default), force-clear a legacy interrupt hold, "
-            "or inspect peer status. If the peer is already past the inflight phase, interrupt can be "
-            "a no-op: the response and queued follow-ups still flow."
+            "Send the agent-type-specific interrupt key sequence (Codex: Escape; Claude: Escape then "
+            "one Ctrl-C when active work exists) and cancel the active peer message (default), "
+            "force-clear a legacy interrupt hold, or inspect peer status. If the peer is already past "
+            "the inflight phase, interrupt can be a no-op: the response and queued follow-ups still flow."
         ),
     )
     parser.add_argument("target", nargs="?", help="peer alias to act on (omit with --status to query all peers)")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--clear-hold", action="store_true", help="clear legacy held_interrupt residue without sending ESC (normally unnecessary post-v1.5; unsafe if peer is still running)")
+    mode.add_argument("--clear-hold", action="store_true", help="clear legacy held_interrupt residue or partial interrupt-failure delivery gate without sending keys (unsafe if peer is still running or input is dirty)")
     mode.add_argument("--status", action="store_true", help="show busy/held/queue state for the target (or all peers if no target)")
     parser.add_argument("--session", dest="session")
     parser.add_argument("--from", dest="sender")
@@ -165,14 +168,19 @@ def main() -> int:
     summary = {
         "target": args.target,
         "esc_sent": bool(response.get("esc_sent")),
+        "interrupt_ok": bool(response.get("interrupt_ok", response.get("esc_sent"))),
+        "interrupt_keys": response.get("interrupt_keys") or [],
+        "cc_sent": response.get("cc_sent"),
         "held": bool(response.get("held")),
         "cancelled_message_ids": response.get("cancelled_message_ids") or [],
         "prior_active_message_id": response.get("prior_active_message_id"),
     }
     if response.get("esc_error"):
         summary["esc_error"] = response["esc_error"]
+    if response.get("cc_error"):
+        summary["cc_error"] = response["cc_error"]
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0 if response.get("esc_sent") else 1
+    return 0 if summary["interrupt_ok"] else 1
 
 
 if __name__ == "__main__":

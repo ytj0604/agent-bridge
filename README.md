@@ -77,7 +77,7 @@ agent_send_peer               request / notice / broadcast / partial broadcast
 agent_view_peer               read a peer's terminal (snapshot, since-last, search)
 agent_alarm                   self-wake notice (cancelled by qualifying peer message)
 agent_extend_wait             extend a watchdog after a wake
-agent_interrupt_peer          ESC + cancel a peer's active turn
+agent_interrupt_peer          model-specific interrupt + cancel active turn
 ```
 
 From inside an agent pane, `agent_list_peers` prints the full cheat sheet — exact flag semantics, watchdog/alarm/interrupt rules, large-payload guidance — so a model can self-recover the protocol without human help.
