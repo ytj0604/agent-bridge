@@ -51,8 +51,45 @@ def request_extend(bridge_session: str, sender: str, message_id: str, seconds: f
     except Exception as exc:
         return False, {}, f"invalid daemon response: {exc}"
     if not response.get("ok"):
-        return False, {}, str(response.get("error") or "daemon rejected request")
+        return False, response if isinstance(response, dict) else {}, str(response.get("error") or "daemon rejected request")
     return True, response, ""
+
+
+def extend_wait_error_message(message_id: str, error: str, response: dict) -> str:
+    hint = str(response.get("hint") or "").strip()
+    if error == "message_recently_responded":
+        base = (
+            f"agent_extend_wait: message {message_id!r} already reached a terminal response. "
+            "A [bridge:result] may already be queued or may arrive as a separate prompt; "
+            "do not keep extending this id."
+        )
+    elif error == "message_already_terminal":
+        base = (
+            f"agent_extend_wait: message {message_id!r} is already terminal "
+            "(cancelled, interrupted, undeliverable, or otherwise closed); no active watchdog remains."
+        )
+    elif error == "message_unknown":
+        base = (
+            f"agent_extend_wait: message {message_id!r} is unknown to the daemon "
+            "(invalid id, too old, or daemon restarted); it cannot be extended."
+        )
+    elif error == "message_not_found":
+        base = (
+            f"agent_extend_wait: message {message_id!r} not found in queue. "
+            "It may already have responded, and a [bridge:result] may already be queued "
+            "or may arrive as a separate prompt; do not keep extending this id."
+        )
+    elif error == "not_owner":
+        base = f"agent_extend_wait: message {message_id!r} was not sent by you; only the original sender can extend its watchdog."
+    elif error == "aggregate_extend_not_supported":
+        base = f"agent_extend_wait: message {message_id!r} is a delivered aggregate broadcast member; per-message response extend is not supported in v1.5."
+    elif error in {"message_not_in_delivered_state", "message_not_extendable_state"}:
+        base = f"agent_extend_wait: message {message_id!r} is not in an extendable watchdog state. Pending messages have no active delivery attempt yet; inflight/submitted delivery and delivered response waits can be extended."
+    else:
+        base = f"agent_extend_wait: {error}"
+    if hint and hint not in base:
+        return f"{base} Hint: {hint}"
+    return base
 
 
 def main() -> int:
@@ -116,17 +153,7 @@ def main() -> int:
 
     ok, response, error = request_extend(session, sender, args.message_id, args.seconds)
     if not ok:
-        if error == "message_not_found":
-            msg = f"agent_extend_wait: message {args.message_id!r} not found in queue (already responded, interrupted, or invalid id)."
-        elif error == "not_owner":
-            msg = f"agent_extend_wait: message {args.message_id!r} was not sent by you; only the original sender can extend its watchdog."
-        elif error == "aggregate_extend_not_supported":
-            msg = f"agent_extend_wait: message {args.message_id!r} is a delivered aggregate broadcast member; per-message response extend is not supported in v1.5."
-        elif error in {"message_not_in_delivered_state", "message_not_extendable_state"}:
-            msg = f"agent_extend_wait: message {args.message_id!r} is not in an extendable watchdog state. Pending messages have no active delivery attempt yet; inflight/submitted delivery and delivered response waits can be extended."
-        else:
-            msg = f"agent_extend_wait: {error}"
-        print(msg, file=sys.stderr)
+        print(extend_wait_error_message(args.message_id, error, response), file=sys.stderr)
         return 1
     summary = {
         "message_id": response.get("message_id") or args.message_id,

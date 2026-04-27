@@ -76,6 +76,36 @@ EMPTY_RESPONSE_BODY = "(empty response)"
 WATCHDOG_PHASE_DELIVERY = "delivery"
 WATCHDOG_PHASE_RESPONSE = "response"
 WATCHDOG_PHASE_ALARM = "alarm"
+RESPONSE_LIKE_TOMBSTONE_REASONS = {
+    # Tombstone reasons emitted today include terminal_response,
+    # reply_received, interrupted_tombstone_terminal, aggregate_complete,
+    # cancelled_by_sender, interrupted, prompt_intercepted, endpoint_lost,
+    # daemon_restart_lost_routing_ctx, and turn_id_mismatch_expired. Only
+    # response-like reasons get the "result may be queued/arriving" guidance;
+    # every other tombstone still proves the message is terminal.
+    "terminal_response",
+    "reply_received",
+    "interrupted_tombstone_terminal",
+    "aggregate_complete",
+}
+EXTEND_WATCHDOG_HINTS = {
+    "message_recently_responded": (
+        "This request is already terminal; a [bridge:result] may already be queued "
+        "or may arrive as a separate prompt. Do not keep extending this id."
+    ),
+    "message_already_terminal": (
+        "This request is already terminal (cancelled, interrupted, undeliverable, "
+        "or otherwise closed); there is no active watchdog to extend."
+    ),
+    "message_unknown": (
+        "No active or recent terminal record exists for this message id; it may be "
+        "invalid, too old, or lost across daemon restart."
+    ),
+    "message_not_found": (
+        "This daemon reported the message as missing. It may already have responded "
+        "and the [bridge:result] may be queued or arriving separately."
+    ),
+}
 _STOP_SIGNAL: int | None = None
 PROMPT_BODY_CONTROL_TRANSLATION = {
     codepoint: None
@@ -478,10 +508,10 @@ class BridgeDaemon:
         # delivery to that target until another interrupt completes the full
         # configured key sequence, or an operator manually clears it.
         self.interrupt_partial_failure_blocks: dict[str, dict] = {}
-        # interrupted_turns[alias] stores tombstones for interrupted prompts.
-        # These do not block delivery; they suppress identifiable late
-        # prompt_submitted / response_finished events from the cancelled turn
-        # so corrected replacement prompts can run immediately after ESC.
+        # interrupted_turns[alias] stores short-lived message tombstones. Some
+        # suppress identifiable late prompt_submitted / response_finished events
+        # from cancelled turns; all help model-facing commands distinguish
+        # recently terminal ids from never-seen ids.
         self.interrupted_turns: dict[str, list[dict]] = {}
         # Coarse RLock that serializes mutations to in-memory routing state
         # (busy, reserved, current_prompt_by_agent, held_interrupt,
@@ -704,7 +734,12 @@ class BridgeDaemon:
                 return {"ok": False, "error": "seconds must be a finite positive number"}
             ok, err, deadline = self.upsert_message_watchdog(sender, message_id, additional_sec)
             if not ok:
-                return {"ok": False, "error": err or "extend_failed"}
+                error = err or "extend_failed"
+                response = {"ok": False, "error": error, "message_id": message_id}
+                hint = self.extend_watchdog_error_hint(error)
+                if hint:
+                    response["hint"] = hint
+                return response
             return {"ok": True, "new_deadline": deadline, "message_id": message_id}
         if op == "cancel_message":
             self.reload_participants()
@@ -1488,6 +1523,53 @@ class BridgeDaemon:
             )
         self.try_deliver(str(message["to"]))
 
+    def suppress_pending_watchdog_wakes(
+        self,
+        *,
+        ref_message_id: str | None = None,
+        ref_aggregate_id: str | None = None,
+        reason: str,
+    ) -> list[dict]:
+        message_id = str(ref_message_id or "")
+        aggregate_id = str(ref_aggregate_id or "")
+        if bool(message_id) == bool(aggregate_id):
+            self.log(
+                "watchdog_wake_suppression_skipped",
+                reason="invalid_ref",
+                ref_message_id=message_id,
+                ref_aggregate_id=aggregate_id,
+            )
+            return []
+        key = "ref_message_id" if message_id else "ref_aggregate_id"
+        expected = message_id or aggregate_id
+
+        def mutator(queue: list[dict]) -> list[dict]:
+            removed: list[dict] = []
+            kept: list[dict] = []
+            for item in queue:
+                if (
+                    item.get("from") == "bridge"
+                    and item.get("intent") == "watchdog_wake"
+                    and item.get("status") == "pending"
+                    and str(item.get(key) or "") == expected
+                ):
+                    removed.append(dict(item))
+                    continue
+                kept.append(item)
+            queue[:] = kept
+            return removed
+
+        removed = self.queue.update(mutator)
+        for item in removed:
+            self.log(
+                "watchdog_wake_suppressed",
+                message_id=item.get("id"),
+                ref_message_id=item.get("ref_message_id"),
+                ref_aggregate_id=item.get("ref_aggregate_id"),
+                reason=reason,
+            )
+        return removed
+
     def reserve_next(self, target: str) -> dict | None:
         with self.state_lock:
             if (
@@ -1743,6 +1825,15 @@ class BridgeDaemon:
         arm_msg["watchdog_at"] = deadline.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         self.register_watchdog(arm_msg)
 
+    def tombstone_extend_error(self, tombstone: dict) -> str:
+        reason = str(tombstone.get("reason") or "")
+        if reason in RESPONSE_LIKE_TOMBSTONE_REASONS:
+            return "message_recently_responded"
+        return "message_already_terminal"
+
+    def extend_watchdog_error_hint(self, error: str | None) -> str:
+        return EXTEND_WATCHDOG_HINTS.get(str(error or ""), "")
+
     def upsert_message_watchdog(self, sender: str, message_id: str, additional_sec: float) -> tuple[bool, str | None, str | None]:
         # All validation + upsert inside a single state_lock acquire so the
         # checks and the registration cannot interleave with delivery,
@@ -1752,7 +1843,13 @@ class BridgeDaemon:
             queue = list(self.queue.read())
             item = next((it for it in queue if it.get("id") == message_id), None)
             if not item:
-                return False, "message_not_found", None
+                tombstone = self._find_message_tombstone(message_id)
+                if tombstone:
+                    owner = str(tombstone.get("prior_sender") or "")
+                    if owner and owner != sender:
+                        return False, "not_owner", None
+                    return False, self.tombstone_extend_error(tombstone), None
+                return False, "message_unknown", None
             if str(item.get("from") or "") != sender:
                 return False, "not_owner", None
             status = str(item.get("status") or "")
@@ -1894,6 +1991,7 @@ class BridgeDaemon:
                 self.cancel_watchdogs_for_message(message_id, reason="cancelled_by_sender", phase=WATCHDOG_PHASE_DELIVERY)
             else:
                 self.cancel_watchdogs_for_message(message_id, reason="cancelled_by_sender")
+            self.suppress_pending_watchdog_wakes(ref_message_id=message_id, reason="cancelled_by_sender")
 
             suppress_late_hooks = bool(status == "inflight" and nonce)
             self._record_message_tombstone(
@@ -1972,6 +2070,15 @@ class BridgeDaemon:
             self.current_prompt_by_agent.pop(target, None)
             self.busy[target] = False
         self.cancel_watchdogs_for_message(message_id, reason="endpoint_lost")
+        self.suppress_pending_watchdog_wakes(ref_message_id=message_id, reason="endpoint_lost")
+        self._record_message_tombstone(
+            target,
+            removed,
+            by_sender="bridge",
+            reason="endpoint_lost",
+            suppress_late_hooks=False,
+            prompt_submitted_seen=bool(removed.get("status") in {"submitted", "delivered"}),
+        )
 
         reason = str(endpoint_detail.get("reason") or "endpoint_lost")
         probe_status = str(endpoint_detail.get("probe_status") or "")
@@ -2346,6 +2453,9 @@ class BridgeDaemon:
                 return "delivery_missing_message_id"
             item = self._lookup_queue_item(message_id)
             if not item:
+                tombstone = self._find_message_tombstone(message_id)
+                if tombstone:
+                    return f"delivery_message_terminal_{tombstone.get('reason') or 'unknown'}"
                 return "delivery_message_missing"
             status = str(item.get("status") or "")
             if status not in {"inflight", "submitted"}:
@@ -2365,6 +2475,9 @@ class BridgeDaemon:
                 return "response_missing_message_id"
             item = self._lookup_queue_item(message_id)
             if not item:
+                tombstone = self._find_message_tombstone(message_id)
+                if tombstone:
+                    return f"response_message_terminal_{tombstone.get('reason') or 'unknown'}"
                 return "response_message_missing"
             status = str(item.get("status") or "")
             if status != "delivered":
@@ -2413,6 +2526,9 @@ class BridgeDaemon:
             "hop_count": 0,
             "auto_return": False,
             "reply_to": wd.get("ref_message_id"),
+            "ref_message_id": wd.get("ref_message_id"),
+            "ref_aggregate_id": wd.get("ref_aggregate_id"),
+            "watchdog_phase": self.normalize_watchdog_phase(wd),
             "source": "watchdog_fire",
             "bridge_session": self.bridge_session,
             "status": "pending",
@@ -2468,6 +2584,16 @@ class BridgeDaemon:
                     self.cancel_watchdogs_for_message(str(msg_id), reason=reason, phase=WATCHDOG_PHASE_DELIVERY)
                 else:
                     self.cancel_watchdogs_for_message(str(msg_id), reason=reason)
+                self.suppress_pending_watchdog_wakes(ref_message_id=str(msg_id), reason=reason)
+                if reason == "prompt_intercepted":
+                    self._record_message_tombstone(
+                        target,
+                        cm,
+                        by_sender=by_sender,
+                        reason=reason,
+                        suppress_late_hooks=True,
+                        prompt_submitted_seen=True,
+                    )
 
         # Active context's message_id should normally be in `cancelled`
         # when cancelling delivered messages, but defend against state that
@@ -2479,6 +2605,16 @@ class BridgeDaemon:
                 self.cancel_watchdogs_for_message(str(act_id), reason=reason, phase=WATCHDOG_PHASE_DELIVERY)
             else:
                 self.cancel_watchdogs_for_message(str(act_id), reason=reason)
+            self.suppress_pending_watchdog_wakes(ref_message_id=str(act_id), reason=reason)
+            if reason == "prompt_intercepted":
+                self._record_message_tombstone(
+                    target,
+                    {**active_context, "id": act_id},
+                    by_sender=by_sender,
+                    reason=reason,
+                    suppress_late_hooks=True,
+                    prompt_submitted_seen=True,
+                )
 
         for cm in cancelled:
             msg_id = cm.get("id")
@@ -3222,6 +3358,15 @@ class BridgeDaemon:
                 self.last_enter_ts.pop(message_id, None)
                 if not aggregate_id:
                     self.cancel_watchdogs_for_message(message_id, reason="turn_id_mismatch_expired")
+                self.suppress_pending_watchdog_wakes(ref_message_id=message_id, reason="turn_id_mismatch_expired")
+                self._record_message_tombstone(
+                    target,
+                    {**context, "id": message_id},
+                    by_sender="bridge",
+                    reason="turn_id_mismatch_expired",
+                    suppress_late_hooks=False,
+                    prompt_submitted_seen=True,
+                )
             self.current_prompt_by_agent.pop(target, None)
             self.busy[target] = False
             self.reserved[target] = None
@@ -3550,6 +3695,25 @@ class BridgeDaemon:
             lines.append("")
         return "\n".join(lines).rstrip()
 
+    def _record_aggregate_completion_tombstones(self, aggregate: dict) -> None:
+        requester = str(aggregate.get("requester") or "")
+        message_ids = aggregate.get("message_ids") or {}
+        if not isinstance(message_ids, dict):
+            return
+        for alias, message_id in message_ids.items():
+            alias_str = str(alias or "")
+            msg_id = str(message_id or "")
+            if not alias_str or not msg_id:
+                continue
+            self._record_message_tombstone(
+                alias_str,
+                {"id": msg_id, "from": requester},
+                by_sender="bridge",
+                reason="aggregate_complete",
+                suppress_late_hooks=False,
+                prompt_submitted_seen=True,
+            )
+
     def collect_aggregate_response(self, sender: str, text: str, context: dict) -> None:
         aggregate_id = str(context.get("aggregate_id") or "")
         if not aggregate_id:
@@ -3646,18 +3810,21 @@ class BridgeDaemon:
         )
         message["aggregate_id"] = aggregate_id
         message["aggregate_expected"] = completed.get("expected") or expected
-        self.queue_message(message)
-        self.log(
-            "aggregate_result_queued",
-            message_id=message["id"],
-            aggregate_id=aggregate_id,
-            to=message["to"],
-            kind="result",
-            intent=return_intent,
-            causal_id=message["causal_id"],
-            expected_count=len(completed.get("expected") or []),
-        )
-        self.cancel_watchdogs_for_aggregate(aggregate_id, reason="aggregate_complete")
+        with self.state_lock:
+            self._record_aggregate_completion_tombstones(completed)
+            self.cancel_watchdogs_for_aggregate(aggregate_id, reason="aggregate_complete")
+            self.suppress_pending_watchdog_wakes(ref_aggregate_id=aggregate_id, reason="aggregate_complete")
+            self.queue_message(message)
+            self.log(
+                "aggregate_result_queued",
+                message_id=message["id"],
+                aggregate_id=aggregate_id,
+                to=message["to"],
+                kind="result",
+                intent=return_intent,
+                causal_id=message["causal_id"],
+                expected_count=len(completed.get("expected") or []),
+            )
 
     def maybe_return_response(self, sender: str, text: str, context: dict) -> None:
         requester = context.get("from")
@@ -3666,6 +3833,10 @@ class BridgeDaemon:
             return
         if not context.get("auto_return"):
             return
+
+        message_id = str(context.get("id") or "")
+        if message_id:
+            self.suppress_pending_watchdog_wakes(ref_message_id=message_id, reason="terminal_response")
 
         if context.get("aggregate_id"):
             self.collect_aggregate_response(sender, text, context)
@@ -3708,6 +3879,7 @@ class BridgeDaemon:
     def _cleanup_terminal_context_locked(self, sender: str, context: dict, *, watchdog_reason: str) -> None:
         msg_id = context.get("id")
         if msg_id:
+            self.suppress_pending_watchdog_wakes(ref_message_id=str(msg_id), reason=watchdog_reason)
             self.remove_delivered_message(sender, msg_id)
             self.last_enter_ts.pop(str(msg_id), None)
             # Aggregate watchdogs are cancelled inside collect_aggregate_response
@@ -4079,6 +4251,18 @@ class BridgeDaemon:
 
         self.queue.update(mutator)
         for item in recovered:
+            message_id = str(item.get("id") or "")
+            target = str(item.get("to") or "")
+            if message_id:
+                self.suppress_pending_watchdog_wakes(ref_message_id=message_id, reason="daemon_restart_lost_routing_ctx")
+                self._record_message_tombstone(
+                    target,
+                    item,
+                    by_sender="bridge",
+                    reason="daemon_restart_lost_routing_ctx",
+                    suppress_late_hooks=False,
+                    prompt_submitted_seen=True,
+                )
             self.log(
                 "delivered_orphan_recovered",
                 message_id=item.get("id"),

@@ -1569,7 +1569,51 @@ def scenario_extend_wait_unknown_message(label: str, tmpdir: Path) -> None:
     participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
     d = make_daemon(tmpdir, participants)
     ok, err, deadline = d.upsert_message_watchdog("claude", "msg-does-not-exist", 60.0)
-    assert_true(not ok and err == "message_not_found", f"{label}: unknown message id should error message_not_found, got ok={ok}, err={err!r}")
+    assert_true(not ok and err == "message_unknown", f"{label}: unknown message id should error message_unknown, got ok={ok}, err={err!r}")
+    result = _daemon_command_result(d, {"op": "extend_watchdog", "from": "claude", "message_id": "msg-does-not-exist", "seconds": 60.0})
+    assert_true(result.get("error") == "message_unknown" and "invalid" in str(result.get("hint") or ""), f"{label}: daemon should return stable unknown hint: {result}")
+    print(f"  PASS  {label}")
+
+
+def scenario_extend_wait_terminal_tombstone_classification(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    d._record_message_tombstone(
+        "codex",
+        {"id": "msg-recent-response", "from": "claude"},
+        by_sender="bridge",
+        reason="terminal_response",
+        suppress_late_hooks=False,
+        prompt_submitted_seen=True,
+    )
+    d._record_message_tombstone(
+        "codex",
+        {"id": "msg-already-cancelled", "from": "claude"},
+        by_sender="claude",
+        reason="cancelled_by_sender",
+        suppress_late_hooks=False,
+        prompt_submitted_seen=False,
+    )
+    d._record_message_tombstone(
+        "codex",
+        {"id": "msg-unknown-terminal-reason", "from": "claude"},
+        by_sender="bridge",
+        reason="new_future_terminal_reason",
+        suppress_late_hooks=False,
+        prompt_submitted_seen=True,
+    )
+
+    ok_recent, err_recent, _ = d.upsert_message_watchdog("claude", "msg-recent-response", 60.0)
+    ok_done, err_done, _ = d.upsert_message_watchdog("claude", "msg-already-cancelled", 60.0)
+    ok_unknown_reason, err_unknown_reason, _ = d.upsert_message_watchdog("claude", "msg-unknown-terminal-reason", 60.0)
+    ok_foreign, err_foreign, _ = d.upsert_message_watchdog("codex", "msg-recent-response", 60.0)
+    assert_true(not ok_recent and err_recent == "message_recently_responded", f"{label}: response tombstone classification wrong: {ok_recent}, {err_recent!r}")
+    assert_true(not ok_done and err_done == "message_already_terminal", f"{label}: cancelled tombstone classification wrong: {ok_done}, {err_done!r}")
+    assert_true(not ok_unknown_reason and err_unknown_reason == "message_already_terminal", f"{label}: unknown tombstone reason must default terminal: {ok_unknown_reason}, {err_unknown_reason!r}")
+    assert_true(not ok_foreign and err_foreign == "not_owner", f"{label}: foreign tombstone owner should be rejected: {ok_foreign}, {err_foreign!r}")
+
+    result = _daemon_command_result(d, {"op": "extend_watchdog", "from": "claude", "message_id": "msg-recent-response", "seconds": 60.0})
+    assert_true(result.get("error") == "message_recently_responded" and "[bridge:result]" in str(result.get("hint") or ""), f"{label}: daemon should return recently-responded hint: {result}")
     print(f"  PASS  {label}")
 
 
@@ -1896,10 +1940,167 @@ def scenario_delivery_watchdog_fire_inflight_notice(label: str, tmpdir: Path) ->
     assert_true(wake_id not in d.watchdogs, f"{label}: delivery watchdog should fire once")
     notices = [it for it in d.queue.read() if it.get("from") == "bridge" and it.get("to") == "claude" and it.get("intent") == "watchdog_wake"]
     assert_true(len(notices) == 1, f"{label}: one watchdog notice expected, got {notices}")
+    assert_true(notices[0].get("ref_message_id") == "msg-delivery-fire", f"{label}: watchdog notice should carry ref_message_id: {notices[0]}")
+    assert_true(not notices[0].get("ref_aggregate_id"), f"{label}: non-aggregate watchdog notice should not carry ref_aggregate_id: {notices[0]}")
     body = notices[0].get("body") or ""
     for token in ("not completed bridge delivery", "agent_extend_wait msg-delivery-fire <sec>", "agent_interrupt_peer codex", "agent_view_peer codex"):
         assert_true(token in body, f"{label}: delivery watchdog body missing {token!r}: {body!r}")
     assert_true("held_interrupt" not in body and "--clear-hold" not in body, f"{label}: delivery watchdog body should not mention hold internals: {body!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_watchdog_fire_after_terminal_suppresses_notice(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    d._record_message_tombstone(
+        "codex",
+        {"id": "msg-terminal-watchdog", "from": "claude"},
+        by_sender="bridge",
+        reason="terminal_response",
+        suppress_late_hooks=False,
+        prompt_submitted_seen=True,
+    )
+    wake_id = _plant_watchdog(
+        d,
+        "wake-terminal-watchdog",
+        sender="claude",
+        message_id="msg-terminal-watchdog",
+        to="codex",
+        deadline=time.time() - 1.0,
+    )
+    d.watchdogs[wake_id]["watchdog_phase"] = "response"
+
+    d.check_watchdogs()
+
+    assert_true(wake_id not in d.watchdogs, f"{label}: stale terminal watchdog should be consumed")
+    notices = [it for it in d.queue.read() if it.get("intent") == "watchdog_wake"]
+    assert_true(not notices, f"{label}: terminal stale watchdog must not enqueue notice: {notices}")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    skipped = [e for e in events if e.get("event") == "watchdog_skipped_stale" and e.get("wake_id") == wake_id]
+    assert_true(skipped and "terminal_response" in str(skipped[-1].get("reason") or ""), f"{label}: terminal skip reason should be logged: {skipped}")
+    print(f"  PASS  {label}")
+
+
+def scenario_pending_watchdog_wake_removed_on_terminal(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%99"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%98"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.try_deliver = lambda *args, **kwargs: None  # type: ignore[assignment]
+    msg = _delivered_request("msg-terminal-suppress", "alice", "bob")
+    msg["causal_id"] = "causal-terminal-suppress"
+    msg["intent"] = "review"
+    msg["hop_count"] = 2
+
+    def add(queue):
+        queue.extend([
+            msg,
+            {
+                "id": "msg-stale-wake",
+                "created_ts": utc_now(),
+                "updated_ts": utc_now(),
+                "from": "bridge",
+                "to": "alice",
+                "kind": "notice",
+                "intent": "watchdog_wake",
+                "body": "stale wake",
+                "causal_id": "causal-terminal-suppress",
+                "hop_count": 0,
+                "auto_return": False,
+                "reply_to": "msg-terminal-suppress",
+                "ref_message_id": "msg-terminal-suppress",
+                "source": "watchdog_fire",
+                "bridge_session": "test-session",
+                "status": "pending",
+                "nonce": None,
+                "delivery_attempts": 0,
+            },
+            {
+                "id": "msg-unrelated-wake",
+                "created_ts": utc_now(),
+                "updated_ts": utc_now(),
+                "from": "bridge",
+                "to": "alice",
+                "kind": "notice",
+                "intent": "watchdog_wake",
+                "body": "unrelated wake",
+                "causal_id": "causal-other",
+                "hop_count": 0,
+                "auto_return": False,
+                "reply_to": "msg-other",
+                "ref_message_id": "msg-other",
+                "source": "watchdog_fire",
+                "bridge_session": "test-session",
+                "status": "pending",
+                "nonce": None,
+                "delivery_attempts": 0,
+            },
+            {
+                "id": "msg-delivered-wake",
+                "created_ts": utc_now(),
+                "updated_ts": utc_now(),
+                "from": "bridge",
+                "to": "alice",
+                "kind": "notice",
+                "intent": "watchdog_wake",
+                "body": "already delivered wake",
+                "causal_id": "causal-terminal-suppress",
+                "hop_count": 0,
+                "auto_return": False,
+                "reply_to": "msg-terminal-suppress",
+                "ref_message_id": "msg-terminal-suppress",
+                "source": "watchdog_fire",
+                "bridge_session": "test-session",
+                "status": "delivered",
+                "nonce": None,
+                "delivery_attempts": 1,
+            },
+            {
+                "id": "msg-inflight-wake",
+                "created_ts": utc_now(),
+                "updated_ts": utc_now(),
+                "from": "bridge",
+                "to": "alice",
+                "kind": "notice",
+                "intent": "watchdog_wake",
+                "body": "inflight wake",
+                "causal_id": "causal-terminal-suppress",
+                "hop_count": 0,
+                "auto_return": False,
+                "reply_to": "msg-terminal-suppress",
+                "ref_message_id": "msg-terminal-suppress",
+                "source": "watchdog_fire",
+                "bridge_session": "test-session",
+                "status": "inflight",
+                "nonce": "wake-nonce",
+                "delivery_attempts": 1,
+            },
+        ])
+        return None
+
+    d.queue.update(add)
+    d.current_prompt_by_agent["bob"] = {
+        "id": "msg-terminal-suppress",
+        "nonce": msg.get("nonce"),
+        "causal_id": msg.get("causal_id"),
+        "hop_count": 2,
+        "from": "alice",
+        "kind": "request",
+        "intent": "review",
+        "auto_return": True,
+        "turn_id": "t-terminal-suppress",
+    }
+    d.busy["bob"] = True
+
+    d.handle_response_finished({"agent": "bob", "bridge_agent": "bob", "turn_id": "t-terminal-suppress", "last_assistant_message": "done"})
+
+    queue = d.queue.read()
+    ids = {item.get("id") for item in queue}
+    assert_true("msg-stale-wake" not in ids, f"{label}: matching pending wake should be suppressed: {queue}")
+    assert_true({"msg-unrelated-wake", "msg-delivered-wake", "msg-inflight-wake"}.issubset(ids), f"{label}: unrelated/non-pending wakes must remain: {queue}")
+    result = next((it for it in queue if it.get("kind") == "result" and it.get("reply_to") == "msg-terminal-suppress"), None)
+    assert_true(result is not None and result.get("source") == "auto_return", f"{label}: real result should remain queued: {queue}")
     print(f"  PASS  {label}")
 
 
@@ -2203,6 +2404,85 @@ def scenario_aggregate_response_watchdog_text_uses_progress(label: str, tmpdir: 
     assert_true(f"aggregate {agg_id} has not completed" in text, f"{label}: aggregate response text should identify aggregate: {text!r}")
     assert_true("Replied: 1/2" in text and "Missing peers: w2" in text, f"{label}: aggregate response text should include progress: {text!r}")
     assert_true("not completed bridge delivery" not in text, f"{label}: aggregate response text should not use delivery wording: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_aggregate_completion_suppresses_pending_watchdog_wake(label: str, tmpdir: Path) -> None:
+    participants = {
+        "manager": {"alias": "manager", "agent_type": "claude", "pane": "%90"},
+        "w1": {"alias": "w1", "agent_type": "codex", "pane": "%91"},
+        "w2": {"alias": "w2", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.try_deliver = lambda *args, **kwargs: None  # type: ignore[assignment]
+    agg_id = "agg-suppress-wake"
+    context = {
+        "aggregate_id": agg_id,
+        "from": "manager",
+        "aggregate_expected": ["w1", "w2"],
+        "aggregate_message_ids": {"w1": "msg-agg-suppress-w1", "w2": "msg-agg-suppress-w2"},
+        "causal_id": "causal-agg-suppress",
+        "intent": "review",
+        "hop_count": 1,
+    }
+    d.collect_aggregate_response("w1", "w1 ok", {**context, "id": "msg-agg-suppress-w1"})
+
+    def add_wakes(queue):
+        queue.extend([
+            {
+                "id": "msg-agg-stale-wake",
+                "created_ts": utc_now(),
+                "updated_ts": utc_now(),
+                "from": "bridge",
+                "to": "manager",
+                "kind": "notice",
+                "intent": "watchdog_wake",
+                "body": "aggregate stale wake",
+                "causal_id": "causal-agg-suppress",
+                "hop_count": 0,
+                "auto_return": False,
+                "reply_to": "",
+                "ref_aggregate_id": agg_id,
+                "source": "watchdog_fire",
+                "bridge_session": "test-session",
+                "status": "pending",
+                "nonce": None,
+                "delivery_attempts": 0,
+            },
+            {
+                "id": "msg-agg-delivered-wake",
+                "created_ts": utc_now(),
+                "updated_ts": utc_now(),
+                "from": "bridge",
+                "to": "manager",
+                "kind": "notice",
+                "intent": "watchdog_wake",
+                "body": "aggregate delivered wake",
+                "causal_id": "causal-agg-suppress",
+                "hop_count": 0,
+                "auto_return": False,
+                "reply_to": "",
+                "ref_aggregate_id": agg_id,
+                "source": "watchdog_fire",
+                "bridge_session": "test-session",
+                "status": "delivered",
+                "nonce": None,
+                "delivery_attempts": 1,
+            },
+        ])
+        return None
+
+    d.queue.update(add_wakes)
+    d.collect_aggregate_response("w2", "w2 ok", {**context, "id": "msg-agg-suppress-w2"})
+
+    queue = d.queue.read()
+    ids = {item.get("id") for item in queue}
+    assert_true("msg-agg-stale-wake" not in ids, f"{label}: pending aggregate wake should be suppressed: {queue}")
+    assert_true("msg-agg-delivered-wake" in ids, f"{label}: delivered aggregate wake should remain: {queue}")
+    result = next((it for it in queue if it.get("source") == "aggregate_return" and it.get("aggregate_id") == agg_id), None)
+    assert_true(result is not None and result.get("to") == "manager", f"{label}: aggregate result should remain queued: {queue}")
+    ok, err, _ = d.upsert_message_watchdog("manager", "msg-agg-suppress-w2", 60.0)
+    assert_true(not ok and err == "message_recently_responded", f"{label}: completed aggregate leg should not be unknown: ok={ok}, err={err!r}")
     print(f"  PASS  {label}")
 
 
@@ -7283,7 +7563,7 @@ def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, t
 
 def scenario_watchdog_phase_doc_surfaces_are_consistent(label: str, tmpdir: Path) -> None:
     phase_tokens = ["delivery/submission", "response", "same <sec> per phase", "up to two phase intervals"]
-    extend_tokens = ["inflight/submitted delivery", "delivered aggregate response"]
+    extend_tokens = ["inflight/submitted delivery", "delivered aggregate response", "stale watchdog wakes", "[bridge:result]", "queued/arriving"]
 
     cheat = "\n".join(bridge_instructions.model_cheat_sheet())
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
@@ -9868,6 +10148,47 @@ def scenario_extend_wait_finite_positive_calls_request_extend(label: str, tmpdir
     print(f"  PASS  {label}")
 
 
+def scenario_extend_wait_terminal_error_texts(label: str, tmpdir: Path) -> None:
+    bew = _import_extend_wait_module()
+    bew.resolve_caller_from_pane = lambda **kwargs: bridge_identity.CallerResolution(True, "test-session", "alice")  # type: ignore[assignment]
+    bew.ensure_daemon_running = lambda session: ""
+    bew.room_status = lambda session: argparse.Namespace(active_enough_for_enqueue=True, reason="ok")
+    bew.load_session = lambda session: _participants_state(["alice", "bob"])
+
+    cases = [
+        (
+            "message_recently_responded",
+            {"hint": "daemon hint: [bridge:result] may already be queued"},
+            ("[bridge:result]", "queued", "do not keep extending"),
+        ),
+        (
+            "message_already_terminal",
+            {},
+            ("already terminal", "no active watchdog"),
+        ),
+        (
+            "message_unknown",
+            {},
+            ("unknown", "cannot be extended"),
+        ),
+        (
+            "message_not_found",
+            {},
+            ("[bridge:result]", "separate prompt", "do not keep extending"),
+        ),
+    ]
+    for error, response_extra, tokens in cases:
+        def request_extend(_session: str, _sender: str, message_id: str, _seconds: float, *, error=error, response_extra=response_extra):
+            return False, {"error": error, "message_id": message_id, **response_extra}, error
+
+        bew.request_extend = request_extend
+        code, out, err = _run_extend_wait_main(bew, ["msg-cli-terminal", "1", "--session", "test-session", "--from", "alice", "--allow-spoof"])
+        assert_true(code == 1 and out == "", f"{label}: {error} should exit 1 with no stdout: code={code} out={out!r} err={err!r}")
+        for token in tokens:
+            assert_true(token in err, f"{label}: {error} stderr missing {token!r}: {err!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_alarm_negative_nan_inf_minus_inf_rejected(label: str, tmpdir: Path) -> None:
     ba = _import_alarm_module()
     ba.request_alarm = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("request_alarm must not run for invalid delay"))
@@ -11332,6 +11653,7 @@ def main() -> int:
             ("extend_wait_upserts_watchdog", scenario_extend_wait_upserts_watchdog),
             ("extend_wait_aggregate_rejected", scenario_extend_wait_aggregate_rejected),
             ("extend_wait_unknown_message", scenario_extend_wait_unknown_message),
+            ("extend_wait_terminal_tombstone_classification", scenario_extend_wait_terminal_tombstone_classification),
             ("extend_wait_pending_rejected", scenario_extend_wait_pending_rejected),
             ("extend_wait_not_owner", scenario_extend_wait_not_owner),
             ("cancel_message_pending_removes_row", scenario_cancel_message_pending_removes_row),
@@ -11345,6 +11667,8 @@ def main() -> int:
             ("cancel_message_aggregate_per_leg_keeps_other_legs", scenario_cancel_message_aggregate_per_leg_keeps_other_legs),
             ("delivery_watchdog_arms_on_reserve", scenario_delivery_watchdog_arms_on_reserve),
             ("delivery_watchdog_fire_inflight_notice", scenario_delivery_watchdog_fire_inflight_notice),
+            ("watchdog_fire_after_terminal_suppresses_notice", scenario_watchdog_fire_after_terminal_suppresses_notice),
+            ("pending_watchdog_wake_removed_on_terminal", scenario_pending_watchdog_wake_removed_on_terminal),
             ("delivery_watchdog_extend_replaces_wake", scenario_delivery_watchdog_extend_replaces_wake),
             ("delivery_watchdog_submitted_extend_and_text", scenario_delivery_watchdog_submitted_extend_and_text),
             ("delivery_watchdog_aggregate_pending_extend_rejected", scenario_delivery_watchdog_aggregate_pending_extend_rejected),
@@ -11357,6 +11681,7 @@ def main() -> int:
             ("delivery_watchdog_aggregate_leg_coexists_with_response", scenario_delivery_watchdog_aggregate_leg_coexists_with_response),
             ("delivery_watchdog_aggregate_interrupt_cancels_leg_only", scenario_delivery_watchdog_aggregate_interrupt_cancels_leg_only),
             ("aggregate_response_watchdog_text_uses_progress", scenario_aggregate_response_watchdog_text_uses_progress),
+            ("aggregate_completion_suppresses_pending_watchdog_wake", scenario_aggregate_completion_suppresses_pending_watchdog_wake),
             ("duplicate_enqueue_does_not_cancel_alarm", scenario_duplicate_enqueue_does_not_cancel_alarm),
             ("alarm_op_invalid_delay_is_rejected", scenario_alarm_op_invalid_delay_is_rejected_not_crashed),
             ("send_peer_watchdog_negative_one_rejected", scenario_send_peer_watchdog_negative_one_rejected),
@@ -11370,6 +11695,7 @@ def main() -> int:
             ("send_peer_watchdog_abc_argparse_error", scenario_send_peer_watchdog_abc_argparse_error),
             ("extend_wait_zero_negative_nan_inf_rejected", scenario_extend_wait_zero_negative_nan_inf_rejected),
             ("extend_wait_finite_positive_calls_request_extend", scenario_extend_wait_finite_positive_calls_request_extend),
+            ("extend_wait_terminal_error_texts", scenario_extend_wait_terminal_error_texts),
             ("alarm_negative_nan_inf_minus_inf_rejected", scenario_alarm_negative_nan_inf_minus_inf_rejected),
             ("alarm_zero_and_finite_positive_call_request_alarm", scenario_alarm_zero_and_finite_positive_call_request_alarm),
             ("alarm_request_failure_prints_no_success_hint", scenario_alarm_request_failure_prints_no_success_hint),
