@@ -21,17 +21,23 @@ Each room is a background daemon attached to existing tmux panes (the bridge doe
 ## Install
 
 ```bash
-./install.sh         # interactive
-./install.sh --yes   # non-interactive, auto-append PATH
+./install.sh         # default install (auto-PATH; pass --no-shell-rc to opt out)
+./install.sh --yes   # non-interactive
 ```
 
 Hook config install failure is fatal by default. Use `--skip-hooks` for a shim-only install that should not touch hooks. Use `--ignore-hook-failure` only as an explicit diagnostic escape hatch when you want shims installed even though hook events will not work until fixed; it has no effect with `--skip-hooks`.
 
 After install:
 
-1. **Reload your shell** (`source ~/.bashrc`) or open a new terminal so the new shims are on `PATH`.
-2. **Restart any running Claude / Codex sessions** so they pick up the new hooks.
-3. **Verify**: `bridge_healthcheck`.
+1. The installer adds an Agent Bridge PATH block to your shell rc by default. Use `--no-shell-rc` to opt out and paste the printed block yourself.
+   Agent Bridge owns the lines between `# >>> Agent Bridge >>>` and `# <<< Agent Bridge <<<`; do not put custom shell code inside that block.
+2. **Reload your shell** or open a new terminal so the new shims are on `PATH`. Already-running shells and agent panes keep their old PATH.
+3. For unattended bridge work, start agents in a trusted or externally sandboxed workspace with permission prompts disabled:
+   - Claude Code: `claude --permission-mode bypassPermissions`
+   - Codex: `codex --dangerously-bypass-approvals-and-sandbox`
+   Otherwise permission prompts can stall peer requests until a human responds.
+4. **Restart any running Claude / Codex sessions** so they pick up the new hooks and PATH.
+5. **Verify**: `bridge_healthcheck`.
 
 ## Quickstart
 

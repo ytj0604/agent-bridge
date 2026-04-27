@@ -21,6 +21,7 @@ import errno
 import inspect
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -4865,6 +4866,7 @@ def _write_fake_hook_installer(root: Path, *, exit_code: int = 0, argv_file: Pat
 def _fake_install_env(tmpdir: Path, *, path_prefix: Path | None = None) -> dict[str, str]:
     env = dict(os.environ)
     env["HOME"] = str(tmpdir / "home")
+    env["SHELL"] = "/bin/bash"
     env["XDG_BIN_HOME"] = str(tmpdir / "xdg-bin")
     env["XDG_CONFIG_HOME"] = str(tmpdir / "xdg-config")
     env["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
@@ -4881,18 +4883,22 @@ def _run_fake_install(
     *,
     env: dict[str, str] | None = None,
     skip_hooks: bool = True,
+    yes: bool = True,
+    shell_rc: bool = False,
     extra_args: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
     cmd = [
         "bash",
         str(root / "install.sh"),
-        "--yes",
         "--bin-dir",
         str(bin_dir),
     ]
+    if yes:
+        cmd.append("--yes")
     if skip_hooks:
         cmd.append("--skip-hooks")
-    cmd.append("--no-shell-rc")
+    if not shell_rc:
+        cmd.append("--no-shell-rc")
     cmd.extend(extra_args or [])
     return subprocess.run(
         cmd,
@@ -5029,6 +5035,170 @@ def scenario_install_sh_chmods_target_or_fails(label: str, tmpdir: Path) -> None
     assert_true(proc.returncode != 0, f"{label}: chmod failure must hard fail")
     assert_true("cannot make shim target executable for agent_alarm" in proc.stderr, f"{label}: chmod failure stderr should name shim: {proc.stderr!r}")
     assert_true(not os.access(failing_root / "model-bin" / "agent_alarm", os.X_OK), f"{label}: failed chmod target should remain non-executable")
+    print(f"  PASS  {label}")
+
+
+def _fake_uname(tmpdir: Path, value: str) -> Path:
+    fakebin = tmpdir / f"fake-uname-{value.lower()}"
+    fakebin.mkdir(parents=True, exist_ok=True)
+    uname = fakebin / "uname"
+    uname.write_text(f"#!/usr/bin/env bash\nprintf '%s\\n' {shlex.quote(value)}\n", encoding="utf-8")
+    os.chmod(uname, 0o755)
+    return fakebin
+
+
+def _agent_bridge_path_block(bin_dir: Path) -> str:
+    return (
+        "# >>> Agent Bridge >>>\n"
+        f"export PATH={shlex.quote(str(bin_dir))}:\"$PATH\"\n"
+        "# <<< Agent Bridge <<<\n"
+    )
+
+
+def scenario_install_sh_default_updates_shell_rc(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "install-rc-default"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    bin_dir = tmpdir / "shims-rc-default"
+    env = _fake_install_env(tmpdir)
+    proc = _run_fake_install(root, bin_dir, env=env, yes=False, shell_rc=True)
+    assert_true(proc.returncode == 0, f"{label}: default install should succeed: stdout={proc.stdout!r} stderr={proc.stderr!r}")
+    rc = Path(env["HOME"]) / ".bashrc"
+    assert_true(rc.exists(), f"{label}: bash on Linux should write .bashrc")
+    text = rc.read_text(encoding="utf-8")
+    block = _agent_bridge_path_block(bin_dir)
+    assert_true(block in text, f"{label}: rc should contain marked PATH block: {text!r}")
+    assert_true(text.count("# >>> Agent Bridge >>>") == 1, f"{label}: marker should appear once: {text!r}")
+    assert_true("permission mode note" in proc.stdout, f"{label}: install should print permission mode note: {proc.stdout!r}")
+    assert_true("--permission-mode bypassPermissions" in proc.stdout, f"{label}: Claude permission flag should be shown: {proc.stdout!r}")
+    assert_true("--dangerously-bypass-approvals-and-sandbox" in proc.stdout, f"{label}: Codex permission flag should be shown: {proc.stdout!r}")
+    assert_true(not list(rc.parent.glob(".bashrc.agent-bridge.bak.*")), f"{label}: no backup needed for newly-created rc")
+
+    proc2 = _run_fake_install(root, bin_dir, env=env, yes=False, shell_rc=True)
+    assert_true(proc2.returncode == 0, f"{label}: repeated install should succeed: {proc2.stderr!r}")
+    text2 = rc.read_text(encoding="utf-8")
+    assert_true(text2.count("# >>> Agent Bridge >>>") == 1, f"{label}: repeated install must not duplicate marker: {text2!r}")
+    assert_true(not list(rc.parent.glob(".bashrc.agent-bridge.bak.*")), f"{label}: repeated no-op should not create backup")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_shell_rc_dry_run_and_opt_out(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "install-rc-dry"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    bin_dir = tmpdir / "shims-rc-dry"
+    env = _fake_install_env(tmpdir)
+    rc = Path(env["HOME"]) / ".bashrc"
+
+    proc_dry = _run_fake_install(root, bin_dir, env=env, yes=False, shell_rc=True, extra_args=["--dry-run"])
+    assert_true(proc_dry.returncode == 0, f"{label}: dry-run should succeed: {proc_dry.stderr!r}")
+    assert_true("add PATH block to" in proc_dry.stdout, f"{label}: dry-run should show planned rc edit: {proc_dry.stdout!r}")
+    assert_true(not rc.exists(), f"{label}: dry-run must not create rc file")
+
+    proc_no_rc = _run_fake_install(root, bin_dir, env=env, yes=False, shell_rc=False)
+    assert_true(proc_no_rc.returncode == 0, f"{label}: --no-shell-rc should succeed: {proc_no_rc.stderr!r}")
+    assert_true("PATH note: add this block" in proc_no_rc.stdout, f"{label}: opt-out should print PATH note: {proc_no_rc.stdout!r}")
+    assert_true("# >>> Agent Bridge >>>" in proc_no_rc.stdout, f"{label}: opt-out note should include paste-ready marker block: {proc_no_rc.stdout!r}")
+    assert_true(not rc.exists(), f"{label}: --no-shell-rc must not create rc file")
+
+    proc_yes_no_rc = _run_fake_install(root, bin_dir, env=env, yes=True, shell_rc=False)
+    assert_true(proc_yes_no_rc.returncode == 0, f"{label}: --yes --no-shell-rc should succeed: {proc_yes_no_rc.stderr!r}")
+    assert_true(not rc.exists(), f"{label}: --no-shell-rc must win over --yes")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_shell_rc_target_selection(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "install-rc-targets"
+    root.mkdir()
+    _write_fake_install_tree(root)
+
+    env_zsh = _fake_install_env(tmpdir / "zsh")
+    env_zsh["SHELL"] = "/bin/zsh"
+    proc_zsh = _run_fake_install(root, tmpdir / "shims-zsh", env=env_zsh, yes=False, shell_rc=True)
+    assert_true(proc_zsh.returncode == 0, f"{label}: zsh install should succeed: {proc_zsh.stderr!r}")
+    assert_true((Path(env_zsh["HOME"]) / ".zshrc").exists(), f"{label}: zsh should target .zshrc")
+
+    env_other = _fake_install_env(tmpdir / "other")
+    env_other["SHELL"] = "/usr/bin/fish"
+    proc_other = _run_fake_install(root, tmpdir / "shims-other", env=env_other, yes=False, shell_rc=True)
+    assert_true(proc_other.returncode == 0, f"{label}: other shell install should succeed: {proc_other.stderr!r}")
+    assert_true((Path(env_other["HOME"]) / ".profile").exists(), f"{label}: unknown shell should target .profile")
+
+    env_darwin = _fake_install_env(tmpdir / "darwin", path_prefix=_fake_uname(tmpdir, "Darwin"))
+    env_darwin["SHELL"] = "/bin/bash"
+    proc_darwin = _run_fake_install(root, tmpdir / "shims-darwin", env=env_darwin, yes=False, shell_rc=True)
+    assert_true(proc_darwin.returncode == 0, f"{label}: Darwin bash install should succeed: {proc_darwin.stderr!r}")
+    assert_true((Path(env_darwin["HOME"]) / ".bash_profile").exists(), f"{label}: Darwin bash should target .bash_profile")
+    assert_true(not (Path(env_darwin["HOME"]) / ".bashrc").exists(), f"{label}: Darwin bash should not write .bashrc")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_shell_rc_backup_and_path_short_circuit(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "install-rc-backup"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    bin_dir = tmpdir / "shims-rc-backup"
+    env = _fake_install_env(tmpdir)
+    home = Path(env["HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    rc = home / ".bashrc"
+    rc.write_text("existing config\n", encoding="utf-8")
+    proc = _run_fake_install(root, bin_dir, env=env, yes=False, shell_rc=True)
+    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
+    backups = list(home.glob(".bashrc.agent-bridge.bak.*"))
+    assert_true(len(backups) == 1, f"{label}: exactly one backup expected, got {backups}")
+    assert_true(backups[0].read_text(encoding="utf-8") == "existing config\n", f"{label}: backup should preserve original rc")
+    assert_true(_agent_bridge_path_block(bin_dir) in rc.read_text(encoding="utf-8"), f"{label}: rc should get path block")
+
+    env_path_ok = _fake_install_env(tmpdir / "path-ok", path_prefix=tmpdir / "already-on-path")
+    bin_on_path = tmpdir / "already-on-path"
+    proc_path_ok = _run_fake_install(root, bin_on_path, env=env_path_ok, yes=False, shell_rc=True)
+    assert_true(proc_path_ok.returncode == 0, f"{label}: PATH-ok install should succeed: {proc_path_ok.stderr!r}")
+    assert_true(not (Path(env_path_ok["HOME"]) / ".bashrc").exists(), f"{label}: bin_dir already on PATH should not write rc")
+    assert_true("add PATH block" not in proc_path_ok.stdout, f"{label}: PATH-ok install should not announce rc edit: {proc_path_ok.stdout!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_shell_quotes_bin_dir_metacharacters(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "install-rc-quote"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    raw = "bin with spaces 'quotes' \"dbl\" $(touch pwn) `uname`\nnext"
+    bin_dir = tmpdir / raw
+    env = _fake_install_env(tmpdir)
+    proc = _run_fake_install(root, bin_dir, env=env, yes=False, shell_rc=True)
+    assert_true(proc.returncode == 0, f"{label}: install should accept metacharacter bin_dir: stdout={proc.stdout!r} stderr={proc.stderr!r}")
+    rc = Path(env["HOME"]) / ".bashrc"
+    text = rc.read_text(encoding="utf-8")
+    prefix = "export PATH="
+    suffix = ":\"$PATH\""
+    start = text.find(prefix)
+    finish = text.find(suffix, start)
+    assert_true(start >= 0 and finish >= 0, f"{label}: rc should contain export assignment: {text!r}")
+    rhs = text[start + len(prefix): finish + len(suffix)]
+    parsed = shlex.split(rhs)[0]
+    assert_true(parsed == f"{bin_dir}:$PATH", f"{label}: quoted export should parse back to literal bin_dir plus PATH: parsed={parsed!r} text={text!r}")
+    assert_true(f"export PATH={shlex.quote(str(bin_dir))}:\"$PATH\"" in text, f"{label}: rc should shell-quote bin_dir: {text!r}")
+    assert_true('export PATH="' not in text, f"{label}: rc must not use unsafe double-quoted bin_dir form: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_shell_rc_replaces_existing_marker_block(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "install-rc-replace"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir)
+    bin_a = tmpdir / "bin-a"
+    bin_b = tmpdir / "bin b"
+    proc_a = _run_fake_install(root, bin_a, env=env, yes=False, shell_rc=True)
+    assert_true(proc_a.returncode == 0, f"{label}: first install should succeed: {proc_a.stderr!r}")
+    proc_b = _run_fake_install(root, bin_b, env=env, yes=False, shell_rc=True)
+    assert_true(proc_b.returncode == 0, f"{label}: second install should succeed: {proc_b.stderr!r}")
+    rc = Path(env["HOME"]) / ".bashrc"
+    text = rc.read_text(encoding="utf-8")
+    assert_true(text.count("# >>> Agent Bridge >>>") == 1 and text.count("# <<< Agent Bridge <<<") == 1, f"{label}: marker block should be replaced, not appended: {text!r}")
+    assert_true(str(bin_a) not in text, f"{label}: old bin_dir should be removed from managed block: {text!r}")
+    assert_true(f"export PATH={shlex.quote(str(bin_b))}:\"$PATH\"" in text, f"{label}: new bin_dir should be present and quoted: {text!r}")
     print(f"  PASS  {label}")
 
 
@@ -9929,6 +10099,12 @@ def main() -> int:
             ("direct_exec_targets_executable", scenario_direct_exec_targets_executable),
             ("healthcheck_executable_helper_distinguishes_states", scenario_healthcheck_executable_helper_distinguishes_states),
             ("install_sh_chmods_target_or_fails", scenario_install_sh_chmods_target_or_fails),
+            ("install_sh_default_updates_shell_rc", scenario_install_sh_default_updates_shell_rc),
+            ("install_sh_shell_rc_dry_run_and_opt_out", scenario_install_sh_shell_rc_dry_run_and_opt_out),
+            ("install_sh_shell_rc_target_selection", scenario_install_sh_shell_rc_target_selection),
+            ("install_sh_shell_rc_backup_and_path_short_circuit", scenario_install_sh_shell_rc_backup_and_path_short_circuit),
+            ("install_sh_shell_quotes_bin_dir_metacharacters", scenario_install_sh_shell_quotes_bin_dir_metacharacters),
+            ("install_sh_shell_rc_replaces_existing_marker_block", scenario_install_sh_shell_rc_replaces_existing_marker_block),
             ("install_sh_hook_failure_hard_fails", scenario_install_sh_hook_failure_hard_fails),
             ("install_sh_hook_failure_ignore_flag_allows_success", scenario_install_sh_hook_failure_ignore_flag_allows_success),
             ("install_sh_hook_dry_run_failure_hard_fails", scenario_install_sh_hook_dry_run_failure_hard_fails),

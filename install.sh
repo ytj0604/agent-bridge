@@ -8,7 +8,9 @@ yes="0"
 dry_run="0"
 install_hooks="1"
 ignore_hook_failure="0"
-update_shell_rc="ask"
+update_shell_rc="auto"
+path_block_begin="# >>> Agent Bridge >>>"
+path_block_end="# <<< Agent Bridge <<<"
 
 usage() {
   local code="${1:-2}"
@@ -17,8 +19,136 @@ usage: install.sh [--yes] [--dry-run] [--bin-dir DIR] [--skip-hooks] [--ignore-h
 
   --skip-hooks            do not run hook config installation
   --ignore-hook-failure   explicit shim-only/diagnostic escape hatch; only applies when hook installation runs
+  --no-shell-rc           do not add the Agent Bridge PATH block to your shell rc
 EOF
   exit "$code"
+}
+
+detect_shell_rc() {
+  local shell_name os_name
+  shell_name="${SHELL##*/}"
+  os_name="$(uname -s 2>/dev/null || true)"
+  case "$shell_name" in
+    zsh)
+      printf '%s\n' "$HOME/.zshrc"
+      ;;
+    bash)
+      if [[ "$os_name" == "Darwin" ]]; then
+        printf '%s\n' "$HOME/.bash_profile"
+      else
+        printf '%s\n' "$HOME/.bashrc"
+      fi
+      ;;
+    *)
+      printf '%s\n' "$HOME/.profile"
+      ;;
+  esac
+}
+
+print_path_block() {
+  python3 - "$bin_dir" "$path_block_begin" "$path_block_end" <<'PY'
+import shlex
+import sys
+
+bin_dir = sys.argv[1]
+begin = sys.argv[2]
+end = sys.argv[3]
+quoted = shlex.quote(bin_dir)
+print(begin)
+print(f'export PATH={quoted}:"$PATH"')
+print(end)
+PY
+}
+
+path_block_needs_update() {
+  local rc_path="$1"
+  python3 - "$rc_path" "$bin_dir" "$path_block_begin" "$path_block_end" <<'PY'
+from pathlib import Path
+import shlex
+import sys
+
+path = Path(sys.argv[1])
+bin_dir = sys.argv[2]
+begin = sys.argv[3]
+end = sys.argv[4]
+quoted = shlex.quote(bin_dir)
+block = f'{begin}\nexport PATH={quoted}:"$PATH"\n{end}\n'
+try:
+    original = path.read_text(encoding="utf-8")
+except FileNotFoundError:
+    original = ""
+
+start = original.find(begin)
+finish = original.find(end, start + len(begin)) if start >= 0 else -1
+if start >= 0 and finish >= 0:
+    finish += len(end)
+    replacement = block.rstrip("\n")
+    updated = original[:start] + replacement + original[finish:]
+    if not updated.endswith("\n"):
+        updated += "\n"
+else:
+    prefix = original
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    if prefix:
+        prefix += "\n"
+    updated = prefix + block
+
+if updated == original:
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
+write_path_block() {
+  local rc_path="$1"
+  python3 - "$rc_path" "$bin_dir" "$path_block_begin" "$path_block_end" <<'PY'
+from pathlib import Path
+import shlex
+import sys
+
+path = Path(sys.argv[1])
+bin_dir = sys.argv[2]
+begin = sys.argv[3]
+end = sys.argv[4]
+quoted = shlex.quote(bin_dir)
+block = f'{begin}\nexport PATH={quoted}:"$PATH"\n{end}\n'
+try:
+    original = path.read_text(encoding="utf-8")
+except FileNotFoundError:
+    original = ""
+
+start = original.find(begin)
+finish = original.find(end, start + len(begin)) if start >= 0 else -1
+if start >= 0 and finish >= 0:
+    finish += len(end)
+    replacement = block.rstrip("\n")
+    updated = original[:start] + replacement + original[finish:]
+    if not updated.endswith("\n"):
+        updated += "\n"
+else:
+    prefix = original
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    if prefix:
+        prefix += "\n"
+    updated = prefix + block
+
+if updated == original:
+    sys.exit(0)
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(updated, encoding="utf-8")
+PY
+}
+
+backup_rc_if_needed() {
+  local rc_path="$1"
+  if [[ ! -e "$rc_path" ]]; then
+    return
+  fi
+  if path_block_needs_update "$rc_path"; then
+    cp "$rc_path" "$rc_path.agent-bridge.bak.$(date +%Y%m%d%H%M%S).$$"
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
@@ -103,24 +233,20 @@ case ":$PATH:" in
 esac
 
 if [[ "$path_ok" == "0" ]]; then
-  line="export PATH=\"$bin_dir:\$PATH\""
-  rc_file="${SHELL##*/}"
-  case "$rc_file" in
-    zsh) rc_path="$HOME/.zshrc" ;;
-    bash) rc_path="$HOME/.bashrc" ;;
-    *) rc_path="$HOME/.profile" ;;
-  esac
-  if [[ "$update_shell_rc" != "never" && "$yes" == "1" ]]; then
-    echo "add PATH line to $rc_path"
+  rc_path="$(detect_shell_rc)"
+  if [[ "$update_shell_rc" != "never" ]]; then
+    echo "add PATH block to $rc_path"
     if [[ "$dry_run" != "1" ]]; then
-      touch "$rc_path"
-      if ! grep -Fq "$line" "$rc_path"; then
-        printf '\n# Agent Bridge\n%s\n' "$line" >> "$rc_path"
+      if path_block_needs_update "$rc_path"; then
+        backup_rc_if_needed "$rc_path"
+        write_path_block "$rc_path"
+      else
+        echo "PATH block already present in $rc_path"
       fi
     fi
   else
-    echo "PATH note: add this to your shell rc if human bridge commands are not found:"
-    echo "$line"
+    echo "PATH note: add this block to your shell rc if bridge commands are not found:"
+    print_path_block
   fi
 fi
 
@@ -158,4 +284,10 @@ if ! command -v tmux >/dev/null 2>&1; then
   echo "         install with your package manager, e.g. 'apt install tmux' or 'brew install tmux'." >&2
 fi
 
+cat <<'EOF'
+permission mode note: for unattended agent-to-agent work, start agents in a trusted or externally sandboxed workspace with permission prompts disabled.
+  Claude Code: claude --permission-mode bypassPermissions
+  Codex:       codex --dangerously-bypass-approvals-and-sandbox
+Otherwise permission prompts can stall bridge requests until a human responds.
+EOF
 echo "run: $bin_dir/bridge_healthcheck"
