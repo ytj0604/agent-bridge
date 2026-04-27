@@ -8898,29 +8898,62 @@ def scenario_send_peer_rejects_implicit_split_inline_body(label: str, tmpdir: Pa
     print(f"  PASS  {label}")
 
 
-def scenario_send_peer_rejects_option_after_destination(label: str, tmpdir: Path) -> None:
+def scenario_send_peer_accepts_option_after_destination_with_stdin(label: str, tmpdir: Path) -> None:
     bs = _import_send_peer_module()
     _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--to", "bob", "--kind", "notice", "hello"],
-        stdin_isatty=True,
-    )
-    assert_true(code == 2 and not calls and out == "", f"{label}: option leakage after --to must reject")
-    assert_true("after the destination" in err and "--kind" in err, f"{label}: stderr identifies leaked option: {err!r}")
+    for argv in (
+        ["--session", "test-session", "--from", "alice", "--to", "bob", "--watchdog", "1800", "--stdin"],
+        ["--session", "test-session", "--from", "alice", "--to", "bob", "--watchdog=1800", "--stdin"],
+        ["--session", "test-session", "--from", "alice", "--all", "--watchdog", "1800", "--stdin"],
+    ):
+        code, out, err, calls = _run_send_peer_with_fake_subprocess(
+            bs,
+            argv,
+            stdin_text="stdin body",
+            stdin_isatty=False,
+        )
+        assert_true(code == 0 and len(calls) == 1, f"{label}: option after destination before stdin should succeed for {argv}: code={code} err={err!r}")
+        cmd, kwargs = calls[0]
+        if "--all" in argv:
+            assert_true("--all" in cmd and "--to" not in cmd, f"{label}: broadcast destination preserved: {cmd}")
+        else:
+            assert_true(cmd[cmd.index("--to") + 1] == "bob", f"{label}: target preserved: {cmd}")
+        assert_true("--watchdog=1800.0" in cmd and "--stdin" in cmd, f"{label}: watchdog and stdin forwarded: {cmd}")
+        assert_true(kwargs.get("input") == b"stdin body", f"{label}: stdin body preserved: {kwargs}")
     print(f"  PASS  {label}")
 
 
-def scenario_send_peer_rejects_option_after_implicit_target(label: str, tmpdir: Path) -> None:
+def scenario_send_peer_accepts_option_after_implicit_target_with_stdin(label: str, tmpdir: Path) -> None:
     bs = _import_send_peer_module()
     _patch_send_peer_for_unit(bs)
     code, out, err, calls = _run_send_peer_with_fake_subprocess(
         bs,
-        ["--session", "test-session", "--from", "alice", "bob", "--kind", "notice", "hello"],
+        ["--session", "test-session", "--from", "alice", "bob", "--watchdog", "1800", "--stdin"],
+        stdin_text="stdin body",
+        stdin_isatty=False,
+    )
+    assert_true(code == 0 and len(calls) == 1, f"{label}: option after implicit target before stdin should succeed: code={code} err={err!r}")
+    cmd, kwargs = calls[0]
+    assert_true(cmd[cmd.index("--to") + 1] == "bob", f"{label}: implicit target forwarded: {cmd}")
+    assert_true("--watchdog=1800.0" in cmd and "--stdin" in cmd, f"{label}: watchdog and stdin forwarded: {cmd}")
+    assert_true(kwargs.get("input") == b"stdin body", f"{label}: stdin body preserved: {kwargs}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_accepts_options_after_destination_before_inline_body(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--to", "bob", "--kind", "request", "--watchdog", "0", "hello world"],
         stdin_isatty=True,
     )
-    assert_true(code == 2 and not calls and out == "", f"{label}: option leakage after implicit target must reject")
-    assert_true("after the destination" in err and "--kind" in err, f"{label}: stderr identifies leaked option: {err!r}")
+    assert_true(code == 0 and len(calls) == 1, f"{label}: options after destination before inline body should succeed: code={code} err={err!r}")
+    cmd, kwargs = calls[0]
+    assert_true(cmd[cmd.index("--to") + 1] == "bob", f"{label}: target preserved: {cmd}")
+    assert_true("--kind" in cmd and cmd[cmd.index("--kind") + 1] == "request", f"{label}: kind forwarded: {cmd}")
+    assert_true("--watchdog=0.0" in cmd, f"{label}: watchdog 0 forwarded: {cmd}")
+    assert_true(kwargs.get("input") == b"hello world", f"{label}: inline body preserved via stdin handoff: {kwargs}")
     print(f"  PASS  {label}")
 
 
@@ -8929,11 +8962,57 @@ def scenario_send_peer_rejects_option_after_inline_body(label: str, tmpdir: Path
     _patch_send_peer_for_unit(bs)
     code, out, err, calls = _run_send_peer_with_fake_subprocess(
         bs,
-        ["--session", "test-session", "--from", "alice", "--to", "bob", "hello", "--kind", "notice"],
+        ["--session", "test-session", "--from", "alice", "--to", "bob", "hello", "--watchdog", "1800"],
         stdin_isatty=True,
     )
     assert_true(code == 2 and not calls and out == "", f"{label}: option after body must reject")
-    assert_true("after the inline body" in err or "after the destination" in err, f"{label}: stderr explains option position: {err!r}")
+    assert_true("after the inline body" in err and "--watchdog" in err, f"{label}: stderr explains option position: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_rejects_duplicate_destination_after_destination(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    for argv in (
+        ["--session", "test-session", "--from", "alice", "--to", "bob", "--to", "carol", "--stdin"],
+        ["--session", "test-session", "--from", "alice", "--to", "bob", "--to", "carol"],
+        ["--session", "test-session", "--from", "alice", "--to", "bob", "--all"],
+    ):
+        code, out, err, calls = _run_send_peer_with_fake_subprocess(
+            bs,
+            argv,
+            stdin_text="stdin body",
+            stdin_isatty=False,
+        )
+        assert_true(code == 2 and not calls and out == "", f"{label}: duplicate destination must reject for {argv}")
+        assert_true("use exactly one destination selector" in err, f"{label}: duplicate destination diagnostic for {argv}: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_implicit_target_option_without_body_reports_body_required(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "bob", "--watchdog", "1800"],
+        stdin_isatty=True,
+    )
+    assert_true(code == 2 and not calls and out == "", f"{label}: implicit target with options but no body should reject")
+    assert_true("message body is required" in err and "after the inline body" not in err, f"{label}: missing-body diagnostic should stay clear: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_rejects_allow_spoof_after_implicit_target(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "bob", "--allow-spoof", "--stdin"],
+        stdin_text="stdin body",
+        stdin_isatty=False,
+    )
+    assert_true(code == 2 and not calls and out == "", f"{label}: --allow-spoof after implicit target must reject")
+    assert_true("--allow-spoof" in err and "before the destination" in err, f"{label}: placement diagnostic should be clear: {err!r}")
     print(f"  PASS  {label}")
 
 
@@ -10245,9 +10324,13 @@ def main() -> int:
             ("send_peer_watchdog_finite_value_forwarded_with_equals", scenario_send_peer_watchdog_finite_value_forwarded_with_equals),
             ("send_peer_rejects_split_inline_body", scenario_send_peer_rejects_split_inline_body),
             ("send_peer_rejects_implicit_split_inline_body", scenario_send_peer_rejects_implicit_split_inline_body),
-            ("send_peer_rejects_option_after_destination", scenario_send_peer_rejects_option_after_destination),
-            ("send_peer_rejects_option_after_implicit_target", scenario_send_peer_rejects_option_after_implicit_target),
+            ("send_peer_accepts_option_after_destination_with_stdin", scenario_send_peer_accepts_option_after_destination_with_stdin),
+            ("send_peer_accepts_option_after_implicit_target_with_stdin", scenario_send_peer_accepts_option_after_implicit_target_with_stdin),
+            ("send_peer_accepts_options_after_destination_before_inline_body", scenario_send_peer_accepts_options_after_destination_before_inline_body),
             ("send_peer_rejects_option_after_inline_body", scenario_send_peer_rejects_option_after_inline_body),
+            ("send_peer_rejects_duplicate_destination_after_destination", scenario_send_peer_rejects_duplicate_destination_after_destination),
+            ("send_peer_implicit_target_option_without_body_reports_body_required", scenario_send_peer_implicit_target_option_without_body_reports_body_required),
+            ("send_peer_rejects_allow_spoof_after_implicit_target", scenario_send_peer_rejects_allow_spoof_after_implicit_target),
             ("send_peer_single_inline_body_uses_stdin_handoff", scenario_send_peer_single_inline_body_uses_stdin_handoff),
             ("send_peer_request_success_prints_anti_wait_hint", scenario_send_peer_request_success_prints_anti_wait_hint),
             ("send_peer_notice_success_prints_alarm_and_anti_wait_hints", scenario_send_peer_notice_success_prints_alarm_and_anti_wait_hints),

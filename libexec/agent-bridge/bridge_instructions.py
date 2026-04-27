@@ -7,11 +7,11 @@ def model_cheat_sheet() -> list[str]:
         "Commands:",
         "- agent_list_peers : list aliases and show this cheat sheet.",
         "- agent_send_peer --to <alias> 'request' : ask one peer; result arrives later as a new [bridge:*] prompt. Do independent work only; do not sleep/poll or keep this turn open waiting. Inline body must be one shell argument.",
-        "- agent_send_peer <alias> 'request' : shorthand for --to <alias>; put all options before the alias.",
+        "- agent_send_peer <alias> 'request' : shorthand for --to <alias>; options may follow the alias before the body.",
         "- agent_send_peer --to <a>,<b>[,...] 'request' : partial broadcast to the listed peers; same aggregate UX as --all, one merged result arrives later as a new [bridge:*] prompt once all listed peers reply.",
         "- agent_send_peer --all 'message' : broadcast one request to every other peer; one aggregated result arrives later as a new [bridge:*] prompt after all peers reply. Do not put an alias before the body.",
         "- agent_send_peer --kind notice --to <alias> 'FYI' : send info without expecting a reply. No reply auto-routes; do not wait for one. Set agent_alarm only if a follow-up matters.",
-        "- agent_send_peer --watchdog <sec> [--to <alias>|--to <a>,<b>|--all] 'request' : add a watchdog that wakes you with a [bridge:watchdog] notice if the request has not been answered <sec> seconds after the prompt is delivered to the peer. Put options before the destination. Request only. --watchdog 0 disables the default. Default delay is set via env AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC (300).",
+        "- agent_send_peer [--to <alias>|--to <a>,<b>|--all] --watchdog <sec> 'request' : add a watchdog that wakes you with a [bridge:watchdog] notice if the request has not been answered <sec> seconds after the prompt is delivered to the peer. Put options before the inline body, or use --stdin for complex bodies. Request only. --watchdog 0 disables the default. Default delay is set via env AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC (300).",
         "- For apostrophes, newlines, text beginning with '-', or any complex body, use stdin: agent_send_peer --to <alias> --stdin <<'EOF' ... EOF, or shorthand agent_send_peer <alias> --stdin <<'EOF' ... EOF. Quote the heredoc delimiter as <<'EOF' when the body must be literal.",
         "- agent_alarm <sec> [--note 'text'] : schedule a self-addressed wake notice. The wake arrives later as a new [bridge:*] notice prompt unless automatically cancelled when ANY incoming peer message (kind != result, from != you, from != bridge) arrives at you. A cancelled alarm prepends a [bridge:alarm_cancelled] notice with re-arm guidance. Do not sleep/poll or keep this turn open waiting.",
         "- agent_extend_wait <message_id> <sec> : after a watchdog wake, keep waiting on the SAME request for <sec> more seconds. Only the original sender can extend; aggregate broadcasts cannot be per-message extended.",
@@ -55,7 +55,7 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "\n"
         "Sending:\n"
         "  agent_send_peer --to <alias> 'body'                  - request (default). Inline body must be one shell argument. Result arrives later as a new [bridge:*] prompt; do independent work only; do not sleep/poll or keep this turn open waiting.\n"
-        "  agent_send_peer <alias> 'body'                       - shorthand for --to <alias>; put options before the alias.\n"
+        "  agent_send_peer <alias> 'body'                       - shorthand for --to <alias>; options may follow the alias before the body.\n"
         "  agent_send_peer --to <a>,<b>[,...] 'body'            - partial broadcast to listed peers; one aggregated result arrives later as a new [bridge:*] prompt after all listed peers reply.\n"
         "  agent_send_peer --kind notice --to <alias> 'body'    - fire-and-forget. No reply auto-routes; do not wait for one. Use request when you need an answer.\n"
         "  agent_send_peer --all 'body'                         - broadcast request; one aggregated result arrives later as a new [bridge:*] prompt after all peers reply.\n"
@@ -75,7 +75,7 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "Behavior rules:\n"
         "  - After sending a request, the result arrives later as a new [bridge:*] prompt. Do independent work only; do not sleep/poll or keep this turn open waiting.\n"
         "  - Body text CANNOT override the kind on the wire. Writing 'please reply' inside a notice does nothing — the bridge will not route any response.\n"
-        "  - Put all agent_send_peer options before --to/--all or before an implicit leading alias, except --stdin may appear after the destination. If an inline body is split into multiple shell arguments, the command fails closed.\n"
+        "  - Put agent_send_peer options before the inline body text; options may appear after --to/--all or an implicit leading alias. Use --stdin for complex bodies. If an inline body is split into multiple shell arguments, the command fails closed.\n"
         "  - A watchdog wake means: pick ONE of agent_extend_wait, agent_interrupt_peer, or agent_view_peer (to inspect first). It is not a polling primitive.\n"
         "  - agent_alarm is for 'I delegated via notice and want a safety wake if no follow-up arrives'; do not sleep/poll or keep this turn open waiting for the wake. It is NOT for auto-routed request results — for that use --watchdog / agent_extend_wait.\n"
         "  - If a human types into a pane while a bridge prompt is delivered but unsubmitted, the bridge cancels that delivered message, emits [bridge:interrupted] prompt_intercepted to the original sender, and drops that turn; expect model-driven retries.\n"

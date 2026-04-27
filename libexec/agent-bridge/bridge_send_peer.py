@@ -152,8 +152,11 @@ def _precheck_participants(argv: list[str]) -> set[str]:
         return set()
 
 
-def _remaining_has_body_or_stdin(argv: list[str], start: int) -> bool:
-    return any(token == STDIN_OPTION or not token.startswith("-") for token in argv[start:])
+def _remaining_has_cli_tail(argv: list[str], start: int) -> bool:
+    # Leading-alias shorthand should be selected when anything follows the
+    # alias. Options are allowed after the alias, so don't try to classify
+    # option values as body text here.
+    return start < len(argv)
 
 
 def validate_send_peer_argv(
@@ -169,6 +172,7 @@ def validate_send_peer_argv(
     body_seen = False
     stdin_seen = False
     allow_spoof_seen = False
+    option_after_destination_seen = False
     destination_count = 0
     index = 0
 
@@ -183,23 +187,19 @@ def validate_send_peer_argv(
         opt = _classify_option_token(token, value_options, flag_options)
         if opt is not None and (opt[0] in value_options or opt[0] in flag_options):
             opt_name, takes_value, attached_value = opt
-            if destination_selected:
-                if opt_name == STDIN_OPTION and not body_seen:
-                    stdin_seen = True
-                    index += 1
-                    continue
-                return (
-                    f"option {opt_name} appeared after the destination. "
-                    "Put all options before --to/--all, or use --stdin for complex message bodies. "
-                    f"{SHELL_BODY_HINT}"
-                )
             if body_seen:
                 return (
                     f"option {opt_name} appeared after the inline body. "
                     f"{SHELL_BODY_HINT}"
                 )
+            if destination_selected:
+                option_after_destination_seen = True
+                if opt_name == "--allow-spoof":
+                    return "option --allow-spoof must appear before the destination"
             if opt_name == STDIN_OPTION:
                 stdin_seen = True
+            # For post-destination --allow-spoof, the branch above has already
+            # returned. This tracks only the pre-destination scan.
             if opt_name == "--allow-spoof":
                 allow_spoof_seen = True
             if opt_name in DESTINATION_OPTIONS:
@@ -237,7 +237,7 @@ def validate_send_peer_argv(
             allow_spoof_seen
             and not precheck_session
             and token not in RESERVED_IMPLICIT_TARGETS
-            and _remaining_has_body_or_stdin(argv, index + 1)
+            and _remaining_has_cli_tail(argv, index + 1)
         ):
             return (
                 "leading-alias shorthand cannot be validated under --allow-spoof "
@@ -248,7 +248,7 @@ def validate_send_peer_argv(
         if (
             not body_seen
             and (token in participants or token in RESERVED_IMPLICIT_TARGETS)
-            and _remaining_has_body_or_stdin(argv, index + 1)
+            and _remaining_has_cli_tail(argv, index + 1)
         ):
             destination_selected = True
             destination_count += 1
@@ -259,6 +259,9 @@ def validate_send_peer_argv(
             return f"message body was split into multiple shell arguments. {SHELL_BODY_HINT}"
         body_seen = True
         index += 1
+
+    if destination_selected and option_after_destination_seen and not body_seen and not stdin_seen:
+        return "message body is required; use --stdin or one inline body argument"
 
     return ""
 
