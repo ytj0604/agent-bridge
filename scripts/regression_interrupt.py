@@ -8188,8 +8188,8 @@ def scenario_view_peer_doc_surfaces_disclose_search_semantics(label: str, tmpdir
     assert_true(phrase in search_lines[0], f"{label}: cheat-sheet search line must disclose search semantics: {search_lines[0]!r}")
 
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
-    assert_true(search_shape in probe, f"{label}: probe prompt must keep the search command shape")
-    assert_true(phrase in probe, f"{label}: probe prompt must disclose search semantics")
+    assert_true("agent_view_peer" in probe, f"{label}: probe prompt must keep compact view command reference")
+    assert_true("debug surfaces" in probe and "do not poll" in probe.lower(), f"{label}: probe prompt must frame view/status commands as debug, not polling: {probe!r}")
 
     help_result = subprocess.run(
         [sys.executable, str(LIBEXEC / "bridge_view_peer.py"), "--help"],
@@ -8257,15 +8257,11 @@ def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir:
     assert_true("use when you sent the wrong prompt" not in interrupt_lines[0].lower(), f"{label}: interrupt line must not suggest unqualified wrong-prompt retraction: {interrupt_lines[0]!r}")
 
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
-    assert_true(command_shape in probe, f"{label}: probe prompt must keep the interrupt command shape")
-    assert_true(phrase in probe, f"{label}: probe prompt must disclose no-op race")
-    assert_true(key_sequence_phrase in probe and ctrl_c_phrase in probe, f"{label}: probe prompt must disclose Claude C-c sequence")
+    assert_true(command_shape in probe, f"{label}: probe prompt must keep compact interrupt command shape")
     assert_true("force-cancel" not in probe, f"{label}: probe prompt must not imply force-cancel")
-    for token in boundary_tokens + ["agent_interrupt_peer", "post-pane-touch"]:
+    for token in ("agent_cancel_message", "pending", "inflight pre-pane-touch/pre-paste", "pane-mode-deferred", "agent_interrupt_peer", "active/post-pane-touch"):
         assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing boundary token {token!r}")
-    for token in clear_hold_tokens:
-        assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing clear-hold token {token!r}")
-    for token in ("Use --json", "show JSON busy/held/queue"):
+    for token in ("--json", "--status is JSON"):
         assert_true(token in probe, f"{label}: probe prompt missing action JSON token {token!r}")
     assert_true("use for a wrong prompt" not in probe.lower(), f"{label}: probe must not suggest unqualified wrong-prompt interrupt")
 
@@ -8314,12 +8310,8 @@ def scenario_prompt_intercepted_doc_surfaces_disclose_user_typing_collision(labe
     assert_true(len(matching_lines) == 1, f"{label}: expected one prompt_intercepted cheat-sheet bullet, got {matching_lines!r}")
     assert_true(phrase in matching_lines[0], f"{label}: cheat-sheet bullet must disclose user-typing collision exactly: {matching_lines[0]!r}")
 
-    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
-    assert_true(phrase in probe, f"{label}: probe prompt must disclose user-typing collision exactly")
-
     for needle in critical_substrings:
         assert_true(needle in matching_lines[0], f"{label}: cheat-sheet bullet missing critical substring {needle!r}: {matching_lines[0]!r}")
-        assert_true(needle in probe, f"{label}: probe prompt missing critical substring {needle!r}")
     print(f"  PASS  {label}")
 
 
@@ -8342,10 +8334,24 @@ def scenario_response_send_guard_doc_surfaces_are_precise(label: str, tmpdir: Pa
     ]
     cheat = "\n".join(bridge_instructions.model_cheat_sheet())
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
+    lowered_cheat = cheat.lower()
+    for token in required_doc_tokens:
+        assert_true(token.lower() in lowered_cheat, f"{label}: cheat sheet missing response guard token {token!r}")
+    compact_probe_tokens = [
+        "response-time send guard",
+        "auto-return peer request",
+        "requester",
+        "current_prompt.from",
+        "blocked/rejected",
+        "third-party",
+        "review/collaboration",
+        "other validations still apply",
+    ]
+    lowered_probe = probe.lower()
+    for token in compact_probe_tokens:
+        assert_true(token.lower() in lowered_probe, f"{label}: probe prompt missing compact response guard token {token!r}")
     for surface_name, surface in (("cheat sheet", cheat), ("probe prompt", probe)):
         lowered = surface.lower()
-        for token in required_doc_tokens:
-            assert_true(token.lower() in lowered, f"{label}: {surface_name} missing response guard token {token!r}")
         for fragment in forbidden_fragments:
             assert_true(fragment.lower() not in lowered, f"{label}: {surface_name} must not contain overbroad guard wording {fragment!r}")
 
@@ -8376,8 +8382,48 @@ def scenario_response_send_guard_doc_surfaces_are_precise(label: str, tmpdir: Pa
     print(f"  PASS  {label}")
 
 
+def scenario_probe_prompt_is_compact_quickstart(label: str, tmpdir: Path) -> None:
+    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
+    lines = probe.splitlines()
+    assert_true(len(lines) <= 20, f"{label}: probe should stay compact (<=20 lines), got {len(lines)} lines")
+    assert_true(len(probe) <= 3750, f"{label}: probe should stay compact (<=3750 chars), got {len(probe)} chars")
+    compact_tokens = [
+        "AGGREGATE_ID",
+        "agent_aggregate_status",
+        "--watchdog 0",
+        "AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC=300",
+        "per-phase",
+        "not a queue timer",
+        "pending -> inflight",
+        "inflight -> delivered",
+        "agent_cancel_message",
+        "agent_interrupt_peer",
+        "--json",
+        "current_prompt.from",
+        "one inline argument",
+        "--stdin heredoc",
+        "not both",
+        "missing_body",
+        "empty_stdin",
+        "unexpected_positional_after_stdin",
+        "stdin_inline_conflict",
+        "piped_stdin_inline_conflict",
+        "do not poll",
+        "debug surfaces",
+        "11000",
+        "Never read bridge state files",
+        "agent_list_peers",
+        "full cheat sheet",
+    ]
+    lowered = probe.lower()
+    for token in compact_tokens:
+        assert_true(token.lower() in lowered, f"{label}: compact probe missing required token {token!r}: {probe!r}")
+    assert_true("Run agent_list_peers for the full cheat sheet" in lines[-2], f"{label}: full-reference pointer should be final visible guidance before exact reply: {lines[-2:]!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, tmpdir: Path) -> None:
-    request_tokens = ["result arrives later as a new [bridge:*] prompt", "Do independent work only", "do not sleep/poll"]
+    request_tokens = ["result arrives later as a new [bridge:*] prompt", "Do independent work", "do not sleep/poll"]
     alarm_tokens = ["[bridge:*] notice prompt", "do not sleep/poll"]
     body_input_tokens = [
         "one inline argument",
@@ -8403,6 +8449,8 @@ def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, t
     notice_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_send_peer --kind notice")]
     assert_true(len(notice_lines) == 1, f"{label}: expected one cheat-sheet notice rule, got {notice_lines!r}")
     assert_true("no reply auto-routes" in notice_lines[0].lower(), f"{label}: notice rule must mention no auto-route: {notice_lines[0]!r}")
+    assert_true("Set agent_alarm if a follow-up matters" in notice_lines[0], f"{label}: notice rule should use direct follow-up wording: {notice_lines[0]!r}")
+    assert_true("only if a follow-up matters" not in notice_lines[0], f"{label}: notice rule should drop old only-if wording: {notice_lines[0]!r}")
     alarm_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_alarm <sec>")]
     assert_true(len(alarm_lines) == 1, f"{label}: expected one cheat-sheet alarm rule, got {alarm_lines!r}")
     for token in alarm_tokens:
@@ -8413,27 +8461,14 @@ def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, t
     for token in body_input_tokens:
         assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing body-input token {token!r}")
         assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing body-input token {token!r}")
-    probe_lines = [line.strip() for line in probe.splitlines()]
-    sending_lines = [
-        line for line in probe_lines
-        if line.startswith("agent_send_peer --to <alias> 'body'") and "request (default)" in line
-    ]
-    behavior_lines = [line for line in probe_lines if line.startswith("- After sending a request,")]
-    notice_probe_lines = [line for line in probe_lines if line.startswith("agent_send_peer --kind notice")]
-    alarm_probe_lines = [line for line in probe_lines if line.startswith("agent_alarm <sec>")]
-    assert_true(len(sending_lines) == 1, f"{label}: expected one probe request sending line, got {sending_lines!r}")
-    assert_true(len(behavior_lines) == 1, f"{label}: expected one probe request behavior rule, got {behavior_lines!r}")
-    assert_true(len(notice_probe_lines) == 1, f"{label}: expected one probe notice line, got {notice_probe_lines!r}")
-    assert_true(len(alarm_probe_lines) == 1, f"{label}: expected one probe alarm line, got {alarm_probe_lines!r}")
-    for surface, line in (("probe sending line", sending_lines[0]), ("probe behavior rule", behavior_lines[0])):
-        for token in request_tokens:
-            assert_true(token.lower() in line.lower(), f"{label}: {surface} missing token {token!r}: {line!r}")
-        for forbidden in forbidden_fragments:
-            assert_true(forbidden not in line, f"{label}: {surface} should drop old wording {forbidden!r}: {line!r}")
-    assert_true("no reply auto-routes" in notice_probe_lines[0].lower(), f"{label}: probe notice line must mention no auto-route: {notice_probe_lines[0]!r}")
-    for token in alarm_tokens:
-        assert_true(token.lower() in alarm_probe_lines[0].lower(), f"{label}: probe alarm line missing token {token!r}: {alarm_probe_lines[0]!r}")
-    assert_true("[bridge:alarm_cancelled]" in alarm_probe_lines[0] and "re-arm" in alarm_probe_lines[0].lower(), f"{label}: probe alarm line must mention cancellation marker and re-arm guidance: {alarm_probe_lines[0]!r}")
+    for token in request_tokens:
+        assert_true(token.lower() in probe.lower(), f"{label}: compact probe missing request token {token!r}")
+    for forbidden in forbidden_fragments:
+        assert_true(forbidden not in probe, f"{label}: compact probe should drop old wording {forbidden!r}")
+    assert_true("no reply auto-routes" in probe.lower(), f"{label}: probe notice text must mention no auto-route")
+    assert_true("Set agent_alarm if a follow-up matters" in probe, f"{label}: probe should use direct follow-up wording: {probe!r}")
+    assert_true("only if a follow-up matters" not in probe, f"{label}: probe should drop old only-if wording: {probe!r}")
+    assert_true("agent_alarm <sec>" in probe and "[bridge:*] notice" in probe, f"{label}: compact probe should retain alarm command and wake shape")
     print(f"  PASS  {label}")
 
 
@@ -8490,18 +8525,32 @@ def scenario_watchdog_phase_doc_surfaces_are_consistent(label: str, tmpdir: Path
     )
     send_help_text = " ".join((send_help.stdout + send_help.stderr).split())
     assert_true(send_help.returncode == 0, f"{label}: agent_send_peer --help should exit 0, got {send_help.returncode}: {send_help_text!r}")
-    for surface_name, surface in (("cheat sheet", cheat), ("probe prompt", probe), ("bridge_send_peer help", send_help_text)):
+    for surface_name, surface in (("cheat sheet", cheat), ("bridge_send_peer help", send_help_text)):
         lowered = surface.lower()
         for token in canonical_watchdog_tokens:
             assert_true(token.lower() in lowered, f"{label}: {surface_name} missing watchdog token {token!r}: {surface!r}")
         for forbidden in forbidden_bare_default_fragments:
             assert_true(forbidden not in lowered, f"{label}: {surface_name} has bare hard-coded default wording {forbidden!r}: {surface!r}")
+    compact_probe_watchdog_tokens = [
+        "AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC=300",
+        "per-phase",
+        "not a queue timer",
+        "pending -> inflight",
+        "inflight -> delivered",
+        "300s delivery + 300s response",
+        "--watchdog 0",
+    ]
+    lowered_probe = probe.lower()
+    for token in compact_probe_watchdog_tokens:
+        assert_true(token.lower() in lowered_probe, f"{label}: compact probe missing watchdog token {token!r}: {probe!r}")
+    for forbidden in forbidden_bare_default_fragments:
+        assert_true(forbidden not in lowered_probe, f"{label}: compact probe has bare hard-coded default wording {forbidden!r}: {probe!r}")
     for surface_name, surface in (("cheat sheet watchdog line", cheat_watchdog_line), ("probe watchdog line", probe_watchdog_line), ("bridge_send_peer help", send_help_text)):
         lowered = surface.lower()
         for forbidden in model_watchdog_forbidden_tokens:
             assert_true(forbidden not in lowered, f"{label}: {surface_name} should not expose model-facing no-auto-return wording {forbidden!r}: {surface!r}")
     assert_true("Request only" in cheat_watchdog_line, f"{label}: cheat sheet watchdog line must keep request-only boundary: {cheat_watchdog_line!r}")
-    assert_true("on a request" in probe_watchdog_line, f"{label}: probe watchdog line must keep request-only boundary: {probe_watchdog_line!r}")
+    assert_true("request" in probe_watchdog_line.lower(), f"{label}: probe watchdog line must keep request boundary: {probe_watchdog_line!r}")
     assert_true("Request only" in send_help_text, f"{label}: help watchdog text must keep request-only boundary: {send_help_text!r}")
     assert_true("auto-return peer request" in response_guard_line, f"{label}: cheat sheet response guard must keep auto-return wording: {response_guard_line!r}")
     assert_true("auto-return peer request" in probe_response_guard_line, f"{label}: probe response guard must keep auto-return wording: {probe_response_guard_line!r}")
@@ -8550,7 +8599,7 @@ def scenario_watchdog_phase_doc_surfaces_are_consistent(label: str, tmpdir: Path
 def scenario_wait_status_doc_surfaces_anti_polling(label: str, tmpdir: Path) -> None:
     cheat = "\n".join(bridge_instructions.model_cheat_sheet())
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
-    required_tokens = [
+    cheat_tokens = [
         "agent_wait_status",
         "do not poll",
         "human-prompted",
@@ -8558,8 +8607,10 @@ def scenario_wait_status_doc_surfaces_anti_polling(label: str, tmpdir: Path) -> 
         "agent_view_peer",
         "peer pane debugging",
     ]
-    for token in required_tokens:
+    for token in cheat_tokens:
         assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing wait_status token {token!r}")
+    compact_probe_tokens = ["agent_wait_status", "debug surfaces", "do not poll", "human prompt", "watchdog", "suspected bridge issue"]
+    for token in compact_probe_tokens:
         assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing wait_status token {token!r}")
 
     help_result = subprocess.run(
@@ -8579,7 +8630,7 @@ def scenario_wait_status_doc_surfaces_anti_polling(label: str, tmpdir: Path) -> 
 def scenario_aggregate_status_doc_surfaces_leg_level_and_anti_polling(label: str, tmpdir: Path) -> None:
     cheat = "\n".join(bridge_instructions.model_cheat_sheet())
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
-    required_tokens = [
+    cheat_tokens = [
         "agent_aggregate_status",
         "leg-level",
         "agent_wait_status",
@@ -8590,9 +8641,11 @@ def scenario_aggregate_status_doc_surfaces_leg_level_and_anti_polling(label: str
         "watchdog",
         "do not poll",
     ]
+    compact_probe_tokens = ["agent_aggregate_status", "leg-level", "AGGREGATE_ID", "watchdog", "do not poll", "debug surfaces"]
     forbidden_tokens = ["track progress", "monitor progress"]
-    for token in required_tokens:
+    for token in cheat_tokens:
         assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing aggregate_status token {token!r}")
+    for token in compact_probe_tokens:
         assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing aggregate_status token {token!r}")
     for token in forbidden_tokens:
         assert_true(token.lower() not in cheat.lower(), f"{label}: cheat sheet should avoid polling-like token {token!r}")
@@ -13676,6 +13729,7 @@ def main() -> int:
             ("interrupt_peer_doc_surfaces_disclose_no_op_race", scenario_interrupt_peer_doc_surfaces_disclose_no_op_race),
             ("prompt_intercepted_doc_surfaces_disclose_user_typing_collision", scenario_prompt_intercepted_doc_surfaces_disclose_user_typing_collision),
             ("response_send_guard_doc_surfaces_are_precise", scenario_response_send_guard_doc_surfaces_are_precise),
+            ("probe_prompt_is_compact_quickstart", scenario_probe_prompt_is_compact_quickstart),
             ("send_peer_wait_doc_surfaces_name_blocking_consequence", scenario_send_peer_wait_doc_surfaces_name_blocking_consequence),
             ("watchdog_phase_doc_surfaces_are_consistent", scenario_watchdog_phase_doc_surfaces_are_consistent),
             ("wait_status_doc_surfaces_anti_polling", scenario_wait_status_doc_surfaces_anti_polling),

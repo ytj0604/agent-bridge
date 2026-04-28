@@ -55,7 +55,7 @@ REQUEST_SENT_HINT = (
 )
 NOTICE_SENT_HINT = (
     "NOTICE_SENT: no reply auto-routes. "
-    "Do not wait for one; set agent_alarm only if a follow-up matters."
+    "Do not wait for one; set agent_alarm if a follow-up matters."
 )
 AMBIENT_STDIN_READ_BYTES = (MAX_INLINE_SEND_BODY_CHARS + 1) * 4 + 4
 
