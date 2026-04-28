@@ -45,6 +45,10 @@ STDIN_INLINE_CONFLICT_MESSAGE = (
     "--stdin and an inline body cannot be combined. Pick one: either pass the inline body as a single argument, "
     "or use --stdin with stdin/heredoc and no inline body."
 )
+PIPED_STDIN_INLINE_CONFLICT_MESSAGE = (
+    "piped stdin and an inline body cannot be combined. Pick one: either remove the pipe and pass the inline body "
+    "as a single argument, or drop the inline body and use --stdin with stdin/heredoc."
+)
 REQUEST_SENT_HINT = (
     "REQUEST_SENT: result arrives later as a new [bridge:*] prompt. "
     "Do independent work only; do not sleep/poll or keep this turn open waiting."
@@ -71,6 +75,7 @@ def body_input_error(code: str) -> BodyInputError:
         "empty_stdin": EMPTY_STDIN_MESSAGE,
         "unexpected_positional_after_stdin": UNEXPECTED_POSITIONAL_AFTER_STDIN_MESSAGE,
         "stdin_inline_conflict": STDIN_INLINE_CONFLICT_MESSAGE,
+        "piped_stdin_inline_conflict": PIPED_STDIN_INLINE_CONFLICT_MESSAGE,
     }
     return BodyInputError(code, messages[code])
 
@@ -436,7 +441,9 @@ def parse_body_and_target(args: argparse.Namespace, session: str) -> tuple[str |
         if len(words) > 1:
             raise ValueError(f"message body was split into multiple shell arguments. {SHELL_BODY_HINT}")
         if non_tty_stdin_text():
-            raise ValueError("cannot combine piped stdin with a positional inline body")
+            # Explicit --stdin conflicts are classified earlier; this branch is
+            # only the implicit ambient-pipe plus inline-body collision.
+            raise body_input_error("piped_stdin_inline_conflict")
         body = words[0]
         if not body.strip():
             raise body_input_error("missing_body")

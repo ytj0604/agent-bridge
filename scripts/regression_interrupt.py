@@ -8387,6 +8387,7 @@ def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, t
         "empty_stdin",
         "unexpected_positional_after_stdin",
         "stdin_inline_conflict",
+        "piped_stdin_inline_conflict",
         "self-recovery guidance",
     ]
     forbidden_fragments = ["End your turn; sleep/polling blocks the wake you await.", "do not sleep or poll"]
@@ -12176,6 +12177,14 @@ def scenario_send_peer_body_input_diagnostics_are_specific(label: str, tmpdir: P
         stdin_text="stdin body",
         tokens=("--stdin and an inline body cannot be combined", "Pick one", "single argument", "stdin/heredoc"),
     )
+    _assert_send_peer_body_error(
+        label,
+        "piped stdin plus inline body",
+        ["--to", "bob", "inline body"],
+        code="piped_stdin_inline_conflict",
+        stdin_text="piped body",
+        tokens=("piped stdin and an inline body cannot be combined", "remove the pipe", "inline body", "--stdin", "heredoc"),
+    )
     print(f"  PASS  {label}")
 
 
@@ -12444,7 +12453,7 @@ except Exception as exc:
     cases = {
         "idle-inline": {"ok": True, "target": "bob", "body": "hello"},
         "idle-empty": {"ok": False, "error_contains": "missing_body"},
-        "partial-inline": {"ok": False, "error_contains": "cannot combine piped stdin"},
+        "partial-inline": {"ok": False, "error_contains": "piped_stdin_inline_conflict"},
     }
     for case, expected in cases.items():
         try:
@@ -12667,7 +12676,10 @@ def scenario_send_peer_rejects_pipe_with_positional_body(label: str, tmpdir: Pat
         stdin_isatty=False,
     )
     assert_true(code == 2 and not calls and out == "", f"{label}: pipe + positional body must reject")
-    assert_true("piped stdin" in err, f"{label}: stderr explains pipe collision: {err!r}")
+    assert_true(err.startswith("agent_send_peer: piped_stdin_inline_conflict: "), f"{label}: stderr includes stable pipe collision code: {err!r}")
+    for token in ("piped stdin and an inline body cannot be combined", "remove the pipe", "--stdin", "heredoc"):
+        assert_true(token in err, f"{label}: stderr explains pipe collision with token {token!r}: {err!r}")
+    assert_true("cannot combine piped stdin with a positional inline body" not in err, f"{label}: legacy un-coded phrase must stay absent: {err!r}")
     print(f"  PASS  {label}")
 
 
