@@ -8,6 +8,7 @@ import os
 import select
 import subprocess
 import sys
+from dataclasses import dataclass
 
 from bridge_identity import read_attached_mapping, read_live_by_pane, read_pane_lock, resolve_caller_from_pane
 from bridge_participants import active_participants, load_session
@@ -27,6 +28,23 @@ SHELL_BODY_HINT = (
     "or any body that may be split by shell quoting, use: "
     "agent_send_peer --to <alias> --stdin <<'EOF' ... EOF"
 )
+MISSING_BODY_MESSAGE = (
+    "message body is required. Provide it as a single inline argument after the options/target, "
+    "or pass --stdin and pipe the body in via heredoc (<<'EOF' ... EOF). "
+    "Example: agent_send_peer <alias> 'hello' or agent_send_peer <alias> --stdin <<'EOF' ... EOF."
+)
+EMPTY_STDIN_MESSAGE = (
+    "--stdin received an empty body (no data on stdin / heredoc body was empty). "
+    "Pass non-empty body lines between <<'EOF' and EOF."
+)
+UNEXPECTED_POSITIONAL_AFTER_STDIN_MESSAGE = (
+    "--stdin reads body from stdin; extra positional argument(s) after --stdin are not allowed. "
+    "Either drop --stdin and pass the inline body, or remove the trailing positional and pipe via heredoc."
+)
+STDIN_INLINE_CONFLICT_MESSAGE = (
+    "--stdin and an inline body cannot be combined. Pick one: either pass the inline body as a single argument, "
+    "or use --stdin with stdin/heredoc and no inline body."
+)
 REQUEST_SENT_HINT = (
     "REQUEST_SENT: result arrives later as a new [bridge:*] prompt. "
     "Do independent work only; do not sleep/poll or keep this turn open waiting."
@@ -36,6 +54,29 @@ NOTICE_SENT_HINT = (
     "Do not wait for one; set agent_alarm only if a follow-up matters."
 )
 AMBIENT_STDIN_READ_BYTES = (MAX_INLINE_SEND_BODY_CHARS + 1) * 4 + 4
+
+
+@dataclass(frozen=True)
+class BodyInputError(Exception):
+    code: str
+    message: str
+
+    def __str__(self) -> str:
+        return f"{self.code}: {self.message}"
+
+
+def body_input_error(code: str) -> BodyInputError:
+    messages = {
+        "missing_body": MISSING_BODY_MESSAGE,
+        "empty_stdin": EMPTY_STDIN_MESSAGE,
+        "unexpected_positional_after_stdin": UNEXPECTED_POSITIONAL_AFTER_STDIN_MESSAGE,
+        "stdin_inline_conflict": STDIN_INLINE_CONFLICT_MESSAGE,
+    }
+    return BodyInputError(code, messages[code])
+
+
+def format_body_input_error(error: BodyInputError) -> str:
+    return f"agent_send_peer: {error.code}: {error.message}"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -171,7 +212,7 @@ def validate_send_peer_argv(
     parser: argparse.ArgumentParser,
     *,
     participants: set[str] | None = None,
-) -> str:
+) -> str | BodyInputError:
     value_options, flag_options = option_kinds_from_parser(parser)
     precheck_session = _precheck_session(argv) if participants is None else ""
     participants = participants if participants is not None else _precheck_participants(argv)
@@ -195,6 +236,8 @@ def validate_send_peer_argv(
         if opt is not None and (opt[0] in value_options or opt[0] in flag_options):
             opt_name, takes_value, attached_value = opt
             if body_seen:
+                if opt_name == STDIN_OPTION:
+                    return body_input_error("stdin_inline_conflict")
                 return (
                     f"option {opt_name} appeared after the inline body. "
                     f"{SHELL_BODY_HINT}"
@@ -230,7 +273,7 @@ def validate_send_peer_argv(
 
         if destination_selected:
             if stdin_seen:
-                return "cannot combine --stdin with a positional inline body"
+                return body_input_error("unexpected_positional_after_stdin")
             if body_seen:
                 return f"message body was split into multiple shell arguments. {SHELL_BODY_HINT}"
             body_seen = True
@@ -238,7 +281,7 @@ def validate_send_peer_argv(
             continue
 
         if stdin_seen and token not in participants and token not in RESERVED_IMPLICIT_TARGETS:
-            return "cannot combine --stdin with a positional inline body"
+            return body_input_error("unexpected_positional_after_stdin")
 
         if (
             allow_spoof_seen
@@ -268,7 +311,7 @@ def validate_send_peer_argv(
         index += 1
 
     if destination_selected and option_after_destination_seen and not body_seen and not stdin_seen:
-        return "message body is required; use --stdin or one inline body argument"
+        return body_input_error("missing_body")
 
     return ""
 
@@ -385,18 +428,24 @@ def parse_body_and_target(args: argparse.Namespace, session: str) -> tuple[str |
 
     if args.stdin_body:
         if words:
-            raise ValueError("cannot combine --stdin with a positional inline body")
+            raise body_input_error("stdin_inline_conflict")
         body = read_limited_text(sys.stdin)
+        if not body.strip():
+            raise body_input_error("empty_stdin")
     elif words:
         if len(words) > 1:
             raise ValueError(f"message body was split into multiple shell arguments. {SHELL_BODY_HINT}")
         if non_tty_stdin_text():
             raise ValueError("cannot combine piped stdin with a positional inline body")
         body = words[0]
+        if not body.strip():
+            raise body_input_error("missing_body")
     elif not sys.stdin.isatty():
         body = non_tty_stdin_text()
+        if not body.strip():
+            raise body_input_error("missing_body")
     else:
-        body = ""
+        raise body_input_error("missing_body")
 
     args.target_all = target_all
     return target, body
@@ -407,7 +456,13 @@ def main() -> int:
     argv = sys.argv[1:]
     precheck_error = validate_send_peer_argv(argv, parser)
     if precheck_error:
-        print(f"agent_send_peer: {precheck_error}", file=sys.stderr)
+        if isinstance(precheck_error, BodyInputError):
+            # Stable body-input codes are deliberately narrow; unrelated
+            # parser, placement, watchdog, and identity diagnostics keep their
+            # established wording for compatibility.
+            print(format_body_input_error(precheck_error), file=sys.stderr)
+        else:
+            print(f"agent_send_peer: {precheck_error}", file=sys.stderr)
         return 2
     args = parser.parse_args()
 
@@ -435,11 +490,11 @@ def main() -> int:
 
     try:
         target, body = parse_body_and_target(args, session)
+    except BodyInputError as exc:
+        print(format_body_input_error(exc), file=sys.stderr)
+        return 2
     except ValueError as exc:
         print(f"agent_send_peer: {exc}", file=sys.stderr)
-        return 2
-    if not body.strip():
-        print("agent_send_peer: message body is required", file=sys.stderr)
         return 2
     ok, size_error = validate_peer_body_size(body)
     if not ok:

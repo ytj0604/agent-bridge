@@ -8083,8 +8083,19 @@ def scenario_response_send_guard_doc_surfaces_are_precise(label: str, tmpdir: Pa
 def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, tmpdir: Path) -> None:
     request_tokens = ["result arrives later as a new [bridge:*] prompt", "Do independent work only", "do not sleep/poll"]
     alarm_tokens = ["[bridge:*] notice prompt", "do not sleep/poll"]
+    body_input_tokens = [
+        "one inline argument",
+        "--stdin heredoc",
+        "not both",
+        "missing_body",
+        "empty_stdin",
+        "unexpected_positional_after_stdin",
+        "stdin_inline_conflict",
+        "self-recovery guidance",
+    ]
     forbidden_fragments = ["End your turn; sleep/polling blocks the wake you await.", "do not sleep or poll"]
 
+    cheat = "\n".join(bridge_instructions.model_cheat_sheet())
     cheat_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- After sending a request,")]
     assert_true(len(cheat_lines) == 1, f"{label}: expected one cheat-sheet request-wait rule, got {cheat_lines!r}")
     cheat_line = cheat_lines[0]
@@ -8102,6 +8113,9 @@ def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, t
     assert_true("[bridge:alarm_cancelled]" in alarm_lines[0] and "re-arm" in alarm_lines[0].lower(), f"{label}: alarm rule must mention cancellation marker and re-arm guidance: {alarm_lines[0]!r}")
 
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
+    for token in body_input_tokens:
+        assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing body-input token {token!r}")
+        assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing body-input token {token!r}")
     probe_lines = [line.strip() for line in probe.splitlines()]
     sending_lines = [
         line for line in probe_lines
@@ -10588,6 +10602,18 @@ def _run_send_peer_main(bs, argv: list[str], stdin_text: str = "", stdin_isatty:
     return int(code), out.getvalue(), err.getvalue()
 
 
+def _run_send_peer_script(argv: list[str], stdin_text: str = "") -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(LIBEXEC / "bridge_send_peer.py"), *argv],
+        cwd=str(ROOT),
+        input=stdin_text,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=5,
+    )
+
+
 def _patch_enqueue_for_unit(be, state: dict, *, socket_error: str = "") -> None:
     be.ensure_daemon_running = lambda session: ""
     be.room_status = lambda session: argparse.Namespace(active_enough_for_enqueue=True, reason="ok")
@@ -11557,6 +11583,67 @@ def scenario_send_peer_watchdog_finite_value_forwarded_with_equals(label: str, t
     print(f"  PASS  {label}")
 
 
+def _assert_send_peer_body_error(
+    label: str,
+    case: str,
+    argv: list[str],
+    *,
+    code: str,
+    stdin_text: str = "",
+    tokens: tuple[str, ...],
+) -> None:
+    proc = _run_send_peer_script(
+        ["--allow-spoof", "--session", "test-session", "--from", "alice", *argv],
+        stdin_text=stdin_text,
+    )
+    assert_true(proc.returncode == 2, f"{label}: {case} should exit 2, got {proc.returncode}, stderr={proc.stderr!r}")
+    assert_true(proc.stdout == "", f"{label}: {case} should not print stdout: {proc.stdout!r}")
+    assert_true(proc.stderr.startswith(f"agent_send_peer: {code}: "), f"{label}: {case} missing stable code {code!r}: {proc.stderr!r}")
+    for token in tokens:
+        assert_true(token in proc.stderr, f"{label}: {case} missing token {token!r}: {proc.stderr!r}")
+
+
+def scenario_send_peer_body_input_diagnostics_are_specific(label: str, tmpdir: Path) -> None:
+    _assert_send_peer_body_error(
+        label,
+        "missing body",
+        ["--to", "bob"],
+        code="missing_body",
+        tokens=(
+            "message body is required",
+            "single inline argument",
+            "agent_send_peer <alias> 'hello'",
+            "agent_send_peer <alias> --stdin <<'EOF' ... EOF",
+        ),
+    )
+    for case, stdin_text in (("empty stdin", ""), ("whitespace stdin", " \n\t")):
+        _assert_send_peer_body_error(
+            label,
+            case,
+            ["--to", "bob", "--stdin"],
+            code="empty_stdin",
+            stdin_text=stdin_text,
+            tokens=("--stdin received an empty body", "heredoc body was empty", "non-empty body lines"),
+        )
+    _assert_send_peer_body_error(
+        label,
+        "positional after stdin",
+        ["--to", "bob", "--stdin", "some-body"],
+        code="unexpected_positional_after_stdin",
+        stdin_text="stdin body",
+        tokens=("--stdin reads body from stdin", "extra positional argument", "drop --stdin", "pipe via heredoc"),
+    )
+    _assert_send_peer_body_error(
+        label,
+        "stdin plus inline body",
+        ["--to", "bob", "inline body", "--stdin"],
+        code="stdin_inline_conflict",
+        stdin_text="stdin body",
+        tokens=("--stdin and an inline body cannot be combined", "Pick one", "single argument", "stdin/heredoc"),
+    )
+    print(f"  PASS  {label}")
+
+
 def scenario_send_peer_rejects_split_inline_body(label: str, tmpdir: Path) -> None:
     bs = _import_send_peer_module()
     _patch_send_peer_for_unit(bs)
@@ -11683,7 +11770,7 @@ def scenario_send_peer_implicit_target_option_without_body_reports_body_required
         stdin_isatty=True,
     )
     assert_true(code == 2 and not calls and out == "", f"{label}: implicit target with options but no body should reject")
-    assert_true("message body is required" in err and "after the inline body" not in err, f"{label}: missing-body diagnostic should stay clear: {err!r}")
+    assert_true("missing_body" in err and "message body is required" in err and "after the inline body" not in err, f"{label}: missing-body diagnostic should stay clear: {err!r}")
     print(f"  PASS  {label}")
 
 
@@ -11704,16 +11791,17 @@ def scenario_send_peer_rejects_allow_spoof_after_implicit_target(label: str, tmp
 def scenario_send_peer_single_inline_body_uses_stdin_handoff(label: str, tmpdir: Path) -> None:
     bs = _import_send_peer_module()
     _patch_send_peer_for_unit(bs)
+    body = "  can't stop"
     code, out, err, calls = _run_send_peer_with_fake_subprocess(
         bs,
-        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--to", "bob", "hello world"],
+        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--to", "bob", body],
         stdin_isatty=True,
     )
     assert_true(code == 0 and len(calls) == 1, f"{label}: single argv body should enqueue once: code={code} err={err!r}")
     cmd, kwargs = calls[0]
     assert_true("--stdin" in cmd and "--body" not in cmd, f"{label}: wrapper must hand body to enqueue via stdin: {cmd}")
     assert_true(cmd[cmd.index("--to") + 1] == "bob", f"{label}: target preserved: {cmd}")
-    assert_true(kwargs.get("input") == b"hello world", f"{label}: body encoded as utf-8 bytes: {kwargs}")
+    assert_true(kwargs.get("input") == body.encode("utf-8"), f"{label}: body encoded as utf-8 bytes: {kwargs}")
     print(f"  PASS  {label}")
 
 
@@ -11817,7 +11905,7 @@ except Exception as exc:
 """
     cases = {
         "idle-inline": {"ok": True, "target": "bob", "body": "hello"},
-        "idle-empty": {"ok": True, "target": "bob", "body": ""},
+        "idle-empty": {"ok": False, "error_contains": "missing_body"},
         "partial-inline": {"ok": False, "error_contains": "cannot combine piped stdin"},
     }
     for case, expected in cases.items():
@@ -11862,7 +11950,7 @@ def scenario_send_peer_inline_body_accepts_empty_non_tty_stdin(label: str, tmpdi
 def scenario_send_peer_explicit_stdin_multibyte_body(label: str, tmpdir: Path) -> None:
     bs = _import_send_peer_module()
     _patch_send_peer_for_unit(bs)
-    body = "한글 can't --kind request `x`"
+    body = "  first line\ncan't --kind request `x`\n"
     code, out, err, calls = _run_send_peer_with_fake_subprocess(
         bs,
         ["--session", "test-session", "--from", "alice", "--kind", "notice", "--to", "bob", "--stdin"],
@@ -12027,7 +12115,7 @@ def scenario_send_peer_rejects_stdin_with_positional_body(label: str, tmpdir: Pa
         stdin_isatty=False,
     )
     assert_true(code == 2 and not calls and out == "", f"{label}: --stdin + positional body must reject")
-    assert_true("cannot combine --stdin" in err, f"{label}: stderr explains collision: {err!r}")
+    assert_true("unexpected_positional_after_stdin" in err and "extra positional argument" in err, f"{label}: stderr explains collision: {err!r}")
     print(f"  PASS  {label}")
 
 
@@ -13136,6 +13224,7 @@ def main() -> int:
             ("send_peer_watchdog_bare_minus_inf_argparse_error_at_shim", scenario_send_peer_watchdog_bare_minus_inf_argparse_error_at_shim),
             ("send_peer_watchdog_equals_minus_inf_reports_finite_error_at_shim", scenario_send_peer_watchdog_equals_minus_inf_reports_finite_error_at_shim),
             ("send_peer_watchdog_finite_value_forwarded_with_equals", scenario_send_peer_watchdog_finite_value_forwarded_with_equals),
+            ("send_peer_body_input_diagnostics_are_specific", scenario_send_peer_body_input_diagnostics_are_specific),
             ("send_peer_rejects_split_inline_body", scenario_send_peer_rejects_split_inline_body),
             ("send_peer_rejects_implicit_split_inline_body", scenario_send_peer_rejects_implicit_split_inline_body),
             ("send_peer_accepts_option_after_destination_with_stdin", scenario_send_peer_accepts_option_after_destination_with_stdin),
