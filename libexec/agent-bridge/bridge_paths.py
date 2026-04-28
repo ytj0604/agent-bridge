@@ -252,7 +252,7 @@ def pin_runtime_roots() -> dict:
 
 
 def python_exe() -> str:
-    return os.environ.get("AGENT_BRIDGE_PYTHON") or sys.executable or "python3"
+    return sys.executable or "python3"
 
 
 def script_path(name: str) -> Path:

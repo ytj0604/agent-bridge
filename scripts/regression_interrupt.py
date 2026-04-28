@@ -6839,6 +6839,50 @@ def _write_fake_install_tree(root: Path, *, omit: Path | None = None) -> None:
     os.chmod(hook, 0o755)
 
 
+def _write_fake_python3(fakebin: Path, version: str) -> Path:
+    fakebin.mkdir(parents=True, exist_ok=True)
+    major_minor = tuple(int(part) for part in version.split(".")[:2])
+    gate_exit = 0 if major_minor >= (3, 10) else 1
+    path = fakebin / "python3"
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"${1:-}\" == \"-c\" && \"${2:-}\" == *agent_bridge_python_gate_v1* ]]; then\n"
+        f"  printf '%s\\n' {shlex.quote(version)}\n"
+        "  printf '%s\\n' \"$0\"\n"
+        f"  exit {gate_exit}\n"
+        "fi\n"
+        f"exec {shlex.quote(sys.executable)} \"$@\"\n",
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o755)
+    return fakebin
+
+
+def _assert_python_gate_failure(label: str, proc: subprocess.CompletedProcess) -> None:
+    assert_true(proc.returncode != 0, f"{label}: expected Python gate failure")
+    assert_true("###################################################################" in proc.stderr, f"{label}: emphasized delimiter missing: {proc.stderr!r}")
+    assert_true("Python 3.10" in proc.stderr, f"{label}: Python 3.10 token missing: {proc.stderr!r}")
+    assert_true("ERROR: agent-bridge requires Python 3.10 or newer." in proc.stderr, f"{label}: targeted error missing: {proc.stderr!r}")
+
+
+def _write_fake_healthcheck_tree(root: Path) -> None:
+    (root / "bin").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "bin" / "bridge_healthcheck.sh", root / "bin" / "bridge_healthcheck.sh")
+    os.chmod(root / "bin" / "bridge_healthcheck.sh", 0o755)
+    shutil.copytree(
+        LIBEXEC,
+        root / "libexec" / "agent-bridge",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    for _, relative in DIRECT_EXECUTABLE_TARGETS:
+        target = root / relative
+        if relative == Path("bin/bridge_healthcheck.sh"):
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        os.chmod(target, 0o755)
+
+
 def _write_fake_hook_installer(root: Path, *, exit_code: int = 0, argv_file: Path | None = None) -> Path:
     path = root / "libexec" / "agent-bridge" / "bridge_install_hooks.py"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -6859,6 +6903,7 @@ def _write_fake_hook_installer(root: Path, *, exit_code: int = 0, argv_file: Pat
 
 def _fake_install_env(tmpdir: Path, *, path_prefix: Path | None = None) -> dict[str, str]:
     env = dict(os.environ)
+    env.pop("AGENT_BRIDGE" + "_PYTHON", None)
     env["HOME"] = str(tmpdir / "home")
     env["SHELL"] = "/bin/bash"
     env["XDG_BIN_HOME"] = str(tmpdir / "xdg-bin")
@@ -6868,6 +6913,15 @@ def _fake_install_env(tmpdir: Path, *, path_prefix: Path | None = None) -> dict[
     env["AGENT_BRIDGE_LOG_DIR"] = str(tmpdir / "log")
     if path_prefix is not None:
         env["PATH"] = f"{path_prefix}:{env.get('PATH', '')}"
+    return env
+
+
+def _fake_healthcheck_env(tmpdir: Path, root: Path, fakebin: Path) -> dict[str, str]:
+    env = _fake_install_env(tmpdir)
+    env.pop("AGENT_BRIDGE_HOME", None)
+    env.pop("AGENT_BRIDGE" + "_PYTHON", None)
+    env["PATH"] = f"{fakebin}:{root / 'bin'}:{root / 'model-bin'}:{env.get('PATH', '')}"
+    _write_seed_hook_configs(Path(env["HOME"]))
     return env
 
 
@@ -6896,6 +6950,16 @@ def _run_fake_install(
     cmd.extend(extra_args or [])
     return subprocess.run(
         cmd,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+
+def _run_fake_healthcheck(root: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", str(root / "bin" / "bridge_healthcheck.sh")],
         capture_output=True,
         text=True,
         env=env,
@@ -6988,6 +7052,78 @@ def _assert_hook_config_unchanged(label: str, path: Path, before: bytes, proc: s
     for needle in needles:
         assert_true(needle in proc.stderr, f"{label}: stderr should contain {needle!r}: {proc.stderr!r}")
     assert_true(path.read_bytes() == before, f"{label}: invalid existing hook config must not be overwritten")
+
+
+def scenario_python_env_override_removed_from_tracked_files(label: str, tmpdir: Path) -> None:
+    forbidden = "AGENT_BRIDGE" + "_PYTHON"
+    proc = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, timeout=10)
+    assert_true(proc.returncode == 0, f"{label}: git ls-files failed: {proc.stderr!r}")
+    hits = []
+    for rel in proc.stdout.splitlines():
+        path = ROOT / rel
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        if forbidden in text:
+            hits.append(rel)
+    assert_true(not hits, f"{label}: forbidden Python override token remains in tracked files: {hits}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_python_version_gate(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "install-python-gate"
+    root.mkdir()
+    _write_fake_install_tree(root)
+
+    fake39 = _write_fake_python3(tmpdir / "fake-python-39", "3.9.18")
+    env39 = _fake_install_env(tmpdir / "env39", path_prefix=fake39)
+    proc39 = _run_fake_install(root, tmpdir / "shims39", env=env39)
+    _assert_python_gate_failure(f"{label}: python 3.9", proc39)
+    assert_true("install shim:" not in proc39.stdout, f"{label}: gate should fail before shim work: {proc39.stdout!r}")
+
+    proc39_dry = _run_fake_install(root, tmpdir / "shims39-dry", env=env39, extra_args=["--dry-run"])
+    _assert_python_gate_failure(f"{label}: python 3.9 dry-run", proc39_dry)
+    assert_true("install shim:" not in proc39_dry.stdout, f"{label}: dry-run gate should fail before shim work: {proc39_dry.stdout!r}")
+
+    fake310 = _write_fake_python3(tmpdir / "fake-python-310", "3.10.14")
+    proc310 = _run_fake_install(root, tmpdir / "shims310", env=_fake_install_env(tmpdir / "env310", path_prefix=fake310))
+    assert_true(proc310.returncode == 0, f"{label}: fake Python 3.10 should pass install: {proc310.stderr!r}")
+    assert_true(os.access(tmpdir / "shims310" / "agent_send_peer", os.X_OK), f"{label}: install should write shims after passing gate")
+
+    fake311 = _write_fake_python3(tmpdir / "fake-python-311", "3.11.9")
+    proc311 = _run_fake_install(
+        root,
+        tmpdir / "shims311",
+        env=_fake_install_env(tmpdir / "env311", path_prefix=fake311),
+        extra_args=["--dry-run"],
+    )
+    assert_true(proc311.returncode == 0, f"{label}: fake Python 3.11 dry-run should pass install: {proc311.stderr!r}")
+    assert_true("install shim:" in proc311.stdout, f"{label}: dry-run should reach shim preview after passing gate: {proc311.stdout!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_bridge_healthcheck_sh_python_version_gate(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "healthcheck-python-gate"
+    root.mkdir()
+    _write_fake_healthcheck_tree(root)
+
+    fake39 = _write_fake_python3(tmpdir / "hc-fake-python-39", "3.9.18")
+    proc39 = _run_fake_healthcheck(root, _fake_healthcheck_env(tmpdir / "hc-env39", root, fake39))
+    _assert_python_gate_failure(f"{label}: python 3.9", proc39)
+    assert_true("ok   install_root" not in proc39.stdout, f"{label}: gate should fail before Python healthcheck output: {proc39.stdout!r}")
+
+    fake310 = _write_fake_python3(tmpdir / "hc-fake-python-310", "3.10.14")
+    proc310 = _run_fake_healthcheck(root, _fake_healthcheck_env(tmpdir / "hc-env310", root, fake310))
+    assert_true(proc310.returncode == 0, f"{label}: fake Python 3.10 healthcheck should pass: {proc310.stderr!r}")
+    assert_true("ok   install_root" in proc310.stdout, f"{label}: healthcheck should run after passing gate: {proc310.stdout!r}")
+
+    fake311 = _write_fake_python3(tmpdir / "hc-fake-python-311", "3.11.9")
+    proc311 = _run_fake_healthcheck(root, _fake_healthcheck_env(tmpdir / "hc-env311", root, fake311))
+    assert_true(proc311.returncode == 0, f"{label}: fake Python 3.11 healthcheck should pass: {proc311.stderr!r}")
+    print(f"  PASS  {label}")
 
 
 def scenario_install_sh_chmods_target_or_fails(label: str, tmpdir: Path) -> None:
@@ -14014,6 +14150,9 @@ def main() -> int:
             ("uninstall_sh_hook_helper_failure_aborts", scenario_uninstall_sh_hook_helper_failure_aborts),
             ("direct_exec_targets_executable", scenario_direct_exec_targets_executable),
             ("healthcheck_executable_helper_distinguishes_states", scenario_healthcheck_executable_helper_distinguishes_states),
+            ("python_env_override_removed_from_tracked_files", scenario_python_env_override_removed_from_tracked_files),
+            ("install_sh_python_version_gate", scenario_install_sh_python_version_gate),
+            ("bridge_healthcheck_sh_python_version_gate", scenario_bridge_healthcheck_sh_python_version_gate),
             ("install_sh_chmods_target_or_fails", scenario_install_sh_chmods_target_or_fails),
             ("install_sh_default_updates_shell_rc", scenario_install_sh_default_updates_shell_rc),
             ("install_sh_shell_rc_dry_run_and_opt_out", scenario_install_sh_shell_rc_dry_run_and_opt_out),

@@ -17,7 +17,8 @@ BRIDGE_BIN_DIR="$BRIDGE_ROOT/bin"
 BRIDGE_MODEL_BIN_DIR="$BRIDGE_ROOT/model-bin"
 BRIDGE_HOOK_DIR="$BRIDGE_ROOT/hooks"
 BRIDGE_LIBEXEC_DIR="$BRIDGE_ROOT/libexec/agent-bridge"
-BRIDGE_PYTHON="${AGENT_BRIDGE_PYTHON:-python3}"
+# Keep bridge shims on the same system python3; install/healthcheck enforce >=3.10.
+BRIDGE_PYTHON="python3"
 
 export AGENT_BRIDGE_HOME="$BRIDGE_ROOT"
 

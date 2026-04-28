@@ -1,8 +1,68 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent)' "$0")"
+resolve_script_dir() {
+  local source="$1"
+  local dir
+  while [[ -L "$source" ]]; do
+    dir="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
+    source="$(readlink "$source")"
+    [[ "$source" != /* ]] && source="$dir/$source"
+  done
+  cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd
+}
+
+print_python_requirement_error() {
+  local detected="$1"
+  {
+    echo "###################################################################"
+    echo "# ERROR: agent-bridge requires Python 3.10 or newer."
+    echo "#"
+    echo "# Detected: $detected"
+    echo "# Required: Python 3.10+"
+    echo "#"
+    echo '# Please install Python 3.10+ and ensure it is available as `python3`'
+    echo "# in your PATH before running ./install.sh again."
+    echo "###################################################################"
+  } >&2
+}
+
+require_python_310() {
+  local python_path
+  if ! python_path="$(command -v "$python_bin" 2>/dev/null)"; then
+    print_python_requirement_error "python3 not found in PATH"
+    exit 1
+  fi
+
+  local probe status version executable
+  status=0
+  probe="$("$python_bin" -c '
+# agent_bridge_python_gate_v1
+import platform
+import sys
+
+print(platform.python_version())
+print(sys.executable or "python3")
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+' 2>/dev/null)" || status=$?
+  if [[ "$status" -eq 0 ]]; then
+    return
+  fi
+
+  version="$(printf '%s\n' "$probe" | sed -n '1p')"
+  executable="$(printf '%s\n' "$probe" | sed -n '2p')"
+  if [[ -n "$version" ]]; then
+    print_python_requirement_error "Python $version at ${executable:-$python_path}"
+  else
+    print_python_requirement_error "unable to run python3 at $python_path"
+  fi
+  exit 1
+}
+
+root="$(resolve_script_dir "$0")"
 libexec_dir="$root/libexec/agent-bridge"
+python_bin="python3"
+require_python_310
 bin_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"
 yes="0"
 dry_run="0"
@@ -46,7 +106,7 @@ detect_shell_rc() {
 }
 
 print_path_block() {
-  python3 - "$bin_dir" "$path_block_begin" "$path_block_end" <<'PY'
+  "$python_bin" - "$bin_dir" "$path_block_begin" "$path_block_end" <<'PY'
 import shlex
 import sys
 
@@ -62,7 +122,7 @@ PY
 
 path_block_needs_update() {
   local rc_path="$1"
-  python3 - "$rc_path" "$bin_dir" "$path_block_begin" "$path_block_end" <<'PY'
+  "$python_bin" - "$rc_path" "$bin_dir" "$path_block_begin" "$path_block_end" <<'PY'
 from pathlib import Path
 import shlex
 import sys
@@ -102,7 +162,7 @@ PY
 
 write_path_block() {
   local rc_path="$1"
-  python3 - "$rc_path" "$bin_dir" "$path_block_begin" "$path_block_end" <<'PY'
+  "$python_bin" - "$rc_path" "$bin_dir" "$path_block_begin" "$path_block_end" <<'PY'
 from pathlib import Path
 import shlex
 import sys
@@ -260,7 +320,7 @@ if [[ "$install_hooks" == "1" ]]; then
     args+=(--dry-run)
   fi
   echo "install hooks via $hook_command"
-  if python3 "${args[@]}"; then
+  if "$python_bin" "${args[@]}"; then
     :
   else
     status="$?"
