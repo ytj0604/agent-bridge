@@ -1374,7 +1374,10 @@ def scenario_response_send_guard_socket_request_notice(label: str, tmpdir: Path)
     result = d.handle_enqueue_command([request_msg])
     assert_true(not result.get("ok"), f"{label}: request to requester must be blocked")
     assert_true(result.get("error_kind") == "response_send_guard", f"{label}: guard block must carry structured error_kind: {result}")
-    assert_true("do not call agent_send_peer" in str(result.get("error")), f"{label}: error must explain normal reply: {result}")
+    error_text = str(result.get("error") or "")
+    for token in ("current_prompt.from=alice", "separate agent_send_peer", "blocked/rejected", "requester", "third-party", "review/collaboration", "other validations still apply"):
+        assert_true(token in error_text, f"{label}: error missing token {token!r}: {error_text!r}")
+    assert_true("do not call agent_send_peer" not in error_text, f"{label}: error must not imply all send_peer is forbidden: {error_text!r}")
 
     notice_msg = _qualifying_message("bob", "alice", kind="notice", body="wrong notice")
     result2 = d.handle_enqueue_command([notice_msg])
@@ -1441,11 +1444,14 @@ def scenario_response_send_guard_socket_aggregate_and_held(label: str, tmpdir: P
     participants = {
         "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91", "status": "active"},
         "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "status": "active"},
+        "carol": {"alias": "carol", "agent_type": "codex", "pane": "%93", "status": "active"},
     }
     d = make_daemon(tmpdir, participants)
     _set_response_context(d, "bob", "alice", aggregate_id="agg-active")
     aggregate_result = d.handle_enqueue_command([_qualifying_message("bob", "alice", kind="request", body="agg follow-up")])
     assert_true(not aggregate_result.get("ok"), f"{label}: aggregate response context must block send to requester")
+    third_party_result = d.handle_enqueue_command([_qualifying_message("bob", "carol", kind="request", body="agg review")])
+    assert_true(third_party_result.get("ok"), f"{label}: aggregate context must not block third-party peer send: {third_party_result}")
 
     d.held_interrupt["bob"] = {"since": utc_now(), "since_ts": time.time(), "prior_message_id": "msg-active-response"}
     held_result = d.handle_enqueue_command([_qualifying_message("bob", "alice", kind="notice", body="held follow-up")])
@@ -8021,6 +8027,59 @@ def scenario_prompt_intercepted_doc_surfaces_disclose_user_typing_collision(labe
     print(f"  PASS  {label}")
 
 
+def scenario_response_send_guard_doc_surfaces_are_precise(label: str, tmpdir: Path) -> None:
+    required_doc_tokens = [
+        "response-time send guard",
+        "auto-return peer request",
+        "requester",
+        "current_prompt.from",
+        "blocked/rejected",
+        "target list containing that requester",
+        "third-party peer sends",
+        "review/collaboration",
+        "other validations still apply",
+    ]
+    forbidden_fragments = [
+        "do not call agent_send_peer",
+        "cannot send peer messages during response",
+        "no agent_send_peer during response",
+    ]
+    cheat = "\n".join(bridge_instructions.model_cheat_sheet())
+    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
+    for surface_name, surface in (("cheat sheet", cheat), ("probe prompt", probe)):
+        lowered = surface.lower()
+        for token in required_doc_tokens:
+            assert_true(token.lower() in lowered, f"{label}: {surface_name} missing response guard token {token!r}")
+        for fragment in forbidden_fragments:
+            assert_true(fragment.lower() not in lowered, f"{label}: {surface_name} must not contain overbroad guard wording {fragment!r}")
+
+    text = bridge_response_guard.format_response_send_violation(
+        bridge_response_guard.ResponseSendViolation(
+            sender="bob",
+            requester="alice",
+            message_id="msg-guard-doc",
+            outgoing_kind="request",
+            blocked_targets=("alice", "carol"),
+            source="test",
+        )
+    )
+    lowered_error = text.lower()
+    for token in (
+        "requester",
+        "current_prompt.from=alice",
+        "separate agent_send_peer",
+        "blocked/rejected",
+        "target list includes that requester",
+        "third-party",
+        "review/collaboration",
+        "other validations still apply",
+    ):
+        assert_true(token.lower() in lowered_error, f"{label}: guard error missing token {token!r}: {text!r}")
+    for fragment in forbidden_fragments:
+        assert_true(fragment.lower() not in lowered_error, f"{label}: guard error must not contain overbroad wording {fragment!r}: {text!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, tmpdir: Path) -> None:
     request_tokens = ["result arrives later as a new [bridge:*] prompt", "Do independent work only", "do not sleep/poll"]
     alarm_tokens = ["[bridge:*] notice prompt", "do not sleep/poll"]
@@ -12255,10 +12314,15 @@ def scenario_response_send_guard_socket_cli_error_kind(label: str, tmpdir: Path)
     be = _import_enqueue_module()
     state = _participants_state(["alice", "bob"])
     _patch_enqueue_for_unit(be, state)
-    guard_error = (
-        "agent_send_peer: you are currently responding to a peer request from alice. "
-        "Reply normally; do not call agent_send_peer; bridge auto-returns your reply. "
-        "If you really intend to send a separate request/notice to alice, retry with --force."
+    guard_error = bridge_response_guard.format_response_send_violation(
+        bridge_response_guard.ResponseSendViolation(
+            sender="bob",
+            requester="alice",
+            message_id="msg-guard-cli",
+            outgoing_kind="request",
+            blocked_targets=("alice",),
+            source="test",
+        )
     )
     be.enqueue_via_daemon_socket = lambda session, messages, **kwargs: (True, [], guard_error, "response_send_guard")
 
@@ -12277,7 +12341,8 @@ def scenario_response_send_guard_socket_cli_error_kind(label: str, tmpdir: Path)
     assert_true(code == 2, f"{label}: socket guard exits 2, got {code}")
     assert_true(out == "", f"{label}: socket guard has no stdout: {out!r}")
     assert_true(err.count("agent_send_peer:") == 1, f"{label}: socket guard must not double-prefix stderr: {err!r}")
-    assert_true("do not call agent_send_peer" in err and "--force" in err, f"{label}: canonical guard text present: {err!r}")
+    for token in ("separate agent_send_peer", "current_prompt.from=alice", "third-party", "review/collaboration", "--force"):
+        assert_true(token in err, f"{label}: canonical guard text missing {token!r}: {err!r}")
     print(f"  PASS  {label}")
 
 
@@ -12362,7 +12427,7 @@ def scenario_response_send_guard_fallback_blocks_unchanged(label: str, tmpdir: P
     )
     assert_true(code == 2, f"{label}: blocked fallback exits 2, got {code}, err={err!r}")
     assert_true(out == "", f"{label}: blocked fallback has no stdout: {out!r}")
-    assert_true("do not call agent_send_peer" in err, f"{label}: blocked fallback explains normal reply: {err!r}")
+    assert_true("separate agent_send_peer" in err and "current_prompt.from=alice" in err, f"{label}: blocked fallback explains requester-only guard: {err!r}")
     after = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
     assert_true(before == after, f"{label}: blocked fallback must leave queue and event files byte-identical")
     print(f"  PASS  {label}")
@@ -12394,9 +12459,42 @@ def scenario_response_send_guard_fallback_all_blocks_unchanged(label: str, tmpdi
     )
     assert_true(code == 2, f"{label}: --all including requester must be blocked, got {code}, err={err!r}")
     assert_true(out == "", f"{label}: blocked --all has no stdout: {out!r}")
-    assert_true("target list includes alice" in err, f"{label}: --all error should mention requester inclusion: {err!r}")
+    assert_true("target list includes that requester" in err and "current_prompt.from=alice" in err, f"{label}: --all error should mention requester inclusion: {err!r}")
     after = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
     assert_true(before == after, f"{label}: blocked --all fallback must leave files unchanged")
+    print(f"  PASS  {label}")
+
+
+def scenario_response_send_guard_fallback_partial_blocks_unchanged(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob", "carol"])
+    _patch_enqueue_for_unit(be, state)
+    queue_file = tmpdir / "pending.json"
+    state_file = tmpdir / "events.raw.jsonl"
+    public_file = tmpdir / "events.jsonl"
+    _write_json(queue_file, [_delivered_request("msg-delivered-partial", "alice", "bob")])
+    state_file.write_text("raw-before\n", encoding="utf-8")
+    public_file.write_text("public-before\n", encoding="utf-8")
+    before = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
+
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "bob",
+            "--to", "alice,carol",
+            "--body", "partial while replying",
+            "--queue-file", str(queue_file),
+            "--state-file", str(state_file),
+            "--public-state-file", str(public_file),
+        ],
+    )
+    assert_true(code == 2, f"{label}: partial target list including requester must be blocked, got {code}, err={err!r}")
+    assert_true(out == "", f"{label}: blocked partial has no stdout: {out!r}")
+    for token in ("target list includes that requester", "current_prompt.from=alice", "third-party", "other validations still apply"):
+        assert_true(token in err, f"{label}: partial error missing token {token!r}: {err!r}")
+    after = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
+    assert_true(before == after, f"{label}: blocked partial fallback must leave files unchanged")
     print(f"  PASS  {label}")
 
 
@@ -12914,6 +13012,7 @@ def main() -> int:
             ("view_peer_doc_surfaces_disclose_search_semantics", scenario_view_peer_doc_surfaces_disclose_search_semantics),
             ("interrupt_peer_doc_surfaces_disclose_no_op_race", scenario_interrupt_peer_doc_surfaces_disclose_no_op_race),
             ("prompt_intercepted_doc_surfaces_disclose_user_typing_collision", scenario_prompt_intercepted_doc_surfaces_disclose_user_typing_collision),
+            ("response_send_guard_doc_surfaces_are_precise", scenario_response_send_guard_doc_surfaces_are_precise),
             ("send_peer_wait_doc_surfaces_name_blocking_consequence", scenario_send_peer_wait_doc_surfaces_name_blocking_consequence),
             ("watchdog_phase_doc_surfaces_are_consistent", scenario_watchdog_phase_doc_surfaces_are_consistent),
             ("wait_status_doc_surfaces_anti_polling", scenario_wait_status_doc_surfaces_anti_polling),
@@ -13064,6 +13163,7 @@ def main() -> int:
             ("enqueue_fallback_write_failure_preserves_stderr", scenario_enqueue_fallback_write_failure_preserves_stderr),
             ("response_send_guard_fallback_blocks_unchanged", scenario_response_send_guard_fallback_blocks_unchanged),
             ("response_send_guard_fallback_all_blocks_unchanged", scenario_response_send_guard_fallback_all_blocks_unchanged),
+            ("response_send_guard_fallback_partial_blocks_unchanged", scenario_response_send_guard_fallback_partial_blocks_unchanged),
             ("response_send_guard_fallback_force_allows", scenario_response_send_guard_fallback_force_allows),
             ("response_send_guard_fallback_no_auto_return_allowed", scenario_response_send_guard_fallback_no_auto_return_allowed),
             ("response_send_guard_fallback_false_positive_resistance", scenario_response_send_guard_fallback_false_positive_resistance),

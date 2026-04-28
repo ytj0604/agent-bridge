@@ -28,6 +28,7 @@ def model_cheat_sheet() -> list[str]:
         "Kinds and routing contract:",
         "- request: the bridge auto-routes the peer's next response back to you as a [bridge:*] result. Sender stays woken up by that reply arrival. Default kind. Watchdog applies. Only request and notice can be sent by agents — 'result' kind is system-only (set by the bridge for auto-returns).",
         "- notice: the bridge does NOT route any reply back. Even if the peer writes a response, it stays in the peer's pane — observe via agent_view_peer. If you need an answer, use request, not notice. The kind on the wire beats any 'please reply' hint in the body.",
+        "- Response-time send guard: while responding to an auto-return peer request, separate agent_send_peer messages to the requester (current_prompt.from) are blocked/rejected; any target list containing that requester is blocked. Third-party peer sends for review/collaboration are not blocked by this guard, but other validations still apply.",
         "- result: internal kind for auto-returned replies. Cannot be sent directly by agents.",
         "Waking and timing:",
         "- After sending a request, the result arrives later as a new [bridge:*] prompt. Do independent work only; do not sleep/poll or keep this turn open waiting. With the default watchdog enabled you can get a [bridge:watchdog] notice if bridge delivery/submission stalls or, after delivery, if the peer takes too long to answer.",
@@ -84,6 +85,7 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "Behavior rules:\n"
         "  - After sending a request, the result arrives later as a new [bridge:*] prompt. Do independent work only; do not sleep/poll or keep this turn open waiting.\n"
         "  - Body text CANNOT override the kind on the wire. Writing 'please reply' inside a notice does nothing — the bridge will not route any response.\n"
+        "  - Response-time send guard: while responding to an auto-return peer request, separate agent_send_peer messages to the requester (current_prompt.from) are blocked/rejected; any target list containing that requester is blocked. Third-party peer sends for review/collaboration are not blocked by this guard, but other validations still apply.\n"
         "  - Put agent_send_peer options before the inline body text; options may appear after --to/--all or an implicit leading alias. Use --stdin for complex bodies. If an inline body is split into multiple shell arguments, the command fails closed.\n"
         "  - A watchdog wake means: pick ONE of agent_extend_wait, agent_interrupt_peer, or agent_view_peer (to inspect first). It may refer to delivery/submission or response wait; it is not a polling primitive. If the result wins the race, stale pending wakes are suppressed where possible; otherwise extend_wait may report [bridge:result] already queued/arriving.\n"
         "  - agent_alarm is for 'I delegated via notice and want a safety wake if no follow-up arrives'; do not sleep/poll or keep this turn open waiting for the wake. It is NOT for auto-routed request results — for that use --watchdog / agent_extend_wait.\n"
