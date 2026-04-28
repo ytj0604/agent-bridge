@@ -2,13 +2,16 @@
 """Interrupt a peer or manage legacy interrupt hold state.
 
 Modes:
-- (default) interrupt key sequence + cancel active peer turn; pending
-  corrections may continue after a complete sequence. Claude targets may
-  receive one Ctrl-C after ESC to clear submitted-prompt input residue:
+- (default) interrupt key sequence + cancel active/post-pane-touch peer work
+  only; other pending queued messages are not removed. Use
+  agent_cancel_message for pending, inflight pre-pane-touch/pre-paste, or
+  pane-mode-deferred queued-message retraction. Claude targets may receive
+  one Ctrl-C after ESC to clear submitted-prompt input residue:
     agent_interrupt_peer <alias>
 - Clear legacy hold residue without sending ESC. Normally unnecessary for
-  post-v1.5 corrections (UNSAFE if peer might still be running — see warning
-  printed by daemon):
+  post-v1.5 corrections. Use only after --status shows held=true or
+  interrupt_partial_failure_blocked=true and idle fields busy=false,
+  current_prompt_id=null, inflight_count=0, delivered_count=0:
     agent_interrupt_peer <alias> --clear-hold
 - Inspect status of a peer or all peers:
     agent_interrupt_peer [<alias>] --status
@@ -60,14 +63,17 @@ def main() -> int:
         prog="agent_interrupt_peer",
         description=(
             "Send the agent-type-specific interrupt key sequence (Codex: Escape; Claude: Escape then "
-            "one Ctrl-C when active work exists) and cancel the active peer message (default), "
-            "force-clear a legacy interrupt hold, or inspect peer status. If the peer is already past "
-            "the inflight phase, interrupt can be a no-op: the response and queued follow-ups still flow."
+            "one Ctrl-C when active work exists) and cancel only the active/post-pane-touch peer message "
+            "(inflight post-pane-touch, submitted, delivered, or responding active turns), force-clear "
+            "a legacy interrupt hold, or inspect peer status. Interrupt removes the active turn only, "
+            "not other pending queued messages; use agent_cancel_message for pending, inflight pre-pane-touch/pre-paste, "
+            "or pane-mode-deferred queued-message retraction. If the peer is already past the inflight "
+            "phase, interrupt can be a no-op: the response and queued follow-ups still flow."
         ),
     )
     parser.add_argument("target", nargs="?", help="peer alias to act on (omit with --status to query all peers)")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--clear-hold", action="store_true", help="clear legacy held_interrupt residue or partial interrupt-failure delivery gate without sending keys (unsafe if peer is still running or input is dirty)")
+    mode.add_argument("--clear-hold", action="store_true", help="clear held_interrupt residue or partial interrupt-failure gate only after --status shows held=true or interrupt_partial_failure_blocked=true and idle fields busy=false, current_prompt_id=null, inflight_count=0, delivered_count=0; unsafe with turn in progress, dirty input, or active delivered/inflight work")
     mode.add_argument("--status", action="store_true", help="show busy/held/queue state for the target (or all peers if no target)")
     parser.add_argument("--session", dest="session")
     parser.add_argument("--from", dest="sender")

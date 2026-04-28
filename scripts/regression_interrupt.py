@@ -7917,18 +7917,56 @@ def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir:
     key_sequence_phrase = "Claude"
     ctrl_c_phrase = "Ctrl-C"
     command_shape = "agent_interrupt_peer <alias>"
+    boundary_tokens = [
+        "agent_cancel_message",
+        "pending",
+        "inflight pre-pane-touch/pre-paste",
+        "pane-mode-deferred",
+        "active/post-pane-touch",
+        "submitted",
+        "delivered",
+        "not other pending queued messages",
+    ]
+    clear_hold_tokens = [
+        "held=true",
+        "interrupt_partial_failure_blocked=true",
+        "busy=false",
+        "current_prompt_id=null",
+        "inflight_count=0",
+        "delivered_count=0",
+        "idle",
+        "dirty input",
+        "turn in progress",
+        "active delivered/inflight work",
+    ]
 
     interrupt_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith(f"- {command_shape} :")]
     assert_true(len(interrupt_lines) == 1, f"{label}: expected one default interrupt cheat-sheet line, got {interrupt_lines!r}")
     assert_true(phrase in interrupt_lines[0], f"{label}: cheat-sheet interrupt line must disclose no-op race: {interrupt_lines[0]!r}")
     assert_true(key_sequence_phrase in interrupt_lines[0] and ctrl_c_phrase in interrupt_lines[0], f"{label}: cheat-sheet interrupt line must disclose Claude C-c sequence: {interrupt_lines[0]!r}")
     assert_true("force-cancel" not in interrupt_lines[0], f"{label}: default interrupt line must not imply force-cancel: {interrupt_lines[0]!r}")
+    for token in boundary_tokens:
+        assert_true(token.lower() in interrupt_lines[0].lower(), f"{label}: interrupt cheat line missing boundary token {token!r}: {interrupt_lines[0]!r}")
+    cancel_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_cancel_message <message_id> :")]
+    assert_true(len(cancel_lines) == 1, f"{label}: expected one cancel cheat-sheet line, got {cancel_lines!r}")
+    for token in ("pending", "inflight pre-pane-touch/pre-paste", "pane-mode-deferred", "agent_interrupt_peer", "submitted", "delivered"):
+        assert_true(token.lower() in cancel_lines[0].lower(), f"{label}: cancel cheat line missing symmetric token {token!r}: {cancel_lines[0]!r}")
+    clear_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_interrupt_peer <alias> --clear-hold :")]
+    assert_true(len(clear_lines) == 1, f"{label}: expected one clear-hold cheat-sheet line, got {clear_lines!r}")
+    for token in clear_hold_tokens:
+        assert_true(token.lower() in clear_lines[0].lower(), f"{label}: clear-hold cheat line missing token {token!r}: {clear_lines[0]!r}")
+    assert_true("use when you sent the wrong prompt" not in interrupt_lines[0].lower(), f"{label}: interrupt line must not suggest unqualified wrong-prompt retraction: {interrupt_lines[0]!r}")
 
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
     assert_true(command_shape in probe, f"{label}: probe prompt must keep the interrupt command shape")
     assert_true(phrase in probe, f"{label}: probe prompt must disclose no-op race")
     assert_true(key_sequence_phrase in probe and ctrl_c_phrase in probe, f"{label}: probe prompt must disclose Claude C-c sequence")
     assert_true("force-cancel" not in probe, f"{label}: probe prompt must not imply force-cancel")
+    for token in boundary_tokens + ["agent_interrupt_peer", "post-pane-touch"]:
+        assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing boundary token {token!r}")
+    for token in clear_hold_tokens:
+        assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing clear-hold token {token!r}")
+    assert_true("use for a wrong prompt" not in probe.lower(), f"{label}: probe must not suggest unqualified wrong-prompt interrupt")
 
     help_result = subprocess.run(
         [sys.executable, str(LIBEXEC / "bridge_interrupt_peer.py"), "--help"],
@@ -7939,12 +7977,17 @@ def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir:
     )
     help_text = help_result.stdout + help_result.stderr
     normalized_help = " ".join(help_text.split())
+    normalized_help_tokens = normalized_help.replace("- ", "-")
     normalized_help_noop_ok = phrase in normalized_help or phrase.replace("no-op", "no- op") in normalized_help
     assert_true(help_result.returncode == 0, f"{label}: agent_interrupt_peer --help should exit 0, got {help_result.returncode}: {help_text!r}")
     assert_true("--clear-hold" in help_text, f"{label}: --help output must include interrupt-specific options")
     assert_true(normalized_help_noop_ok, f"{label}: --help output must disclose no-op race: {help_text!r}")
     assert_true(key_sequence_phrase in normalized_help and ctrl_c_phrase in normalized_help, f"{label}: --help output must disclose Claude C-c sequence: {help_text!r}")
     assert_true("force-cancel" not in normalized_help, f"{label}: --help output must not imply force-cancel: {help_text!r}")
+    for token in boundary_tokens:
+        assert_true(token.lower() in normalized_help_tokens.lower(), f"{label}: --help missing boundary token {token!r}: {help_text!r}")
+    for token in clear_hold_tokens:
+        assert_true(token.lower() in normalized_help_tokens.lower(), f"{label}: --help missing clear-hold token {token!r}: {help_text!r}")
     print(f"  PASS  {label}")
 
 
