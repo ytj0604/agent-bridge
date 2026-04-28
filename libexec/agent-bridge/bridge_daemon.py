@@ -107,7 +107,15 @@ EXTEND_WATCHDOG_HINTS = {
         "This daemon reported the message as missing. It may already have responded "
         "and the [bridge:result] may be queued or arriving separately."
     ),
+    "watchdog_requires_auto_return": (
+        "This request has no automatic return route, so the bridge cannot attach or "
+        "extend a watchdog for it."
+    ),
 }
+WATCHDOG_REQUIRES_AUTO_RETURN_ERROR = "watchdog_requires_auto_return"
+WATCHDOG_REQUIRES_AUTO_RETURN_TEXT = (
+    "watchdog requires auto_return; use --no-auto-return without --watchdog or set --watchdog 0"
+)
 _STOP_SIGNAL: int | None = None
 PROMPT_BODY_CONTROL_TRANSLATION = {
     codepoint: None
@@ -604,6 +612,60 @@ class BridgeDaemon:
                 except OSError:
                     pass
 
+    def _finite_watchdog_delay(self, message: dict) -> float | None:
+        if "watchdog_delay_sec" not in message:
+            return None
+        try:
+            delay = float(message.get("watchdog_delay_sec"))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(delay):
+            return None
+        return delay
+
+    def _watchdog_strip_log_fields(self, message: dict, *, phase: str, delay: float, reason: str) -> dict:
+        return {
+            "message_id": message.get("id"),
+            "from": message.get("from"),
+            "from_agent": message.get("from"),
+            "to": message.get("to"),
+            "kind": message.get("kind"),
+            "status": message.get("status"),
+            "phase": phase,
+            "watchdog_phase": phase,
+            "delay_sec": delay,
+            "watchdog_delay_sec": delay,
+            "reason": reason,
+        }
+
+    def _strip_no_auto_return_watchdog_metadata(self, message: dict, *, phase: str, reason: str) -> dict | None:
+        if bool(message.get("auto_return")) or "watchdog_delay_sec" not in message:
+            return None
+        raw_value = message.pop("watchdog_delay_sec", None)
+        try:
+            delay = float(raw_value)
+        except (TypeError, ValueError):
+            return None
+        if math.isfinite(delay) and delay > 0:
+            return self._watchdog_strip_log_fields(message, phase=phase, delay=delay, reason=reason)
+        return None
+
+    def validate_enqueue_watchdog_metadata(self, message: dict) -> dict | None:
+        delay = self._finite_watchdog_delay(message)
+        if delay is None:
+            return None
+        if delay <= 0:
+            message.pop("watchdog_delay_sec", None)
+            return None
+        if not bool(message.get("auto_return")):
+            return {
+                "ok": False,
+                "error": WATCHDOG_REQUIRES_AUTO_RETURN_TEXT,
+                "error_kind": WATCHDOG_REQUIRES_AUTO_RETURN_ERROR,
+                "message_id": message.get("id"),
+            }
+        return None
+
     def handle_enqueue_command(self, messages: list, force_response_send: bool = False) -> dict:
         if not isinstance(messages, list):
             return {"ok": False, "error": "messages must be a list"}
@@ -640,6 +702,9 @@ class BridgeDaemon:
                         "error": format_response_send_violation(violation),
                         "error_kind": "response_send_guard",
                     }
+                watchdog_error = self.validate_enqueue_watchdog_metadata(message)
+                if watchdog_error:
+                    return watchdog_error
                 validated.append(message)
             for message in validated:
                 self.enqueue_ipc_message(message)
@@ -2330,7 +2395,26 @@ class BridgeDaemon:
             raw_delay = float(message["watchdog_delay_sec"])
         except (TypeError, ValueError):
             return
-        if not math.isfinite(raw_delay) or raw_delay < 0:
+        if not math.isfinite(raw_delay) or raw_delay <= 0:
+            return
+        if not bool(message.get("auto_return")):
+            message_id = str(message.get("id") or "")
+            stripped_log = self._watchdog_strip_log_fields(
+                message,
+                phase=phase,
+                delay=raw_delay,
+                reason="arm_guard",
+            )
+
+            def strip_mutator(queue: list[dict]) -> None:
+                for item in queue:
+                    if item.get("id") == message_id and not bool(item.get("auto_return")):
+                        item.pop("watchdog_delay_sec", None)
+                        return
+
+            if message_id:
+                self.queue.update(strip_mutator)
+            self.log("watchdog_stripped_no_auto_return", **stripped_log)
             return
         deadline = datetime.now(timezone.utc) + timedelta(seconds=raw_delay)
         arm_msg = dict(message)
@@ -2373,6 +2457,8 @@ class BridgeDaemon:
             status = str(item.get("status") or "")
             if status not in {"inflight", "submitted", "delivered"}:
                 return False, "message_not_extendable_state", None
+            if not bool(item.get("auto_return")):
+                return False, WATCHDOG_REQUIRES_AUTO_RETURN_ERROR, None
             if item.get("aggregate_id") and status == "delivered":
                 return False, "aggregate_extend_not_supported", None
             try:
@@ -4726,17 +4812,27 @@ class BridgeDaemon:
         self._maybe_cancel_alarms_for_incoming(item)
         body_changed = item.get("body") != original_body
         new_body = item.get("body") if body_changed else None
+        stripped_logs: list[dict] = []
 
         def update_mut(queue: list[dict]) -> None:
             for q in queue:
                 if q.get("id") == message_id:
                     if body_changed:
                         q["body"] = new_body
+                    stripped_log = self._strip_no_auto_return_watchdog_metadata(
+                        q,
+                        phase="ingress",
+                        reason="ingress_finalize",
+                    )
+                    if stripped_log:
+                        stripped_logs.append(stripped_log)
                     q["status"] = "pending"
                     q["updated_ts"] = utc_now()
                     return
 
         self.queue.update(update_mut)
+        for fields in stripped_logs:
+            self.log("watchdog_stripped_no_auto_return", **fields)
 
     def _recover_ingressing_messages(self) -> None:
         # Startup recovery: any queue items left in transient "ingressing"
@@ -4747,16 +4843,26 @@ class BridgeDaemon:
         # so just promote these to "pending" and unblock delivery; log
         # the recovery for operator visibility.
         recovered: list[str] = []
+        stripped_logs: list[dict] = []
 
         def mutator(queue: list[dict]) -> None:
             for item in queue:
                 if item.get("status") == "ingressing":
+                    stripped_log = self._strip_no_auto_return_watchdog_metadata(
+                        item,
+                        phase="recovery",
+                        reason="ingressing_recovered",
+                    )
+                    if stripped_log:
+                        stripped_logs.append(stripped_log)
                     item["status"] = "pending"
                     item["updated_ts"] = utc_now()
                     item["last_error"] = "ingressing_recovered_after_daemon_restart"
                     recovered.append(str(item.get("id") or ""))
 
         self.queue.update(mutator)
+        for fields in stripped_logs:
+            self.log("watchdog_stripped_no_auto_return", **fields)
         for msg_id in recovered:
             self.log("ingressing_recovered", message_id=msg_id)
 
@@ -4845,6 +4951,7 @@ class BridgeDaemon:
             self.last_ingressing_check = now
             threshold = now - self.INGRESSING_AGE_PROMOTE_SEC
             promoted: list[tuple[str, float, bool]] = []
+            stripped_logs: list[dict] = []
 
             def mutator(queue: list[dict]) -> None:
                 for item in queue:
@@ -4860,12 +4967,21 @@ class BridgeDaemon:
                     if not age_unknown and ts >= threshold:
                         continue
                     age_sec = max(0.0, now - ts) if not age_unknown else 0.0
+                    stripped_log = self._strip_no_auto_return_watchdog_metadata(
+                        item,
+                        phase="promotion",
+                        reason="ingressing_promoted_aged",
+                    )
+                    if stripped_log:
+                        stripped_logs.append(stripped_log)
                     item["status"] = "pending"
                     item["updated_ts"] = utc_now()
                     item["last_error"] = "ingressing_promoted_aged"
                     promoted.append((str(item.get("id") or ""), age_sec, age_unknown))
 
             self.queue.update(mutator)
+            for fields in stripped_logs:
+                self.log("watchdog_stripped_no_auto_return", **fields)
             for msg_id, age_sec, age_unknown in promoted:
                 fields: dict = {
                     "message_id": msg_id,

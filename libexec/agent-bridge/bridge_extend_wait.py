@@ -83,6 +83,8 @@ def extend_wait_error_message(message_id: str, error: str, response: dict) -> st
         base = f"agent_extend_wait: message {message_id!r} was not sent by you; only the original sender can extend its watchdog."
     elif error == "aggregate_extend_not_supported":
         base = f"agent_extend_wait: message {message_id!r} is a delivered aggregate broadcast member; per-message response extend is not supported in v1.5."
+    elif error == "watchdog_requires_auto_return":
+        base = f"agent_extend_wait: message {message_id!r} has no automatic return route; watchdogs require auto_return and cannot be extended for this request."
     elif error in {"message_not_in_delivered_state", "message_not_extendable_state"}:
         base = f"agent_extend_wait: message {message_id!r} is not in an extendable watchdog state. Pending messages have no active delivery attempt yet; inflight/submitted delivery and delivered response waits can be extended."
     else:

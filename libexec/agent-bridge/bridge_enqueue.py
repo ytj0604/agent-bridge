@@ -36,6 +36,10 @@ from bridge_util import (
 # as a per-phase delay: delivery watchdog from inflight reservation, then
 # response watchdog after prompt submission marks the message delivered.
 USER_SENDABLE_KINDS = sorted({"request", "notice"})
+WATCHDOG_REQUIRES_AUTO_RETURN_TEXT = (
+    "agent_send_peer: --watchdog requires auto_return; use --no-auto-return "
+    "without --watchdog or set --watchdog 0."
+)
 
 
 def should_create_aggregate(kind: str, sender: str, no_auto_return: bool, targets: list[str]) -> bool:
@@ -172,7 +176,7 @@ def main() -> int:
         "--watchdog",
         type=float,
         default=None,
-        help="seconds per phase after which to wake the sender: first if bridge delivery/submission stalls, then after prompt delivery if no response_finished arrived. 0 disables.",
+        help="seconds per phase after which to wake the sender: first if bridge delivery/submission stalls, then after prompt delivery if no response_finished arrived. Requires auto_return; 0 disables.",
     )
     args = parser.parse_args()
 
@@ -254,11 +258,11 @@ def main() -> int:
     aggregate_started_ts = utc_now() if aggregate_id else ""
     aggregate_mode = "all" if args.target_all else "partial"
 
-    # v1.5 watchdog: enforce request-only at the enqueue boundary as well
-    # (defense-in-depth; bridge_send_peer also rejects). Resolve the delay
-    # in seconds: explicit --watchdog overrides; if unset for kind=request,
-    # apply the env-driven default. --watchdog 0 disables.
+    # v1.5 watchdog: parse value validity first, then request-kind, then
+    # auto-return compatibility. Default watchdogs attach only to rows with
+    # an automatic response route; --watchdog 0 is an explicit disable.
     watchdog_delay_sec: float | None = None
+    explicit_watchdog_positive = False
     if args.watchdog is not None:
         try:
             val = float(args.watchdog)
@@ -279,10 +283,19 @@ def main() -> int:
             return 2
         if val > 0:
             watchdog_delay_sec = val
+            explicit_watchdog_positive = True
         else:
             watchdog_delay_sec = None  # explicit disable
-    elif kind == "request" and args.sender != "bridge":
+    elif kind == "request" and args.sender != "bridge" and not args.no_auto_return:
         watchdog_delay_sec = _resolve_default_watchdog_seconds()
+    if explicit_watchdog_positive:
+        invalid_targets = [
+            target for target in targets
+            if not (kind == "request" and args.sender != "bridge" and not args.no_auto_return and target != "bridge")
+        ]
+        if invalid_targets:
+            print(WATCHDOG_REQUIRES_AUTO_RETURN_TEXT, file=sys.stderr)
+            return 2
     messages_and_records = []
     for target in targets:
         auto_return = not args.no_auto_return and kind == "request" and args.sender != "bridge" and target != "bridge"
@@ -316,7 +329,7 @@ def main() -> int:
             message["aggregate_expected"] = list(targets)
             message["aggregate_started_ts"] = aggregate_started_ts
             message["aggregate_mode"] = aggregate_mode
-        if watchdog_delay_sec is not None:
+        if watchdog_delay_sec is not None and auto_return:
             message["watchdog_delay_sec"] = watchdog_delay_sec
 
         record = {

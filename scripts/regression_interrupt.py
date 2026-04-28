@@ -8027,12 +8027,16 @@ def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, t
 def scenario_watchdog_phase_doc_surfaces_are_consistent(label: str, tmpdir: Path) -> None:
     phase_tokens = ["delivery/submission", "response", "same <sec> per phase", "up to two phase intervals"]
     extend_tokens = ["inflight/submitted delivery", "delivered aggregate response", "stale watchdog wakes", "[bridge:result]", "queued/arriving"]
+    auto_return_tokens = ["auto-return", "--no-auto-return", "--watchdog 0"]
 
     cheat = "\n".join(bridge_instructions.model_cheat_sheet())
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
     for token in phase_tokens:
         assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing watchdog phase token {token!r}")
         assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing watchdog phase token {token!r}")
+    for token in auto_return_tokens:
+        assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing watchdog auto-return token {token!r}")
+        assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing watchdog auto-return token {token!r}")
     for token in extend_tokens:
         assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing extend token {token!r}")
 
@@ -10651,6 +10655,95 @@ def scenario_send_peer_watchdog_finite_positive_succeeds(label: str, tmpdir: Pat
     print(f"  PASS  {label}")
 
 
+def scenario_send_peer_no_auto_return_explicit_watchdog_rejected(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--no-auto-return", "--watchdog", "10"))
+    assert_true(code == 2, f"{label}: no-auto-return + watchdog should exit 2, got {code}, err={err!r}")
+    assert_true(out == "", f"{label}: rejected enqueue has no stdout: {out!r}")
+    assert_true("watchdog requires auto_return" in err and "--watchdog 0" in err, f"{label}: error should guide disable/use: {err!r}")
+    assert_true(not (tmpdir / "pending.json").exists(), f"{label}: rejected enqueue must write zero rows")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_no_auto_return_watchdog_zero_succeeds(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--no-auto-return", "--watchdog", "0"))
+    assert_true(code == 0, f"{label}: no-auto-return + watchdog 0 should succeed, got {code}, err={err!r}")
+    queue = json.loads((tmpdir / "pending.json").read_text(encoding="utf-8"))
+    assert_true(queue[0].get("auto_return") is False, f"{label}: row should disable auto_return: {queue}")
+    assert_true("watchdog_delay_sec" not in queue[0], f"{label}: watchdog 0 should leave no metadata: {queue}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_no_auto_return_invalid_watchdog_value_precedence(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    for raw, expected in [("-1", "-1"), ("nan", "nan"), ("inf", "inf")]:
+        case_dir = tmpdir / raw.replace("-", "minus_")
+        case_dir.mkdir(parents=True, exist_ok=True)
+        _patch_enqueue_for_unit(be, state)
+        watchdog_args = (f"--watchdog={raw}",) if raw.startswith("-") else ("--watchdog", raw)
+        code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(case_dir, "--no-auto-return", *watchdog_args))
+        assert_true(code == 2 and out == "", f"{label}: invalid {raw!r} should fail before auto_return check: code={code} out={out!r} err={err!r}")
+        assert_true("finite non-negative" in err and f"got {expected}" in err, f"{label}: value diagnostic should win for {raw!r}: {err!r}")
+        assert_true("watchdog requires auto_return" not in err, f"{label}: auto_return error must not mask invalid value: {err!r}")
+        assert_true(not (case_dir / "pending.json").exists(), f"{label}: invalid watchdog must not enqueue for {raw!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_no_auto_return_skips_default_watchdog(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    with patched_environ(AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC="42"):
+        code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--no-auto-return"))
+    assert_true(code == 0, f"{label}: no-auto-return should succeed with default watchdog env, got {code}, err={err!r}")
+    queue = json.loads((tmpdir / "pending.json").read_text(encoding="utf-8"))
+    assert_true(queue[0].get("auto_return") is False, f"{label}: row should have auto_return false: {queue}")
+    assert_true("watchdog_delay_sec" not in queue[0], f"{label}: default watchdog must be skipped: {queue}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_auto_return_default_watchdog_still_attaches(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    with patched_environ(AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC="42"):
+        code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir))
+    assert_true(code == 0, f"{label}: normal request should succeed with default watchdog, got {code}, err={err!r}")
+    queue = json.loads((tmpdir / "pending.json").read_text(encoding="utf-8"))
+    assert_true(queue[0].get("auto_return") is True, f"{label}: row should have auto_return true: {queue}")
+    assert_true(queue[0].get("watchdog_delay_sec") == 42.0, f"{label}: default watchdog should attach: {queue}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_no_auto_return_broadcast_watchdog_rejected(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob", "carol"])
+    _patch_enqueue_for_unit(be, state)
+    argv = [
+        "--session", "test-session",
+        "--from", "alice",
+        "--all",
+        "--kind", "request",
+        "--body", "hello",
+        "--queue-file", str(tmpdir / "pending.json"),
+        "--state-file", str(tmpdir / "events.raw.jsonl"),
+        "--public-state-file", str(tmpdir / "events.jsonl"),
+        "--no-auto-return",
+        "--watchdog", "10",
+    ]
+    code, out, err = _run_enqueue_main(be, argv)
+    assert_true(code == 2 and out == "", f"{label}: broadcast no-auto watchdog should reject: code={code} out={out!r} err={err!r}")
+    assert_true("watchdog requires auto_return" in err, f"{label}: error should explain auto_return requirement: {err!r}")
+    assert_true(not (tmpdir / "pending.json").exists(), f"{label}: rejected broadcast must write zero rows")
+    print(f"  PASS  {label}")
+
+
 def scenario_send_peer_watchdog_inf_with_notice_reports_finite_error_first(label: str, tmpdir: Path) -> None:
     be = _import_enqueue_module()
     state = _participants_state(["alice", "bob"])
@@ -11051,6 +11144,54 @@ def scenario_daemon_upsert_message_watchdog_rejects_non_finite(label: str, tmpdi
     print(f"  PASS  {label}")
 
 
+def scenario_daemon_enqueue_rejects_no_auto_return_watchdog_atomically(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "agent_type": "claude", "pane": "%99"}, "codex": {"alias": "codex", "agent_type": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    good = test_message("msg-good-auto", frm="claude", to="codex", status="ingressing")
+    good["watchdog_delay_sec"] = 30.0
+    bad = test_message("msg-bad-noauto", frm="claude", to="codex", status="ingressing")
+    bad["auto_return"] = False
+    bad["watchdog_delay_sec"] = 30.0
+    result = _daemon_command_result(d, {"op": "enqueue", "messages": [good, bad]})
+    assert_true(result.get("ok") is False, f"{label}: malformed batch should reject: {result}")
+    assert_true(result.get("error_kind") == "watchdog_requires_auto_return", f"{label}: stable error_kind expected: {result}")
+    assert_true("watchdog requires auto_return" in str(result.get("error") or ""), f"{label}: error text should explain requirement: {result}")
+    assert_true(d.queue.read() == [], f"{label}: batch rejection must be atomic: {d.queue.read()}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_enqueue_no_auto_return_watchdog_zero_normalized(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "agent_type": "claude", "pane": "%99"}, "codex": {"alias": "codex", "agent_type": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = test_message("msg-noauto-zero", frm="claude", to="codex", status="ingressing")
+    msg["auto_return"] = False
+    msg["watchdog_delay_sec"] = 0.0
+    result = _daemon_command_result(d, {"op": "enqueue", "messages": [msg]})
+    assert_true(result.get("ok") is True, f"{label}: watchdog 0 should be accepted as disable: {result}")
+    queue = d.queue.read()
+    assert_true(len(queue) == 1 and queue[0].get("status") == "pending", f"{label}: row should be queued pending: {queue}")
+    assert_true(queue[0].get("auto_return") is False, f"{label}: auto_return false should be preserved: {queue}")
+    assert_true("watchdog_delay_sec" not in queue[0], f"{label}: watchdog 0 metadata should be normalized away: {queue}")
+    assert_true(not d.watchdogs, f"{label}: no watchdog should be registered: {d.watchdogs}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_upsert_no_auto_return_watchdog_rejected(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = test_message("msg-noauto-extend", frm="claude", to="codex", status="inflight")
+    msg["auto_return"] = False
+    msg["watchdog_delay_sec"] = 60.0
+    d.queue.update(lambda queue: queue.append(msg) or None)
+    ok, err, deadline = d.upsert_message_watchdog("claude", "msg-noauto-extend", 60.0)
+    assert_true(not ok and err == "watchdog_requires_auto_return" and deadline is None, f"{label}: no-auto row must not be extendable: {(ok, err, deadline)}")
+    result = _daemon_command_result(d, {"op": "extend_watchdog", "from": "claude", "message_id": "msg-noauto-extend", "seconds": 60.0})
+    assert_true(result.get("ok") is False and result.get("error") == "watchdog_requires_auto_return", f"{label}: socket extend should surface stable code: {result}")
+    assert_true("auto" in str(result.get("hint") or "").lower(), f"{label}: hint should mention auto-return route: {result}")
+    assert_true(not d.watchdogs, f"{label}: rejected extend must not arm watchdogs: {d.watchdogs}")
+    print(f"  PASS  {label}")
+
+
 def scenario_daemon_register_alarm_rejects_non_finite_and_negative(label: str, tmpdir: Path) -> None:
     participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
     d = make_daemon(tmpdir, participants)
@@ -11072,6 +11213,62 @@ def scenario_daemon_mark_message_delivered_ignores_non_finite_watchdog(label: st
     assert_true(not any(wd.get("ref_message_id") == "msg-stale-watchdog-inf" for wd in d.watchdogs.values()), f"{label}: non-finite stored delay must not arm watchdog: {d.watchdogs}")
     queued = next((it for it in d.queue.read() if it.get("id") == "msg-stale-watchdog-inf"), None)
     assert_true(queued is not None and queued.get("status") == "delivered", f"{label}: queue row should be delivered: {queued}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_no_auto_return_watchdog_arm_guard_strips(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = test_message("msg-noauto-arm", frm="claude", to="codex", status="pending")
+    msg["auto_return"] = False
+    msg["watchdog_delay_sec"] = 60.0
+    d.queue.update(lambda queue: queue.append(msg) or None)
+    reserved = d.reserve_next("codex")
+    assert_true(reserved is not None and reserved.get("status") == "inflight", f"{label}: row should still reserve: {reserved}")
+    assert_true(not _watchdogs_for_message(d, "msg-noauto-arm"), f"{label}: no-auto row must not arm watchdog: {d.watchdogs}")
+    queued = next((it for it in d.queue.read() if it.get("id") == "msg-noauto-arm"), None)
+    assert_true(queued is not None and "watchdog_delay_sec" not in queued, f"{label}: guard should strip stale metadata: {queued}")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    stripped = [e for e in events if e.get("event") == "watchdog_stripped_no_auto_return" and e.get("message_id") == "msg-noauto-arm"]
+    assert_true(stripped and stripped[-1].get("watchdog_phase") == "delivery", f"{label}: strip event should be logged: {stripped}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_no_auto_return_watchdog_ingress_sanitizers(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+
+    d_apply = make_daemon(tmpdir / "apply", participants)
+    msg_apply = test_message("msg-noauto-apply", frm="claude", to="codex", status="ingressing")
+    msg_apply["auto_return"] = False
+    msg_apply["watchdog_delay_sec"] = 60.0
+    d_apply.queue.update(lambda queue: queue.append(msg_apply) or None)
+    with d_apply.state_lock:
+        d_apply._apply_alarm_cancel_to_queued_message("msg-noauto-apply")
+    queue_apply = d_apply.queue.read()
+    assert_true(queue_apply[0].get("status") == "pending" and "watchdog_delay_sec" not in queue_apply[0], f"{label}: apply finalize should strip metadata: {queue_apply}")
+
+    d_recover = make_daemon(tmpdir / "recover", participants)
+    msg_recover = test_message("msg-noauto-recover", frm="claude", to="codex", status="ingressing")
+    msg_recover["auto_return"] = False
+    msg_recover["watchdog_delay_sec"] = 60.0
+    d_recover.queue.update(lambda queue: queue.append(msg_recover) or None)
+    d_recover._recover_ingressing_messages()
+    queue_recover = d_recover.queue.read()
+    assert_true(queue_recover[0].get("status") == "pending" and "watchdog_delay_sec" not in queue_recover[0], f"{label}: restart recovery should strip metadata: {queue_recover}")
+
+    d_promote = make_daemon(tmpdir / "promote", participants)
+    msg_promote = test_message("msg-noauto-promote", frm="claude", to="codex", status="ingressing")
+    msg_promote["created_ts"] = "1970-01-01T00:00:00.000000Z"
+    msg_promote["auto_return"] = False
+    msg_promote["watchdog_delay_sec"] = 60.0
+    d_promote.queue.update(lambda queue: queue.append(msg_promote) or None)
+    d_promote.last_ingressing_check = 0.0
+    d_promote._promote_aged_ingressing()
+    queue_promote = d_promote.queue.read()
+    assert_true(queue_promote[0].get("status") == "pending" and "watchdog_delay_sec" not in queue_promote[0], f"{label}: aged promotion should strip metadata: {queue_promote}")
+    for subdir, msg_id in [("apply", "msg-noauto-apply"), ("recover", "msg-noauto-recover"), ("promote", "msg-noauto-promote")]:
+        events = read_events(tmpdir / subdir / "events.raw.jsonl")
+        assert_true(any(e.get("event") == "watchdog_stripped_no_auto_return" and e.get("message_id") == msg_id for e in events), f"{label}: {subdir} should log strip event: {events}")
     print(f"  PASS  {label}")
 
 
@@ -12453,6 +12650,12 @@ def main() -> int:
             ("send_peer_watchdog_minus_inf_rejected", scenario_send_peer_watchdog_minus_inf_rejected),
             ("send_peer_watchdog_zero_disables_for_request", scenario_send_peer_watchdog_zero_disables_for_request),
             ("send_peer_watchdog_finite_positive_succeeds", scenario_send_peer_watchdog_finite_positive_succeeds),
+            ("send_peer_no_auto_return_explicit_watchdog_rejected", scenario_send_peer_no_auto_return_explicit_watchdog_rejected),
+            ("send_peer_no_auto_return_watchdog_zero_succeeds", scenario_send_peer_no_auto_return_watchdog_zero_succeeds),
+            ("send_peer_no_auto_return_invalid_watchdog_value_precedence", scenario_send_peer_no_auto_return_invalid_watchdog_value_precedence),
+            ("send_peer_no_auto_return_skips_default_watchdog", scenario_send_peer_no_auto_return_skips_default_watchdog),
+            ("send_peer_auto_return_default_watchdog_still_attaches", scenario_send_peer_auto_return_default_watchdog_still_attaches),
+            ("send_peer_no_auto_return_broadcast_watchdog_rejected", scenario_send_peer_no_auto_return_broadcast_watchdog_rejected),
             ("send_peer_watchdog_inf_with_notice_reports_finite_error_first", scenario_send_peer_watchdog_inf_with_notice_reports_finite_error_first),
             ("send_peer_watchdog_zero_with_notice_still_rejects_request_only", scenario_send_peer_watchdog_zero_with_notice_still_rejects_request_only),
             ("send_peer_watchdog_abc_argparse_error", scenario_send_peer_watchdog_abc_argparse_error),
@@ -12472,8 +12675,13 @@ def main() -> int:
             ("daemon_socket_alarm_op_rejects_non_finite", scenario_daemon_socket_alarm_op_rejects_non_finite),
             ("daemon_socket_extend_watchdog_op_rejects_non_finite", scenario_daemon_socket_extend_watchdog_op_rejects_non_finite),
             ("daemon_upsert_message_watchdog_rejects_non_finite", scenario_daemon_upsert_message_watchdog_rejects_non_finite),
+            ("daemon_enqueue_rejects_no_auto_return_watchdog_atomically", scenario_daemon_enqueue_rejects_no_auto_return_watchdog_atomically),
+            ("daemon_enqueue_no_auto_return_watchdog_zero_normalized", scenario_daemon_enqueue_no_auto_return_watchdog_zero_normalized),
+            ("daemon_upsert_no_auto_return_watchdog_rejected", scenario_daemon_upsert_no_auto_return_watchdog_rejected),
             ("daemon_register_alarm_rejects_non_finite_and_negative", scenario_daemon_register_alarm_rejects_non_finite_and_negative),
             ("daemon_mark_message_delivered_ignores_non_finite_watchdog", scenario_daemon_mark_message_delivered_ignores_non_finite_watchdog),
+            ("daemon_no_auto_return_watchdog_arm_guard_strips", scenario_daemon_no_auto_return_watchdog_arm_guard_strips),
+            ("daemon_no_auto_return_watchdog_ingress_sanitizers", scenario_daemon_no_auto_return_watchdog_ingress_sanitizers),
             ("daemon_socket_ack_message_unsupported_does_not_delete_queue", scenario_daemon_socket_ack_message_unsupported_does_not_delete_queue),
             ("daemon_ack_message_helper_removed", scenario_daemon_ack_message_helper_removed),
             ("stale_watchdog_skipped", scenario_stale_watchdog_skipped),
