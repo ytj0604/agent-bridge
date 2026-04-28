@@ -21,6 +21,7 @@ import errno
 import inspect
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -1581,7 +1582,7 @@ def scenario_extend_wait_unknown_message(label: str, tmpdir: Path) -> None:
     ok, err, deadline = d.upsert_message_watchdog("claude", "msg-does-not-exist", 60.0)
     assert_true(not ok and err == "message_unknown", f"{label}: unknown message id should error message_unknown, got ok={ok}, err={err!r}")
     result = _daemon_command_result(d, {"op": "extend_watchdog", "from": "claude", "message_id": "msg-does-not-exist", "seconds": 60.0})
-    assert_true(result.get("error") == "message_unknown" and "invalid" in str(result.get("hint") or ""), f"{label}: daemon should return stable unknown hint: {result}")
+    assert_true(result.get("error") == "message_unknown" and "old or restart-lost ids cannot be extended" in str(result.get("hint") or ""), f"{label}: daemon should return stable unknown hint: {result}")
     print(f"  PASS  {label}")
 
 
@@ -11150,37 +11151,92 @@ def scenario_extend_wait_terminal_error_texts(label: str, tmpdir: Path) -> None:
     bew.room_status = lambda session: argparse.Namespace(active_enough_for_enqueue=True, reason="ok")
     bew.load_session = lambda session: _participants_state(["alice", "bob"])
 
+    def normalized_sentence_fragments(text: str) -> list[str]:
+        fragments = re.split(r"\.\s+", text)
+        normalized: list[str] = []
+        for fragment in fragments:
+            cleaned = " ".join(fragment.strip().lower().split())
+            if len(cleaned) >= 30:
+                normalized.append(cleaned)
+        return normalized
+
+    daemon_hints = {
+        "message_recently_responded": "A [bridge:result] may already be queued or arriving; do not keep extending this id.",
+        "message_already_terminal": "No active watchdog remains; do not retry this id.",
+        "message_unknown": "Verify the id; old or restart-lost ids cannot be extended.",
+        "message_not_found": "A [bridge:result] may already be queued or arriving; do not keep extending this id.",
+        "not_owner": "Only the original sender can extend; check the id you intended.",
+        "aggregate_extend_not_supported": "Per-message extend is not supported for delivered aggregate members; wait for the broadcast result.",
+        "watchdog_requires_auto_return": "This request has no automatic return route; the bridge cannot extend its watchdog.",
+        "message_not_in_delivered_state": "Only inflight/submitted delivery and delivered response waits can be extended.",
+        "message_not_extendable_state": "Only inflight/submitted delivery and delivered response waits can be extended.",
+    }
     cases = [
         (
             "message_recently_responded",
-            {"hint": "daemon hint: [bridge:result] may already be queued"},
-            ("[bridge:result]", "queued", "do not keep extending"),
+            ("already reached a terminal response", "[bridge:result]", "queued", "do not keep extending"),
         ),
         (
             "message_already_terminal",
-            {},
-            ("already terminal", "no active watchdog"),
+            ("already terminal", "No active watchdog remains", "do not retry"),
         ),
         (
             "message_unknown",
-            {},
-            ("unknown", "cannot be extended"),
+            ("unknown to the daemon", "Verify the id", "cannot be extended"),
         ),
         (
             "message_not_found",
-            {},
-            ("[bridge:result]", "separate prompt", "do not keep extending"),
+            ("not found by the daemon", "[bridge:result]", "queued", "do not keep extending"),
+        ),
+        (
+            "not_owner",
+            ("not sent by you", "Only the original sender", "check the id"),
+        ),
+        (
+            "aggregate_extend_not_supported",
+            ("delivered aggregate broadcast member", "Per-message extend", "broadcast result"),
+        ),
+        (
+            "watchdog_requires_auto_return",
+            ("no automatic return route", "cannot extend its watchdog"),
+        ),
+        (
+            "message_not_in_delivered_state",
+            ("not in an extendable watchdog state", "inflight/submitted delivery", "delivered response"),
+        ),
+        (
+            "message_not_extendable_state",
+            ("not in an extendable watchdog state", "inflight/submitted delivery", "delivered response"),
         ),
     ]
-    for error, response_extra, tokens in cases:
-        def request_extend(_session: str, _sender: str, message_id: str, _seconds: float, *, error=error, response_extra=response_extra):
-            return False, {"error": error, "message_id": message_id, **response_extra}, error
+    assert_true(daemon_hints == bew.EXTEND_WAIT_FALLBACK_HINTS, f"{label}: CLI fallback hints must match expected canonical hints")
+    assert_true(daemon_hints == bridge_daemon.EXTEND_WATCHDOG_HINTS, f"{label}: daemon hints must match expected canonical hints")
+    legacy_verbose_fragments = [
+        "A [bridge:result] may already be queued or may arrive as a separate prompt",
+        "It may already have responded, and a [bridge:result] may already be queued",
+        "Pending messages have no active delivery attempt yet",
+    ]
+    for error, tokens in cases:
+        for mode in ("new-daemon", "old-daemon"):
+            response_extra = {"hint": daemon_hints[error]} if mode == "new-daemon" else {}
 
-        bew.request_extend = request_extend
-        code, out, err = _run_extend_wait_main(bew, ["msg-cli-terminal", "1", "--session", "test-session", "--from", "alice", "--allow-spoof"])
-        assert_true(code == 1 and out == "", f"{label}: {error} should exit 1 with no stdout: code={code} out={out!r} err={err!r}")
-        for token in tokens:
-            assert_true(token in err, f"{label}: {error} stderr missing {token!r}: {err!r}")
+            def request_extend(_session: str, _sender: str, message_id: str, _seconds: float, *, error=error, response_extra=response_extra):
+                return False, {"error": error, "message_id": message_id, **response_extra}, error
+
+            bew.request_extend = request_extend
+            code, out, err = _run_extend_wait_main(bew, ["msg-cli-terminal", "1", "--session", "test-session", "--from", "alice", "--allow-spoof"])
+            assert_true(code == 1 and out == "", f"{label}: {error} {mode} should exit 1 with no stdout: code={code} out={out!r} err={err!r}")
+            assert_true(f"({error})." in err, f"{label}: {error} {mode} stderr missing stable code parenthetical: {err!r}")
+            assert_true("Hint: " in err, f"{label}: {error} {mode} stderr missing literal Hint prefix: {err!r}")
+            body, hint = err.split("Hint: ", 1)
+            body_fragments = set(normalized_sentence_fragments(body))
+            hint_fragments = set(normalized_sentence_fragments(hint))
+            duplicates = body_fragments & hint_fragments
+            assert_true(not duplicates, f"{label}: {error} {mode} duplicated body/Hint fragments >=30 chars: {duplicates!r} in {err!r}")
+            for token in tokens:
+                assert_true(token in err, f"{label}: {error} {mode} stderr missing {token!r}: {err!r}")
+            for fragment in legacy_verbose_fragments:
+                assert_true(fragment not in body, f"{label}: {error} {mode} body kept legacy verbose recovery wording {fragment!r}: {err!r}")
     print(f"  PASS  {label}")
 
 

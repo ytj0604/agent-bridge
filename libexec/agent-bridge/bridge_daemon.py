@@ -91,26 +91,19 @@ RESPONSE_LIKE_TOMBSTONE_REASONS = {
     "aggregate_complete",
 }
 EXTEND_WATCHDOG_HINTS = {
-    "message_recently_responded": (
-        "This request is already terminal; a [bridge:result] may already be queued "
-        "or may arrive as a separate prompt. Do not keep extending this id."
-    ),
-    "message_already_terminal": (
-        "This request is already terminal (cancelled, interrupted, undeliverable, "
-        "or otherwise closed); there is no active watchdog to extend."
-    ),
-    "message_unknown": (
-        "No active or recent terminal record exists for this message id; it may be "
-        "invalid, too old, or lost across daemon restart."
-    ),
+    "message_recently_responded": "A [bridge:result] may already be queued or arriving; do not keep extending this id.",
+    "message_already_terminal": "No active watchdog remains; do not retry this id.",
+    "message_unknown": "Verify the id; old or restart-lost ids cannot be extended.",
     "message_not_found": (
-        "This daemon reported the message as missing. It may already have responded "
-        "and the [bridge:result] may be queued or arriving separately."
+        "A [bridge:result] may already be queued or arriving; do not keep extending this id."
     ),
-    "watchdog_requires_auto_return": (
-        "This request has no automatic return route, so the bridge cannot attach or "
-        "extend a watchdog for it."
+    "not_owner": "Only the original sender can extend; check the id you intended.",
+    "aggregate_extend_not_supported": (
+        "Per-message extend is not supported for delivered aggregate members; wait for the broadcast result."
     ),
+    "watchdog_requires_auto_return": "This request has no automatic return route; the bridge cannot extend its watchdog.",
+    "message_not_in_delivered_state": "Only inflight/submitted delivery and delivered response waits can be extended.",
+    "message_not_extendable_state": "Only inflight/submitted delivery and delivered response waits can be extended.",
 }
 WATCHDOG_REQUIRES_AUTO_RETURN_ERROR = "watchdog_requires_auto_return"
 WATCHDOG_REQUIRES_AUTO_RETURN_TEXT = (

@@ -22,6 +22,36 @@ from bridge_participants import active_participants, load_session, room_status
 from bridge_paths import run_root
 
 
+EXTEND_WAIT_FALLBACK_HINTS = {
+    "message_recently_responded": "A [bridge:result] may already be queued or arriving; do not keep extending this id.",
+    "message_already_terminal": "No active watchdog remains; do not retry this id.",
+    "message_unknown": "Verify the id; old or restart-lost ids cannot be extended.",
+    # Legacy daemons returned message_not_found before they could distinguish
+    # terminal tombstones from genuinely unknown ids. Keep the safer
+    # recently-responded recovery guidance for rolling upgrades.
+    "message_not_found": "A [bridge:result] may already be queued or arriving; do not keep extending this id.",
+    "not_owner": "Only the original sender can extend; check the id you intended.",
+    "aggregate_extend_not_supported": (
+        "Per-message extend is not supported for delivered aggregate members; wait for the broadcast result."
+    ),
+    "watchdog_requires_auto_return": "This request has no automatic return route; the bridge cannot extend its watchdog.",
+    "message_not_in_delivered_state": "Only inflight/submitted delivery and delivered response waits can be extended.",
+    "message_not_extendable_state": "Only inflight/submitted delivery and delivered response waits can be extended.",
+}
+
+EXTEND_WAIT_ERROR_FACTS = {
+    "message_recently_responded": "already reached a terminal response",
+    "message_already_terminal": "is already terminal",
+    "message_unknown": "is unknown to the daemon",
+    "message_not_found": "was not found by the daemon",
+    "not_owner": "was not sent by you",
+    "aggregate_extend_not_supported": "is a delivered aggregate broadcast member",
+    "watchdog_requires_auto_return": "has no automatic return route",
+    "message_not_in_delivered_state": "is not in an extendable watchdog state",
+    "message_not_extendable_state": "is not in an extendable watchdog state",
+}
+
+
 def request_extend(bridge_session: str, sender: str, message_id: str, seconds: float) -> tuple[bool, dict, str]:
     socket_path = run_root() / f"{bridge_session}.sock"
     if not socket_path.exists():
@@ -56,40 +86,14 @@ def request_extend(bridge_session: str, sender: str, message_id: str, seconds: f
 
 
 def extend_wait_error_message(message_id: str, error: str, response: dict) -> str:
-    hint = str(response.get("hint") or "").strip()
-    if error == "message_recently_responded":
-        base = (
-            f"agent_extend_wait: message {message_id!r} already reached a terminal response. "
-            "A [bridge:result] may already be queued or may arrive as a separate prompt; "
-            "do not keep extending this id."
-        )
-    elif error == "message_already_terminal":
-        base = (
-            f"agent_extend_wait: message {message_id!r} is already terminal "
-            "(cancelled, interrupted, undeliverable, or otherwise closed); no active watchdog remains."
-        )
-    elif error == "message_unknown":
-        base = (
-            f"agent_extend_wait: message {message_id!r} is unknown to the daemon "
-            "(invalid id, too old, or daemon restarted); it cannot be extended."
-        )
-    elif error == "message_not_found":
-        base = (
-            f"agent_extend_wait: message {message_id!r} not found in queue. "
-            "It may already have responded, and a [bridge:result] may already be queued "
-            "or may arrive as a separate prompt; do not keep extending this id."
-        )
-    elif error == "not_owner":
-        base = f"agent_extend_wait: message {message_id!r} was not sent by you; only the original sender can extend its watchdog."
-    elif error == "aggregate_extend_not_supported":
-        base = f"agent_extend_wait: message {message_id!r} is a delivered aggregate broadcast member; per-message response extend is not supported in v1.5."
-    elif error == "watchdog_requires_auto_return":
-        base = f"agent_extend_wait: message {message_id!r} has no automatic return route; watchdogs require auto_return and cannot be extended for this request."
-    elif error in {"message_not_in_delivered_state", "message_not_extendable_state"}:
-        base = f"agent_extend_wait: message {message_id!r} is not in an extendable watchdog state. Pending messages have no active delivery attempt yet; inflight/submitted delivery and delivered response waits can be extended."
+    error_code = str(error or "")
+    hint = str(response.get("hint") or "").strip() or EXTEND_WAIT_FALLBACK_HINTS.get(error_code, "")
+    fact = EXTEND_WAIT_ERROR_FACTS.get(error_code)
+    if fact:
+        base = f"agent_extend_wait: message {message_id!r} {fact} ({error_code})."
     else:
-        base = f"agent_extend_wait: {error}"
-    if hint and hint not in base:
+        base = f"agent_extend_wait: {error_code}"
+    if hint:
         return f"{base} Hint: {hint}"
     return base
 
