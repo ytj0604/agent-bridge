@@ -16,9 +16,10 @@ Exits non-zero if any scenario fails.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import errno
 import inspect
+import io
 import json
 import os
 import re
@@ -63,6 +64,7 @@ import bridge_cancel_message  # noqa: E402
 import bridge_wait_status  # noqa: E402
 import bridge_aggregate_status  # noqa: E402
 import bridge_join  # noqa: E402
+import bridge_leave  # noqa: E402
 import bridge_pane_probe  # noqa: E402
 import bridge_response_guard  # noqa: E402
 import bridge_codex_config  # noqa: E402
@@ -3885,6 +3887,352 @@ def scenario_wait_for_probe_retries_enter_with_pane_id(label: str, tmpdir: Path)
 def scenario_wait_for_probe_no_retry_without_pane_id(label: str, tmpdir: Path) -> None:
     calls = _run_wait_for_probe_retry_case(tmpdir, pane_id="")
     assert_true(calls == [], f"{label}: empty pane_id must not retry Enter, got {calls}")
+    print(f"  PASS  {label}")
+
+
+@contextmanager
+def isolated_bridge_cli_env(tmpdir: Path):
+    keys = [
+        "AGENT_BRIDGE_STATE_DIR",
+        "AGENT_BRIDGE_RUN_DIR",
+        "AGENT_BRIDGE_LOG_DIR",
+        "AGENT_BRIDGE_CONFIG_DIR",
+        "AGENT_BRIDGE_RUNTIME_DIR",
+        "AGENT_BRIDGE_RUNTIME_FILE",
+    ]
+    old = {key: os.environ.get(key) for key in keys}
+    state_dir = tmpdir / "state"
+    try:
+        os.environ["AGENT_BRIDGE_STATE_DIR"] = str(state_dir)
+        os.environ["AGENT_BRIDGE_RUN_DIR"] = str(tmpdir / "run")
+        os.environ["AGENT_BRIDGE_LOG_DIR"] = str(tmpdir / "log")
+        os.environ["AGENT_BRIDGE_CONFIG_DIR"] = str(tmpdir / "config")
+        os.environ.pop("AGENT_BRIDGE_RUNTIME_DIR", None)
+        os.environ.pop("AGENT_BRIDGE_RUNTIME_FILE", None)
+        yield state_dir
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def active_cli_participant(alias: str, *, agent: str = "codex", pane: str = "%41", target: str = "test:1.0", session_id: str = "sess-active") -> dict:
+    return {
+        "alias": alias,
+        "agent_type": agent,
+        "pane": pane,
+        "target": target,
+        "hook_session_id": session_id,
+        "cwd": "/active",
+        "model": "model-active",
+        "status": "active",
+    }
+
+
+def detached_cli_participant(alias: str, *, agent: str = "codex", pane: str = "%42", target: str = "test:2.0", session_id: str = "sess-detached") -> dict:
+    return {
+        "alias": alias,
+        "agent_type": agent,
+        "pane": pane,
+        "target": target,
+        "hook_session_id": session_id,
+        "cwd": "/detached",
+        "model": "model-detached",
+        "status": "detached",
+        "detached_at": "2026-04-28T00:00:00Z",
+        "detach_reason": "test detach",
+        "last_pane": pane,
+        "endpoint_status": "endpoint_lost",
+        "endpoint_lost_at": "2026-04-28T00:01:00Z",
+        "endpoint_lost_reason": "test endpoint lost",
+    }
+
+
+def write_cli_session(state_dir: Path, participants: dict[str, dict], *, queue: list[dict] | None = None) -> Path:
+    session_dir = state_dir / "test-session"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    queue_file = session_dir / "pending.json"
+    write_json_atomic(queue_file, queue or [])
+    state = {
+        "session": "test-session",
+        "state_dir": str(session_dir),
+        "queue_file": str(queue_file),
+        "bus_file": str(session_dir / "events.raw.jsonl"),
+        "events_file": str(session_dir / "events.jsonl"),
+        "participants": participants,
+        "panes": {alias: record.get("pane") for alias, record in participants.items() if record.get("pane")},
+        "targets": {alias: record.get("target") for alias, record in participants.items() if record.get("target")},
+        "hook_session_ids": {
+            alias: record.get("hook_session_id") for alias, record in participants.items() if record.get("hook_session_id")
+        },
+    }
+    write_json_atomic(session_dir / "session.json", state)
+    return session_dir / "session.json"
+
+
+def run_bridge_join_cli(alias: str, pane: str, *, target: str = "test:9.0", session_id: str = "sess-new") -> tuple[int, str, str]:
+    old_argv = sys.argv[:]
+    old_send_prompt = bridge_join.send_prompt
+    old_wait_for_probe = bridge_join.wait_for_probe
+    old_backfill = bridge_join.backfill_session_process_identities
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    try:
+        bridge_join.send_prompt = lambda *args, **kwargs: None  # type: ignore[assignment]
+        bridge_join.wait_for_probe = lambda *args, **kwargs: {"session_id": session_id, "cwd": "/joined", "model": "model-new"}  # type: ignore[assignment]
+        bridge_join.backfill_session_process_identities = lambda *args, **kwargs: {alias: {"status": "verified"}}  # type: ignore[assignment]
+        sys.argv = [
+            "bridge_join.py",
+            "--session",
+            "test-session",
+            "--agent",
+            "codex",
+            "--alias",
+            alias,
+            "--pane",
+            pane,
+            "--pane-target",
+            target,
+            "--no-resolve-pane",
+            "--no-notify",
+        ]
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = bridge_join.main()
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 1
+            if not isinstance(exc.code, int):
+                stderr.write(str(exc.code))
+    finally:
+        sys.argv = old_argv
+        bridge_join.send_prompt = old_send_prompt  # type: ignore[assignment]
+        bridge_join.wait_for_probe = old_wait_for_probe  # type: ignore[assignment]
+        bridge_join.backfill_session_process_identities = old_backfill  # type: ignore[assignment]
+    return int(code), stdout.getvalue(), stderr.getvalue()
+
+
+def pane_locks(state_dir: Path) -> dict:
+    return read_json(state_dir / "pane-locks.json", {"version": 1, "panes": {}}).get("panes") or {}
+
+
+def assert_pane_lock(label: str, state_dir: Path, pane: str, *, alias: str, session_id: str) -> None:
+    lock = pane_locks(state_dir).get(pane) or {}
+    assert_true(lock.get("bridge_session") == "test-session", f"{label}: pane lock should point at test-session: {lock}")
+    assert_true(lock.get("alias") == alias, f"{label}: pane lock should point at {alias}: {lock}")
+    assert_true(lock.get("hook_session_id") == session_id, f"{label}: pane lock should point at {session_id}: {lock}")
+
+
+def scenario_detached_leave_explicit_cleanup(label: str, tmpdir: Path) -> None:
+    with isolated_bridge_cli_env(tmpdir) as state_dir:
+        participants = {
+            "alice": active_cli_participant("alice", agent="claude", pane="%41", target="test:1.0", session_id="sess-alice"),
+            "bob": detached_cli_participant("bob", pane="%42", target="test:2.0", session_id="sess-bob"),
+        }
+        queue = [
+            {"id": "msg-to-bob", "from": "alice", "to": "bob"},
+            {"id": "msg-from-bob", "from": "bob", "to": "alice"},
+            {"id": "msg-kept", "from": "alice", "to": "carol"},
+        ]
+        session_path = write_cli_session(state_dir, participants, queue=queue)
+
+        notices: list[tuple[str, str]] = []
+        tmux_calls: list[tuple[str, str]] = []
+        old_argv = sys.argv[:]
+        old_resolve = bridge_leave.resolve_participant_endpoint_detail
+        old_tmux_send = bridge_leave.tmux_send_literal
+        old_enqueue = bridge_leave.enqueue_membership_notice
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        try:
+            bridge_leave.resolve_participant_endpoint_detail = lambda *args, **kwargs: {"ok": False, "reason": "process_mismatch"}  # type: ignore[assignment]
+            bridge_leave.tmux_send_literal = lambda pane, text, *args, **kwargs: tmux_calls.append((pane, text))  # type: ignore[assignment]
+            bridge_leave.enqueue_membership_notice = lambda session, body: notices.append((session, body))  # type: ignore[assignment]
+            sys.argv = ["bridge_leave.py", "--session", "test-session", "--alias", "bob", "--json"]
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = bridge_leave.main()
+        finally:
+            sys.argv = old_argv
+            bridge_leave.resolve_participant_endpoint_detail = old_resolve  # type: ignore[assignment]
+            bridge_leave.tmux_send_literal = old_tmux_send  # type: ignore[assignment]
+            bridge_leave.enqueue_membership_notice = old_enqueue  # type: ignore[assignment]
+
+        result = json.loads(stdout.getvalue())
+        state = read_json(session_path, {})
+        queue_after = read_json(Path(state.get("queue_file") or ""), [])
+        assert_true(code == 0, f"{label}: bridge_leave.main should return 0")
+        assert_true(result.get("left") == "bob" and result.get("left_notice_sent") == 0, f"{label}: unexpected leave result: {result}")
+        assert_true(result.get("left_notice_error") == "process_mismatch", f"{label}: stale endpoint reason should be reported: {result}")
+        assert_true(tmux_calls == [], f"{label}: stale detached endpoint must not receive direct tmux notice")
+        assert_true("bob" not in (state.get("participants") or {}), f"{label}: detached alias should be removed from session")
+        assert_true("bob" not in (state.get("panes") or {}), f"{label}: legacy pane map should be removed")
+        assert_true("bob" not in (state.get("targets") or {}), f"{label}: legacy target map should be removed")
+        assert_true("bob" not in (state.get("hook_session_ids") or {}), f"{label}: legacy hook id map should be removed")
+        assert_true([item.get("id") for item in queue_after] == ["msg-kept"], f"{label}: pending messages involving alias should be removed: {queue_after}")
+        assert_true(
+            len(notices) == 1 and notices[0][1].startswith("Bridge membership: bob left."),
+            f"{label}: active remaining participant should receive membership notice: {notices}",
+        )
+        assert_true(result.get("removed_pending_messages") == 2, f"{label}: removed pending count should be 2: {result}")
+
+    print(f"  PASS  {label}")
+
+
+def scenario_detached_leave_no_notice_when_only_inactive_remain(label: str, tmpdir: Path) -> None:
+    with isolated_bridge_cli_env(tmpdir) as state_dir:
+        write_cli_session(
+            state_dir,
+            {
+                "bob": detached_cli_participant("bob", pane="%42", session_id="sess-bob"),
+                "carol": detached_cli_participant("carol", pane="%43", session_id="sess-carol"),
+            },
+        )
+
+        notices: list[tuple[str, str]] = []
+        old_argv = sys.argv[:]
+        old_resolve = bridge_leave.resolve_participant_endpoint_detail
+        old_enqueue = bridge_leave.enqueue_membership_notice
+        stdout = io.StringIO()
+        try:
+            bridge_leave.resolve_participant_endpoint_detail = lambda *args, **kwargs: {"ok": False, "reason": "process_mismatch"}  # type: ignore[assignment]
+            bridge_leave.enqueue_membership_notice = lambda session, body: notices.append((session, body))  # type: ignore[assignment]
+            sys.argv = ["bridge_leave.py", "--session", "test-session", "--alias", "bob", "--json"]
+            with redirect_stdout(stdout), redirect_stderr(io.StringIO()):
+                code = bridge_leave.main()
+        finally:
+            sys.argv = old_argv
+            bridge_leave.resolve_participant_endpoint_detail = old_resolve  # type: ignore[assignment]
+            bridge_leave.enqueue_membership_notice = old_enqueue  # type: ignore[assignment]
+
+        assert_true(code == 0, f"{label}: bridge_leave.main should return 0")
+        assert_true(notices == [], f"{label}: no active remaining participants should suppress membership notice: {notices}")
+
+    print(f"  PASS  {label}")
+
+
+def scenario_detached_join_same_alias_same_pane(label: str, tmpdir: Path) -> None:
+    with isolated_bridge_cli_env(tmpdir) as state_dir:
+        session_path = write_cli_session(
+            state_dir,
+            {"bob": detached_cli_participant("bob", pane="%42", target="old:2.0", session_id="sess-old")},
+        )
+
+        code, _stdout, stderr = run_bridge_join_cli("bob", "%42", target="new:2.0", session_id="sess-new")
+
+        state = read_json(session_path, {})
+        record = (state.get("participants") or {}).get("bob") or {}
+        stale_keys = {"detached_at", "detach_reason", "last_pane", "endpoint_status", "endpoint_lost_at", "endpoint_lost_reason"}
+        assert_true(code == 0, f"{label}: detached same-pane rejoin should succeed: {stderr}")
+        assert_true(record.get("status") == "active", f"{label}: participant should become active: {record}")
+        assert_true(record.get("pane") == "%42" and record.get("target") == "new:2.0", f"{label}: endpoint should be refreshed: {record}")
+        assert_true(record.get("hook_session_id") == "sess-new", f"{label}: hook_session_id should be refreshed: {record}")
+        assert_true(record.get("cwd") == "/joined" and record.get("model") == "model-new", f"{label}: probe metadata should be refreshed: {record}")
+        assert_true(stale_keys.isdisjoint(record), f"{label}: stale detached/endpoint metadata should be cleared: {record}")
+        assert_true((state.get("panes") or {}).get("bob") == "%42", f"{label}: legacy pane map should be refreshed: {state}")
+        assert_true((state.get("targets") or {}).get("bob") == "new:2.0", f"{label}: legacy target map should be refreshed: {state}")
+        assert_true((state.get("hook_session_ids") or {}).get("bob") == "sess-new", f"{label}: legacy hook id map should be refreshed: {state}")
+        assert_pane_lock(label, state_dir, "%42", alias="bob", session_id="sess-new")
+
+    print(f"  PASS  {label}")
+
+
+def scenario_detached_join_same_alias_different_pane(label: str, tmpdir: Path) -> None:
+    with isolated_bridge_cli_env(tmpdir) as state_dir:
+        session_path = write_cli_session(
+            state_dir,
+            {"bob": detached_cli_participant("bob", pane="%42", target="old:2.0", session_id="sess-old")},
+        )
+
+        code, _stdout, stderr = run_bridge_join_cli("bob", "%44", target="new:4.0", session_id="sess-new-pane")
+
+        state = read_json(session_path, {})
+        record = (state.get("participants") or {}).get("bob") or {}
+        assert_true(code == 0, f"{label}: detached different-pane rejoin should succeed: {stderr}")
+        assert_true(record.get("status") == "active", f"{label}: participant should become active: {record}")
+        assert_true(record.get("pane") == "%44" and record.get("target") == "new:4.0", f"{label}: endpoint should switch panes: {record}")
+        assert_true(record.get("hook_session_id") == "sess-new-pane", f"{label}: hook_session_id should switch: {record}")
+        assert_true((state.get("panes") or {}).get("bob") == "%44", f"{label}: legacy pane map should switch: {state}")
+        assert_true((state.get("targets") or {}).get("bob") == "new:4.0", f"{label}: legacy target map should switch: {state}")
+        assert_true((state.get("hook_session_ids") or {}).get("bob") == "sess-new-pane", f"{label}: legacy hook id map should switch: {state}")
+        locks = pane_locks(state_dir)
+        assert_true("%42" not in locks, f"{label}: detached old pane should not keep a stale lock: {locks}")
+        assert_pane_lock(label, state_dir, "%44", alias="bob", session_id="sess-new-pane")
+
+    print(f"  PASS  {label}")
+
+
+def scenario_detached_join_different_alias_same_pane_allowed(label: str, tmpdir: Path) -> None:
+    with isolated_bridge_cli_env(tmpdir) as state_dir:
+        session_path = write_cli_session(
+            state_dir,
+            {"bob": detached_cli_participant("bob", pane="%42", target="old:2.0", session_id="sess-old")},
+        )
+
+        code, _stdout, stderr = run_bridge_join_cli("alice", "%42", target="new:2.0", session_id="sess-alice")
+
+        state = read_json(session_path, {})
+        participants = state.get("participants") or {}
+        bob = participants.get("bob") or {}
+        alice = participants.get("alice") or {}
+        assert_true(code == 0, f"{label}: explicit different-alias join should be able to reuse a detached pane: {stderr}")
+        assert_true(bob.get("status") == "detached", f"{label}: original detached record should remain non-routable: {bob}")
+        assert_true(alice.get("status") == "active" and alice.get("pane") == "%42", f"{label}: new alias should own active pane: {alice}")
+        assert_pane_lock(label, state_dir, "%42", alias="alice", session_id="sess-alice")
+
+    print(f"  PASS  {label}")
+
+
+def scenario_active_join_same_alias_still_rejected(label: str, tmpdir: Path) -> None:
+    with isolated_bridge_cli_env(tmpdir) as state_dir:
+        write_cli_session(state_dir, {"bob": active_cli_participant("bob", pane="%42", session_id="sess-active")})
+
+        code, _stdout, stderr = run_bridge_join_cli("bob", "%44", target="new:4.0", session_id="sess-new")
+
+        assert_true(code != 0 and "alias already exists in test-session: bob" in stderr, f"{label}: active alias should still be rejected: code={code} stderr={stderr!r}")
+
+    print(f"  PASS  {label}")
+
+
+def scenario_join_blank_status_same_pane_still_rejected(label: str, tmpdir: Path) -> None:
+    with isolated_bridge_cli_env(tmpdir) as state_dir:
+        bob = active_cli_participant("bob", pane="%42", session_id="sess-blank")
+        bob["status"] = ""
+        write_cli_session(state_dir, {"bob": bob})
+
+        code, _stdout, stderr = run_bridge_join_cli("alice", "%42", target="new:4.0", session_id="sess-new")
+
+        assert_true(
+            code != 0 and "pane is already registered: %42" in stderr,
+            f"{label}: blank status should normalize to active and keep pane reserved: code={code} stderr={stderr!r}",
+        )
+
+    print(f"  PASS  {label}")
+
+
+def scenario_join_other_session_pane_lock_still_rejected(label: str, tmpdir: Path) -> None:
+    with isolated_bridge_cli_env(tmpdir) as state_dir:
+        write_cli_session(state_dir, {})
+        write_json_atomic(
+            state_dir / "pane-locks.json",
+            {
+                "version": 1,
+                "panes": {
+                    "%45": {
+                        "bridge_session": "other-session",
+                        "agent": "codex",
+                        "alias": "other",
+                        "target": "other:5.0",
+                        "hook_session_id": "sess-other",
+                    }
+                },
+            },
+        )
+
+        code, _stdout, stderr = run_bridge_join_cli("bob", "%45", target="new:5.0", session_id="sess-new")
+
+        assert_true(code != 0 and "pane is already registered: %45" in stderr, f"{label}: other-session pane lock should still reject join: code={code} stderr={stderr!r}")
+
     print(f"  PASS  {label}")
 
 
@@ -13560,6 +13908,14 @@ def main() -> int:
             ("pane_mode_grace_zero_disables_cancel", scenario_pane_mode_grace_zero_disables_cancel),
             ("wait_for_probe_retries_enter_with_pane_id", scenario_wait_for_probe_retries_enter_with_pane_id),
             ("wait_for_probe_no_retry_without_pane_id", scenario_wait_for_probe_no_retry_without_pane_id),
+            ("detached_leave_explicit_cleanup", scenario_detached_leave_explicit_cleanup),
+            ("detached_leave_no_notice_when_only_inactive_remain", scenario_detached_leave_no_notice_when_only_inactive_remain),
+            ("detached_join_same_alias_same_pane", scenario_detached_join_same_alias_same_pane),
+            ("detached_join_same_alias_different_pane", scenario_detached_join_same_alias_different_pane),
+            ("detached_join_different_alias_same_pane_allowed", scenario_detached_join_different_alias_same_pane_allowed),
+            ("active_join_same_alias_still_rejected", scenario_active_join_same_alias_still_rejected),
+            ("join_blank_status_same_pane_still_rejected", scenario_join_blank_status_same_pane_still_rejected),
+            ("join_other_session_pane_lock_still_rejected", scenario_join_other_session_pane_lock_still_rejected),
             ("join_probe_passes_pane_id_to_wait", scenario_join_probe_passes_pane_id_to_wait),
             ("bridge_attach_start_daemon_argv_includes_from_start", scenario_bridge_attach_start_daemon_argv_includes_from_start),
             ("bridge_daemon_ctl_start_subparser_accepts_from_start", scenario_bridge_daemon_ctl_start_subparser_accepts_from_start),

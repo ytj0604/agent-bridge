@@ -10,7 +10,7 @@ from pathlib import Path
 
 from bridge_attach import pane_locks_file, registry_file
 from bridge_identity import resolve_participant_endpoint_detail
-from bridge_participants import active_participants, format_peer_summary, load_session, save_session_state, session_state_exists
+from bridge_participants import active_participants, format_peer_summary, load_session, participants_from_state, save_session_state, session_state_exists
 from bridge_paths import ensure_runtime_writable, libexec_dir, state_root
 from bridge_util import locked_json
 
@@ -121,7 +121,7 @@ def main() -> int:
         )
 
     state = load_session(args.session)
-    participants = active_participants(state)
+    participants = participants_from_state(state)
     record = participants.get(args.alias)
     if not record:
         raise SystemExit(f"alias not found in {args.session}: {args.alias}")

@@ -102,6 +102,8 @@ def read_pane_locks() -> dict:
 
 def pane_is_registered(pane_id: str, state: dict) -> bool:
     for record in (state.get("participants") or {}).values():
+        if (record.get("status") or "active") != "active":
+            continue
         if str(record.get("pane") or "") == pane_id:
             return True
     lock = read_pane_locks().get(pane_id)
