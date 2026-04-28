@@ -8143,6 +8143,11 @@ def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, t
 
 
 def scenario_watchdog_phase_doc_surfaces_are_consistent(label: str, tmpdir: Path) -> None:
+    def _line_containing(lines: list[str], token: str) -> str:
+        matches = [line for line in lines if token in line]
+        assert_true(len(matches) == 1, f"{label}: expected one line containing {token!r}, got {matches!r}")
+        return matches[0]
+
     canonical_watchdog_tokens = [
         "AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC",
         "300",
@@ -8155,9 +8160,15 @@ def scenario_watchdog_phase_doc_surfaces_are_consistent(label: str, tmpdir: Path
         "not a queue timer",
         "same <sec> per phase",
         "up to two phase intervals",
-        "auto-return",
-        "--no-auto-return",
+        "request",
         "--watchdog 0",
+    ]
+    model_watchdog_forbidden_tokens = [
+        "--no-auto-return",
+        "no-auto-return",
+        "no auto-return",
+        "requires auto-return",
+        "auto-return",
     ]
     forbidden_bare_default_fragments = [
         "for example default 300s",
@@ -8166,8 +8177,14 @@ def scenario_watchdog_phase_doc_surfaces_are_consistent(label: str, tmpdir: Path
     ]
     extend_tokens = ["inflight/submitted delivery", "delivered aggregate response", "stale watchdog wakes", "[bridge:result]", "queued/arriving"]
 
-    cheat = "\n".join(bridge_instructions.model_cheat_sheet())
+    cheat_lines = bridge_instructions.model_cheat_sheet()
+    cheat = "\n".join(cheat_lines)
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
+    probe_lines = probe.splitlines()
+    cheat_watchdog_line = _line_containing(cheat_lines, "--watchdog <sec>")
+    probe_watchdog_line = _line_containing(probe_lines, "--watchdog <sec>")
+    response_guard_line = _line_containing(cheat_lines, "Response-time send guard")
+    probe_response_guard_line = _line_containing(probe_lines, "Response-time send guard")
 
     send_help = subprocess.run(
         [sys.executable, str(LIBEXEC / "bridge_send_peer.py"), "--help"],
@@ -8184,6 +8201,15 @@ def scenario_watchdog_phase_doc_surfaces_are_consistent(label: str, tmpdir: Path
             assert_true(token.lower() in lowered, f"{label}: {surface_name} missing watchdog token {token!r}: {surface!r}")
         for forbidden in forbidden_bare_default_fragments:
             assert_true(forbidden not in lowered, f"{label}: {surface_name} has bare hard-coded default wording {forbidden!r}: {surface!r}")
+    for surface_name, surface in (("cheat sheet watchdog line", cheat_watchdog_line), ("probe watchdog line", probe_watchdog_line), ("bridge_send_peer help", send_help_text)):
+        lowered = surface.lower()
+        for forbidden in model_watchdog_forbidden_tokens:
+            assert_true(forbidden not in lowered, f"{label}: {surface_name} should not expose model-facing no-auto-return wording {forbidden!r}: {surface!r}")
+    assert_true("Request only" in cheat_watchdog_line, f"{label}: cheat sheet watchdog line must keep request-only boundary: {cheat_watchdog_line!r}")
+    assert_true("on a request" in probe_watchdog_line, f"{label}: probe watchdog line must keep request-only boundary: {probe_watchdog_line!r}")
+    assert_true("Request only" in send_help_text, f"{label}: help watchdog text must keep request-only boundary: {send_help_text!r}")
+    assert_true("auto-return peer request" in response_guard_line, f"{label}: cheat sheet response guard must keep auto-return wording: {response_guard_line!r}")
+    assert_true("auto-return peer request" in probe_response_guard_line, f"{label}: probe response guard must keep auto-return wording: {probe_response_guard_line!r}")
     assert_true("pending -> inflight" in cheat and "inflight -> delivered" in cheat, f"{label}: cheat sheet missing exact phase transitions")
     assert_true("pending -> inflight" in probe and "inflight -> delivered" in probe, f"{label}: probe prompt missing exact phase transitions")
     assert_true("pending -> inflight" in send_help_text and "inflight -> delivered" in send_help_text, f"{label}: help missing exact phase transitions: {send_help_text!r}")
@@ -8201,6 +8227,28 @@ def scenario_watchdog_phase_doc_surfaces_are_consistent(label: str, tmpdir: Path
     assert_true(extend_help.returncode == 0, f"{label}: agent_extend_wait --help should exit 0, got {extend_help.returncode}: {extend_help_text!r}")
     for token in ("delivery", "response"):
         assert_true(token in extend_help_text, f"{label}: bridge_extend_wait help missing {token!r}: {extend_help_text!r}")
+
+    send_no_auto = subprocess.run(
+        [sys.executable, str(LIBEXEC / "bridge_send_peer.py"), "--no-auto-return", "--to", "bob", "hello"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert_true(send_no_auto.returncode == 2, f"{label}: model-facing --no-auto-return should reject, got {send_no_auto.returncode}: {send_no_auto.stderr!r}")
+    assert_true(send_no_auto.stdout == "", f"{label}: rejected --no-auto-return should not print stdout: {send_no_auto.stdout!r}")
+    assert_true("--no-auto-return" in send_no_auto.stderr and "unrecognized" in send_no_auto.stderr, f"{label}: --no-auto-return rejection should be explicit: {send_no_auto.stderr!r}")
+
+    enqueue_help = subprocess.run(
+        [sys.executable, str(LIBEXEC / "bridge_enqueue.py"), "--help"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    enqueue_help_text = enqueue_help.stdout + enqueue_help.stderr
+    assert_true(enqueue_help.returncode == 0, f"{label}: bridge_enqueue --help should exit 0, got {enqueue_help.returncode}: {enqueue_help_text!r}")
+    assert_true("--no-auto-return" in enqueue_help_text, f"{label}: internal enqueue surface must preserve --no-auto-return: {enqueue_help_text!r}")
     print(f"  PASS  {label}")
 
 

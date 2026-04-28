@@ -100,8 +100,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Per-phase watchdog timer, not a queue timer: delivery/submission starts at "
             "pending -> inflight, response starts at inflight -> delivered after prompt delivery. "
             "A request may wait up to two phase intervals; AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC=300 "
-            "means up to 300s delivery + 300s response. Request only; requires auto-return; "
-            "--no-auto-return gets no watchdog; use --watchdog 0 to disable the default."
+            "means up to 300s delivery + 300s response. Request only; "
+            "use --watchdog 0 to disable the default."
         ),
     )
     parser.add_argument("--stdin", dest="stdin_body", action="store_true", help="read the message body from stdin")
