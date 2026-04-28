@@ -54,7 +54,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--watchdog",
         type=float,
         metavar="SEC",
-        help="schedule watchdog wakes after SEC seconds per phase: delivery/submission first, then response after prompt delivery. Request only. Use 0 to explicitly disable the default watchdog.",
+        help=(
+            "schedule watchdog wakes using the same <sec> per phase. "
+            "Per-phase watchdog timer, not a queue timer: delivery/submission starts at "
+            "pending -> inflight, response starts at inflight -> delivered after prompt delivery. "
+            "A request may wait up to two phase intervals; AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC=300 "
+            "means up to 300s delivery + 300s response. Request only; requires auto-return; "
+            "--no-auto-return gets no watchdog; use --watchdog 0 to disable the default."
+        ),
     )
     parser.add_argument("--stdin", dest="stdin_body", action="store_true", help="read the message body from stdin")
     parser.add_argument("--allow-spoof", action="store_true", help="allow --from/--session to differ from the caller tmux pane lock")

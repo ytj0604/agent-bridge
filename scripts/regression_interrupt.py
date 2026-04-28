@@ -8127,20 +8127,31 @@ def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, t
 
 
 def scenario_watchdog_phase_doc_surfaces_are_consistent(label: str, tmpdir: Path) -> None:
-    phase_tokens = ["delivery/submission", "response", "same <sec> per phase", "up to two phase intervals"]
+    canonical_watchdog_tokens = [
+        "AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC",
+        "300",
+        "phase",
+        "delivery",
+        "response",
+        "pending",
+        "inflight",
+        "delivered",
+        "not a queue timer",
+        "same <sec> per phase",
+        "up to two phase intervals",
+        "auto-return",
+        "--no-auto-return",
+        "--watchdog 0",
+    ]
+    forbidden_bare_default_fragments = [
+        "for example default 300s",
+        "default 300s delivery",
+        "default 300s response",
+    ]
     extend_tokens = ["inflight/submitted delivery", "delivered aggregate response", "stale watchdog wakes", "[bridge:result]", "queued/arriving"]
-    auto_return_tokens = ["auto-return", "--no-auto-return", "--watchdog 0"]
 
     cheat = "\n".join(bridge_instructions.model_cheat_sheet())
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
-    for token in phase_tokens:
-        assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing watchdog phase token {token!r}")
-        assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing watchdog phase token {token!r}")
-    for token in auto_return_tokens:
-        assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing watchdog auto-return token {token!r}")
-        assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing watchdog auto-return token {token!r}")
-    for token in extend_tokens:
-        assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing extend token {token!r}")
 
     send_help = subprocess.run(
         [sys.executable, str(LIBEXEC / "bridge_send_peer.py"), "--help"],
@@ -8151,8 +8162,17 @@ def scenario_watchdog_phase_doc_surfaces_are_consistent(label: str, tmpdir: Path
     )
     send_help_text = " ".join((send_help.stdout + send_help.stderr).split())
     assert_true(send_help.returncode == 0, f"{label}: agent_send_peer --help should exit 0, got {send_help.returncode}: {send_help_text!r}")
-    for token in ("per phase", "delivery/submission", "response"):
-        assert_true(token in send_help_text, f"{label}: bridge_send_peer help missing {token!r}: {send_help_text!r}")
+    for surface_name, surface in (("cheat sheet", cheat), ("probe prompt", probe), ("bridge_send_peer help", send_help_text)):
+        lowered = surface.lower()
+        for token in canonical_watchdog_tokens:
+            assert_true(token.lower() in lowered, f"{label}: {surface_name} missing watchdog token {token!r}: {surface!r}")
+        for forbidden in forbidden_bare_default_fragments:
+            assert_true(forbidden not in lowered, f"{label}: {surface_name} has bare hard-coded default wording {forbidden!r}: {surface!r}")
+    assert_true("pending -> inflight" in cheat and "inflight -> delivered" in cheat, f"{label}: cheat sheet missing exact phase transitions")
+    assert_true("pending -> inflight" in probe and "inflight -> delivered" in probe, f"{label}: probe prompt missing exact phase transitions")
+    assert_true("pending -> inflight" in send_help_text and "inflight -> delivered" in send_help_text, f"{label}: help missing exact phase transitions: {send_help_text!r}")
+    for token in extend_tokens:
+        assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing extend token {token!r}")
 
     extend_help = subprocess.run(
         [sys.executable, str(LIBEXEC / "bridge_extend_wait.py"), "--help"],
