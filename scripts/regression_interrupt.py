@@ -8392,6 +8392,7 @@ def scenario_probe_prompt_is_compact_quickstart(label: str, tmpdir: Path) -> Non
         "agent_aggregate_status",
         "--watchdog 0",
         "AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC=300",
+        "auto-cancelled by any incoming peer request/notice from another agent",
         "per-phase",
         "not a queue timer",
         "pending -> inflight",
@@ -8410,6 +8411,8 @@ def scenario_probe_prompt_is_compact_quickstart(label: str, tmpdir: Path) -> Non
         "piped_stdin_inline_conflict",
         "do not poll",
         "debug surfaces",
+        "suspected stuck peer",
+        "(view_peer)",
         "11000",
         "Never read bridge state files",
         "agent_list_peers",
@@ -8609,7 +8612,7 @@ def scenario_wait_status_doc_surfaces_anti_polling(label: str, tmpdir: Path) -> 
     ]
     for token in cheat_tokens:
         assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing wait_status token {token!r}")
-    compact_probe_tokens = ["agent_wait_status", "debug surfaces", "do not poll", "human prompt", "watchdog", "suspected bridge issue"]
+    compact_probe_tokens = ["agent_wait_status", "debug surfaces", "do not poll", "human prompt", "watchdog", "bridge-state debug"]
     for token in compact_probe_tokens:
         assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing wait_status token {token!r}")
 
