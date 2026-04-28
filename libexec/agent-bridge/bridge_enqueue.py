@@ -78,6 +78,19 @@ def format_numeric_value(value: float) -> str:
     return format(float(value), "g")
 
 
+def format_enqueue_success_stdout(ids: list[str], aggregate_id: str = "") -> str:
+    """Return the stable stdout contract for successful enqueue.
+
+    Aggregate sends intentionally produce mixed stdout: msg-id lines first,
+    followed by one tagged machine-parseable metadata line. Success hints such
+    as REQUEST_SENT/NOTICE_SENT stay on bridge_send_peer.py stderr.
+    """
+    lines = [str(item) for item in ids]
+    if aggregate_id:
+        lines.append(f"AGGREGATE_ID: {aggregate_id}")
+    return "\n".join(lines)
+
+
 WRITE_FAILURE_ERRNOS = {errno.EROFS, errno.EACCES, errno.EPERM}
 
 
@@ -371,7 +384,7 @@ def main() -> int:
                 return 2
             print(f"agent_send_peer: {ipc_error}", file=sys.stderr)
             return 1
-        print("\n".join(ipc_ids))
+        print(format_enqueue_success_stdout(ipc_ids, aggregate_id))
         return 0
 
     violation = response_send_violation(
@@ -434,7 +447,7 @@ def main() -> int:
         append_jsonl(state_file, fallback_record)
     except OSError:
         pass
-    print("\n".join(ids))
+    print(format_enqueue_success_stdout(ids, aggregate_id))
     return 0
 
 

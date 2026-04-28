@@ -5827,12 +5827,14 @@ def scenario_enqueue_aggregate_metadata_modes(label: str, tmpdir: Path) -> None:
             ],
         )
         assert_true(code == 0, f"{label}: aggregate enqueue {expected_mode} should succeed: code={code} err={err!r}")
-        ids = out.strip().splitlines()
+        lines = _stdout_lines(out)
         queue = json.loads(queue_file.read_text(encoding="utf-8"))
-        assert_true(len(ids) == 2 and len(queue) == 2, f"{label}: aggregate enqueue should create two legs: out={out!r} queue={queue}")
+        assert_true(len(lines) == 3 and len(queue) == 2, f"{label}: aggregate enqueue should create two legs plus aggregate id: out={out!r} queue={queue}")
+        ids = lines[:2]
+        stdout_aggregate_id = _aggregate_id_from_stdout(out)
         aggregate_ids = {item.get("aggregate_id") for item in queue}
         started_values = {item.get("aggregate_started_ts") for item in queue}
-        assert_true(len(aggregate_ids) == 1 and next(iter(aggregate_ids)), f"{label}: legs should share aggregate id: {queue}")
+        assert_true(aggregate_ids == {stdout_aggregate_id}, f"{label}: legs should share printed aggregate id: out={out!r} queue={queue}")
         assert_true(len(started_values) == 1 and next(iter(started_values)), f"{label}: legs should share aggregate_started_ts: {queue}")
         assert_true({item.get("aggregate_mode") for item in queue} == {expected_mode}, f"{label}: aggregate mode mismatch for {expected_mode}: {queue}")
         assert_true(all(item.get("aggregate_message_ids") == {"bob": ids[0], "carol": ids[1]} for item in queue), f"{label}: aggregate message map mismatch: ids={ids} queue={queue}")
@@ -8239,11 +8241,19 @@ def scenario_aggregate_status_doc_surfaces_leg_level_and_anti_polling(label: str
         "leg-level",
         "agent_wait_status",
         "one aggregate",
+        "AGGREGATE_ID",
+        "aggregate_id",
+        "human prompt",
+        "watchdog",
         "do not poll",
     ]
+    forbidden_tokens = ["track progress", "monitor progress"]
     for token in required_tokens:
         assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing aggregate_status token {token!r}")
         assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing aggregate_status token {token!r}")
+    for token in forbidden_tokens:
+        assert_true(token.lower() not in cheat.lower(), f"{label}: cheat sheet should avoid polling-like token {token!r}")
+        assert_true(token.lower() not in probe.lower(), f"{label}: probe prompt should avoid polling-like token {token!r}")
 
     help_result = subprocess.run(
         [sys.executable, str(LIBEXEC / "bridge_aggregate_status.py"), "--help"],
@@ -10627,6 +10637,23 @@ def _write_json(path: Path, data) -> None:
     path.write_text(json.dumps(data, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
 
 
+def _stdout_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line]
+
+
+def _aggregate_id_from_stdout(text: str) -> str:
+    lines = [line for line in _stdout_lines(text) if line.startswith("AGGREGATE_ID: ")]
+    assert_true(len(lines) == 1, f"expected exactly one AGGREGATE_ID line, got {lines!r} in {text!r}")
+    aggregate_id = lines[0].split(": ", 1)[1]
+    assert_true(aggregate_id.startswith("agg-"), f"aggregate id line should carry agg- id: {lines[0]!r}")
+    return aggregate_id
+
+
+def _assert_aggregate_stdout_order(label: str, text: str, expected_ids: list[str], expected_aggregate_id: str) -> None:
+    lines = _stdout_lines(text)
+    assert_true(lines == [*expected_ids, f"AGGREGATE_ID: {expected_aggregate_id}"], f"{label}: aggregate stdout order mismatch: {lines!r}")
+
+
 def scenario_enqueue_rejects_body_and_stdin_before_session_lookup(label: str, tmpdir: Path) -> None:
     be = _import_enqueue_module()
     calls = {"read": 0, "ensure": 0}
@@ -10720,6 +10747,117 @@ def scenario_enqueue_stdin_only_still_works(label: str, tmpdir: Path) -> None:
     assert_true(out.strip().startswith("msg-"), f"{label}: stdin-only enqueue returns id: {out!r}")
     queue = json.loads(queue_file.read_text(encoding="utf-8"))
     assert_true(queue and queue[0].get("body") == "stdin body", f"{label}: stdin body preserved: {queue}")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_aggregate_stdout_socket_and_fallback(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob", "carol"])
+
+    _patch_enqueue_for_unit(be, state)
+    socket_messages: list[dict] = []
+
+    def fake_socket(_session: str, messages: list[dict], **_kwargs):
+        socket_messages[:] = [dict(message) for message in messages]
+        return True, [str(message["id"]) for message in messages], "", ""
+
+    be.enqueue_via_daemon_socket = fake_socket
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "alice",
+            "--to", "bob,carol",
+            "--body", "socket aggregate",
+            "--queue-file", str(tmpdir / "socket-pending.json"),
+            "--state-file", str(tmpdir / "socket-events.raw.jsonl"),
+            "--public-state-file", str(tmpdir / "socket-events.jsonl"),
+        ],
+    )
+    assert_true(code == 0 and err == "", f"{label}: socket aggregate should succeed: code={code} err={err!r}")
+    socket_ids = [str(message["id"]) for message in socket_messages]
+    socket_aggregate_id = str(socket_messages[0].get("aggregate_id") or "")
+    assert_true(socket_aggregate_id and all(message.get("aggregate_id") == socket_aggregate_id for message in socket_messages), f"{label}: socket messages must share aggregate_id: {socket_messages}")
+    _assert_aggregate_stdout_order(label, out, socket_ids, socket_aggregate_id)
+    assert_true("AGGREGATE_ID:" not in err, f"{label}: aggregate id must not go to stderr: {err!r}")
+
+    be = _import_enqueue_module()
+    _patch_enqueue_for_unit(be, state)
+    queue_file = tmpdir / "fallback-pending.json"
+    state_file = tmpdir / "fallback-events.raw.jsonl"
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "alice",
+            "--to", "bob,carol",
+            "--body", "fallback aggregate",
+            "--queue-file", str(queue_file),
+            "--state-file", str(state_file),
+            "--public-state-file", str(tmpdir / "fallback-events.jsonl"),
+        ],
+    )
+    assert_true(code == 0 and err == "", f"{label}: fallback aggregate should succeed: code={code} err={err!r}")
+    queue = json.loads(queue_file.read_text(encoding="utf-8"))
+    fallback_ids = [str(message["id"]) for message in queue]
+    fallback_aggregate_id = str(queue[0].get("aggregate_id") or "")
+    assert_true(fallback_aggregate_id and all(message.get("aggregate_id") == fallback_aggregate_id for message in queue), f"{label}: fallback queue rows must share aggregate_id: {queue}")
+    _assert_aggregate_stdout_order(label, out, fallback_ids, fallback_aggregate_id)
+    events = read_events(state_file)
+    event_aggregate_ids = {event.get("aggregate_id") for event in events if event.get("event") == "message_queued"}
+    assert_true(event_aggregate_ids == {fallback_aggregate_id}, f"{label}: queued events must use printed aggregate_id: {events}")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_aggregate_stdout_all_and_negative_cases(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob", "carol"])
+    _patch_enqueue_for_unit(be, state)
+    queue_file = tmpdir / "all-pending.json"
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "alice",
+            "--all",
+            "--body", "all aggregate",
+            "--queue-file", str(queue_file),
+            "--state-file", str(tmpdir / "all-events.raw.jsonl"),
+            "--public-state-file", str(tmpdir / "all-events.jsonl"),
+        ],
+    )
+    assert_true(code == 0 and err == "", f"{label}: --all aggregate should succeed: code={code} err={err!r}")
+    queue = json.loads(queue_file.read_text(encoding="utf-8"))
+    aggregate_id = _aggregate_id_from_stdout(out)
+    _assert_aggregate_stdout_order(label, out, [str(message["id"]) for message in queue], aggregate_id)
+    assert_true(all(message.get("aggregate_id") == aggregate_id for message in queue), f"{label}: --all queue rows must match stdout aggregate_id: {queue}")
+
+    negative_cases = [
+        ("single-target", ["--to", "bob"]),
+        ("no-auto-return", ["--to", "bob,carol", "--no-auto-return"]),
+        ("notice", ["--kind", "notice", "--to", "bob,carol"]),
+        ("dedup-to-single", ["--to", "bob,bob"]),
+    ]
+    for case, target_args in negative_cases:
+        be = _import_enqueue_module()
+        _patch_enqueue_for_unit(be, state)
+        case_queue = tmpdir / f"{case}-pending.json"
+        code, out, err = _run_enqueue_main(
+            be,
+            [
+                "--session", "test-session",
+                "--from", "alice",
+                *target_args,
+                "--body", f"{case} body",
+                "--queue-file", str(case_queue),
+                "--state-file", str(tmpdir / f"{case}-events.raw.jsonl"),
+                "--public-state-file", str(tmpdir / f"{case}-events.jsonl"),
+            ],
+        )
+        assert_true(code == 0 and err == "", f"{label}: {case} should succeed without aggregate: code={code} err={err!r}")
+        assert_true("AGGREGATE_ID:" not in out, f"{label}: {case} must not print aggregate id: {out!r}")
+        rows = json.loads(case_queue.read_text(encoding="utf-8"))
+        assert_true(not any(row.get("aggregate_id") for row in rows), f"{label}: {case} rows must not carry aggregate_id: {rows}")
     print(f"  PASS  {label}")
 
 
@@ -11816,6 +11954,7 @@ def scenario_send_peer_request_success_prints_anti_wait_hint(label: str, tmpdir:
     )
     assert_true(code == 0 and len(calls) == 1, f"{label}: request should succeed: code={code} err={err!r}")
     assert_true(out == "msg-test123\n", f"{label}: enqueue stdout must be preserved exactly: {out!r}")
+    assert_true("AGGREGATE_ID:" not in out and "AGGREGATE_ID:" not in err, f"{label}: single target must not expose aggregate id: out={out!r} err={err!r}")
     for token in ("REQUEST_SENT", "[bridge:*]", "do not sleep/poll"):
         assert_true(token in err, f"{label}: request hint missing token {token!r}: {err!r}")
     assert_true("notice sent" not in err and "Safety wake" not in err and "NOTICE_SENT" not in err, f"{label}: request must not print notice hint: {err!r}")
@@ -11844,8 +11983,8 @@ def scenario_send_peer_aggregate_request_success_prints_result_hint(label: str, 
     bs = _import_send_peer_module()
     _patch_send_peer_for_unit(bs)
     for argv, stdout_text in (
-        (["--session", "test-session", "--from", "alice", "--to", "bob,carol", "hello world"], "msg-bob\nmsg-carol\n"),
-        (["--session", "test-session", "--from", "alice", "--all", "hello world"], "msg-bob\nmsg-carol\n"),
+        (["--session", "test-session", "--from", "alice", "--to", "bob,carol", "hello world"], "msg-bob\nmsg-carol\nAGGREGATE_ID: agg-wrapper-partial\n"),
+        (["--session", "test-session", "--from", "alice", "--all", "hello world"], "msg-bob\nmsg-carol\nAGGREGATE_ID: agg-wrapper-all\n"),
     ):
         code, out, err, calls = _run_send_peer_with_fake_subprocess(
             bs,
@@ -11855,6 +11994,8 @@ def scenario_send_peer_aggregate_request_success_prints_result_hint(label: str, 
         )
         assert_true(code == 0 and len(calls) == 1, f"{label}: aggregate request should succeed for {argv}: code={code} err={err!r}")
         assert_true(out == stdout_text, f"{label}: enqueue stdout must be preserved exactly for {argv}: {out!r}")
+        assert_true(out.count("AGGREGATE_ID: agg-") == 1, f"{label}: aggregate stdout should include exactly one aggregate id for {argv}: {out!r}")
+        assert_true("AGGREGATE_ID:" not in err, f"{label}: aggregate id belongs on stdout, not stderr: {err!r}")
         for token in ("REQUEST_SENT", "result arrives later", "[bridge:*]", "do not sleep/poll"):
             assert_true(token in err, f"{label}: aggregate request hint missing token {token!r} for {argv}: {err!r}")
         assert_true("reply arrives later" not in err, f"{label}: aggregate hint must say result, not reply: {err!r}")
@@ -13258,6 +13399,8 @@ def main() -> int:
             ("enqueue_rejects_body_and_stdin_argv_order_independent", scenario_enqueue_rejects_body_and_stdin_argv_order_independent),
             ("enqueue_body_only_still_works", scenario_enqueue_body_only_still_works),
             ("enqueue_stdin_only_still_works", scenario_enqueue_stdin_only_still_works),
+            ("enqueue_aggregate_stdout_socket_and_fallback", scenario_enqueue_aggregate_stdout_socket_and_fallback),
+            ("enqueue_aggregate_stdout_all_and_negative_cases", scenario_enqueue_aggregate_stdout_all_and_negative_cases),
             ("enqueue_bare_body_without_value_remains_argparse_owned", scenario_enqueue_bare_body_without_value_remains_argparse_owned),
             ("enqueue_rejects_oversized_body_unchanged", scenario_enqueue_rejects_oversized_body_unchanged),
             ("enqueue_stdin_rejects_oversized_body_unchanged", scenario_enqueue_stdin_rejects_oversized_body_unchanged),
