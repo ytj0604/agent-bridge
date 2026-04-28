@@ -117,43 +117,68 @@ prompt-body integrity check that survives model TUI behavior.
 
 ---
 
-### K-02: Codex sandbox socket block forces fallback with recovery gaps
+### K-02: Codex sandbox blocks socket transport; file fallback is the de-facto path
 
-**Status**: current.
+**Status**: current; file fallback runs cleanly in normal operation. The only
+unresolved part is the daemon-restart recovery race noted below.
 
-**Symptom**: Some Codex sandbox profiles block daemon UNIX socket `connect()`,
-so `agent_send_peer` uses file fallback (`pending.json` plus event log) instead
-of daemon socket enqueue. The normal fallback path works, but recovery paths can
-promote an `ingressing` row without the live path's alarm-cancel semantics.
+**Symptom**: In default Codex sandbox modes, every `connect()` syscall from a
+Codex-spawned subprocess returns `EPERM` regardless of socket family or
+destination. Codex peers' `agent_send_peer` cannot reach
+`<run_root>/<session>.sock`; the CLI silently falls back to writing a
+`status="ingressing"` row into `queue.json` plus a `message_queued` event. The
+daemon picks it up via its event-tail loop and finalizes (alarm cancel + body
+prepend + promote to pending) under `state_lock`. Model-facing UX is identical
+to socket transport.
 
-**Root cause**: macOS/iOS `sandbox-exec` or runtime policy can block
-`connect()` for UNIX sockets even when ordinary file writes are allowed. The
-current shared JSON fallback keeps sends working, but it is weaker than daemon
-socket enqueue as a transport and recovery boundary.
+**Root cause**: Codex spawns user subprocesses with a stricter sandbox profile
+than the Codex CLI process itself. The Linux sandbox uses bubblewrap + seccomp;
+`connect(2)` is blocked unconditionally for both `AF_UNIX` and `AF_INET`
+regardless of the user's `[sandbox_workspace_write] network_access` config.
+That config setting governs only the Codex CLI's own outbound API access, not
+its spawned subprocesses. Upstream tracking:
+[openai/codex#16910](https://github.com/openai/codex/issues/16910) (AF_UNIX
+support feature request) and
+[openai/codex#10797](https://github.com/openai/codex/issues/10797).
 
-**Mitigation / candidate approaches**: Happy-path fallback rows use
-`status="ingressing"` and are finalized under daemon `state_lock`, including
-alarm cancellation and body prepend. Future transport candidates are proposals:
-FIFO/named pipe could preserve stream-like delivery without UNIX socket
-`connect()`, but needs portable blocking/error handling; Maildir-style atomic
-file queues could avoid socket use and shared-file races, but require a larger
-queue redesign and platform watchers; TCP loopback may work where sandbox
-network-outbound is allowed, but needs port allocation and local access-control
-design.
+**Mitigation / candidate approaches**: The file-fallback path is the normal
+operating mode for Codex peers under any non-`danger-full-access` sandbox, not
+an exceptional code path. Ingressing rows finalize under daemon `state_lock`
+with the same alarm-cancel and body-prepend semantics as socket ingress, so
+end-to-end behaviour is functionally equivalent. The only setting that permits
+direct socket connect from Codex peers today is
+`sandbox_mode = "danger-full-access"`, which trades sandbox isolation for
+direct transport. Future transport candidates are deferred:
+- *Maildir-style atomic file queue* — structurally clean and would close the
+  recovery race below by giving each message its own atomically-renamed
+  crash-safe file. Significant implementation cost (queue redesign +
+  platform-specific watchers) without an observed day-to-day benefit while the
+  current fallback works; deferred unless Codex sandbox semantics change or the
+  recovery race becomes operationally observed.
+- *FIFO (named pipe)* — gives no recovery improvement over current fallback
+  (in-flight bytes also lost on daemon crash) and `mkfifo()` may itself be
+  sandbox-blocked. Not pursued.
+- *TCP loopback* — empirically blocked by the Codex sandbox identically to
+  `AF_UNIX`, so not a viable workaround.
 
-**Residual risk**: `_recover_ingressing_messages` and
-`_promote_aged_ingressing` promote stale rows but do not apply alarm-cancel
-semantics. An alarm that would have been cancelled by the live ingress path can
-still fire later. See also the *In-Memory Live Routing State* structural limit
-above — alarm-cancel state is daemon memory and does not survive into the
-recovery path.
+**Residual risk**: `_recover_ingressing_messages` and `_promote_aged_ingressing`
+promote stale rows on daemon restart but do not reapply the alarm-cancel
+semantics that the live ingress path runs under `state_lock`. An alarm the live
+ingress path would have cancelled can therefore fire later if the daemon dies
+inside the few-millisecond finalize window. See also the *In-Memory Live
+Routing State* structural limit above — alarm-cancel state is daemon memory
+and does not survive into the recovery path.
 
-**Evidence**: `bridge_enqueue.py` fallback path,
-`bridge_daemon.py::enqueue_ipc_message`,
-`bridge_daemon.py::handle_external_message_queued`,
+**Evidence**: `bridge_enqueue.py::enqueue_via_daemon_socket`, `bridge_enqueue.py`
+file-fallback block, `bridge_daemon.py::handle_external_message_queued`,
 `bridge_daemon.py::_apply_alarm_cancel_to_queued_message`,
 `bridge_daemon.py::_recover_ingressing_messages`, and
-`bridge_daemon.py::_promote_aged_ingressing`.
+`bridge_daemon.py::_promote_aged_ingressing`. Empirical probe (2026-04-28): in
+default Codex sandbox, a `python3` subprocess returned
+`PermissionError [Errno 1] Operation not permitted` for both
+`socket.AF_UNIX.connect('/tmp/agent-bridge-0/run/agent-bridge-auto.sock')` and
+`socket.AF_INET.connect(('127.0.0.1', <live-listener>))` despite
+`[sandbox_workspace_write] network_access = true` set in `~/.codex/config.toml`.
 
 ---
 
