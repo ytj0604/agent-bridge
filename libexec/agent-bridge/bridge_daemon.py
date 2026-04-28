@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import signal
 import socket
 import struct
@@ -76,6 +77,9 @@ EMPTY_RESPONSE_BODY = "(empty response)"
 WATCHDOG_PHASE_DELIVERY = "delivery"
 WATCHDOG_PHASE_RESPONSE = "response"
 WATCHDOG_PHASE_ALARM = "alarm"
+ALARM_CLIENT_WAKE_ID_RE = re.compile(r"^wake-[a-f0-9]{12}$")
+ALARM_WAKE_TOMBSTONE_TTL_SECONDS = 60 * 60
+ALARM_WAKE_TOMBSTONE_LIMIT = 4096
 WAIT_STATUS_SECTION_LIMIT = 50
 AGGREGATE_STATUS_LEG_LIMIT = 100
 RESPONSE_LIKE_TOMBSTONE_REASONS = {
@@ -501,6 +505,7 @@ class BridgeDaemon:
         self.stop_logged = False
         self.last_enter_ts: dict[str, float] = {}
         self.watchdogs: dict[str, dict] = {}
+        self.alarm_wake_tombstones: OrderedDict[str, dict] = OrderedDict()
         # held_interrupt is a legacy/manual recovery marker. New default
         # interrupts no longer enter it; --clear-hold can still release old
         # or manually planted holds. It is informational for delivery: queued
@@ -742,10 +747,13 @@ class BridgeDaemon:
             if not math.isfinite(delay_value) or delay_value < 0:
                 return {"ok": False, "error": "delay_seconds must be a finite non-negative number"}
             body = request.get("body")
-            wake_id = self.register_alarm(sender, delay_value, body if isinstance(body, str) else None)
-            if not wake_id:
-                return {"ok": False, "error": "failed to register alarm"}
-            return {"ok": True, "wake_id": wake_id}
+            wake_id = request.get("wake_id")
+            return self.register_alarm_result(
+                sender,
+                delay_value,
+                body if isinstance(body, str) else None,
+                wake_id=str(wake_id) if wake_id is not None else None,
+            )
         if op == "interrupt":
             self.reload_participants()
             sender = str(request.get("from") or "")
@@ -990,7 +998,9 @@ class BridgeDaemon:
         for wake_id in list(self.watchdogs.keys()):
             wd = self.watchdogs.get(wake_id)
             if wd and wd.get("is_alarm") and wd.get("sender") == target:
-                cancelled.append((wake_id, self.watchdogs.pop(wake_id)))
+                removed = self.watchdogs.pop(wake_id)
+                self._record_alarm_wake_tombstone(wake_id, removed, "registered_then_cancelled")
+                cancelled.append((wake_id, removed))
         if not cancelled:
             return
         notes: list[str] = []
@@ -2871,19 +2881,136 @@ class BridgeDaemon:
             return raw
         return WATCHDOG_PHASE_RESPONSE
 
-    def register_alarm(self, sender: str, delay_seconds: float, body: str | None = None) -> str | None:
+    def _prune_alarm_wake_tombstones(self, now: float | None = None) -> None:
+        now_value = time.time() if now is None else now
+        for wake_id in list(self.alarm_wake_tombstones.keys()):
+            try:
+                expires_at = float(self.alarm_wake_tombstones[wake_id].get("expires_at") or 0.0)
+            except (TypeError, ValueError):
+                expires_at = 0.0
+            if expires_at and expires_at > now_value:
+                continue
+            self.alarm_wake_tombstones.pop(wake_id, None)
+        while len(self.alarm_wake_tombstones) > ALARM_WAKE_TOMBSTONE_LIMIT:
+            self.alarm_wake_tombstones.popitem(last=False)
+
+    def _record_alarm_wake_tombstone(self, wake_id: str, wd: dict, status: str) -> None:
+        if not ALARM_CLIENT_WAKE_ID_RE.fullmatch(str(wake_id or "")):
+            return
+        if not wd.get("is_alarm"):
+            return
+        now = time.time()
+        self.alarm_wake_tombstones[str(wake_id)] = {
+            "sender": str(wd.get("sender") or ""),
+            "status": status,
+            "alarm_body": str(wd.get("alarm_body") or ""),
+            "alarm_delay_seconds": wd.get("alarm_delay_seconds"),
+            "recorded_ts": now,
+            "expires_at": now + ALARM_WAKE_TOMBSTONE_TTL_SECONDS,
+        }
+        self.alarm_wake_tombstones.move_to_end(str(wake_id))
+        self._prune_alarm_wake_tombstones(now)
+
+    def _same_alarm_request(self, existing: dict, sender: str, delay: float, body: str | None) -> bool:
+        if str(existing.get("sender") or "") != sender:
+            return False
+        if str(existing.get("alarm_body") or "") != (body or ""):
+            return False
+        try:
+            existing_delay = float(existing.get("alarm_delay_seconds"))
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(existing_delay) and existing_delay == delay
+
+    def _alarm_conflict_reason(self, existing: dict, sender: str, delay: float, body: str | None) -> str:
+        if existing.get("is_alarm") is False:
+            return "existing_non_alarm"
+        if str(existing.get("sender") or "") != sender:
+            return "sender_mismatch"
+        if str(existing.get("alarm_body") or "") != (body or ""):
+            return "metadata_mismatch"
+        try:
+            existing_delay = float(existing.get("alarm_delay_seconds"))
+        except (TypeError, ValueError):
+            return "metadata_mismatch"
+        if not math.isfinite(existing_delay) or existing_delay != delay:
+            return "metadata_mismatch"
+        return "metadata_mismatch"
+
+    def _log_alarm_register_conflict(self, wake_id: str, sender: str, existing: dict, reason: str) -> None:
+        self.log(
+            "alarm_register_conflict",
+            wake_id=wake_id,
+            sender=sender,
+            reason=reason,
+            existing_sender=str(existing.get("sender") or ""),
+            existing_is_alarm=existing.get("is_alarm"),
+            existing_status=existing.get("status"),
+        )
+
+    def register_alarm_result(
+        self,
+        sender: str,
+        delay_seconds: float,
+        body: str | None = None,
+        *,
+        wake_id: str | None = None,
+    ) -> dict:
         if not sender or sender == "bridge":
-            return None
+            return {"ok": False, "error": "invalid_sender"}
         try:
             delay = float(delay_seconds)
         except (TypeError, ValueError):
-            return None
+            return {"ok": False, "error": "delay_seconds must be a number"}
         if not math.isfinite(delay) or delay < 0:
-            return None
+            return {"ok": False, "error": "delay_seconds must be a finite non-negative number"}
+        client_supplied_wake_id = wake_id is not None
+        requested_wake_id = short_id("wake") if wake_id is None else wake_id
+        if not ALARM_CLIENT_WAKE_ID_RE.fullmatch(requested_wake_id):
+            return {"ok": False, "error": "wake_id must match wake-[a-f0-9]{12}"}
         deadline = time.time() + delay
-        wake_id = short_id("wake")
         with self.state_lock:
-            self.watchdogs[wake_id] = {
+            self._prune_alarm_wake_tombstones()
+            if not client_supplied_wake_id:
+                while requested_wake_id in self.watchdogs or requested_wake_id in self.alarm_wake_tombstones:
+                    requested_wake_id = short_id("wake")
+            existing = self.watchdogs.get(requested_wake_id)
+            if existing:
+                if existing.get("is_alarm") and self._same_alarm_request(existing, sender, delay, body):
+                    self.log(
+                        "alarm_register_idempotent_replay",
+                        wake_id=requested_wake_id,
+                        sender=sender,
+                        alarm_status="active",
+                    )
+                    return {"ok": True, "wake_id": requested_wake_id, "alarm_status": "active", "duplicate": True}
+                self._log_alarm_register_conflict(
+                    requested_wake_id,
+                    sender,
+                    existing,
+                    self._alarm_conflict_reason(existing, sender, delay, body),
+                )
+                return {"ok": False, "error": "wake_id conflict"}
+            tombstone = self.alarm_wake_tombstones.get(requested_wake_id)
+            if tombstone:
+                if self._same_alarm_request(tombstone, sender, delay, body):
+                    self.alarm_wake_tombstones.move_to_end(requested_wake_id)
+                    alarm_status = str(tombstone.get("status") or "removed")
+                    self.log(
+                        "alarm_register_idempotent_replay",
+                        wake_id=requested_wake_id,
+                        sender=sender,
+                        alarm_status=alarm_status,
+                    )
+                    return {"ok": True, "wake_id": requested_wake_id, "alarm_status": alarm_status, "duplicate": True}
+                self._log_alarm_register_conflict(
+                    requested_wake_id,
+                    sender,
+                    tombstone,
+                    self._alarm_conflict_reason(tombstone, sender, delay, body),
+                )
+                return {"ok": False, "error": "wake_id conflict"}
+            self.watchdogs[requested_wake_id] = {
                 "sender": sender,
                 "deadline": deadline,
                 "watchdog_phase": WATCHDOG_PHASE_ALARM,
@@ -2895,14 +3022,21 @@ class BridgeDaemon:
                 "ref_causal_id": None,
                 "is_alarm": True,
                 "alarm_body": body or "",
+                "alarm_delay_seconds": delay,
             }
             self.log(
                 "alarm_registered",
-                wake_id=wake_id,
+                wake_id=requested_wake_id,
                 sender=sender,
                 delay_seconds=delay,
             )
-        return wake_id
+        return {"ok": True, "wake_id": requested_wake_id, "alarm_status": "registered", "duplicate": False}
+
+    def register_alarm(self, sender: str, delay_seconds: float, body: str | None = None, wake_id: str | None = None) -> str | None:
+        result = self.register_alarm_result(sender, delay_seconds, body, wake_id=wake_id)
+        if not result.get("ok"):
+            return None
+        return str(result.get("wake_id") or "")
 
     def check_watchdogs(self) -> None:
         with self.state_lock:
@@ -3086,7 +3220,9 @@ class BridgeDaemon:
         sender = str(wd.get("sender") or "")
         self.reload_participants()
         if not sender or sender not in self.participants:
-            self.watchdogs.pop(wake_id, None)
+            removed = self.watchdogs.pop(wake_id, None)
+            if removed and removed.get("is_alarm"):
+                self._record_alarm_wake_tombstone(wake_id, removed, "sender_inactive")
             self.log(
                 "watchdog_fire_skipped",
                 wake_id=wake_id,
@@ -3096,7 +3232,9 @@ class BridgeDaemon:
             return
         skip_reason = self.watchdog_fire_skip_reason(wd)
         if skip_reason:
-            self.watchdogs.pop(wake_id, None)
+            removed = self.watchdogs.pop(wake_id, None)
+            if removed and removed.get("is_alarm"):
+                self._record_alarm_wake_tombstone(wake_id, removed, f"skipped_{skip_reason}")
             self.log(
                 "watchdog_skipped_stale",
                 wake_id=wake_id,
@@ -3108,7 +3246,9 @@ class BridgeDaemon:
             )
             return
         self.stamp_turn_id_mismatch_post_watchdog_unblock(wd)
-        self.watchdogs.pop(wake_id, None)
+        removed = self.watchdogs.pop(wake_id, None)
+        if removed and removed.get("is_alarm"):
+            self._record_alarm_wake_tombstone(wake_id, removed, "fired")
         body = self.build_watchdog_fire_text(wd)
         synthetic = {
             "id": short_id("msg"),

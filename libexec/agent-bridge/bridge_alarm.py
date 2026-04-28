@@ -19,41 +19,74 @@ from bridge_daemon_client import ensure_daemon_running
 from bridge_identity import resolve_caller_from_pane
 from bridge_participants import active_participants, load_session, room_status
 from bridge_paths import run_root
+from bridge_util import short_id
 
 ALARM_SET_HINT = (
     "ALARM_SET: wake arrives later as a new [bridge:*] notice prompt unless cancelled by an incoming peer request/notice; "
     "do not sleep/poll or keep this turn open waiting."
 )
+ALARM_SOCKET_TIMEOUT_SECONDS = 2.0
+ALARM_SOCKET_MAX_ATTEMPTS = 3
 
 
 def request_alarm(bridge_session: str, sender: str, delay_seconds: float, body: str | None) -> tuple[bool, str, str]:
     socket_path = run_root() / f"{bridge_session}.sock"
     if not socket_path.exists():
         return False, "", f"daemon socket not found: {socket_path}"
-    payload: dict = {"op": "alarm", "from": sender, "delay_seconds": float(delay_seconds)}
+    wake_id = short_id("wake")
+    payload: dict = {"op": "alarm", "from": sender, "delay_seconds": float(delay_seconds), "wake_id": wake_id}
     if body:
         payload["body"] = body
     request = json.dumps(payload, ensure_ascii=True) + "\n"
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(2.0)
-            client.connect(str(socket_path))
-            client.sendall(request.encode("utf-8"))
-            raw = b""
-            while b"\n" not in raw and len(raw) < 2_000_000:
-                chunk = client.recv(65536)
-                if not chunk:
-                    break
-                raw += chunk
-    except OSError as exc:
-        return False, "", f"daemon socket error: {exc}"
-    try:
-        response = json.loads(raw.decode("utf-8"))
-    except Exception as exc:
-        return False, "", f"invalid daemon response: {exc}"
-    if not response.get("ok"):
-        return False, "", str(response.get("error") or "daemon rejected alarm")
-    return True, str(response.get("wake_id") or ""), ""
+    last_timeout: socket.timeout | None = None
+    for attempt in range(1, ALARM_SOCKET_MAX_ATTEMPTS + 1):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(ALARM_SOCKET_TIMEOUT_SECONDS)
+                client.connect(str(socket_path))
+                client.sendall(request.encode("utf-8"))
+                raw = b""
+                while b"\n" not in raw and len(raw) < 2_000_000:
+                    chunk = client.recv(65536)
+                    if not chunk:
+                        break
+                    raw += chunk
+        except socket.timeout as exc:
+            last_timeout = exc
+            if attempt < ALARM_SOCKET_MAX_ATTEMPTS:
+                print(
+                    f"agent_alarm: daemon socket timeout for wake_id {wake_id}; retrying "
+                    f"({attempt + 1}/{ALARM_SOCKET_MAX_ATTEMPTS})",
+                    file=sys.stderr,
+                )
+                continue
+            return (
+                False,
+                "",
+                f"daemon socket error after {ALARM_SOCKET_MAX_ATTEMPTS} attempts for wake_id {wake_id}: {last_timeout}",
+            )
+        except OSError as exc:
+            return False, "", f"daemon socket error for wake_id {wake_id}: {exc}"
+        try:
+            response = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            return False, "", f"invalid daemon response for wake_id {wake_id}: {exc}"
+        if not response.get("ok"):
+            return False, "", str(response.get("error") or "daemon rejected alarm")
+        response_wake_id = str(response.get("wake_id") or "")
+        if response_wake_id != wake_id:
+            returned = response_wake_id or "(missing)"
+            return (
+                False,
+                "",
+                f"daemon returned wake_id {returned} for requested wake_id {wake_id}; "
+                "reload/restart the bridge daemon so it honors idempotent alarm ids",
+            )
+        if response.get("duplicate"):
+            alarm_status = str(response.get("alarm_status") or "unknown")
+            print(f"agent_alarm: idempotent replay for wake_id {wake_id}; status={alarm_status}", file=sys.stderr)
+        return True, wake_id, ""
+    return False, "", f"daemon socket error after {ALARM_SOCKET_MAX_ATTEMPTS} attempts for wake_id {wake_id}: timed out"
 
 
 def main() -> int:

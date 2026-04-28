@@ -12309,6 +12309,142 @@ def scenario_alarm_request_failure_prints_no_success_hint(label: str, tmpdir: Pa
     print(f"  PASS  {label}")
 
 
+def scenario_alarm_request_retries_timeout_with_stable_wake_id(label: str, tmpdir: Path) -> None:
+    ba = _import_alarm_module()
+    run_dir = tmpdir / "run"
+    run_dir.mkdir()
+    socket_path = run_dir / "test-session.sock"
+    received: list[dict] = []
+    ready = threading.Event()
+
+    def read_payload(conn: socket.socket) -> dict:
+        raw = b""
+        while b"\n" not in raw:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            raw += chunk
+        payload = json.loads(raw.decode("utf-8"))
+        received.append(payload)
+        return payload
+
+    def server() -> None:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+            srv.bind(str(socket_path))
+            srv.listen(4)
+            ready.set()
+            conn, _ = srv.accept()
+            with conn:
+                first = read_payload(conn)
+                time.sleep(0.18)
+                try:
+                    conn.sendall((json.dumps({"ok": True, "wake_id": first["wake_id"]}) + "\n").encode("utf-8"))
+                except OSError:
+                    pass
+            conn, _ = srv.accept()
+            with conn:
+                second = read_payload(conn)
+                conn.sendall((json.dumps({"ok": True, "wake_id": second["wake_id"]}) + "\n").encode("utf-8"))
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+    assert_true(ready.wait(1.0), f"{label}: socket server did not start")
+    ba.run_root = lambda: run_dir  # type: ignore[assignment]
+    ba.short_id = lambda prefix: "wake-111111111111"  # type: ignore[assignment]
+    ba.ALARM_SOCKET_TIMEOUT_SECONDS = 0.15
+    ba.ALARM_SOCKET_MAX_ATTEMPTS = 3
+    stderr = io.StringIO()
+    with redirect_stderr(stderr):
+        ok, wake_id, error = ba.request_alarm("test-session", "alice", 600.0, "follow up")
+    thread.join(1.0)
+    assert_true(ok and wake_id == "wake-111111111111" and error == "", f"{label}: retry should succeed with stable wake id: {(ok, wake_id, error)}")
+    assert_true(not thread.is_alive(), f"{label}: socket server thread should finish")
+    assert_true(len(received) == 2, f"{label}: expected first timeout plus one retry, got {received}")
+    assert_true(received[0].get("wake_id") == received[1].get("wake_id") == "wake-111111111111", f"{label}: retry must reuse wake id: {received}")
+    assert_true("retrying (2/3)" in stderr.getvalue() and "wake-111111111111" in stderr.getvalue(), f"{label}: retry breadcrumb should include wake id: {stderr.getvalue()!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_alarm_request_retry_exhaustion_is_bounded(label: str, tmpdir: Path) -> None:
+    ba = _import_alarm_module()
+    run_dir = tmpdir / "run"
+    run_dir.mkdir()
+    socket_path = run_dir / "test-session.sock"
+    received: list[dict] = []
+    ready = threading.Event()
+
+    def server() -> None:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+            srv.bind(str(socket_path))
+            srv.listen(4)
+            ready.set()
+            for _ in range(2):
+                conn, _ = srv.accept()
+                with conn:
+                    raw = b""
+                    while b"\n" not in raw:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        raw += chunk
+                    received.append(json.loads(raw.decode("utf-8")))
+                    time.sleep(0.12)
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+    assert_true(ready.wait(1.0), f"{label}: socket server did not start")
+    ba.run_root = lambda: run_dir  # type: ignore[assignment]
+    ba.short_id = lambda prefix: "wake-222222222222"  # type: ignore[assignment]
+    ba.ALARM_SOCKET_TIMEOUT_SECONDS = 0.05
+    ba.ALARM_SOCKET_MAX_ATTEMPTS = 2
+    start = time.monotonic()
+    stderr = io.StringIO()
+    with redirect_stderr(stderr):
+        ok, wake_id, error = ba.request_alarm("test-session", "alice", 600.0, "never replies")
+    elapsed = time.monotonic() - start
+    thread.join(1.0)
+    assert_true(not ok and wake_id == "", f"{label}: exhausted retry should fail without stdout wake id: {(ok, wake_id, error)}")
+    assert_true(elapsed < 1.0, f"{label}: retry exhaustion should be bounded, elapsed={elapsed:.3f}s")
+    assert_true("after 2 attempts" in error and "wake-222222222222" in error and "timed out" in error, f"{label}: error must include attempts, wake id, timeout: {error!r}")
+    assert_true(len(received) == 2, f"{label}: server should receive bounded attempts only: {received}")
+    assert_true({item.get("wake_id") for item in received} == {"wake-222222222222"}, f"{label}: all attempts should use stable wake id: {received}")
+    print(f"  PASS  {label}")
+
+
+def scenario_alarm_request_rejects_mismatched_daemon_wake_id(label: str, tmpdir: Path) -> None:
+    ba = _import_alarm_module()
+    run_dir = tmpdir / "run"
+    run_dir.mkdir()
+    socket_path = run_dir / "test-session.sock"
+    ready = threading.Event()
+
+    def server() -> None:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+            srv.bind(str(socket_path))
+            srv.listen(1)
+            ready.set()
+            conn, _ = srv.accept()
+            with conn:
+                raw = b""
+                while b"\n" not in raw:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    raw += chunk
+                conn.sendall((json.dumps({"ok": True, "wake_id": "wake-333333333333"}) + "\n").encode("utf-8"))
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+    assert_true(ready.wait(1.0), f"{label}: socket server did not start")
+    ba.run_root = lambda: run_dir  # type: ignore[assignment]
+    ba.short_id = lambda prefix: "wake-444444444444"  # type: ignore[assignment]
+    ok, wake_id, error = ba.request_alarm("test-session", "alice", 600.0, "old daemon")
+    thread.join(1.0)
+    assert_true(not ok and wake_id == "", f"{label}: mismatched wake id should fail: {(ok, wake_id, error)}")
+    assert_true("wake-333333333333" in error and "wake-444444444444" in error and "reload" in error, f"{label}: mismatch error should mention both ids and reload: {error!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_resolve_default_watchdog_seconds_env_table(label: str, tmpdir: Path) -> None:
     be = _import_enqueue_module()
     cases: list[tuple[str | None, float | None]] = [
@@ -12341,6 +12477,95 @@ def scenario_daemon_socket_alarm_op_rejects_non_finite(label: str, tmpdir: Path)
         assert_true(result.get("ok") is False, f"{label}: alarm {expected} should be rejected: {result}")
         assert_true("finite non-negative" in str(result.get("error") or ""), f"{label}: alarm error should mention finite non-negative: {result}")
         assert_true(d.watchdogs == before, f"{label}: rejected alarm must not mutate watchdogs")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_socket_alarm_op_idempotent_wake_id(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    payload = {"op": "alarm", "from": "claude", "delay_seconds": 600.0, "body": "plan review", "wake_id": "wake-aaaaaaaaaaaa"}
+    first = _daemon_command_result(d, dict(payload))
+    second = _daemon_command_result(d, dict(payload))
+    assert_true(first.get("ok") is True and first.get("wake_id") == "wake-aaaaaaaaaaaa", f"{label}: first alarm should register: {first}")
+    assert_true(second.get("ok") is True and second.get("wake_id") == "wake-aaaaaaaaaaaa", f"{label}: duplicate alarm should be idempotent: {second}")
+    assert_true(second.get("alarm_status") == "active" and second.get("duplicate") is True, f"{label}: duplicate should report active replay: {second}")
+    assert_true(list(d.watchdogs.keys()) == ["wake-aaaaaaaaaaaa"], f"{label}: duplicate must not create another watchdog: {d.watchdogs}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_socket_alarm_op_rejects_invalid_conflicting_wake_id(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    assert_true(
+        bridge_daemon.ALARM_CLIENT_WAKE_ID_RE.fullmatch(bridge_daemon.short_id("wake")) is not None,
+        f"{label}: daemon wake_id regex must match bridge_util.short_id('wake')",
+    )
+    invalid = _daemon_command_result(d, {"op": "alarm", "from": "claude", "delay_seconds": 600.0, "wake_id": "wake-nothex"})
+    assert_true(invalid.get("ok") is False and "wake_id" in str(invalid.get("error") or ""), f"{label}: invalid wake_id must reject: {invalid}")
+    assert_true(not d.watchdogs and not d.alarm_wake_tombstones, f"{label}: invalid wake_id must not mutate state")
+    uppercase = _daemon_command_result(d, {"op": "alarm", "from": "claude", "delay_seconds": 600.0, "wake_id": "wake-ABCDEFABCDEF"})
+    assert_true(uppercase.get("ok") is False and "wake_id" in str(uppercase.get("error") or ""), f"{label}: uppercase wake_id must reject: {uppercase}")
+    assert_true(not d.watchdogs and not d.alarm_wake_tombstones, f"{label}: uppercase wake_id must not mutate state")
+
+    d.watchdogs["wake-bbbbbbbbbbbb"] = {
+        "sender": "claude",
+        "deadline": time.time() + 600.0,
+        "watchdog_phase": bridge_daemon.WATCHDOG_PHASE_RESPONSE,
+        "ref_message_id": "msg-existing",
+        "is_alarm": False,
+    }
+    before = dict(d.watchdogs)
+    non_alarm_conflict = _daemon_command_result(d, {"op": "alarm", "from": "claude", "delay_seconds": 600.0, "wake_id": "wake-bbbbbbbbbbbb"})
+    assert_true(non_alarm_conflict.get("ok") is False and "conflict" in str(non_alarm_conflict.get("error") or ""), f"{label}: non-alarm id conflict must reject: {non_alarm_conflict}")
+    assert_true(d.watchdogs == before, f"{label}: non-alarm conflict must not mutate state")
+
+    good = _daemon_command_result(d, {"op": "alarm", "from": "codex", "delay_seconds": 600.0, "body": "owned", "wake_id": "wake-cccccccccccc"})
+    assert_true(good.get("ok") is True, f"{label}: owner alarm should register: {good}")
+    before = dict(d.watchdogs)
+    sender_conflict = _daemon_command_result(d, {"op": "alarm", "from": "claude", "delay_seconds": 600.0, "body": "owned", "wake_id": "wake-cccccccccccc"})
+    assert_true(sender_conflict.get("ok") is False and "conflict" in str(sender_conflict.get("error") or ""), f"{label}: different sender id conflict must reject: {sender_conflict}")
+    assert_true(d.watchdogs == before, f"{label}: sender conflict must not mutate state")
+
+    metadata_conflict = _daemon_command_result(d, {"op": "alarm", "from": "codex", "delay_seconds": 601.0, "body": "owned", "wake_id": "wake-cccccccccccc"})
+    assert_true(metadata_conflict.get("ok") is False and "conflict" in str(metadata_conflict.get("error") or ""), f"{label}: changed delay conflict must reject: {metadata_conflict}")
+    assert_true(d.watchdogs == before, f"{label}: metadata conflict must not mutate state")
+    conflict_events = [e for e in read_events(tmpdir / "events.raw.jsonl") if e.get("event") == "alarm_register_conflict"]
+    reasons = {str(e.get("reason") or "") for e in conflict_events}
+    assert_true({"existing_non_alarm", "sender_mismatch", "metadata_mismatch"}.issubset(reasons), f"{label}: conflicts should be logged with reasons: {conflict_events}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_socket_alarm_op_idempotent_after_cancelled_or_fired(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+
+    cancel_payload = {"op": "alarm", "from": "claude", "delay_seconds": 600.0, "body": "cancel me", "wake_id": "wake-dddddddddddd"}
+    first = _daemon_command_result(d, dict(cancel_payload))
+    assert_true(first.get("ok") is True, f"{label}: alarm should register before cancel: {first}")
+    d.enqueue_ipc_message(_qualifying_message("codex", "claude", kind="notice", body="done"))
+    assert_true("wake-dddddddddddd" not in d.watchdogs, f"{label}: incoming notice should cancel alarm")
+    cancel_replay = _daemon_command_result(d, dict(cancel_payload))
+    assert_true(cancel_replay.get("ok") is True and cancel_replay.get("alarm_status") == "registered_then_cancelled", f"{label}: retry after cancel should not rearm: {cancel_replay}")
+    assert_true("wake-dddddddddddd" not in d.watchdogs, f"{label}: cancelled replay must not rearm")
+
+    fired_payload = {"op": "alarm", "from": "claude", "delay_seconds": 0.0, "body": "fire me", "wake_id": "wake-eeeeeeeeeeee"}
+    fired_first = _daemon_command_result(d, dict(fired_payload))
+    assert_true(fired_first.get("ok") is True, f"{label}: alarm should register before fire: {fired_first}")
+    d.fire_watchdog("wake-eeeeeeeeeeee", dict(d.watchdogs["wake-eeeeeeeeeeee"]))
+    assert_true("wake-eeeeeeeeeeee" not in d.watchdogs, f"{label}: fired alarm should be removed")
+    fired_replay = _daemon_command_result(d, dict(fired_payload))
+    assert_true(fired_replay.get("ok") is True and fired_replay.get("alarm_status") == "fired", f"{label}: retry after fire should not rearm: {fired_replay}")
+    assert_true("wake-eeeeeeeeeeee" not in d.watchdogs, f"{label}: fired replay must not rearm")
+
+    expired_payload = {"op": "alarm", "from": "claude", "delay_seconds": 600.0, "body": "expired tombstone", "wake_id": "wake-ffffffffffff"}
+    first_expired = _daemon_command_result(d, dict(expired_payload))
+    assert_true(first_expired.get("ok") is True, f"{label}: alarm should register before expired tombstone setup: {first_expired}")
+    removed = d.watchdogs.pop("wake-ffffffffffff")
+    d._record_alarm_wake_tombstone("wake-ffffffffffff", removed, "registered_then_cancelled")
+    d.alarm_wake_tombstones["wake-ffffffffffff"]["expires_at"] = time.time() - 1.0
+    expired_replay = _daemon_command_result(d, dict(expired_payload))
+    assert_true(expired_replay.get("ok") is True and expired_replay.get("alarm_status") == "registered", f"{label}: expired tombstone should allow fresh registration: {expired_replay}")
+    assert_true("wake-ffffffffffff" in d.watchdogs, f"{label}: expired tombstone replay should re-register")
     print(f"  PASS  {label}")
 
 
@@ -12423,6 +12648,12 @@ def scenario_daemon_register_alarm_rejects_non_finite_and_negative(label: str, t
         wake_id = d.register_alarm("claude", value, None)  # type: ignore[arg-type]
         assert_true(wake_id is None, f"{label}: register_alarm must reject {value!r}, got {wake_id!r}")
     assert_true(not d.watchdogs, f"{label}: rejected alarms must not mutate watchdogs")
+    generated = d.register_alarm("claude", 5.0, "legacy")
+    supplied = d.register_alarm("claude", 5.0, "supplied", wake_id="wake-121212121212")
+    conflict = d.register_alarm("codex", 5.0, "supplied", wake_id="wake-121212121212")
+    assert_true(isinstance(generated, str) and generated.startswith("wake-"), f"{label}: legacy shim should return generated wake id string: {generated!r}")
+    assert_true(supplied == "wake-121212121212", f"{label}: legacy shim should return supplied wake id string: {supplied!r}")
+    assert_true(conflict is None, f"{label}: legacy shim should return None on supplied id conflict: {conflict!r}")
     print(f"  PASS  {label}")
 
 
@@ -14015,8 +14246,14 @@ def main() -> int:
             ("alarm_negative_nan_inf_minus_inf_rejected", scenario_alarm_negative_nan_inf_minus_inf_rejected),
             ("alarm_zero_and_finite_positive_call_request_alarm", scenario_alarm_zero_and_finite_positive_call_request_alarm),
             ("alarm_request_failure_prints_no_success_hint", scenario_alarm_request_failure_prints_no_success_hint),
+            ("alarm_request_retries_timeout_with_stable_wake_id", scenario_alarm_request_retries_timeout_with_stable_wake_id),
+            ("alarm_request_retry_exhaustion_is_bounded", scenario_alarm_request_retry_exhaustion_is_bounded),
+            ("alarm_request_rejects_mismatched_daemon_wake_id", scenario_alarm_request_rejects_mismatched_daemon_wake_id),
             ("resolve_default_watchdog_seconds_env_table", scenario_resolve_default_watchdog_seconds_env_table),
             ("daemon_socket_alarm_op_rejects_non_finite", scenario_daemon_socket_alarm_op_rejects_non_finite),
+            ("daemon_socket_alarm_op_idempotent_wake_id", scenario_daemon_socket_alarm_op_idempotent_wake_id),
+            ("daemon_socket_alarm_op_rejects_invalid_conflicting_wake_id", scenario_daemon_socket_alarm_op_rejects_invalid_conflicting_wake_id),
+            ("daemon_socket_alarm_op_idempotent_after_cancelled_or_fired", scenario_daemon_socket_alarm_op_idempotent_after_cancelled_or_fired),
             ("daemon_socket_extend_watchdog_op_rejects_non_finite", scenario_daemon_socket_extend_watchdog_op_rejects_non_finite),
             ("daemon_upsert_message_watchdog_rejects_non_finite", scenario_daemon_upsert_message_watchdog_rejects_non_finite),
             ("daemon_enqueue_rejects_no_auto_return_watchdog_atomically", scenario_daemon_enqueue_rejects_no_auto_return_watchdog_atomically),
