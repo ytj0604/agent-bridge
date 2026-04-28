@@ -31,6 +31,70 @@ from bridge_participants import active_participants, load_session, room_status
 from bridge_paths import run_root
 
 
+def interrupt_summary(target: str, response: dict) -> dict:
+    summary = {
+        "target": target,
+        "esc_sent": bool(response.get("esc_sent")),
+        "interrupt_ok": bool(response.get("interrupt_ok", response.get("esc_sent"))),
+        "interrupt_keys": response.get("interrupt_keys") or [],
+        "cc_sent": response.get("cc_sent"),
+        "held": bool(response.get("held")),
+        "cancelled_message_ids": response.get("cancelled_message_ids") or [],
+        "prior_active_message_id": response.get("prior_active_message_id"),
+    }
+    if response.get("esc_error"):
+        summary["esc_error"] = response["esc_error"]
+    if response.get("cc_error"):
+        summary["cc_error"] = response["cc_error"]
+    return summary
+
+
+def interrupt_text(summary: dict) -> tuple[str, str, str]:
+    target = str(summary.get("target") or "<peer>")
+    cancelled = list(summary.get("cancelled_message_ids") or [])
+    cancelled_count = len(cancelled)
+    if not bool(summary.get("interrupt_ok")):
+        error = str(summary.get("cc_error") or summary.get("esc_error") or "interrupt key sequence failed")
+        code = "interrupt_partial_failure" if summary.get("esc_sent") else "interrupt_failed"
+        body = (
+            f"agent_interrupt_peer: interrupt key sequence for {target} failed "
+            f"({code}); cancelled={cancelled_count}. Error: {error}"
+        )
+        hint = (
+            f"Queued delivery to {target} may be blocked to avoid dirty input; inspect with "
+            f"agent_interrupt_peer {target} --status and use --clear-hold only when idle."
+        )
+        return "", body, hint
+    body = f"agent_interrupt_peer: interrupt sent to {target} (interrupted); cancelled={cancelled_count}."
+    if summary.get("prior_active_message_id"):
+        body += f" prior_active_message_id={summary.get('prior_active_message_id')}."
+    if cancelled_count:
+        hint = "Pending queued messages were not removed; use agent_cancel_message <msg_id> for queued-message retraction."
+    else:
+        hint = "No active message id was cancelled; if this was a no-op, queued follow-ups still flow. Pending queued messages were not removed."
+    return body, "", hint
+
+
+def clear_hold_summary(target: str, response: dict) -> dict:
+    return {
+        "target": target,
+        "had_hold": bool(response.get("had_hold")),
+        "info": response.get("info") or {},
+        "warning": response.get("warning"),
+    }
+
+
+def clear_hold_text(summary: dict) -> tuple[str, str]:
+    target = str(summary.get("target") or "<peer>")
+    if summary.get("had_hold"):
+        body = f"agent_interrupt_peer: cleared hold state for {target} (hold_cleared)."
+    else:
+        body = f"agent_interrupt_peer: no hold state was present for {target} (no_hold)."
+    warning = str(summary.get("warning") or "").strip()
+    hint = warning or "Use --status first; --clear-hold is only safe when held/partial-failure and idle fields are confirmed."
+    return body, hint
+
+
 def send_command(bridge_session: str, payload: dict) -> tuple[bool, dict, str]:
     socket_path = run_root() / f"{bridge_session}.sock"
     if not socket_path.exists():
@@ -78,7 +142,12 @@ def main() -> int:
     parser.add_argument("--session", dest="session")
     parser.add_argument("--from", dest="sender")
     parser.add_argument("--allow-spoof", action="store_true")
+    parser.add_argument("--json", action="store_true", help="print compatibility JSON for action modes; --status is already JSON")
     args = parser.parse_args()
+
+    if args.status and args.json:
+        print("agent_interrupt_peer: --json is redundant with --status; --status always returns JSON.", file=sys.stderr)
+        return 2
 
     session = args.session or os.environ.get("AGENT_BRIDGE_SESSION") or ""
     sender = args.sender or os.environ.get("AGENT_BRIDGE_AGENT") or ""
@@ -157,13 +226,14 @@ def main() -> int:
         if not ok:
             print(f"agent_interrupt_peer: {error}", file=sys.stderr)
             return 1
-        summary = {
-            "target": args.target,
-            "had_hold": bool(response.get("had_hold")),
-            "info": response.get("info") or {},
-            "warning": response.get("warning"),
-        }
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        summary = clear_hold_summary(args.target, response)
+        if args.json:
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
+        else:
+            body, hint = clear_hold_text(summary)
+            print(body)
+            if hint:
+                print(f"Hint: {hint}", file=sys.stderr)
         return 0
 
     # default: ESC + interrupt
@@ -171,21 +241,17 @@ def main() -> int:
     if not ok:
         print(f"agent_interrupt_peer: {error}", file=sys.stderr)
         return 1
-    summary = {
-        "target": args.target,
-        "esc_sent": bool(response.get("esc_sent")),
-        "interrupt_ok": bool(response.get("interrupt_ok", response.get("esc_sent"))),
-        "interrupt_keys": response.get("interrupt_keys") or [],
-        "cc_sent": response.get("cc_sent"),
-        "held": bool(response.get("held")),
-        "cancelled_message_ids": response.get("cancelled_message_ids") or [],
-        "prior_active_message_id": response.get("prior_active_message_id"),
-    }
-    if response.get("esc_error"):
-        summary["esc_error"] = response["esc_error"]
-    if response.get("cc_error"):
-        summary["cc_error"] = response["cc_error"]
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    summary = interrupt_summary(args.target, response)
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    else:
+        stdout_body, stderr_body, hint = interrupt_text(summary)
+        if stdout_body:
+            print(stdout_body)
+        if stderr_body:
+            print(stderr_body, file=sys.stderr)
+        if hint:
+            print(f"Hint: {hint}", file=sys.stderr)
     return 0 if summary["interrupt_ok"] else 1
 
 

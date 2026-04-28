@@ -867,17 +867,26 @@ def scenario_interrupt_double_with_fresh_delivery_sends_cc_again(label: str, tmp
     print(f"  PASS  {label}")
 
 
-def scenario_interrupt_peer_cli_exit_nonzero_on_partial_key_failure(label: str, tmpdir: Path) -> None:
+def _run_interrupt_peer_cli(
+    argv: list[str],
+    response: dict,
+    *,
+    ok: bool = True,
+    error: str = "",
+    state: dict | None = None,
+) -> tuple[int, str, str, list[dict]]:
     import contextlib
     import io
 
-    state = {
-        "session": "test-session",
-        "participants": {
-            "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91"},
-            "bob": {"alias": "bob", "agent_type": "claude", "pane": "%92"},
-        },
-    }
+    if state is None:
+        state = {
+            "session": "test-session",
+            "participants": {
+                "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91"},
+                "bob": {"alias": "bob", "agent_type": "claude", "pane": "%92"},
+            },
+        }
+    calls: list[dict] = []
     old_argv = sys.argv[:]
     old_resolve = bridge_interrupt_peer.resolve_caller_from_pane
     old_ensure = bridge_interrupt_peer.ensure_daemon_running
@@ -887,21 +896,17 @@ def scenario_interrupt_peer_cli_exit_nonzero_on_partial_key_failure(label: str, 
     out = io.StringIO()
     err = io.StringIO()
     try:
-        sys.argv = ["agent_interrupt_peer", "bob", "--session", "test-session", "--from", "alice", "--allow-spoof"]
+        sys.argv = ["agent_interrupt_peer", *argv]
         bridge_interrupt_peer.resolve_caller_from_pane = lambda **_kwargs: argparse.Namespace(ok=True, session="test-session", alias="alice", error="")  # type: ignore[assignment]
         bridge_interrupt_peer.ensure_daemon_running = lambda _session: ""  # type: ignore[assignment]
         bridge_interrupt_peer.room_status = lambda _session: argparse.Namespace(active_enough_for_enqueue=True, reason="ok")  # type: ignore[assignment]
         bridge_interrupt_peer.load_session = lambda _session: state  # type: ignore[assignment]
-        bridge_interrupt_peer.send_command = lambda _session, _payload: (True, {  # type: ignore[assignment]
-            "ok": True,
-            "esc_sent": True,
-            "interrupt_ok": False,
-            "interrupt_keys": ["Escape", "C-c"],
-            "cc_sent": False,
-            "cc_error": "C-c failed",
-            "held": False,
-            "cancelled_message_ids": ["msg-old"],
-        }, "")
+
+        def fake_send_command(_session: str, payload: dict):
+            calls.append(dict(payload))
+            return ok, dict(response), error
+
+        bridge_interrupt_peer.send_command = fake_send_command  # type: ignore[assignment]
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = bridge_interrupt_peer.main()
     finally:
@@ -911,12 +916,138 @@ def scenario_interrupt_peer_cli_exit_nonzero_on_partial_key_failure(label: str, 
         bridge_interrupt_peer.room_status = old_room_status  # type: ignore[assignment]
         bridge_interrupt_peer.load_session = old_load_session  # type: ignore[assignment]
         bridge_interrupt_peer.send_command = old_send_command  # type: ignore[assignment]
+    return code, out.getvalue(), err.getvalue(), calls
 
-    summary = json.loads(out.getvalue())
-    assert_true(code == 1, f"{label}: CLI should exit non-zero on partial interrupt failure, got {code}, stderr={err.getvalue()!r}")
-    assert_true(summary.get("interrupt_ok") is False, f"{label}: summary should expose interrupt_ok=false: {summary}")
-    assert_true(summary.get("cc_sent") is False, f"{label}: summary should expose cc_sent=false: {summary}")
-    assert_true(summary.get("cc_error") == "C-c failed", f"{label}: summary should expose cc_error: {summary}")
+
+def scenario_interrupt_peer_cli_exit_nonzero_on_partial_key_failure(label: str, tmpdir: Path) -> None:
+    response = {
+        "ok": True,
+        "esc_sent": True,
+        "interrupt_ok": False,
+        "interrupt_keys": ["Escape", "C-c"],
+        "cc_sent": False,
+        "cc_error": "C-c failed",
+        "held": False,
+        "cancelled_message_ids": ["msg-old"],
+    }
+    code, out, err, calls = _run_interrupt_peer_cli(
+        ["bob", "--session", "test-session", "--from", "alice", "--allow-spoof", "--json"],
+        response,
+    )
+    summary = json.loads(out)
+    expected = {
+        "target": "bob",
+        "esc_sent": True,
+        "interrupt_ok": False,
+        "interrupt_keys": ["Escape", "C-c"],
+        "cc_sent": False,
+        "held": False,
+        "cancelled_message_ids": ["msg-old"],
+        "prior_active_message_id": None,
+        "cc_error": "C-c failed",
+    }
+    assert_true(code == 1, f"{label}: --json CLI should exit non-zero on partial interrupt failure, got {code}, stderr={err!r}")
+    assert_true(summary == expected, f"{label}: --json summary should preserve compatibility shape: {summary}")
+    assert_true(calls == [{"op": "interrupt", "from": "alice", "target": "bob"}], f"{label}: interrupt payload mismatch: {calls}")
+
+    code, out, err, calls = _run_interrupt_peer_cli(
+        ["bob", "--session", "test-session", "--from", "alice", "--allow-spoof"],
+        response,
+    )
+    assert_true(code == 1, f"{label}: default text CLI should exit non-zero on partial interrupt failure, got {code}")
+    assert_true(out == "", f"{label}: default failure must not leak JSON/stdout: {out!r}")
+    for token in ("agent_interrupt_peer:", "(interrupt_partial_failure)", "cancelled=1", "C-c failed", "Hint:", "--status", "--clear-hold"):
+        assert_true(token in err, f"{label}: default failure stderr missing {token!r}: {err!r}")
+    assert_true("{" not in out and "{" not in err, f"{label}: default failure should not print JSON: out={out!r} err={err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_peer_action_text_and_json_modes(label: str, tmpdir: Path) -> None:
+    success_response = {
+        "ok": True,
+        "esc_sent": True,
+        "interrupt_ok": True,
+        "interrupt_keys": ["Escape"],
+        "cc_sent": None,
+        "held": False,
+        "cancelled_message_ids": ["msg-active"],
+        "prior_active_message_id": "msg-active",
+    }
+    code, out, err, calls = _run_interrupt_peer_cli(
+        ["bob", "--session", "test-session", "--from", "alice", "--allow-spoof"],
+        success_response,
+    )
+    assert_true(code == 0 and calls, f"{label}: default interrupt should succeed: code={code} err={err!r}")
+    for token in ("agent_interrupt_peer:", "(interrupted)", "bob", "cancelled=1", "prior_active_message_id=msg-active"):
+        assert_true(token in out, f"{label}: default success stdout missing {token!r}: {out!r}")
+    assert_true("Hint:" in err and "agent_cancel_message <msg_id>" in err, f"{label}: default success hint missing: {err!r}")
+    assert_true("{" not in out, f"{label}: default success stdout must be text, not JSON: {out!r}")
+
+    code, out, err, _calls = _run_interrupt_peer_cli(
+        ["bob", "--session", "test-session", "--from", "alice", "--allow-spoof"],
+        {**success_response, "cancelled_message_ids": [], "prior_active_message_id": None},
+    )
+    assert_true(code == 0 and "cancelled=0" in out and "no-op" in err, f"{label}: no-op text should be clear: out={out!r} err={err!r}")
+
+    code, out, err, _calls = _run_interrupt_peer_cli(
+        ["bob", "--session", "test-session", "--from", "alice", "--allow-spoof", "--json"],
+        success_response,
+    )
+    expected = {
+        "target": "bob",
+        "esc_sent": True,
+        "interrupt_ok": True,
+        "interrupt_keys": ["Escape"],
+        "cc_sent": None,
+        "held": False,
+        "cancelled_message_ids": ["msg-active"],
+        "prior_active_message_id": "msg-active",
+    }
+    assert_true(code == 0 and err == "" and json.loads(out) == expected, f"{label}: --json interrupt should preserve summary: code={code} out={out!r} err={err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_peer_clear_hold_text_and_json_modes(label: str, tmpdir: Path) -> None:
+    warning = "clear carefully"
+    response = {"ok": True, "had_hold": True, "info": {"reason": "held_interrupt"}, "warning": warning}
+    code, out, err, calls = _run_interrupt_peer_cli(
+        ["bob", "--clear-hold", "--session", "test-session", "--from", "alice", "--allow-spoof"],
+        response,
+    )
+    assert_true(code == 0 and calls == [{"op": "clear_hold", "from": "alice", "target": "bob"}], f"{label}: clear-hold should call daemon: {calls}")
+    assert_true("(hold_cleared)" in out and "bob" in out and "{" not in out, f"{label}: clear-hold stdout should be text: {out!r}")
+    assert_true("Hint:" in err and warning in err, f"{label}: clear-hold warning should be visible on stderr: {err!r}")
+
+    code, out, err, _calls = _run_interrupt_peer_cli(
+        ["bob", "--clear-hold", "--session", "test-session", "--from", "alice", "--allow-spoof"],
+        {**response, "had_hold": False, "info": {}},
+    )
+    assert_true(code == 0 and "(no_hold)" in out and "Hint:" in err, f"{label}: no-hold text should be explicit: out={out!r} err={err!r}")
+
+    code, out, err, _calls = _run_interrupt_peer_cli(
+        ["bob", "--clear-hold", "--session", "test-session", "--from", "alice", "--allow-spoof", "--json"],
+        response,
+    )
+    expected = {"target": "bob", "had_hold": True, "info": {"reason": "held_interrupt"}, "warning": warning}
+    assert_true(code == 0 and err == "" and json.loads(out) == expected, f"{label}: --json clear-hold should preserve summary: code={code} out={out!r} err={err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_peer_status_json_unchanged_and_json_rejected(label: str, tmpdir: Path) -> None:
+    peers = [{"target": "bob", "busy": False, "held": False}]
+    code, out, err, calls = _run_interrupt_peer_cli(
+        ["--status", "--session", "test-session", "--from", "alice", "--allow-spoof"],
+        {"ok": True, "peers": peers},
+    )
+    assert_true(code == 0 and err == "" and json.loads(out) == {"peers": peers}, f"{label}: --status JSON should stay unchanged: code={code} out={out!r} err={err!r}")
+    assert_true(calls == [{"op": "status", "from": "alice", "target": ""}], f"{label}: status payload mismatch: {calls}")
+
+    code, out, err, calls = _run_interrupt_peer_cli(
+        ["--status", "--json", "--session", "test-session", "--from", "alice", "--allow-spoof"],
+        {"ok": True, "peers": peers},
+    )
+    assert_true(code == 2 and out == "" and not calls, f"{label}: --status --json should reject before daemon call: code={code} out={out!r} calls={calls}")
+    assert_true("--json is redundant with --status" in err, f"{label}: --status --json diagnostic should be clear: {err!r}")
     print(f"  PASS  {label}")
 
 
@@ -1705,6 +1836,58 @@ def _add_watchdog_request(d, message_id: str, *, frm: str = "claude", to: str = 
     d.enqueue_ipc_message(msg)
 
 
+def _run_cancel_message_cli(
+    argv: list[str],
+    response: dict,
+    *,
+    ok: bool = True,
+    error: str = "",
+    state: dict | None = None,
+) -> tuple[int, str, str, list[dict]]:
+    import contextlib
+    import io
+
+    if state is None:
+        state = {
+            "session": "test-session",
+            "participants": {
+                "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91"},
+                "bob": {"alias": "bob", "agent_type": "claude", "pane": "%92"},
+            },
+        }
+    calls: list[dict] = []
+    old_argv = sys.argv[:]
+    old_resolve = bridge_cancel_message.resolve_caller_from_pane
+    old_ensure = bridge_cancel_message.ensure_daemon_running
+    old_room_status = bridge_cancel_message.room_status
+    old_load_session = bridge_cancel_message.load_session
+    old_send_command = bridge_cancel_message.send_command
+    out = io.StringIO()
+    err = io.StringIO()
+    try:
+        sys.argv = ["agent_cancel_message", *argv]
+        bridge_cancel_message.resolve_caller_from_pane = lambda **_kwargs: argparse.Namespace(ok=True, session="test-session", alias="alice", error="")  # type: ignore[assignment]
+        bridge_cancel_message.ensure_daemon_running = lambda _session: ""  # type: ignore[assignment]
+        bridge_cancel_message.room_status = lambda _session: argparse.Namespace(active_enough_for_enqueue=True, reason="ok")  # type: ignore[assignment]
+        bridge_cancel_message.load_session = lambda _session: state  # type: ignore[assignment]
+
+        def fake_send_command(_session: str, payload: dict):
+            calls.append(dict(payload))
+            return ok, dict(response), error
+
+        bridge_cancel_message.send_command = fake_send_command  # type: ignore[assignment]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = bridge_cancel_message.main()
+    finally:
+        sys.argv = old_argv
+        bridge_cancel_message.resolve_caller_from_pane = old_resolve  # type: ignore[assignment]
+        bridge_cancel_message.ensure_daemon_running = old_ensure  # type: ignore[assignment]
+        bridge_cancel_message.room_status = old_room_status  # type: ignore[assignment]
+        bridge_cancel_message.load_session = old_load_session  # type: ignore[assignment]
+        bridge_cancel_message.send_command = old_send_command  # type: ignore[assignment]
+    return code, out.getvalue(), err.getvalue(), calls
+
+
 def scenario_cancel_message_pending_removes_row(label: str, tmpdir: Path) -> None:
     participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
     d = make_daemon(tmpdir, participants)
@@ -1783,7 +1966,7 @@ def scenario_cancel_message_inflight_after_enter_rejects_with_interrupt_guidance
     text = bridge_cancel_message.cancel_error_message("msg-cancel-active-inflight", str(result.get("error") or ""), result)
 
     assert_true(not result.get("ok") and result.get("error") == "message_active_use_interrupt", f"{label}: post-enter inflight cancel should be rejected: {result}")
-    assert_true("use agent_interrupt_peer codex" in text, f"{label}: CLI guidance should point to interrupt_peer: {text!r}")
+    assert_true("Use agent_interrupt_peer codex" in text, f"{label}: CLI guidance should point to interrupt_peer: {text!r}")
     assert_true((_queue_item(d, "msg-cancel-active-inflight") or {}).get("status") == "inflight", f"{label}: inflight row should remain")
     assert_true(wake_id in d.watchdogs and _watchdogs_for_message(d, "msg-cancel-active-inflight", "delivery"), f"{label}: delivery watchdog should remain: {d.watchdogs}")
     print(f"  PASS  {label}")
@@ -1801,7 +1984,7 @@ def scenario_cancel_message_submitted_rejects_with_interrupt_guidance(label: str
     text = bridge_cancel_message.cancel_error_message("msg-cancel-submitted", str(result.get("error") or ""), result)
 
     assert_true(not result.get("ok") and result.get("error") == "message_active_use_interrupt", f"{label}: submitted cancel should be rejected: {result}")
-    assert_true("use agent_interrupt_peer codex" in text, f"{label}: CLI guidance should point to interrupt_peer: {text!r}")
+    assert_true("Use agent_interrupt_peer codex" in text, f"{label}: CLI guidance should point to interrupt_peer: {text!r}")
     assert_true((_queue_item(d, "msg-cancel-submitted") or {}).get("status") == "submitted", f"{label}: submitted row should remain")
     assert_true(wake_id in d.watchdogs and _watchdogs_for_message(d, "msg-cancel-submitted", "delivery"), f"{label}: watchdog should remain: {d.watchdogs}")
     print(f"  PASS  {label}")
@@ -1819,7 +2002,7 @@ def scenario_cancel_message_delivered_rejects_with_interrupt_guidance(label: str
     text = bridge_cancel_message.cancel_error_message("msg-cancel-delivered", str(result.get("error") or ""), result)
 
     assert_true(not result.get("ok") and result.get("error") == "message_active_use_interrupt", f"{label}: delivered cancel should be rejected: {result}")
-    assert_true("use agent_interrupt_peer codex" in text, f"{label}: CLI guidance should point to interrupt_peer: {text!r}")
+    assert_true("Use agent_interrupt_peer codex" in text, f"{label}: CLI guidance should point to interrupt_peer: {text!r}")
     assert_true((_queue_item(d, "msg-cancel-delivered") or {}).get("status") == "delivered", f"{label}: delivered row should remain")
     assert_true(wake_id in d.watchdogs and _watchdogs_for_message(d, "msg-cancel-delivered", "response"), f"{label}: response watchdog should remain: {d.watchdogs}")
     print(f"  PASS  {label}")
@@ -1837,7 +2020,7 @@ def scenario_cancel_message_ownership_violation(label: str, tmpdir: Path) -> Non
     text = bridge_cancel_message.cancel_error_message("msg-cancel-owner", str(result.get("error") or ""), result)
 
     assert_true(not result.get("ok") and result.get("error") == "not_owner", f"{label}: non-owner cancel should be rejected: {result}")
-    assert_true("only the original sender can cancel" in text, f"{label}: CLI text should explain ownership: {text!r}")
+    assert_true("Only the original sender can cancel" in text, f"{label}: CLI text should explain ownership: {text!r}")
     assert_true((_queue_item(d, "msg-cancel-owner") or {}).get("status") == "pending", f"{label}: pending row should remain")
     assert_true(wake_id in d.watchdogs and _watchdogs_for_message(d, "msg-cancel-owner", "delivery"), f"{label}: delivery watchdog should remain: {d.watchdogs}")
     print(f"  PASS  {label}")
@@ -1918,6 +2101,108 @@ def scenario_cancel_message_aggregate_per_leg_keeps_other_legs(label: str, tmpdi
     assert_true(aggregate.get("status") == "complete" and {"w1", "w2"}.issubset(replies), f"{label}: aggregate should complete with cancelled + real replies: {aggregate}")
     result = next((item for item in d.queue.read() if item.get("source") == "aggregate_return" and item.get("aggregate_id") == agg_id), None)
     assert_true(result is not None and "cancelled by manager" in str(result.get("body") or "") and "real reply" in str(result.get("body") or ""), f"{label}: aggregate result should include both leg outcomes: {result}")
+    print(f"  PASS  {label}")
+
+
+def scenario_cancel_message_action_text_and_json_modes(label: str, tmpdir: Path) -> None:
+    cancelled_response = {
+        "ok": True,
+        "message_id": "msg-cancel-cli",
+        "cancelled": True,
+        "already_terminal": False,
+        "target": "bob",
+        "status_before": "pending",
+        "aggregate_id": "agg-cancel-cli",
+    }
+    code, out, err, calls = _run_cancel_message_cli(
+        ["msg-cancel-cli", "--session", "test-session", "--from", "alice", "--allow-spoof"],
+        cancelled_response,
+    )
+    assert_true(code == 0 and calls == [{"op": "cancel_message", "from": "alice", "message_id": "msg-cancel-cli"}], f"{label}: cancel should call daemon: {calls}")
+    for token in ("agent_cancel_message:", "(cancelled)", "target=bob", "status_before=pending"):
+        assert_true(token in out, f"{label}: cancel text stdout missing {token!r}: {out!r}")
+    assert_true("Hint:" in err and "No further action" in err, f"{label}: cancel success hint missing: {err!r}")
+    assert_true("{" not in out, f"{label}: default cancel stdout must be text, not JSON: {out!r}")
+
+    terminal_response = {
+        "ok": True,
+        "message_id": "msg-cancel-terminal",
+        "cancelled": False,
+        "already_terminal": True,
+        "target": "bob",
+        "terminal_reason": "terminal_response",
+    }
+    code, out, err, _calls = _run_cancel_message_cli(
+        ["msg-cancel-terminal", "--session", "test-session", "--from", "alice", "--allow-spoof"],
+        terminal_response,
+    )
+    assert_true(code == 0 and "(terminal_response)" in out and "do not retry" in err, f"{label}: terminal idempotent text wrong: out={out!r} err={err!r}")
+
+    code, out, err, _calls = _run_cancel_message_cli(
+        ["msg-cancel-cli", "--session", "test-session", "--from", "alice", "--allow-spoof", "--json"],
+        cancelled_response,
+    )
+    expected_cancelled = {
+        "message_id": "msg-cancel-cli",
+        "cancelled": True,
+        "already_terminal": False,
+        "target": "bob",
+        "status_before": "pending",
+        "aggregate_id": "agg-cancel-cli",
+    }
+    assert_true(code == 0 and err == "" and json.loads(out) == expected_cancelled, f"{label}: --json cancel summary mismatch: code={code} out={out!r} err={err!r}")
+
+    code, out, err, _calls = _run_cancel_message_cli(
+        ["msg-cancel-terminal", "--session", "test-session", "--from", "alice", "--allow-spoof", "--json"],
+        terminal_response,
+    )
+    expected_terminal = {
+        "message_id": "msg-cancel-terminal",
+        "cancelled": False,
+        "already_terminal": True,
+        "target": "bob",
+        "status_before": None,
+        "aggregate_id": None,
+        "terminal_reason": "terminal_response",
+    }
+    assert_true(code == 0 and err == "" and json.loads(out) == expected_terminal, f"{label}: --json terminal summary mismatch: code={code} out={out!r} err={err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_cancel_message_action_error_text_modes(label: str, tmpdir: Path) -> None:
+    cases = [
+        (
+            "message_active_use_interrupt",
+            {"error": "message_active_use_interrupt", "message_id": "msg-active", "target": "bob", "status": "delivered"},
+            ("(message_active_use_interrupt)", "agent_interrupt_peer bob", "Hint:"),
+        ),
+        (
+            "not_owner",
+            {"error": "not_owner", "message_id": "msg-owner", "owner": "carol"},
+            ("(not_owner)", "Only the original sender", "Hint:"),
+        ),
+        (
+            "message_not_found",
+            {"error": "message_not_found", "message_id": "msg-missing"},
+            ("(message_not_found)", "may already have responded", "Hint:"),
+        ),
+        (
+            "unsupported command",
+            {"error": "unsupported command"},
+            ("(unsupported_command)", "Reload/restart", "Hint:"),
+        ),
+    ]
+    for error, response, tokens in cases:
+        code, out, err, _calls = _run_cancel_message_cli(
+            ["msg-error", "--session", "test-session", "--from", "alice", "--allow-spoof"],
+            response,
+            ok=False,
+            error=error,
+        )
+        assert_true(code == 1 and out == "", f"{label}: {error} should exit 1 with no stdout: code={code} out={out!r} err={err!r}")
+        for token in tokens:
+            assert_true(token in err, f"{label}: {error} stderr missing {token!r}: {err!r}")
+        assert_true("{" not in err, f"{label}: {error} stderr should be text, not JSON: {err!r}")
     print(f"  PASS  {label}")
 
 
@@ -7956,14 +8241,19 @@ def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir:
     assert_true("force-cancel" not in interrupt_lines[0], f"{label}: default interrupt line must not imply force-cancel: {interrupt_lines[0]!r}")
     for token in boundary_tokens:
         assert_true(token.lower() in interrupt_lines[0].lower(), f"{label}: interrupt cheat line missing boundary token {token!r}: {interrupt_lines[0]!r}")
+    assert_true("Use --json" in interrupt_lines[0], f"{label}: interrupt cheat line should document JSON opt-in: {interrupt_lines[0]!r}")
     cancel_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_cancel_message <message_id> :")]
     assert_true(len(cancel_lines) == 1, f"{label}: expected one cancel cheat-sheet line, got {cancel_lines!r}")
     for token in ("pending", "inflight pre-pane-touch/pre-paste", "pane-mode-deferred", "agent_interrupt_peer", "submitted", "delivered"):
         assert_true(token.lower() in cancel_lines[0].lower(), f"{label}: cancel cheat line missing symmetric token {token!r}: {cancel_lines[0]!r}")
+    assert_true("Use --json" in cancel_lines[0], f"{label}: cancel cheat line should document JSON opt-in: {cancel_lines[0]!r}")
     clear_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_interrupt_peer <alias> --clear-hold :")]
     assert_true(len(clear_lines) == 1, f"{label}: expected one clear-hold cheat-sheet line, got {clear_lines!r}")
     for token in clear_hold_tokens:
         assert_true(token.lower() in clear_lines[0].lower(), f"{label}: clear-hold cheat line missing token {token!r}: {clear_lines[0]!r}")
+    assert_true("Use --json" in clear_lines[0], f"{label}: clear-hold cheat line should document JSON opt-in: {clear_lines[0]!r}")
+    status_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_interrupt_peer [<alias>] --status :")]
+    assert_true(len(status_lines) == 1 and "JSON" in status_lines[0], f"{label}: status cheat line should keep JSON inspection wording: {status_lines!r}")
     assert_true("use when you sent the wrong prompt" not in interrupt_lines[0].lower(), f"{label}: interrupt line must not suggest unqualified wrong-prompt retraction: {interrupt_lines[0]!r}")
 
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
@@ -7975,6 +8265,8 @@ def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir:
         assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing boundary token {token!r}")
     for token in clear_hold_tokens:
         assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing clear-hold token {token!r}")
+    for token in ("Use --json", "show JSON busy/held/queue"):
+        assert_true(token in probe, f"{label}: probe prompt missing action JSON token {token!r}")
     assert_true("use for a wrong prompt" not in probe.lower(), f"{label}: probe must not suggest unqualified wrong-prompt interrupt")
 
     help_result = subprocess.run(
@@ -7997,6 +8289,7 @@ def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir:
         assert_true(token.lower() in normalized_help_tokens.lower(), f"{label}: --help missing boundary token {token!r}: {help_text!r}")
     for token in clear_hold_tokens:
         assert_true(token.lower() in normalized_help_tokens.lower(), f"{label}: --help missing clear-hold token {token!r}: {help_text!r}")
+    assert_true("--json" in normalized_help, f"{label}: --help should document action JSON opt-in: {help_text!r}")
     print(f"  PASS  {label}")
 
 
@@ -13058,6 +13351,9 @@ def main() -> int:
             ("interrupt_double_within_no_active_skips_cc", scenario_interrupt_double_within_no_active_skips_cc),
             ("interrupt_double_with_fresh_delivery_sends_cc_again", scenario_interrupt_double_with_fresh_delivery_sends_cc_again),
             ("interrupt_peer_cli_exit_nonzero_on_partial_key_failure", scenario_interrupt_peer_cli_exit_nonzero_on_partial_key_failure),
+            ("interrupt_peer_action_text_and_json_modes", scenario_interrupt_peer_action_text_and_json_modes),
+            ("interrupt_peer_clear_hold_text_and_json_modes", scenario_interrupt_peer_clear_hold_text_and_json_modes),
+            ("interrupt_peer_status_json_unchanged_and_json_rejected", scenario_interrupt_peer_status_json_unchanged_and_json_rejected),
             ("interrupted_late_prompt_submitted_before_replacement", scenario_interrupted_late_prompt_submitted_before_replacement),
             ("interrupted_late_prompt_submitted_after_replacement", scenario_interrupted_late_prompt_submitted_after_replacement),
             ("interrupted_late_turn_stop_preserves_replacement", scenario_interrupted_late_turn_stop_preserves_replacement),
@@ -13107,6 +13403,8 @@ def main() -> int:
             ("cancel_message_ownership_violation", scenario_cancel_message_ownership_violation),
             ("cancel_message_idempotent_after_terminal", scenario_cancel_message_idempotent_after_terminal),
             ("cancel_message_aggregate_per_leg_keeps_other_legs", scenario_cancel_message_aggregate_per_leg_keeps_other_legs),
+            ("cancel_message_action_text_and_json_modes", scenario_cancel_message_action_text_and_json_modes),
+            ("cancel_message_action_error_text_modes", scenario_cancel_message_action_error_text_modes),
             ("aggregate_status_open_from_queue_and_reply", scenario_aggregate_status_open_from_queue_and_reply),
             ("aggregate_status_zero_reply_from_queue", scenario_aggregate_status_zero_reply_from_queue),
             ("aggregate_status_cancelled_and_timeout_synthetic_reasons", scenario_aggregate_status_cancelled_and_timeout_synthetic_reasons),
