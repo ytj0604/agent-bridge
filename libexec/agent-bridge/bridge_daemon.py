@@ -29,8 +29,11 @@ from bridge_response_guard import (
 from bridge_util import (
     MAX_PEER_BODY_CHARS,
     append_jsonl,
+    classify_prior_for_hint,
     locked_json,
     normalize_kind,
+    prior_message_hint_candidates,
+    prior_message_hint_entry,
     public_record,
     read_json,
     run_tmux_capture,
@@ -664,10 +667,39 @@ class BridgeDaemon:
             }
         return None
 
+    def _classify_prior_for_hint(self, item: dict) -> str | None:
+        return classify_prior_for_hint(item, self.last_enter_ts)
+
+    def prior_message_hint_for_enqueue(self, message: dict, queue_snapshot: list[dict]) -> dict | None:
+        target = str(message.get("to") or "")
+        sender = str(message.get("from") or "")
+        message_id = str(message.get("id") or "")
+        candidates = prior_message_hint_candidates(message, queue_snapshot, self.last_enter_ts)
+        active_context = self.current_prompt_by_agent.get(target) or {}
+        active_message_id = str(active_context.get("id") or "")
+        if (
+            active_message_id
+            and active_message_id != message_id
+            and str(active_context.get("from") or "") == sender
+        ):
+            prior = {
+                "id": active_message_id,
+                "from": sender,
+                "to": target,
+                "status": "active",
+                "aggregate_id": active_context.get("aggregate_id") or "",
+            }
+            candidates.append((0, len(queue_snapshot), prior, "interrupt"))
+        if not candidates:
+            return None
+        _priority, _index, prior, prior_kind = min(candidates, key=lambda row: (row[0], row[1]))
+        return prior_message_hint_entry(message, prior, prior_kind)
+
     def handle_enqueue_command(self, messages: list, force_response_send: bool = False) -> dict:
         if not isinstance(messages, list):
             return {"ok": False, "error": "messages must be a list"}
         ids = []
+        hints = []
         self.reload_participants()
         with self.state_lock:
             validated: list[dict] = []
@@ -705,9 +737,15 @@ class BridgeDaemon:
                     return watchdog_error
                 validated.append(message)
             for message in validated:
-                self.enqueue_ipc_message(message)
-                ids.append(message["id"])
-        return {"ok": True, "ids": ids}
+                hint = self.prior_message_hint_for_enqueue(message, list(self.queue.read()))
+                if self.enqueue_ipc_message(message):
+                    ids.append(message["id"])
+                    if hint:
+                        hints.append(hint)
+        response = {"ok": True, "ids": ids}
+        if hints:
+            response["hints"] = hints
+        return response
 
     def handle_command_connection(self, conn: socket.socket) -> dict:
         peer_uid = self.peer_uid(conn)
@@ -923,7 +961,7 @@ class BridgeDaemon:
         except OSError:
             return None
 
-    def enqueue_ipc_message(self, message: dict) -> None:
+    def enqueue_ipc_message(self, message: dict) -> bool:
         # Daemon-socket ingress for an externally-originated message
         # (op=enqueue from bridge_enqueue.py). Append the message to the
         # queue, then run the unified alarm-cancel-on-incoming step
@@ -936,7 +974,7 @@ class BridgeDaemon:
         with self.state_lock:
             if any(it.get("id") == message["id"] for it in self.queue.read()):
                 self.log("message_enqueue_skipped_duplicate", message_id=message["id"], from_agent=message.get("from"), to=message.get("to"))
-                return
+                return False
             # Normalize incoming status. Official bridge_enqueue.py always
             # sends "ingressing", but defense-in-depth: if any external
             # client (including older or third-party CLIs) submits a
@@ -975,6 +1013,7 @@ class BridgeDaemon:
                 body=message.get("body"),
             )
             self._apply_alarm_cancel_to_queued_message(str(message["id"]))
+            return True
 
     # v1.5 alarm cancellation: cap the bridge-added notice so it can never
     # crowd out the original body even after multiple alarms.
@@ -2491,14 +2530,9 @@ class BridgeDaemon:
             return True, None, new_deadline_iso
 
     def _message_is_active_inflight_for_cancel(self, item: dict) -> bool:
-        message_id = str(item.get("id") or "")
         if str(item.get("status") or "") != "inflight":
             return False
-        if item.get("pane_mode_enter_deferred_since_ts"):
-            # Enter was intentionally held because the pane is in a tmux mode;
-            # this is still cancellable without touching the peer pane.
-            return False
-        return bool(message_id and self.last_enter_ts.get(message_id) is not None)
+        return self._classify_prior_for_hint(item) == "interrupt"
 
     def _remove_queue_message_by_id(self, message_id: str) -> dict | None:
         def mutator(queue: list[dict]) -> dict | None:
@@ -2559,7 +2593,8 @@ class BridgeDaemon:
 
             status = str(item.get("status") or "")
             target = str(item.get("to") or "")
-            if status in {"submitted", "delivered"}:
+            prior_kind = self._classify_prior_for_hint(item)
+            if prior_kind == "interrupt":
                 return {
                     "ok": False,
                     "error": "message_active_use_interrupt",
@@ -2567,15 +2602,7 @@ class BridgeDaemon:
                     "target": target,
                     "status": status,
                 }
-            if self._message_is_active_inflight_for_cancel(item):
-                return {
-                    "ok": False,
-                    "error": "message_active_use_interrupt",
-                    "message_id": message_id,
-                    "target": target,
-                    "status": "inflight",
-                }
-            if status not in {"pending", "inflight"}:
+            if prior_kind != "cancel":
                 return {
                     "ok": False,
                     "error": "message_not_cancellable_state",

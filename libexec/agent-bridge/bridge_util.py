@@ -28,6 +28,9 @@ SHARED_PAYLOAD_ROOT = "/tmp/agent-bridge-share"
 # suffixes because they have additional disambiguators (timestamp / agent
 # alias / filename namespace).
 SHORT_ID_LEN = 12
+PRIOR_MESSAGE_HINT_PREFIX = "PRIOR_MESSAGE_HINT: "
+PRIOR_HINT_CANCEL = "cancel"
+PRIOR_HINT_INTERRUPT = "interrupt"
 
 
 class TmuxCaptureError(RuntimeError):
@@ -63,6 +66,119 @@ def validate_peer_body_size(body: str, tool_name: str = "agent_send_peer") -> tu
 def read_limited_text(stream, limit: int = MAX_INLINE_SEND_BODY_CHARS) -> str:
     """Read enough text to validate size without consuming an unbounded stdin."""
     return stream.read(max(0, int(limit)) + 1)
+
+
+def classify_prior_for_hint(
+    item: dict,
+    last_enter_ts: dict[str, float] | None = None,
+    *,
+    inflight_without_enter: str | None = PRIOR_HINT_CANCEL,
+) -> str | None:
+    """Classify a same sender->target prior row for model-facing guidance."""
+    status = str(item.get("status") or "")
+    if status == "pending":
+        return PRIOR_HINT_CANCEL
+    if status in {"submitted", "delivered"}:
+        return PRIOR_HINT_INTERRUPT
+    if status == "inflight":
+        if item.get("pane_mode_enter_deferred_since_ts"):
+            return PRIOR_HINT_CANCEL
+        message_id = str(item.get("id") or "")
+        if message_id and last_enter_ts is not None and message_id in last_enter_ts:
+            return PRIOR_HINT_INTERRUPT
+        return inflight_without_enter
+    return None
+
+
+def _aggregate_prior_suffix(prior_aggregate_id: str) -> str:
+    if not prior_aggregate_id:
+        return ""
+    return (
+        f" This affects only this leg of aggregate {prior_aggregate_id}; "
+        "resend as a fresh aggregate if every peer needs the replacement."
+    )
+
+
+def prior_message_hint_entry(message: dict, prior: dict, prior_kind: str) -> dict:
+    target = str(message.get("to") or prior.get("to") or "")
+    prior_id = str(prior.get("id") or "")
+    prior_status = str(prior.get("status") or "active")
+    prior_aggregate_id = str(prior.get("aggregate_id") or "")
+    if prior_kind == PRIOR_HINT_CANCEL:
+        text = (
+            f"{PRIOR_MESSAGE_HINT_PREFIX}{target} still has your earlier message {prior_id} queued "
+            f"(status: {prior_status}). If that send was a mistake, agent_cancel_message {prior_id} "
+            f"retracts it before {target} picks it up; otherwise this send simply queues behind it."
+        )
+    else:
+        if normalize_kind(message.get("kind"), "request") == "notice":
+            tail = "otherwise your queued follow-up will wait behind it."
+        else:
+            tail = "otherwise your follow-up will wait behind the active turn."
+        text = (
+            f"{PRIOR_MESSAGE_HINT_PREFIX}{target} is processing your earlier message {prior_id} "
+            f"(status: {prior_status}). If that send was a mistake, run agent_interrupt_peer {target} "
+            f"--status to confirm, then agent_interrupt_peer {target}; {tail}"
+        )
+    text += _aggregate_prior_suffix(prior_aggregate_id)
+    entry = {
+        "message_id": message.get("id"),
+        "target": target,
+        "prior_message_id": prior_id,
+        "prior_status": prior_status,
+        "prior_kind": prior_kind,
+        "text": text,
+    }
+    if prior_aggregate_id:
+        entry["prior_aggregate_id"] = prior_aggregate_id
+    return entry
+
+
+def prior_message_hint_candidates(
+    message: dict,
+    queue: list[dict],
+    last_enter_ts: dict[str, float] | None = None,
+    *,
+    inflight_without_enter: str | None = PRIOR_HINT_CANCEL,
+) -> list[tuple[int, int, dict, str]]:
+    sender = str(message.get("from") or "")
+    target = str(message.get("to") or "")
+    message_id = str(message.get("id") or "")
+    candidates: list[tuple[int, int, dict, str]] = []
+    for index, item in enumerate(queue):
+        if str(item.get("id") or "") == message_id:
+            continue
+        if str(item.get("from") or "") != sender or str(item.get("to") or "") != target:
+            continue
+        prior_kind = classify_prior_for_hint(
+            item,
+            last_enter_ts,
+            inflight_without_enter=inflight_without_enter,
+        )
+        if not prior_kind:
+            continue
+        priority = 0 if prior_kind == PRIOR_HINT_INTERRUPT else 1
+        candidates.append((priority, index, item, prior_kind))
+    return candidates
+
+
+def prior_message_hint_for_queue(
+    message: dict,
+    queue: list[dict],
+    last_enter_ts: dict[str, float] | None = None,
+    *,
+    inflight_without_enter: str | None = PRIOR_HINT_CANCEL,
+) -> dict | None:
+    candidates = prior_message_hint_candidates(
+        message,
+        queue,
+        last_enter_ts,
+        inflight_without_enter=inflight_without_enter,
+    )
+    if not candidates:
+        return None
+    _priority, _index, prior, prior_kind = min(candidates, key=lambda row: (row[0], row[1]))
+    return prior_message_hint_entry(message, prior, prior_kind)
 
 
 def _default_copy(default: Any) -> Any:

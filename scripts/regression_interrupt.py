@@ -8705,6 +8705,7 @@ def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir:
         "delivered",
         "not other pending queued messages",
     ]
+    trigger_tokens = ["wrong prompt", "stuck peer"]
     clear_hold_tokens = [
         "held=true",
         "interrupt_partial_failure_blocked=true",
@@ -8725,6 +8726,12 @@ def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir:
     assert_true("force-cancel" not in interrupt_lines[0], f"{label}: default interrupt line must not imply force-cancel: {interrupt_lines[0]!r}")
     for token in boundary_tokens:
         assert_true(token.lower() in interrupt_lines[0].lower(), f"{label}: interrupt cheat line missing boundary token {token!r}: {interrupt_lines[0]!r}")
+    for token in trigger_tokens:
+        assert_true(token in interrupt_lines[0].lower(), f"{label}: interrupt cheat line missing trigger token {token!r}: {interrupt_lines[0]!r}")
+    assert_true(
+        "replacement waiting behind active/post-pane-touch work" in interrupt_lines[0].lower(),
+        f"{label}: interrupt cheat line missing active-only replacement trigger: {interrupt_lines[0]!r}",
+    )
     assert_true("Use --json" in interrupt_lines[0], f"{label}: interrupt cheat line should document JSON opt-in: {interrupt_lines[0]!r}")
     cancel_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_cancel_message <message_id> :")]
     assert_true(len(cancel_lines) == 1, f"{label}: expected one cancel cheat-sheet line, got {cancel_lines!r}")
@@ -8738,7 +8745,6 @@ def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir:
     assert_true("Use --json" in clear_lines[0], f"{label}: clear-hold cheat line should document JSON opt-in: {clear_lines[0]!r}")
     status_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_interrupt_peer [<alias>] --status :")]
     assert_true(len(status_lines) == 1 and "JSON" in status_lines[0], f"{label}: status cheat line should keep JSON inspection wording: {status_lines!r}")
-    assert_true("use when you sent the wrong prompt" not in interrupt_lines[0].lower(), f"{label}: interrupt line must not suggest unqualified wrong-prompt retraction: {interrupt_lines[0]!r}")
 
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
     assert_true(command_shape in probe, f"{label}: probe prompt must keep compact interrupt command shape")
@@ -8747,7 +8753,12 @@ def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir:
         assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing boundary token {token!r}")
     for token in ("--json", "--status is JSON"):
         assert_true(token in probe, f"{label}: probe prompt missing action JSON token {token!r}")
-    assert_true("use for a wrong prompt" not in probe.lower(), f"{label}: probe must not suggest unqualified wrong-prompt interrupt")
+    for token in trigger_tokens:
+        assert_true(token in probe.lower(), f"{label}: probe prompt missing trigger token {token!r}")
+    assert_true(
+        "replacement waiting behind active/post-pane-touch work" in probe.lower(),
+        f"{label}: probe prompt missing active-only replacement trigger",
+    )
 
     help_result = subprocess.run(
         [sys.executable, str(LIBEXEC / "bridge_interrupt_peer.py"), "--help"],
@@ -8770,6 +8781,24 @@ def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir:
     for token in clear_hold_tokens:
         assert_true(token.lower() in normalized_help_tokens.lower(), f"{label}: --help missing clear-hold token {token!r}: {help_text!r}")
     assert_true("--json" in normalized_help, f"{label}: --help should document action JSON opt-in: {help_text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_peer_doc_surfaces_no_queued_active_directive(label: str, tmpdir: Path) -> None:
+    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
+    interrupt_lines = [
+        line for line in bridge_instructions.model_cheat_sheet()
+        if line.startswith("- agent_interrupt_peer <alias> :")
+    ]
+    assert_true(len(interrupt_lines) == 1, f"{label}: expected one interrupt cheat-sheet line, got {interrupt_lines!r}")
+    interrupt_line = interrupt_lines[0]
+    for surface_name, surface in (("probe", probe), ("cheat sheet", interrupt_line)):
+        lowered = surface.lower()
+        assert_true("queued/active turn" not in lowered, f"{label}: {surface_name} must not direct interrupt at queued/active turn wording: {surface!r}")
+        assert_true(
+            "replacement waiting behind active/post-pane-touch work" in lowered,
+            f"{label}: {surface_name} must keep active-only replacement wording: {surface!r}",
+        )
     print(f"  PASS  {label}")
 
 
@@ -11512,7 +11541,7 @@ def _patch_enqueue_for_unit(be, state: dict, *, socket_error: str = "") -> None:
     be.room_status = lambda session: argparse.Namespace(active_enough_for_enqueue=True, reason="ok")
     be.sender_matches_caller = lambda args, session: True
     be.load_session = lambda session: state
-    be.enqueue_via_daemon_socket = lambda session, messages, **kwargs: (False, [], socket_error, "")
+    be.enqueue_via_daemon_socket = lambda session, messages, **kwargs: (False, [], [], socket_error, "")
 
 
 def _write_json(path: Path, data) -> None:
@@ -11642,7 +11671,7 @@ def scenario_enqueue_aggregate_stdout_socket_and_fallback(label: str, tmpdir: Pa
 
     def fake_socket(_session: str, messages: list[dict], **_kwargs):
         socket_messages[:] = [dict(message) for message in messages]
-        return True, [str(message["id"]) for message in messages], "", ""
+        return True, [str(message["id"]) for message in messages], [], "", ""
 
     be.enqueue_via_daemon_socket = fake_socket
     code, out, err = _run_enqueue_main(
@@ -12625,6 +12654,257 @@ def scenario_daemon_enqueue_no_auto_return_watchdog_zero_normalized(label: str, 
     print(f"  PASS  {label}")
 
 
+def _prior_hint_daemon(tmpdir: Path) -> bridge_daemon.BridgeDaemon:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+        "carol": {"alias": "carol", "agent_type": "codex", "pane": "%93"},
+        "dana": {"alias": "dana", "agent_type": "codex", "pane": "%94"},
+    }
+    return make_daemon(tmpdir, participants)
+
+
+def _new_enqueue_message(message_id: str, *, sender: str = "alice", target: str = "bob", kind: str = "request") -> dict:
+    msg = test_message(message_id, frm=sender, to=target, status="ingressing")
+    msg["kind"] = kind
+    msg["auto_return"] = kind == "request"
+    return msg
+
+
+def _hint_entries(result: dict) -> list[dict]:
+    hints = result.get("hints") or []
+    assert_true(isinstance(hints, list), f"expected hints list, got {hints!r}")
+    return hints
+
+
+def _single_prior_hint(label: str, result: dict) -> dict:
+    hints = _hint_entries(result)
+    assert_true(len(hints) == 1, f"{label}: expected one prior hint, got {hints!r} in {result}")
+    return hints[0]
+
+
+def scenario_daemon_prior_hint_pending_cancel(label: str, tmpdir: Path) -> None:
+    d = _prior_hint_daemon(tmpdir)
+    d.queue.update(lambda queue: queue.append(test_message("msg-prior-pending", frm="alice", to="bob", status="pending")) or None)
+
+    result = d.handle_enqueue_command([_new_enqueue_message("msg-new-pending")])
+
+    assert_true(result.get("ok") is True and result.get("ids") == ["msg-new-pending"], f"{label}: enqueue result mismatch: {result}")
+    hint = _single_prior_hint(label, result)
+    text = str(hint.get("text") or "")
+    assert_true(hint.get("prior_kind") == "cancel" and hint.get("prior_status") == "pending", f"{label}: expected cancel pending hint: {hint}")
+    assert_true("PRIOR_MESSAGE_HINT: bob still has your earlier message msg-prior-pending queued" in text, f"{label}: cancel text mismatch: {text!r}")
+    assert_true("agent_cancel_message msg-prior-pending" in text and "otherwise this send simply queues behind it" in text, f"{label}: cancel action/tail missing: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_prior_hint_delivered_interrupt(label: str, tmpdir: Path) -> None:
+    d = _prior_hint_daemon(tmpdir)
+    d.queue.update(lambda queue: queue.append(test_message("msg-prior-delivered", frm="alice", to="bob", status="delivered")) or None)
+
+    result = d.handle_enqueue_command([_new_enqueue_message("msg-new-delivered")])
+
+    hint = _single_prior_hint(label, result)
+    text = str(hint.get("text") or "")
+    assert_true(hint.get("prior_kind") == "interrupt" and hint.get("prior_status") == "delivered", f"{label}: expected interrupt delivered hint: {hint}")
+    assert_true("agent_interrupt_peer bob --status" in text and "agent_interrupt_peer bob" in text, f"{label}: interrupt action missing: {text!r}")
+    assert_true("so this new message can deliver" not in text, f"{label}: unsafe wording must stay absent: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_prior_hint_inflight_pane_mode_cancel(label: str, tmpdir: Path) -> None:
+    d = _prior_hint_daemon(tmpdir)
+    prior = test_message("msg-prior-pane-mode", frm="alice", to="bob", status="inflight")
+    prior["pane_mode_enter_deferred_since_ts"] = time.time()
+    d.last_enter_ts["msg-prior-pane-mode"] = time.time()
+    d.queue.update(lambda queue: queue.append(prior) or None)
+
+    result = d.handle_enqueue_command([_new_enqueue_message("msg-new-pane-mode")])
+
+    hint = _single_prior_hint(label, result)
+    assert_true(hint.get("prior_kind") == "cancel" and hint.get("prior_status") == "inflight", f"{label}: pane-mode inflight should be cancellable: {hint}")
+    assert_true("agent_cancel_message msg-prior-pane-mode" in str(hint.get("text") or ""), f"{label}: cancel command missing: {hint}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_prior_hint_inflight_after_enter_interrupt(label: str, tmpdir: Path) -> None:
+    d = _prior_hint_daemon(tmpdir)
+    prior = test_message("msg-prior-active-inflight", frm="alice", to="bob", status="inflight")
+    d.last_enter_ts["msg-prior-active-inflight"] = time.time()
+    d.queue.update(lambda queue: queue.append(prior) or None)
+
+    result = d.handle_enqueue_command([_new_enqueue_message("msg-new-active-inflight")])
+
+    hint = _single_prior_hint(label, result)
+    assert_true(hint.get("prior_kind") == "interrupt" and hint.get("prior_status") == "inflight", f"{label}: post-enter inflight should use interrupt: {hint}")
+    assert_true("agent_interrupt_peer bob --status" in str(hint.get("text") or ""), f"{label}: interrupt status check missing: {hint}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_prior_hint_terminal_or_absent_no_hint(label: str, tmpdir: Path) -> None:
+    d = _prior_hint_daemon(tmpdir)
+    d.queue.update(lambda queue: queue.append(test_message("msg-prior-cancelled", frm="alice", to="bob", status="cancelled")) or None)
+
+    terminal_result = d.handle_enqueue_command([_new_enqueue_message("msg-new-terminal")])
+    absent_result = d.handle_enqueue_command([_new_enqueue_message("msg-new-absent", target="dana")])
+
+    assert_true(_hint_entries(terminal_result) == [], f"{label}: terminal row must not hint: {terminal_result}")
+    assert_true(_hint_entries(absent_result) == [], f"{label}: absent prior must not hint: {absent_result}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_prior_hint_rejections_have_no_hints(label: str, tmpdir: Path) -> None:
+    d = _prior_hint_daemon(tmpdir)
+    _set_response_context(d, "bob", "alice")
+    d.queue.update(lambda queue: queue.append(test_message("msg-prior-for-reject", frm="bob", to="alice", status="pending")) or None)
+    guard_result = d.handle_enqueue_command([_new_enqueue_message("msg-new-guard", sender="bob", target="alice")])
+    assert_true(guard_result.get("ok") is False and guard_result.get("error_kind") == "response_send_guard", f"{label}: guard should reject: {guard_result}")
+    assert_true("hints" not in guard_result and _hint_entries(guard_result) == [], f"{label}: guard rejection must not carry hints: {guard_result}")
+
+    d2 = _prior_hint_daemon(tmpdir / "watchdog")
+    d2.queue.update(lambda queue: queue.append(test_message("msg-prior-watchdog", frm="alice", to="bob", status="pending")) or None)
+    bad = _new_enqueue_message("msg-new-watchdog")
+    bad["auto_return"] = False
+    bad["watchdog_delay_sec"] = 30.0
+    watchdog_result = d2.handle_enqueue_command([bad])
+    assert_true(watchdog_result.get("ok") is False and watchdog_result.get("error_kind") == "watchdog_requires_auto_return", f"{label}: watchdog should reject: {watchdog_result}")
+    assert_true("hints" not in watchdog_result and _hint_entries(watchdog_result) == [], f"{label}: watchdog rejection must not carry hints: {watchdog_result}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_prior_hint_aggregate_suffix(label: str, tmpdir: Path) -> None:
+    d = _prior_hint_daemon(tmpdir)
+    prior = test_message("msg-prior-agg", frm="alice", to="bob", status="delivered")
+    prior["aggregate_id"] = "agg-prior"
+    prior["aggregate_expected"] = ["bob", "carol"]
+    prior["aggregate_message_ids"] = {"bob": "msg-prior-agg", "carol": "msg-prior-agg-carol"}
+    d.queue.update(lambda queue: queue.append(prior) or None)
+
+    result = d.handle_enqueue_command([_new_enqueue_message("msg-new-agg")])
+
+    hint = _single_prior_hint(label, result)
+    text = str(hint.get("text") or "")
+    assert_true(hint.get("prior_aggregate_id") == "agg-prior", f"{label}: structured aggregate id missing: {hint}")
+    assert_true("only this leg of aggregate agg-prior" in text and "fresh aggregate" in text, f"{label}: aggregate suffix missing: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_prior_hint_notice_safe_wording(label: str, tmpdir: Path) -> None:
+    d = _prior_hint_daemon(tmpdir)
+    d.queue.update(lambda queue: queue.append(test_message("msg-prior-notice", frm="alice", to="bob", status="delivered")) or None)
+
+    result = d.handle_enqueue_command([_new_enqueue_message("msg-new-notice", kind="notice")])
+
+    text = str(_single_prior_hint(label, result).get("text") or "")
+    assert_true("your queued follow-up will wait behind it" in text, f"{label}: notice-safe tail missing: {text!r}")
+    assert_true("so this new message can deliver" not in text, f"{label}: unsafe delivery wording must stay absent: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_prior_hint_same_pair_only(label: str, tmpdir: Path) -> None:
+    d = _prior_hint_daemon(tmpdir)
+    d.queue.update(
+        lambda queue: (
+            queue.append(test_message("msg-prior-other-target", frm="alice", to="carol", status="pending")),
+            queue.append(test_message("msg-prior-other-sender", frm="carol", to="bob", status="pending")),
+            None,
+        )[-1]
+    )
+
+    result = d.handle_enqueue_command([_new_enqueue_message("msg-new-same-pair")])
+
+    assert_true(_hint_entries(result) == [], f"{label}: different sender/target rows must not hint: {result}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_prior_hint_multi_target_partial(label: str, tmpdir: Path) -> None:
+    d = _prior_hint_daemon(tmpdir)
+    d.queue.update(
+        lambda queue: (
+            queue.append(test_message("msg-prior-bob", frm="alice", to="bob", status="pending")),
+            queue.append(test_message("msg-prior-carol", frm="alice", to="carol", status="delivered")),
+            None,
+        )[-1]
+    )
+    messages = [
+        _new_enqueue_message("msg-new-bob", target="bob"),
+        _new_enqueue_message("msg-new-carol", target="carol"),
+        _new_enqueue_message("msg-new-dana", target="dana"),
+    ]
+
+    result = d.handle_enqueue_command(messages)
+
+    hints = _hint_entries(result)
+    assert_true(len(hints) == 2, f"{label}: expected exactly two affected-target hints: {hints}")
+    by_target = {hint.get("target"): hint for hint in hints}
+    assert_true(set(by_target) == {"bob", "carol"}, f"{label}: hints should belong to bob/carol only: {hints}")
+    assert_true(by_target["bob"].get("prior_kind") == "cancel" and by_target["carol"].get("prior_kind") == "interrupt", f"{label}: per-target classes mismatch: {hints}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_prior_hint_current_prompt_only(label: str, tmpdir: Path) -> None:
+    d = _prior_hint_daemon(tmpdir)
+    d.current_prompt_by_agent["bob"] = {
+        "id": "msg-prior-active-context",
+        "from": "alice",
+        "kind": "request",
+        "auto_return": True,
+        "aggregate_id": "",
+    }
+
+    result = d.handle_enqueue_command([_new_enqueue_message("msg-new-context")])
+
+    hint = _single_prior_hint(label, result)
+    assert_true(hint.get("prior_kind") == "interrupt" and hint.get("prior_status") == "active", f"{label}: current prompt should produce active interrupt hint: {hint}")
+    assert_true("msg-prior-active-context" in str(hint.get("text") or ""), f"{label}: active context id missing from hint: {hint}")
+    print(f"  PASS  {label}")
+
+
+def scenario_daemon_prior_hint_active_ctx_beats_pending_queue_row(label: str, tmpdir: Path) -> None:
+    d = _prior_hint_daemon(tmpdir)
+    d.queue.update(lambda queue: queue.append(test_message("msg-prior-pending-mask", frm="alice", to="bob", status="pending")) or None)
+    d.current_prompt_by_agent["bob"] = {
+        "id": "msg-prior-active-wins",
+        "from": "alice",
+        "kind": "request",
+        "auto_return": True,
+        "aggregate_id": "",
+    }
+
+    result = d.handle_enqueue_command([_new_enqueue_message("msg-new-active-wins")])
+
+    hint = _single_prior_hint(label, result)
+    text = str(hint.get("text") or "")
+    assert_true(hint.get("prior_kind") == "interrupt", f"{label}: active context must win over pending row: {hint}")
+    assert_true(hint.get("prior_message_id") == "msg-prior-active-wins", f"{label}: hint should point at active context id, not pending row: {hint}")
+    assert_true("agent_interrupt_peer bob --status" in text, f"{label}: active context hint must guide status-confirmed interrupt: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_prior_hint_classifier_drift_invariant(label: str, tmpdir: Path) -> None:
+    d = _prior_hint_daemon(tmpdir)
+    cases = [
+        ("msg-inflight-pre", False, False, "cancel", False),
+        ("msg-inflight-active", True, False, "interrupt", True),
+        ("msg-inflight-deferred", True, True, "cancel", False),
+        ("msg-inflight-deferred-no-enter", False, True, "cancel", False),
+    ]
+    for message_id, has_enter, deferred, expected_kind, expected_active in cases:
+        item = test_message(message_id, frm="alice", to="bob", status="inflight")
+        if has_enter:
+            d.last_enter_ts[message_id] = time.time()
+        else:
+            d.last_enter_ts.pop(message_id, None)
+        if deferred:
+            item["pane_mode_enter_deferred_since_ts"] = time.time()
+        prior_kind = d._classify_prior_for_hint(item)
+        active = d._message_is_active_inflight_for_cancel(item)
+        assert_true(prior_kind == expected_kind, f"{label}: classifier mismatch for {message_id}: {prior_kind!r}")
+        assert_true(active is expected_active, f"{label}: active predicate mismatch for {message_id}: {active!r}")
+        assert_true((prior_kind == "interrupt") == active, f"{label}: classifier drift for {message_id}: {prior_kind!r} vs active={active!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_daemon_upsert_no_auto_return_watchdog_rejected(label: str, tmpdir: Path) -> None:
     participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
     d = make_daemon(tmpdir, participants)
@@ -12803,6 +13083,7 @@ def _run_send_peer_with_fake_subprocess(
     stdin_text: str = "",
     stdin_isatty: bool | None = None,
     stdout_text: str = "",
+    stderr_text: str = "",
     returncode: int = 0,
 ):
     calls: list[tuple[list[str], dict]] = []
@@ -12812,6 +13093,8 @@ def _run_send_peer_with_fake_subprocess(
         calls.append((list(cmd), dict(kwargs)))
         if stdout_text:
             print(stdout_text, end="")
+        if stderr_text:
+            print(stderr_text, end="", file=sys.stderr)
         return argparse.Namespace(returncode=returncode)
 
     try:
@@ -13135,6 +13418,27 @@ def scenario_send_peer_request_success_prints_anti_wait_hint(label: str, tmpdir:
     for token in ("REQUEST_SENT", "[bridge:*]", "do not sleep/poll"):
         assert_true(token in err, f"{label}: request hint missing token {token!r}: {err!r}")
     assert_true("notice sent" not in err and "Safety wake" not in err and "NOTICE_SENT" not in err, f"{label}: request must not print notice hint: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_send_peer_prior_hint_precedes_success_hint(label: str, tmpdir: Path) -> None:
+    bs = _import_send_peer_module()
+    _patch_send_peer_for_unit(bs)
+    prior_hint = "PRIOR_MESSAGE_HINT: bob is processing your earlier message msg-old (status: delivered).\n"
+    code, out, err, calls = _run_send_peer_with_fake_subprocess(
+        bs,
+        ["--session", "test-session", "--from", "alice", "--to", "bob", "hello world"],
+        stdin_isatty=True,
+        stdout_text="msg-new\n",
+        stderr_text=prior_hint,
+    )
+    assert_true(code == 0 and len(calls) == 1, f"{label}: request should succeed: code={code} err={err!r}")
+    assert_true(out == "msg-new\n", f"{label}: enqueue stdout must be preserved exactly: {out!r}")
+    assert_true("PRIOR_MESSAGE_HINT" in err and "REQUEST_SENT" in err, f"{label}: stderr should include prior and success hints: {err!r}")
+    assert_true(
+        err.index("PRIOR_MESSAGE_HINT") < err.index("REQUEST_SENT"),
+        f"{label}: prior hint should appear before wrapper success hint: {err!r}",
+    )
     print(f"  PASS  {label}")
 
 
@@ -13552,6 +13856,155 @@ def scenario_enqueue_stdin_rejects_oversized_body_unchanged(label: str, tmpdir: 
     print(f"  PASS  {label}")
 
 
+def _enqueue_prior_hint_argv(tmpdir: Path, *, kind: str = "request") -> list[str]:
+    return [
+        "--session", "test-session",
+        "--from", "alice",
+        "--to", "bob",
+        "--kind", kind,
+        "--body", "replacement",
+        "--queue-file", str(tmpdir / "pending.json"),
+        "--state-file", str(tmpdir / "events.raw.jsonl"),
+        "--public-state-file", str(tmpdir / "events.jsonl"),
+    ]
+
+
+def scenario_enqueue_socket_success_hints_stderr_stdout_unchanged(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    be.enqueue_via_daemon_socket = lambda session, messages, **kwargs: (  # type: ignore[assignment]
+        True,
+        ["msg-socket-hint"],
+        [{"text": "PRIOR_MESSAGE_HINT: bob still has your earlier message msg-prior queued (status: pending)."}],
+        "",
+        "",
+    )
+
+    code, out, err = _run_enqueue_main(be, _enqueue_prior_hint_argv(tmpdir))
+
+    assert_true(code == 0, f"{label}: socket enqueue should succeed: code={code} err={err!r}")
+    assert_true(out == "msg-socket-hint\n", f"{label}: stdout must contain ids only: {out!r}")
+    assert_true("PRIOR_MESSAGE_HINT:" in err and "PRIOR_MESSAGE_HINT:" not in out, f"{label}: hints must go to stderr only: out={out!r} err={err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_fallback_prior_hint_pending_cancel(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    _write_json(tmpdir / "pending.json", [test_message("msg-fb-prior-pending", frm="alice", to="bob", status="pending")])
+
+    code, out, err = _run_enqueue_main(be, _enqueue_prior_hint_argv(tmpdir))
+
+    assert_true(code == 0, f"{label}: fallback enqueue should succeed: code={code} err={err!r}")
+    assert_true(out.startswith("msg-") and "PRIOR_MESSAGE_HINT" not in out, f"{label}: stdout should contain ids only: {out!r}")
+    assert_true("PRIOR_MESSAGE_HINT:" in err and "agent_cancel_message msg-fb-prior-pending" in err, f"{label}: cancel hint missing: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_fallback_prior_hint_submitted_interrupt(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    _write_json(tmpdir / "pending.json", [test_message("msg-fb-prior-submitted", frm="alice", to="bob", status="submitted")])
+
+    code, out, err = _run_enqueue_main(be, _enqueue_prior_hint_argv(tmpdir))
+
+    assert_true(code == 0, f"{label}: fallback enqueue should succeed: code={code} err={err!r}")
+    assert_true("agent_interrupt_peer bob --status" in err and "msg-fb-prior-submitted" in err, f"{label}: interrupt hint missing: {err!r}")
+    assert_true("so this new message can deliver" not in err, f"{label}: unsafe wording absent: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_fallback_prior_hint_plain_inflight_omitted(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    _write_json(tmpdir / "pending.json", [test_message("msg-fb-prior-inflight", frm="alice", to="bob", status="inflight")])
+
+    code, out, err = _run_enqueue_main(be, _enqueue_prior_hint_argv(tmpdir))
+
+    assert_true(code == 0, f"{label}: fallback enqueue should succeed: code={code} err={err!r}")
+    assert_true(out.startswith("msg-"), f"{label}: stdout should contain id: {out!r}")
+    assert_true("PRIOR_MESSAGE_HINT" not in err, f"{label}: plain inflight fallback must omit hint: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_fallback_prior_hint_pane_mode_inflight_cancel(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    prior = test_message("msg-fb-prior-pane-mode", frm="alice", to="bob", status="inflight")
+    prior["pane_mode_enter_deferred_since_ts"] = time.time()
+    _write_json(tmpdir / "pending.json", [prior])
+
+    code, out, err = _run_enqueue_main(be, _enqueue_prior_hint_argv(tmpdir))
+
+    assert_true(code == 0, f"{label}: fallback enqueue should succeed: code={code} err={err!r}")
+    assert_true("agent_cancel_message msg-fb-prior-pane-mode" in err, f"{label}: pane-mode inflight should get cancel hint: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_fallback_prior_hint_write_failure_suppresses_hint(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    _write_json(tmpdir / "pending.json", [test_message("msg-fb-prior-write-fail", frm="alice", to="bob", status="pending")])
+    old_update_queue = be.update_queue
+
+    def fail_update_queue(_path, _message):
+        raise OSError(errno.EACCES, "denied")
+
+    try:
+        be.update_queue = fail_update_queue  # type: ignore[assignment]
+        code, out, err = _run_enqueue_main(be, _enqueue_prior_hint_argv(tmpdir))
+    finally:
+        be.update_queue = old_update_queue  # type: ignore[assignment]
+
+    assert_true(code == 1 and out == "", f"{label}: write failure should fail before stdout: code={code} out={out!r}")
+    assert_true("not writable" in err or "failed to write" in err, f"{label}: write failure error missing: {err!r}")
+    assert_true("PRIOR_MESSAGE_HINT" not in err, f"{label}: failed enqueue must not print prior hint: {err!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_enqueue_fallback_response_send_guard_no_hint(label: str, tmpdir: Path) -> None:
+    be = _import_enqueue_module()
+    state = _participants_state(["alice", "bob"])
+    _patch_enqueue_for_unit(be, state)
+    queue_file = tmpdir / "pending.json"
+    state_file = tmpdir / "events.raw.jsonl"
+    public_file = tmpdir / "events.jsonl"
+    _write_json(
+        queue_file,
+        [
+            _delivered_request("msg-guard-active", "alice", "bob"),
+            test_message("msg-prior-would-hint", frm="bob", to="alice", status="pending"),
+        ],
+    )
+    state_file.write_text("raw-before\n", encoding="utf-8")
+    public_file.write_text("public-before\n", encoding="utf-8")
+
+    code, out, err = _run_enqueue_main(
+        be,
+        [
+            "--session", "test-session",
+            "--from", "bob",
+            "--to", "alice",
+            "--body", "guarded replacement",
+            "--queue-file", str(queue_file),
+            "--state-file", str(state_file),
+            "--public-state-file", str(public_file),
+        ],
+    )
+
+    assert_true(code == 2, f"{label}: response-send guard should reject: code={code} err={err!r}")
+    assert_true(out == "", f"{label}: rejected fallback send must have no stdout: {out!r}")
+    assert_true("response-time guard" in err and "current_prompt.from=alice" in err, f"{label}: response-send guard text missing: {err!r}")
+    assert_true("PRIOR_MESSAGE_HINT" not in err, f"{label}: rejected fallback send must not print prior hint: {err!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_alarm_cancel_preserves_at_limit_body(label: str, tmpdir: Path) -> None:
     participants = _participants_state(["alice", "bob"])["participants"]
     d = make_daemon(tmpdir, participants)
@@ -13753,7 +14206,7 @@ def scenario_response_send_guard_socket_cli_error_kind(label: str, tmpdir: Path)
             source="test",
         )
     )
-    be.enqueue_via_daemon_socket = lambda session, messages, **kwargs: (True, [], guard_error, "response_send_guard")
+    be.enqueue_via_daemon_socket = lambda session, messages, **kwargs: (True, [], [], guard_error, "response_send_guard")
 
     code, out, err = _run_enqueue_main(
         be,
@@ -13808,7 +14261,7 @@ def scenario_response_send_guard_socket_error_kind_parse(label: str, tmpdir: Pat
     try:
         be.run_root = lambda: run_dir
         thread.start()
-        attempted, ids, error, error_kind = be.enqueue_via_daemon_socket(
+        attempted, ids, hints, error, error_kind = be.enqueue_via_daemon_socket(
             "test-session",
             [{"id": "msg-test", "from": "bob", "to": "alice"}],
             force_response_send=True,
@@ -13824,6 +14277,7 @@ def scenario_response_send_guard_socket_error_kind_parse(label: str, tmpdir: Pat
 
     assert_true(attempted, f"{label}: socket was attempted")
     assert_true(ids == [], f"{label}: rejected socket response has no ids: {ids}")
+    assert_true(hints == [], f"{label}: rejected socket response has no hints: {hints}")
     assert_true(error == response["error"], f"{label}: error string preserved: {error!r}")
     assert_true(error_kind == "response_send_guard", f"{label}: error_kind surfaced: {error_kind!r}")
     assert_true(received and received[0].get("force_response_send") is True, f"{label}: force flag sent over socket: {received}")
@@ -14258,6 +14712,19 @@ def main() -> int:
             ("daemon_upsert_message_watchdog_rejects_non_finite", scenario_daemon_upsert_message_watchdog_rejects_non_finite),
             ("daemon_enqueue_rejects_no_auto_return_watchdog_atomically", scenario_daemon_enqueue_rejects_no_auto_return_watchdog_atomically),
             ("daemon_enqueue_no_auto_return_watchdog_zero_normalized", scenario_daemon_enqueue_no_auto_return_watchdog_zero_normalized),
+            ("daemon_prior_hint_pending_cancel", scenario_daemon_prior_hint_pending_cancel),
+            ("daemon_prior_hint_delivered_interrupt", scenario_daemon_prior_hint_delivered_interrupt),
+            ("daemon_prior_hint_inflight_pane_mode_cancel", scenario_daemon_prior_hint_inflight_pane_mode_cancel),
+            ("daemon_prior_hint_inflight_after_enter_interrupt", scenario_daemon_prior_hint_inflight_after_enter_interrupt),
+            ("daemon_prior_hint_terminal_or_absent_no_hint", scenario_daemon_prior_hint_terminal_or_absent_no_hint),
+            ("daemon_prior_hint_rejections_have_no_hints", scenario_daemon_prior_hint_rejections_have_no_hints),
+            ("daemon_prior_hint_aggregate_suffix", scenario_daemon_prior_hint_aggregate_suffix),
+            ("daemon_prior_hint_notice_safe_wording", scenario_daemon_prior_hint_notice_safe_wording),
+            ("daemon_prior_hint_same_pair_only", scenario_daemon_prior_hint_same_pair_only),
+            ("daemon_prior_hint_multi_target_partial", scenario_daemon_prior_hint_multi_target_partial),
+            ("daemon_prior_hint_current_prompt_only", scenario_daemon_prior_hint_current_prompt_only),
+            ("daemon_prior_hint_active_ctx_beats_pending_queue_row", scenario_daemon_prior_hint_active_ctx_beats_pending_queue_row),
+            ("prior_hint_classifier_drift_invariant", scenario_prior_hint_classifier_drift_invariant),
             ("daemon_upsert_no_auto_return_watchdog_rejected", scenario_daemon_upsert_no_auto_return_watchdog_rejected),
             ("daemon_register_alarm_rejects_non_finite_and_negative", scenario_daemon_register_alarm_rejects_non_finite_and_negative),
             ("daemon_mark_message_delivered_ignores_non_finite_watchdog", scenario_daemon_mark_message_delivered_ignores_non_finite_watchdog),
@@ -14462,6 +14929,7 @@ def main() -> int:
             ("view_peer_search_with_page_after_a19_reports_page_error", scenario_view_peer_search_with_page_after_a19_reports_page_error),
             ("view_peer_doc_surfaces_disclose_search_semantics", scenario_view_peer_doc_surfaces_disclose_search_semantics),
             ("interrupt_peer_doc_surfaces_disclose_no_op_race", scenario_interrupt_peer_doc_surfaces_disclose_no_op_race),
+            ("interrupt_peer_doc_surfaces_no_queued_active_directive", scenario_interrupt_peer_doc_surfaces_no_queued_active_directive),
             ("prompt_intercepted_doc_surfaces_disclose_user_typing_collision", scenario_prompt_intercepted_doc_surfaces_disclose_user_typing_collision),
             ("response_send_guard_doc_surfaces_are_precise", scenario_response_send_guard_doc_surfaces_are_precise),
             ("probe_prompt_is_compact_quickstart", scenario_probe_prompt_is_compact_quickstart),
@@ -14580,6 +15048,7 @@ def main() -> int:
             ("send_peer_rejects_allow_spoof_after_implicit_target", scenario_send_peer_rejects_allow_spoof_after_implicit_target),
             ("send_peer_single_inline_body_uses_stdin_handoff", scenario_send_peer_single_inline_body_uses_stdin_handoff),
             ("send_peer_request_success_prints_anti_wait_hint", scenario_send_peer_request_success_prints_anti_wait_hint),
+            ("send_peer_prior_hint_precedes_success_hint", scenario_send_peer_prior_hint_precedes_success_hint),
             ("send_peer_notice_success_prints_alarm_and_anti_wait_hints", scenario_send_peer_notice_success_prints_alarm_and_anti_wait_hints),
             ("send_peer_aggregate_request_success_prints_result_hint", scenario_send_peer_aggregate_request_success_prints_result_hint),
             ("send_peer_subprocess_failure_prints_no_success_hint", scenario_send_peer_subprocess_failure_prints_no_success_hint),
@@ -14607,6 +15076,13 @@ def main() -> int:
             ("enqueue_bare_body_without_value_remains_argparse_owned", scenario_enqueue_bare_body_without_value_remains_argparse_owned),
             ("enqueue_rejects_oversized_body_unchanged", scenario_enqueue_rejects_oversized_body_unchanged),
             ("enqueue_stdin_rejects_oversized_body_unchanged", scenario_enqueue_stdin_rejects_oversized_body_unchanged),
+            ("enqueue_socket_success_hints_stderr_stdout_unchanged", scenario_enqueue_socket_success_hints_stderr_stdout_unchanged),
+            ("enqueue_fallback_prior_hint_pending_cancel", scenario_enqueue_fallback_prior_hint_pending_cancel),
+            ("enqueue_fallback_prior_hint_submitted_interrupt", scenario_enqueue_fallback_prior_hint_submitted_interrupt),
+            ("enqueue_fallback_prior_hint_plain_inflight_omitted", scenario_enqueue_fallback_prior_hint_plain_inflight_omitted),
+            ("enqueue_fallback_prior_hint_pane_mode_inflight_cancel", scenario_enqueue_fallback_prior_hint_pane_mode_inflight_cancel),
+            ("enqueue_fallback_prior_hint_write_failure_suppresses_hint", scenario_enqueue_fallback_prior_hint_write_failure_suppresses_hint),
+            ("enqueue_fallback_response_send_guard_no_hint", scenario_enqueue_fallback_response_send_guard_no_hint),
             ("alarm_cancel_preserves_at_limit_body", scenario_alarm_cancel_preserves_at_limit_body),
             ("prompt_body_preserves_multiline_and_sanitizes", scenario_prompt_body_preserves_multiline_and_sanitizes),
             ("build_peer_prompt_signature_drops_max_hops", scenario_build_peer_prompt_signature_drops_max_hops),

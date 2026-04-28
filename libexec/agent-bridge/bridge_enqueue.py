@@ -24,6 +24,7 @@ from bridge_util import (
     locked_json,
     locked_json_read,
     normalize_kind,
+    prior_message_hint_for_queue,
     public_record,
     read_limited_text,
     short_id,
@@ -91,6 +92,13 @@ def format_enqueue_success_stdout(ids: list[str], aggregate_id: str = "") -> str
     return "\n".join(lines)
 
 
+def print_prior_message_hints(hints: list[dict]) -> None:
+    for hint in hints:
+        text = str(hint.get("text") or "").strip()
+        if text:
+            print(text, file=sys.stderr)
+
+
 WRITE_FAILURE_ERRNOS = {errno.EROFS, errno.EACCES, errno.EPERM}
 
 
@@ -116,10 +124,10 @@ def write_failure_message(path: Path, exc: OSError, ipc_error: str = "") -> str:
     return f"agent_send_peer: failed to write bridge queue/event state: {path}: {exc}.{suffix}"
 
 
-def enqueue_via_daemon_socket(bridge_session: str, messages: list[dict], *, force_response_send: bool = False) -> tuple[bool, list[str], str, str]:
+def enqueue_via_daemon_socket(bridge_session: str, messages: list[dict], *, force_response_send: bool = False) -> tuple[bool, list[str], list[dict], str, str]:
     socket_path = run_root() / f"{bridge_session}.sock"
     if not socket_path.exists():
-        return False, [], "", ""
+        return False, [], [], "", ""
     payload = {"op": "enqueue", "messages": messages}
     if force_response_send:
         payload["force_response_send"] = True
@@ -136,20 +144,24 @@ def enqueue_via_daemon_socket(bridge_session: str, messages: list[dict], *, forc
                     break
                 raw += chunk
     except OSError as exc:
-        return False, [], f"{socket_path}: {exc}", ""
+        return False, [], [], f"{socket_path}: {exc}", ""
     try:
         response = json.loads(raw.decode("utf-8"))
     except Exception as exc:
-        return True, [], f"invalid daemon socket response: {exc}", ""
+        return True, [], [], f"invalid daemon socket response: {exc}", ""
     if not response.get("ok"):
         return (
             True,
+            [],
             [],
             str(response.get("error") or "daemon socket enqueue failed"),
             str(response.get("error_kind") or ""),
         )
     ids = response.get("ids") or []
-    return True, [str(item) for item in ids], "", ""
+    hints = response.get("hints") or []
+    if not isinstance(hints, list):
+        hints = []
+    return True, [str(item) for item in ids], [item for item in hints if isinstance(item, dict)], "", ""
 
 
 def sender_matches_caller(args: argparse.Namespace, bridge_session: str) -> bool:
@@ -376,7 +388,7 @@ def main() -> int:
             if message.get("aggregate_id") == aggregate_id:
                 message["aggregate_message_ids"] = aggregate_message_ids
                 record["aggregate_message_ids"] = aggregate_message_ids
-    attempted_ipc, ipc_ids, ipc_error, ipc_error_kind = enqueue_via_daemon_socket(bridge_session, messages, force_response_send=args.force)
+    attempted_ipc, ipc_ids, ipc_hints, ipc_error, ipc_error_kind = enqueue_via_daemon_socket(bridge_session, messages, force_response_send=args.force)
     if attempted_ipc:
         if ipc_error:
             if ipc_error_kind == "response_send_guard":
@@ -385,19 +397,33 @@ def main() -> int:
             print(f"agent_send_peer: {ipc_error}", file=sys.stderr)
             return 1
         print(format_enqueue_success_stdout(ipc_ids, aggregate_id))
+        print_prior_message_hints(ipc_hints)
         return 0
 
+    queue_snapshot = locked_json_read(queue_file, [])
     violation = response_send_violation(
         sender=args.sender,
         targets=targets,
         outgoing_kind=kind,
         force=args.force,
-        contexts=contexts_from_queue(args.sender, locked_json_read(queue_file, [])),
+        contexts=contexts_from_queue(args.sender, queue_snapshot),
         source="queue",
     )
     if violation:
         print(format_response_send_violation(violation), file=sys.stderr)
         return 2
+    fallback_hints_by_id = {
+        str(message.get("id") or ""): hint
+        for message in messages
+        if (
+            hint := prior_message_hint_for_queue(
+                message,
+                queue_snapshot,
+                None,
+                inflight_without_enter=None,
+            )
+        )
+    }
 
     # File-write fallback: the message is written directly to queue.json
     # in the transient status="ingressing" state and the message_queued
@@ -411,6 +437,7 @@ def main() -> int:
     # the model pane; operator diagnostics are recorded in raw events.
 
     ids = []
+    fallback_hints = []
     for message, record in messages_and_records:
         try:
             update_queue(queue_file, message)
@@ -430,6 +457,9 @@ def main() -> int:
                 print(write_failure_message(public_path, exc, ipc_error), file=sys.stderr)
                 return 1
         ids.append(message["id"])
+        hint = fallback_hints_by_id.get(str(message.get("id") or ""))
+        if hint:
+            fallback_hints.append(hint)
     fallback_record = {
         "ts": utc_now(),
         "agent": "bridge",
@@ -448,6 +478,7 @@ def main() -> int:
     except OSError:
         pass
     print(format_enqueue_success_stdout(ids, aggregate_id))
+    print_prior_message_hints(fallback_hints)
     return 0
 
 
