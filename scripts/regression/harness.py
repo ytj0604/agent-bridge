@@ -293,3 +293,138 @@ def set_identity_target(state_root_path: Path, *, alias: str = "codex", session_
     lock["target"] = target
     locks.setdefault("panes", {})[pane] = lock
     write_json_atomic(Path(os.environ["AGENT_BRIDGE_PANE_LOCKS"]), locks)
+
+
+def _qualifying_message(sender: str, target: str, kind: str = "notice", body: str = "hi") -> dict:
+    # Mirrors what bridge_enqueue.py emits: a fresh message starts in
+    # transient "ingressing" state and gets finalized to "pending" by
+    # the daemon's _apply_alarm_cancel_to_queued_message helper.
+    return {
+        "id": f"msg-{uuid.uuid4().hex}", "created_ts": utc_now(), "updated_ts": utc_now(),
+        "from": sender, "to": target, "kind": kind, "intent": "test", "body": body,
+        "causal_id": "c", "hop_count": 1, "auto_return": (kind == "request"),
+        "reply_to": None, "source": "test", "bridge_session": "test-session",
+        "status": "ingressing", "nonce": None, "delivery_attempts": 0,
+    }
+
+
+def _delivered_request(message_id: str, requester: str, responder: str, *, auto_return: bool = True) -> dict:
+    msg = _qualifying_message(requester, responder, kind="request", body="delivered request")
+    msg.update({
+        "id": message_id,
+        "status": "delivered",
+        "auto_return": auto_return,
+        "nonce": f"n-{message_id}",
+        "delivered_ts": utc_now(),
+    })
+    return msg
+
+
+def _participants_state(aliases: list[str]) -> dict:
+    return {
+        "session": "test-session",
+        "participants": {a: {"alias": a, "agent_type": "codex", "pane": f"%{i+10}", "status": "active"} for i, a in enumerate(aliases)},
+    }
+
+
+def _write_seed_hook_configs(home: Path) -> tuple[Path, Path]:
+    claude = home / ".claude" / "settings.json"
+    codex = home / ".codex" / "hooks.json"
+    claude.parent.mkdir(parents=True, exist_ok=True)
+    codex.parent.mkdir(parents=True, exist_ok=True)
+    claude.write_text(json.dumps({
+        "hooks": {
+            "Stop": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": "/tmp/bridge-hook --agent claude"},
+                        {"type": "command", "command": "echo keep-claude"},
+                    ]
+                }
+            ],
+            "Notification": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": "/tmp/agent-bridge/hooks/bridge-hook --agent claude"},
+                    ]
+                }
+            ],
+        },
+        "user": "preserve",
+    }, indent=2) + "\n", encoding="utf-8")
+    codex.write_text(json.dumps({
+        "hooks": {
+            "Stop": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": "/tmp/bridge-hook --agent codex"},
+                        {"type": "command", "command": "echo keep-codex"},
+                    ]
+                }
+            ],
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": "/tmp/agent-bridge/hooks/bridge-hook --agent codex"},
+                    ]
+                }
+            ],
+        },
+        "user": "preserve",
+    }, indent=2) + "\n", encoding="utf-8")
+    return claude, codex
+
+
+def _fake_install_env(tmpdir: Path, *, path_prefix: Path | None = None) -> dict[str, str]:
+    env = dict(os.environ)
+    env.pop("AGENT_BRIDGE" + "_PYTHON", None)
+    env["HOME"] = str(tmpdir / "home")
+    env["SHELL"] = "/bin/bash"
+    env["XDG_BIN_HOME"] = str(tmpdir / "xdg-bin")
+    env["XDG_CONFIG_HOME"] = str(tmpdir / "xdg-config")
+    env["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
+    env["AGENT_BRIDGE_RUN_DIR"] = str(tmpdir / "run")
+    env["AGENT_BRIDGE_LOG_DIR"] = str(tmpdir / "log")
+    if path_prefix is not None:
+        env["PATH"] = f"{path_prefix}:{env.get('PATH', '')}"
+    return env
+
+
+def _import_enqueue_module():
+    import importlib
+    be = importlib.import_module("bridge_enqueue")
+    return importlib.reload(be)
+
+
+def _run_enqueue_main(be, argv: list[str], stdin_text: str = "") -> tuple[int, str, str]:
+    import contextlib
+    import io
+    old_argv = sys.argv[:]
+    old_stdin = sys.stdin
+    out = io.StringIO()
+    err = io.StringIO()
+    try:
+        sys.argv = ["bridge_enqueue.py", *argv]
+        sys.stdin = io.StringIO(stdin_text)
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = be.main()
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
+    finally:
+        sys.argv = old_argv
+        sys.stdin = old_stdin
+    return int(code), out.getvalue(), err.getvalue()
+
+
+def _patch_enqueue_for_unit(be, state: dict, *, socket_error: str = "") -> None:
+    be.ensure_daemon_running = lambda session: ""
+    be.room_status = lambda session: argparse.Namespace(active_enough_for_enqueue=True, reason="ok")
+    be.sender_matches_caller = lambda args, session: True
+    be.load_session = lambda session: state
+    be.enqueue_via_daemon_socket = lambda session, messages, **kwargs: (False, [], [], socket_error, "")
+
+
+def _write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")

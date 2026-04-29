@@ -40,6 +40,13 @@ from regression.harness import (
     INSTALL_SHIM_TARGETS,
     LIBEXEC,
     ROOT,
+    _delivered_request,
+    _import_enqueue_module,
+    _participants_state,
+    _patch_enqueue_for_unit,
+    _qualifying_message,
+    _run_enqueue_main,
+    _write_json,
     FakeCommandConn,
     assert_true,
     identity_live_record,
@@ -1199,17 +1206,6 @@ def _enqueue_alarm(d, owner: str, note: str = "") -> str:
     return d.register_alarm(owner, 600.0, note) or ""
 
 
-def _qualifying_message(sender: str, target: str, kind: str = "notice", body: str = "hi") -> dict:
-    # Mirrors what bridge_enqueue.py emits: a fresh message starts in
-    # transient "ingressing" state and gets finalized to "pending" by
-    # the daemon's _apply_alarm_cancel_to_queued_message helper.
-    return {
-        "id": f"msg-{uuid.uuid4().hex}", "created_ts": utc_now(), "updated_ts": utc_now(),
-        "from": sender, "to": target, "kind": kind, "intent": "test", "body": body,
-        "causal_id": "c", "hop_count": 1, "auto_return": (kind == "request"),
-        "reply_to": None, "source": "test", "bridge_session": "test-session",
-        "status": "ingressing", "nonce": None, "delivery_attempts": 0,
-    }
 
 
 def _set_response_context(
@@ -1237,16 +1233,6 @@ def _set_response_context(
     }
 
 
-def _delivered_request(message_id: str, requester: str, responder: str, *, auto_return: bool = True) -> dict:
-    msg = _qualifying_message(requester, responder, kind="request", body="delivered request")
-    msg.update({
-        "id": message_id,
-        "status": "delivered",
-        "auto_return": auto_return,
-        "nonce": f"n-{message_id}",
-        "delivered_ts": utc_now(),
-    })
-    return msg
 
 
 def scenario_response_send_guard_socket_request_notice(label: str, tmpdir: Path) -> None:
@@ -6034,11 +6020,6 @@ def scenario_held_drain_skips_consume_once(label: str, tmpdir: Path) -> None:
 
 # ---------- v1.5.x scenarios: multi-target send_peer ----------
 
-def _participants_state(aliases: list[str]) -> dict:
-    return {
-        "session": "test-session",
-        "participants": {a: {"alias": a, "agent_type": "codex", "pane": f"%{i+10}", "status": "active"} for i, a in enumerate(aliases)},
-    }
 
 
 def scenario_resolve_targets_single(label: str, tmpdir: Path) -> None:
@@ -6268,40 +6249,6 @@ def scenario_aggregate_trigger_no_auto_return_no(label: str, tmpdir: Path) -> No
     print(f"  PASS  {label}")
 
 
-def scenario_enqueue_aggregate_metadata_modes(label: str, tmpdir: Path) -> None:
-    cases = [
-        ("partial", ["--to", "bob,carol"], tmpdir / "partial.json"),
-        ("all", ["--all"], tmpdir / "all.json"),
-    ]
-    for expected_mode, target_args, queue_file in cases:
-        be = _import_enqueue_module()
-        state = _participants_state(["alice", "bob", "carol"])
-        _patch_enqueue_for_unit(be, state)
-        code, out, err = _run_enqueue_main(
-            be,
-            [
-                "--session", "test-session",
-                "--from", "alice",
-                *target_args,
-                "--body", "hello",
-                "--queue-file", str(queue_file),
-                "--state-file", str(tmpdir / f"{expected_mode}.events.raw.jsonl"),
-                "--public-state-file", str(tmpdir / f"{expected_mode}.events.jsonl"),
-            ],
-        )
-        assert_true(code == 0, f"{label}: aggregate enqueue {expected_mode} should succeed: code={code} err={err!r}")
-        lines = _stdout_lines(out)
-        queue = json.loads(queue_file.read_text(encoding="utf-8"))
-        assert_true(len(lines) == 3 and len(queue) == 2, f"{label}: aggregate enqueue should create two legs plus aggregate id: out={out!r} queue={queue}")
-        ids = lines[:2]
-        stdout_aggregate_id = _aggregate_id_from_stdout(out)
-        aggregate_ids = {item.get("aggregate_id") for item in queue}
-        started_values = {item.get("aggregate_started_ts") for item in queue}
-        assert_true(aggregate_ids == {stdout_aggregate_id}, f"{label}: legs should share printed aggregate id: out={out!r} queue={queue}")
-        assert_true(len(started_values) == 1 and next(iter(started_values)), f"{label}: legs should share aggregate_started_ts: {queue}")
-        assert_true({item.get("aggregate_mode") for item in queue} == {expected_mode}, f"{label}: aggregate mode mismatch for {expected_mode}: {queue}")
-        assert_true(all(item.get("aggregate_message_ids") == {"bob": ids[0], "carol": ids[1]} for item in queue), f"{label}: aggregate message map mismatch: ids={ids} queue={queue}")
-    print(f"  PASS  {label}")
 
 
 # ---------- v1.5.x scenarios: forgotten retention + restart guards ----------
@@ -6455,1960 +6402,212 @@ def scenario_queue_status_counts_missing_file(label: str, tmpdir: Path) -> None:
     print(f"  PASS  {label}")
 
 
-def scenario_uninstall_helper_print_paths(label: str, tmpdir: Path) -> None:
-    helper = str(LIBEXEC / "bridge_uninstall_state.py")
-    proc = subprocess.run([sys.executable, helper, "--print-paths"], capture_output=True, text=True, timeout=10)
-    assert_true(proc.returncode == 0, f"{label}: helper exit 0, got {proc.returncode}: {proc.stderr}")
-    payload = json.loads(proc.stdout)
-    for key in ("state", "run", "log"):
-        assert_true(key in payload, f"{label}: payload contains {key}")
-        assert_true(payload[key].endswith(key), f"{label}: {key} path looks like .../<{key}>")
-    print(f"  PASS  {label}")
-
-
-def scenario_uninstall_helper_refuses_dangerous_path(label: str, tmpdir: Path) -> None:
-    helper = str(LIBEXEC / "bridge_uninstall_state.py")
-    env = dict(os.environ)
-    env["AGENT_BRIDGE_STATE_DIR"] = "/etc"  # dangerous
-    proc = subprocess.run([sys.executable, helper, "--dry-run"], env=env, capture_output=True, text=True, timeout=10)
-    assert_true(proc.returncode != 0, f"{label}: must refuse dangerous path, exit was {proc.returncode}")
-    assert_true("refuses" in proc.stderr.lower() or "dangerous" in proc.stderr.lower(), f"{label}: stderr explains refusal: {proc.stderr!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_direct_exec_targets_executable(label: str, tmpdir: Path) -> None:
-    missing = []
-    not_executable = []
-    for name, relative in DIRECT_EXECUTABLE_TARGETS:
-        path = ROOT / relative
-        if not path.exists():
-            missing.append(f"{name}={path}")
-        elif not os.access(path, os.X_OK):
-            not_executable.append(f"{name}={path}")
-    assert_true(not missing, f"{label}: direct exec targets missing: {missing}")
-    assert_true(not not_executable, f"{label}: direct exec targets not executable: {not_executable}")
-    print(f"  PASS  {label}")
-
-
-def scenario_healthcheck_executable_helper_distinguishes_states(label: str, tmpdir: Path) -> None:
-    import importlib
-    hc = importlib.import_module("bridge_healthcheck")
-    importlib.reload(hc)
-
-    missing = tmpdir / "missing-tool"
-    ok, detail = hc.check_executable(missing)
-    assert_true(not ok, f"{label}: missing path must fail")
-    assert_true("missing" in detail and "not executable" not in detail, f"{label}: missing detail must be distinct: {detail!r}")
-
-    tool = tmpdir / "tool"
-    tool.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-    os.chmod(tool, 0o644)
-    ok, detail = hc.check_executable(tool)
-    assert_true(not ok, f"{label}: non-executable file must fail")
-    assert_true("exists but is not executable" in detail, f"{label}: non-executable detail must be distinct: {detail!r}")
-
-    os.chmod(tool, 0o755)
-    ok, detail = hc.check_executable(tool)
-    assert_true(ok and detail == str(tool), f"{label}: executable file must pass, got ok={ok} detail={detail!r}")
-    print(f"  PASS  {label}")
-
-
-def _write_fake_uninstall_tree(root: Path) -> None:
-    shutil.copy2(ROOT / "uninstall.sh", root / "uninstall.sh")
-    libexec = root / "libexec" / "agent-bridge"
-    libexec.mkdir(parents=True, exist_ok=True)
-    for name in ("bridge_uninstall_hooks.py", "bridge_codex_config.py", "bridge_util.py"):
-        shutil.copy2(LIBEXEC / name, libexec / name)
-
-
-def _write_seed_hook_configs(home: Path) -> tuple[Path, Path]:
-    claude = home / ".claude" / "settings.json"
-    codex = home / ".codex" / "hooks.json"
-    claude.parent.mkdir(parents=True, exist_ok=True)
-    codex.parent.mkdir(parents=True, exist_ok=True)
-    claude.write_text(json.dumps({
-        "hooks": {
-            "Stop": [
-                {
-                    "hooks": [
-                        {"type": "command", "command": "/tmp/bridge-hook --agent claude"},
-                        {"type": "command", "command": "echo keep-claude"},
-                    ]
-                }
-            ],
-            "Notification": [
-                {
-                    "hooks": [
-                        {"type": "command", "command": "/tmp/agent-bridge/hooks/bridge-hook --agent claude"},
-                    ]
-                }
-            ],
-        },
-        "user": "preserve",
-    }, indent=2) + "\n", encoding="utf-8")
-    codex.write_text(json.dumps({
-        "hooks": {
-            "Stop": [
-                {
-                    "hooks": [
-                        {"type": "command", "command": "/tmp/bridge-hook --agent codex"},
-                        {"type": "command", "command": "echo keep-codex"},
-                    ]
-                }
-            ],
-            "UserPromptSubmit": [
-                {
-                    "hooks": [
-                        {"type": "command", "command": "/tmp/agent-bridge/hooks/bridge-hook --agent codex"},
-                    ]
-                }
-            ],
-        },
-        "user": "preserve",
-    }, indent=2) + "\n", encoding="utf-8")
-    return claude, codex
-
-
-def _run_fake_uninstall(
-    root: Path,
-    *,
-    env: dict[str, str],
-    extra_args: list[str] | None = None,
-) -> subprocess.CompletedProcess:
-    cmd = ["bash", str(root / "uninstall.sh"), "--bin-dir", str(Path(env["XDG_BIN_HOME"]))]
-    cmd.extend(extra_args or [])
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=10,
-    )
-
-
-def scenario_uninstall_sh_dry_run_invokes_hook_helper_with_dry_run(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "uninstall-dry-run"
-    root.mkdir()
-    _write_fake_uninstall_tree(root)
-    env = _fake_install_env(tmpdir / "dry-env")
-    claude, codex = _write_seed_hook_configs(Path(env["HOME"]))
-    before_claude = claude.read_bytes()
-    before_codex = codex.read_bytes()
-
-    proc = _run_fake_uninstall(root, env=env, extra_args=["--dry-run", "--keep-shims"])
-    assert_true(proc.returncode == 0, f"{label}: dry-run uninstall should succeed: {proc.stderr!r}")
-    assert_true("removed 2 hook command(s)" in proc.stdout, f"{label}: helper output should show removal count: {proc.stdout!r}")
-    assert_true(proc.stdout.count("removed 2 hook command(s)") == 2, f"{label}: helper output should include Claude and Codex counts: {proc.stdout!r}")
-    assert_true("dry-run: python3" not in proc.stdout and "bridge_uninstall_hooks.py" not in proc.stdout, f"{label}: hook helper must be invoked, not printed as dry-run command: {proc.stdout!r}")
-    assert_true(claude.read_bytes() == before_claude, f"{label}: Claude config must be byte-identical under dry-run")
-    assert_true(codex.read_bytes() == before_codex, f"{label}: Codex hooks config must be byte-identical under dry-run")
-    print(f"  PASS  {label}")
-
-
-def scenario_uninstall_sh_non_dry_run_removes_hook_entries(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "uninstall-real"
-    root.mkdir()
-    _write_fake_uninstall_tree(root)
-    env = _fake_install_env(tmpdir / "real-env")
-    claude, codex = _write_seed_hook_configs(Path(env["HOME"]))
-
-    proc = _run_fake_uninstall(root, env=env, extra_args=["--keep-shims"])
-    assert_true(proc.returncode == 0, f"{label}: temp uninstall should succeed: {proc.stderr!r}")
-    claude_text = claude.read_text(encoding="utf-8")
-    codex_text = codex.read_text(encoding="utf-8")
-    assert_true("bridge-hook" not in claude_text and "agent-bridge" not in claude_text, f"{label}: Claude bridge hooks should be removed: {claude_text!r}")
-    assert_true("bridge-hook" not in codex_text and "agent-bridge" not in codex_text, f"{label}: Codex bridge hooks should be removed: {codex_text!r}")
-    assert_true("echo keep-claude" in claude_text and '"user": "preserve"' in claude_text, f"{label}: Claude user entries should remain: {claude_text!r}")
-    assert_true("echo keep-codex" in codex_text and '"user": "preserve"' in codex_text, f"{label}: Codex user entries should remain: {codex_text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_uninstall_sh_keep_hooks_skips_helper_under_dry_run(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "uninstall-keep-hooks"
-    root.mkdir()
-    _write_fake_uninstall_tree(root)
-    sentinel = root / "libexec" / "agent-bridge" / "bridge_uninstall_hooks.py"
-    sentinel.write_text("#!/usr/bin/env python3\nraise SystemExit(42)\n", encoding="utf-8")
-    env = _fake_install_env(tmpdir / "keep-hooks-env")
-
-    proc = _run_fake_uninstall(root, env=env, extra_args=["--dry-run", "--keep-hooks", "--keep-shims"])
-    assert_true(proc.returncode == 0, f"{label}: --keep-hooks must skip failing sentinel helper: {proc.stderr!r}")
-    assert_true("remove Claude/Codex hook entries" not in proc.stdout, f"{label}: hook section should be skipped entirely: {proc.stdout!r}")
-    assert_true("removed " not in proc.stdout, f"{label}: no helper output expected: {proc.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_uninstall_sh_hook_helper_failure_aborts(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "uninstall-helper-fails"
-    root.mkdir()
-    _write_fake_uninstall_tree(root)
-    sentinel = root / "libexec" / "agent-bridge" / "bridge_uninstall_hooks.py"
-    sentinel.write_text("#!/usr/bin/env python3\nraise SystemExit(42)\n", encoding="utf-8")
-    env = _fake_install_env(tmpdir / "helper-fails-env")
-
-    proc = _run_fake_uninstall(root, env=env, extra_args=["--keep-shims"])
-    assert_true(proc.returncode == 1, f"{label}: helper failure should map to uninstall.sh failure exit 1, got {proc.returncode}")
-    assert_true("uninstall.sh: hook removal helper failed; aborting" in proc.stderr, f"{label}: targeted helper failure expected: {proc.stderr!r}")
-    assert_true("uninstall complete" not in proc.stdout, f"{label}: script must abort before completion message: {proc.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def _write_fake_install_tree(root: Path, *, omit: Path | None = None) -> None:
-    shutil.copy2(ROOT / "install.sh", root / "install.sh")
-    helper = root / "libexec" / "agent-bridge" / "bridge_set_editor_mode.py"
-    helper.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(ROOT / "libexec" / "agent-bridge" / "bridge_set_editor_mode.py", helper)
-    for _, relative in INSTALL_SHIM_TARGETS:
-        if omit is not None and relative == omit:
-            continue
-        target = root / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        os.chmod(target, 0o644)
-    hook = root / "hooks" / "bridge-hook"
-    hook.parent.mkdir(parents=True, exist_ok=True)
-    hook.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-    os.chmod(hook, 0o755)
-
-
-def _write_fake_python3(fakebin: Path, version: str) -> Path:
-    fakebin.mkdir(parents=True, exist_ok=True)
-    major_minor = tuple(int(part) for part in version.split(".")[:2])
-    gate_exit = 0 if major_minor >= (3, 10) else 1
-    path = fakebin / "python3"
-    path.write_text(
-        "#!/usr/bin/env bash\n"
-        "if [[ \"${1:-}\" == \"-c\" && \"${2:-}\" == *agent_bridge_python_gate_v1* ]]; then\n"
-        f"  printf '%s\\n' {shlex.quote(version)}\n"
-        "  printf '%s\\n' \"$0\"\n"
-        f"  exit {gate_exit}\n"
-        "fi\n"
-        f"exec {shlex.quote(sys.executable)} \"$@\"\n",
-        encoding="utf-8",
-    )
-    os.chmod(path, 0o755)
-    return fakebin
-
-
-def _assert_python_gate_failure(label: str, proc: subprocess.CompletedProcess) -> None:
-    assert_true(proc.returncode != 0, f"{label}: expected Python gate failure")
-    assert_true("###################################################################" in proc.stderr, f"{label}: emphasized delimiter missing: {proc.stderr!r}")
-    assert_true("Python 3.10" in proc.stderr, f"{label}: Python 3.10 token missing: {proc.stderr!r}")
-    assert_true("ERROR: agent-bridge requires Python 3.10 or newer." in proc.stderr, f"{label}: targeted error missing: {proc.stderr!r}")
-
-
-def _write_fake_healthcheck_tree(root: Path) -> None:
-    (root / "bin").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(ROOT / "bin" / "bridge_healthcheck.sh", root / "bin" / "bridge_healthcheck.sh")
-    os.chmod(root / "bin" / "bridge_healthcheck.sh", 0o755)
-    shutil.copytree(
-        LIBEXEC,
-        root / "libexec" / "agent-bridge",
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-    )
-    for _, relative in DIRECT_EXECUTABLE_TARGETS:
-        target = root / relative
-        if relative == Path("bin/bridge_healthcheck.sh"):
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        os.chmod(target, 0o755)
-
-
-def _write_fake_hook_installer(root: Path, *, exit_code: int = 0, argv_file: Path | None = None) -> Path:
-    path = root / "libexec" / "agent-bridge" / "bridge_install_hooks.py"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    argv_literal = repr(str(argv_file)) if argv_file else "''"
-    path.write_text(
-        "#!/usr/bin/env python3\n"
-        "import pathlib\n"
-        "import sys\n"
-        f"argv_file = {argv_literal}\n"
-        "if argv_file:\n"
-        "    pathlib.Path(argv_file).parent.mkdir(parents=True, exist_ok=True)\n"
-        "    pathlib.Path(argv_file).write_text('\\n'.join(sys.argv[1:]) + '\\n', encoding='utf-8')\n"
-        f"raise SystemExit({int(exit_code)})\n",
-        encoding="utf-8",
-    )
-    return path
-
-
-def _fake_install_env(tmpdir: Path, *, path_prefix: Path | None = None) -> dict[str, str]:
-    env = dict(os.environ)
-    env.pop("AGENT_BRIDGE" + "_PYTHON", None)
-    env["HOME"] = str(tmpdir / "home")
-    env["SHELL"] = "/bin/bash"
-    env["XDG_BIN_HOME"] = str(tmpdir / "xdg-bin")
-    env["XDG_CONFIG_HOME"] = str(tmpdir / "xdg-config")
-    env["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
-    env["AGENT_BRIDGE_RUN_DIR"] = str(tmpdir / "run")
-    env["AGENT_BRIDGE_LOG_DIR"] = str(tmpdir / "log")
-    if path_prefix is not None:
-        env["PATH"] = f"{path_prefix}:{env.get('PATH', '')}"
-    return env
-
-
-def _fake_healthcheck_env(tmpdir: Path, root: Path, fakebin: Path) -> dict[str, str]:
-    env = _fake_install_env(tmpdir)
-    env.pop("AGENT_BRIDGE_HOME", None)
-    env.pop("AGENT_BRIDGE" + "_PYTHON", None)
-    env["PATH"] = f"{fakebin}:{root / 'bin'}:{root / 'model-bin'}:{env.get('PATH', '')}"
-    _write_seed_hook_configs(Path(env["HOME"]))
-    return env
-
-
-def _run_fake_install(
-    root: Path,
-    bin_dir: Path,
-    *,
-    env: dict[str, str] | None = None,
-    skip_hooks: bool = True,
-    yes: bool = True,
-    shell_rc: bool = False,
-    extra_args: list[str] | None = None,
-) -> subprocess.CompletedProcess:
-    cmd = [
-        "bash",
-        str(root / "install.sh"),
-        "--bin-dir",
-        str(bin_dir),
-    ]
-    if yes:
-        cmd.append("--yes")
-    if skip_hooks:
-        cmd.append("--skip-hooks")
-    if not shell_rc:
-        cmd.append("--no-shell-rc")
-    cmd.extend(extra_args or [])
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=10,
-    )
-
-
-def _run_fake_healthcheck(root: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["bash", str(root / "bin" / "bridge_healthcheck.sh")],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=10,
-    )
-
-
-def _run_bridge_install_hooks(
-    tmpdir: Path,
-    *,
-    claude_settings: Path | None = None,
-    codex_hooks: Path | None = None,
-    codex_config: Path | None = None,
-    skip_claude: bool = False,
-    skip_codex: bool = False,
-    dry_run: bool = False,
-) -> subprocess.CompletedProcess:
-    hook_command = tmpdir / "bridge-hook"
-    hook_command.parent.mkdir(parents=True, exist_ok=True)
-    hook_command.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-    os.chmod(hook_command, 0o755)
-    cmd = [
-        sys.executable,
-        str(ROOT / "libexec" / "agent-bridge" / "bridge_install_hooks.py"),
-        "--hook-command",
-        str(hook_command),
-        "--claude-settings",
-        str(claude_settings or (tmpdir / "settings.json")),
-        "--codex-hooks",
-        str(codex_hooks or (tmpdir / "hooks.json")),
-        "--codex-config",
-        str(codex_config or (tmpdir / "config.toml")),
-    ]
-    if skip_claude:
-        cmd.append("--skip-claude")
-    if skip_codex:
-        cmd.append("--skip-codex")
-    if dry_run:
-        cmd.append("--dry-run")
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        env=_fake_install_env(tmpdir),
-        timeout=10,
-    )
-
-
-def _run_bridge_uninstall_hooks(
-    tmpdir: Path,
-    *,
-    claude_settings: Path | None = None,
-    codex_hooks: Path | None = None,
-    codex_config: Path | None = None,
-    skip_claude: bool = False,
-    skip_codex: bool = False,
-    dry_run: bool = False,
-) -> subprocess.CompletedProcess:
-    cmd = [
-        sys.executable,
-        str(ROOT / "libexec" / "agent-bridge" / "bridge_uninstall_hooks.py"),
-        "--claude-settings",
-        str(claude_settings or (tmpdir / "settings.json")),
-        "--codex-hooks",
-        str(codex_hooks or (tmpdir / "hooks.json")),
-        "--codex-config",
-        str(codex_config or (tmpdir / "config.toml")),
-    ]
-    if skip_claude:
-        cmd.append("--skip-claude")
-    if skip_codex:
-        cmd.append("--skip-codex")
-    if dry_run:
-        cmd.append("--dry-run")
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        env=_fake_install_env(tmpdir),
-        timeout=10,
-    )
-
-
-def _run_bridge_set_editor_mode(path: Path, *, dry_run: bool = False, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-    cmd = [
-        sys.executable,
-        str(ROOT / "libexec" / "agent-bridge" / "bridge_set_editor_mode.py"),
-        "--path",
-        str(path),
-    ]
-    if dry_run:
-        cmd.append("--dry-run")
-    env = _fake_install_env(path.parent)
-    if env_extra:
-        env.update(env_extra)
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=10,
-    )
-
-
-def _managed_marker(path: Path) -> Path:
-    return bridge_codex_config.managed_marker_path(path)
-
-
-def _assert_hook_config_unchanged(label: str, path: Path, before: bytes, proc: subprocess.CompletedProcess, *needles: str) -> None:
-    assert_true(proc.returncode != 0, f"{label}: hook installer should fail, got {proc.returncode}: stdout={proc.stdout!r} stderr={proc.stderr!r}")
-    for needle in needles:
-        assert_true(needle in proc.stderr, f"{label}: stderr should contain {needle!r}: {proc.stderr!r}")
-    assert_true(path.read_bytes() == before, f"{label}: invalid existing hook config must not be overwritten")
-
-
-def scenario_python_env_override_removed_from_tracked_files(label: str, tmpdir: Path) -> None:
-    forbidden = "AGENT_BRIDGE" + "_PYTHON"
-    proc = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, timeout=10)
-    assert_true(proc.returncode == 0, f"{label}: git ls-files failed: {proc.stderr!r}")
-    hits = []
-    for rel in proc.stdout.splitlines():
-        path = ROOT / rel
-        if not path.is_file():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        if forbidden in text:
-            hits.append(rel)
-    assert_true(not hits, f"{label}: forbidden Python override token remains in tracked files: {hits}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_python_version_gate(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "install-python-gate"
-    root.mkdir()
-    _write_fake_install_tree(root)
-
-    fake39 = _write_fake_python3(tmpdir / "fake-python-39", "3.9.18")
-    env39 = _fake_install_env(tmpdir / "env39", path_prefix=fake39)
-    proc39 = _run_fake_install(root, tmpdir / "shims39", env=env39)
-    _assert_python_gate_failure(f"{label}: python 3.9", proc39)
-    assert_true("install shim:" not in proc39.stdout, f"{label}: gate should fail before shim work: {proc39.stdout!r}")
-
-    proc39_dry = _run_fake_install(root, tmpdir / "shims39-dry", env=env39, extra_args=["--dry-run"])
-    _assert_python_gate_failure(f"{label}: python 3.9 dry-run", proc39_dry)
-    assert_true("install shim:" not in proc39_dry.stdout, f"{label}: dry-run gate should fail before shim work: {proc39_dry.stdout!r}")
-
-    fake310 = _write_fake_python3(tmpdir / "fake-python-310", "3.10.14")
-    proc310 = _run_fake_install(root, tmpdir / "shims310", env=_fake_install_env(tmpdir / "env310", path_prefix=fake310))
-    assert_true(proc310.returncode == 0, f"{label}: fake Python 3.10 should pass install: {proc310.stderr!r}")
-    assert_true(os.access(tmpdir / "shims310" / "agent_send_peer", os.X_OK), f"{label}: install should write shims after passing gate")
-
-    fake311 = _write_fake_python3(tmpdir / "fake-python-311", "3.11.9")
-    proc311 = _run_fake_install(
-        root,
-        tmpdir / "shims311",
-        env=_fake_install_env(tmpdir / "env311", path_prefix=fake311),
-        extra_args=["--dry-run"],
-    )
-    assert_true(proc311.returncode == 0, f"{label}: fake Python 3.11 dry-run should pass install: {proc311.stderr!r}")
-    assert_true("install shim:" in proc311.stdout, f"{label}: dry-run should reach shim preview after passing gate: {proc311.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_healthcheck_sh_python_version_gate(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "healthcheck-python-gate"
-    root.mkdir()
-    _write_fake_healthcheck_tree(root)
-
-    fake39 = _write_fake_python3(tmpdir / "hc-fake-python-39", "3.9.18")
-    proc39 = _run_fake_healthcheck(root, _fake_healthcheck_env(tmpdir / "hc-env39", root, fake39))
-    _assert_python_gate_failure(f"{label}: python 3.9", proc39)
-    assert_true("ok   install_root" not in proc39.stdout, f"{label}: gate should fail before Python healthcheck output: {proc39.stdout!r}")
-
-    fake310 = _write_fake_python3(tmpdir / "hc-fake-python-310", "3.10.14")
-    proc310 = _run_fake_healthcheck(root, _fake_healthcheck_env(tmpdir / "hc-env310", root, fake310))
-    assert_true(proc310.returncode == 0, f"{label}: fake Python 3.10 healthcheck should pass: {proc310.stderr!r}")
-    assert_true("ok   install_root" in proc310.stdout, f"{label}: healthcheck should run after passing gate: {proc310.stdout!r}")
-
-    fake311 = _write_fake_python3(tmpdir / "hc-fake-python-311", "3.11.9")
-    proc311 = _run_fake_healthcheck(root, _fake_healthcheck_env(tmpdir / "hc-env311", root, fake311))
-    assert_true(proc311.returncode == 0, f"{label}: fake Python 3.11 healthcheck should pass: {proc311.stderr!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_chmods_target_or_fails(label: str, tmpdir: Path) -> None:
-    positive_root = tmpdir / "install-positive"
-    positive_root.mkdir()
-    _write_fake_install_tree(positive_root)
-    alarm_target = positive_root / "model-bin" / "agent_alarm"
-    assert_true(not os.access(alarm_target, os.X_OK), f"{label}: precondition target starts non-executable")
-    proc = _run_fake_install(positive_root, tmpdir / "shims-positive")
-    assert_true(proc.returncode == 0, f"{label}: install should recover non-executable targets, got {proc.returncode}: {proc.stderr}")
-    assert_true(os.access(alarm_target, os.X_OK), f"{label}: install should chmod shim target executable")
-    assert_true(os.access(tmpdir / "shims-positive" / "agent_alarm", os.X_OK), f"{label}: shim itself should be executable")
-
-    missing_root = tmpdir / "install-missing"
-    missing_root.mkdir()
-    _write_fake_install_tree(missing_root, omit=Path("model-bin/agent_alarm"))
-    proc = _run_fake_install(missing_root, tmpdir / "shims-missing")
-    assert_true(proc.returncode != 0, f"{label}: missing shim target must hard fail")
-    assert_true("missing shim target for agent_alarm" in proc.stderr, f"{label}: missing-target stderr should name shim: {proc.stderr!r}")
-
-    failing_root = tmpdir / "install-failing"
-    failing_root.mkdir()
-    _write_fake_install_tree(failing_root)
-    fakebin = tmpdir / "fakebin"
-    fakebin.mkdir()
-    fake_chmod = fakebin / "chmod"
-    fake_chmod.write_text(
-        "#!/usr/bin/env bash\n"
-        "case \"$*\" in\n"
-        "  *model-bin/agent_alarm*) echo fake chmod failure >&2; exit 42 ;;\n"
-        "esac\n"
-        "exec /bin/chmod \"$@\"\n",
-        encoding="utf-8",
-    )
-    os.chmod(fake_chmod, 0o755)
-    env = dict(os.environ)
-    env["PATH"] = f"{fakebin}:{env.get('PATH', '')}"
-    proc = _run_fake_install(failing_root, tmpdir / "shims-failing", env=env)
-    assert_true(proc.returncode != 0, f"{label}: chmod failure must hard fail")
-    assert_true("cannot make shim target executable for agent_alarm" in proc.stderr, f"{label}: chmod failure stderr should name shim: {proc.stderr!r}")
-    assert_true(not os.access(failing_root / "model-bin" / "agent_alarm", os.X_OK), f"{label}: failed chmod target should remain non-executable")
-    print(f"  PASS  {label}")
-
-
-def _fake_uname(tmpdir: Path, value: str) -> Path:
-    fakebin = tmpdir / f"fake-uname-{value.lower()}"
-    fakebin.mkdir(parents=True, exist_ok=True)
-    uname = fakebin / "uname"
-    uname.write_text(f"#!/usr/bin/env bash\nprintf '%s\\n' {shlex.quote(value)}\n", encoding="utf-8")
-    os.chmod(uname, 0o755)
-    return fakebin
-
-
-def _agent_bridge_path_block(bin_dir: Path) -> str:
-    return (
-        "# >>> Agent Bridge >>>\n"
-        f"export PATH={shlex.quote(str(bin_dir))}:\"$PATH\"\n"
-        "# <<< Agent Bridge <<<\n"
-    )
-
-
-def scenario_install_sh_default_updates_shell_rc(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "install-rc-default"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    bin_dir = tmpdir / "shims-rc-default"
-    env = _fake_install_env(tmpdir)
-    proc = _run_fake_install(root, bin_dir, env=env, yes=False, shell_rc=True)
-    assert_true(proc.returncode == 0, f"{label}: default install should succeed: stdout={proc.stdout!r} stderr={proc.stderr!r}")
-    rc = Path(env["HOME"]) / ".bashrc"
-    assert_true(rc.exists(), f"{label}: bash on Linux should write .bashrc")
-    text = rc.read_text(encoding="utf-8")
-    block = _agent_bridge_path_block(bin_dir)
-    assert_true(block in text, f"{label}: rc should contain marked PATH block: {text!r}")
-    assert_true(text.count("# >>> Agent Bridge >>>") == 1, f"{label}: marker should appear once: {text!r}")
-    assert_true("permission mode note" in proc.stdout, f"{label}: install should print permission mode note: {proc.stdout!r}")
-    assert_true("--permission-mode bypassPermissions" in proc.stdout, f"{label}: Claude permission flag should be shown: {proc.stdout!r}")
-    assert_true("--dangerously-bypass-approvals-and-sandbox" in proc.stdout, f"{label}: Codex permission flag should be shown: {proc.stdout!r}")
-    assert_true(not list(rc.parent.glob(".bashrc.agent-bridge.bak.*")), f"{label}: no backup needed for newly-created rc")
-
-    proc2 = _run_fake_install(root, bin_dir, env=env, yes=False, shell_rc=True)
-    assert_true(proc2.returncode == 0, f"{label}: repeated install should succeed: {proc2.stderr!r}")
-    text2 = rc.read_text(encoding="utf-8")
-    assert_true(text2.count("# >>> Agent Bridge >>>") == 1, f"{label}: repeated install must not duplicate marker: {text2!r}")
-    assert_true(not list(rc.parent.glob(".bashrc.agent-bridge.bak.*")), f"{label}: repeated no-op should not create backup")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_shell_rc_dry_run_and_opt_out(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "install-rc-dry"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    bin_dir = tmpdir / "shims-rc-dry"
-    env = _fake_install_env(tmpdir)
-    rc = Path(env["HOME"]) / ".bashrc"
-
-    proc_dry = _run_fake_install(root, bin_dir, env=env, yes=False, shell_rc=True, extra_args=["--dry-run"])
-    assert_true(proc_dry.returncode == 0, f"{label}: dry-run should succeed: {proc_dry.stderr!r}")
-    assert_true("add PATH block to" in proc_dry.stdout, f"{label}: dry-run should show planned rc edit: {proc_dry.stdout!r}")
-    assert_true(not rc.exists(), f"{label}: dry-run must not create rc file")
-
-    proc_no_rc = _run_fake_install(root, bin_dir, env=env, yes=False, shell_rc=False)
-    assert_true(proc_no_rc.returncode == 0, f"{label}: --no-shell-rc should succeed: {proc_no_rc.stderr!r}")
-    assert_true("PATH note: add this block" in proc_no_rc.stdout, f"{label}: opt-out should print PATH note: {proc_no_rc.stdout!r}")
-    assert_true("# >>> Agent Bridge >>>" in proc_no_rc.stdout, f"{label}: opt-out note should include paste-ready marker block: {proc_no_rc.stdout!r}")
-    assert_true(not rc.exists(), f"{label}: --no-shell-rc must not create rc file")
-
-    proc_yes_no_rc = _run_fake_install(root, bin_dir, env=env, yes=True, shell_rc=False)
-    assert_true(proc_yes_no_rc.returncode == 0, f"{label}: --yes --no-shell-rc should succeed: {proc_yes_no_rc.stderr!r}")
-    assert_true(not rc.exists(), f"{label}: --no-shell-rc must win over --yes")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_shell_rc_target_selection(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "install-rc-targets"
-    root.mkdir()
-    _write_fake_install_tree(root)
-
-    env_zsh = _fake_install_env(tmpdir / "zsh")
-    env_zsh["SHELL"] = "/bin/zsh"
-    proc_zsh = _run_fake_install(root, tmpdir / "shims-zsh", env=env_zsh, yes=False, shell_rc=True)
-    assert_true(proc_zsh.returncode == 0, f"{label}: zsh install should succeed: {proc_zsh.stderr!r}")
-    assert_true((Path(env_zsh["HOME"]) / ".zshrc").exists(), f"{label}: zsh should target .zshrc")
-
-    env_other = _fake_install_env(tmpdir / "other")
-    env_other["SHELL"] = "/usr/bin/fish"
-    proc_other = _run_fake_install(root, tmpdir / "shims-other", env=env_other, yes=False, shell_rc=True)
-    assert_true(proc_other.returncode == 0, f"{label}: other shell install should succeed: {proc_other.stderr!r}")
-    assert_true((Path(env_other["HOME"]) / ".profile").exists(), f"{label}: unknown shell should target .profile")
-
-    env_darwin = _fake_install_env(tmpdir / "darwin", path_prefix=_fake_uname(tmpdir, "Darwin"))
-    env_darwin["SHELL"] = "/bin/bash"
-    proc_darwin = _run_fake_install(root, tmpdir / "shims-darwin", env=env_darwin, yes=False, shell_rc=True)
-    assert_true(proc_darwin.returncode == 0, f"{label}: Darwin bash install should succeed: {proc_darwin.stderr!r}")
-    assert_true((Path(env_darwin["HOME"]) / ".bash_profile").exists(), f"{label}: Darwin bash should target .bash_profile")
-    assert_true(not (Path(env_darwin["HOME"]) / ".bashrc").exists(), f"{label}: Darwin bash should not write .bashrc")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_shell_rc_backup_and_path_short_circuit(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "install-rc-backup"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    bin_dir = tmpdir / "shims-rc-backup"
-    env = _fake_install_env(tmpdir)
-    home = Path(env["HOME"])
-    home.mkdir(parents=True, exist_ok=True)
-    rc = home / ".bashrc"
-    rc.write_text("existing config\n", encoding="utf-8")
-    proc = _run_fake_install(root, bin_dir, env=env, yes=False, shell_rc=True)
-    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
-    backups = list(home.glob(".bashrc.agent-bridge.bak.*"))
-    assert_true(len(backups) == 1, f"{label}: exactly one backup expected, got {backups}")
-    assert_true(backups[0].read_text(encoding="utf-8") == "existing config\n", f"{label}: backup should preserve original rc")
-    assert_true(_agent_bridge_path_block(bin_dir) in rc.read_text(encoding="utf-8"), f"{label}: rc should get path block")
-
-    env_path_ok = _fake_install_env(tmpdir / "path-ok", path_prefix=tmpdir / "already-on-path")
-    bin_on_path = tmpdir / "already-on-path"
-    proc_path_ok = _run_fake_install(root, bin_on_path, env=env_path_ok, yes=False, shell_rc=True)
-    assert_true(proc_path_ok.returncode == 0, f"{label}: PATH-ok install should succeed: {proc_path_ok.stderr!r}")
-    assert_true(not (Path(env_path_ok["HOME"]) / ".bashrc").exists(), f"{label}: bin_dir already on PATH should not write rc")
-    assert_true("add PATH block" not in proc_path_ok.stdout, f"{label}: PATH-ok install should not announce rc edit: {proc_path_ok.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_shell_quotes_bin_dir_metacharacters(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "install-rc-quote"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    raw = "bin with spaces 'quotes' \"dbl\" $(touch pwn) `uname`\nnext"
-    bin_dir = tmpdir / raw
-    env = _fake_install_env(tmpdir)
-    proc = _run_fake_install(root, bin_dir, env=env, yes=False, shell_rc=True)
-    assert_true(proc.returncode == 0, f"{label}: install should accept metacharacter bin_dir: stdout={proc.stdout!r} stderr={proc.stderr!r}")
-    rc = Path(env["HOME"]) / ".bashrc"
-    text = rc.read_text(encoding="utf-8")
-    prefix = "export PATH="
-    suffix = ":\"$PATH\""
-    start = text.find(prefix)
-    finish = text.find(suffix, start)
-    assert_true(start >= 0 and finish >= 0, f"{label}: rc should contain export assignment: {text!r}")
-    rhs = text[start + len(prefix): finish + len(suffix)]
-    parsed = shlex.split(rhs)[0]
-    assert_true(parsed == f"{bin_dir}:$PATH", f"{label}: quoted export should parse back to literal bin_dir plus PATH: parsed={parsed!r} text={text!r}")
-    assert_true(f"export PATH={shlex.quote(str(bin_dir))}:\"$PATH\"" in text, f"{label}: rc should shell-quote bin_dir: {text!r}")
-    assert_true('export PATH="' not in text, f"{label}: rc must not use unsafe double-quoted bin_dir form: {text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_shell_rc_replaces_existing_marker_block(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "install-rc-replace"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    env = _fake_install_env(tmpdir)
-    bin_a = tmpdir / "bin-a"
-    bin_b = tmpdir / "bin b"
-    proc_a = _run_fake_install(root, bin_a, env=env, yes=False, shell_rc=True)
-    assert_true(proc_a.returncode == 0, f"{label}: first install should succeed: {proc_a.stderr!r}")
-    proc_b = _run_fake_install(root, bin_b, env=env, yes=False, shell_rc=True)
-    assert_true(proc_b.returncode == 0, f"{label}: second install should succeed: {proc_b.stderr!r}")
-    rc = Path(env["HOME"]) / ".bashrc"
-    text = rc.read_text(encoding="utf-8")
-    assert_true(text.count("# >>> Agent Bridge >>>") == 1 and text.count("# <<< Agent Bridge <<<") == 1, f"{label}: marker block should be replaced, not appended: {text!r}")
-    assert_true(str(bin_a) not in text, f"{label}: old bin_dir should be removed from managed block: {text!r}")
-    assert_true(f"export PATH={shlex.quote(str(bin_b))}:\"$PATH\"" in text, f"{label}: new bin_dir should be present and quoted: {text!r}")
-    print(f"  PASS  {label}")
-
-
-def _claude_backups(path: Path) -> list[Path]:
-    return sorted(path.parent.glob(f"{path.name}.agent-bridge.bak.*"))
-
-
-def _claude_temps(path: Path) -> list[Path]:
-    return sorted(path.parent.glob(f".{path.name}.agent-bridge.tmp.*"))
-
-
-def _assert_ordered_substrings(label: str, text: str, *needles: str) -> None:
-    cursor = -1
-    for needle in needles:
-        index = text.find(needle, cursor + 1)
-        assert_true(index >= 0, f"{label}: missing ordered stdout substring {needle!r}: {text!r}")
-        assert_true(index > cursor, f"{label}: stdout substring {needle!r} is out of order: {text!r}")
-        cursor = index
-
-
-def scenario_install_sh_claude_editor_mode_missing_skips(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "claude-mode-missing"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    env = _fake_install_env(tmpdir)
-    home = Path(env["HOME"])
-
-    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-missing", env=env)
-    assert_true(proc.returncode == 0, f"{label}: missing Claude config should not fail install: {proc.stderr!r}")
-    assert_true(not (home / ".claude.json").exists(), f"{label}: missing Claude config must not be created")
-    assert_true(not (home / ".claude" / "settings.json").exists(), f"{label}: missing Claude settings must not be created")
-    _assert_ordered_substrings(
-        label,
-        proc.stdout,
-        f"skip: Claude Code config absent at {home / '.claude.json'}",
-        f"skip: Claude Code config absent at {home / '.claude' / 'settings.json'}",
-    )
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_updates_with_backup(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "claude-mode-update"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    env = _fake_install_env(tmpdir)
-    home = Path(env["HOME"])
-    home.mkdir(parents=True, exist_ok=True)
-    config = home / ".claude.json"
-    original = b'{\n  "theme": "light",\n  "editorMode": "vim",\n  "nested": {\n    "keep": true\n  }\n}'
-    config.write_bytes(original)
-
-    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-update", env=env)
-    assert_true(proc.returncode == 0, f"{label}: install should update vim editorMode: stdout={proc.stdout!r} stderr={proc.stderr!r}")
-    data = json.loads(config.read_text(encoding="utf-8"))
-    assert_true(data.get("editorMode") == "normal", f"{label}: editorMode should be normal: {data}")
-    assert_true(list(data) == ["theme", "editorMode", "nested"], f"{label}: root key order should be preserved: {list(data)}")
-    assert_true(data.get("nested") == {"keep": True}, f"{label}: nested fields should be preserved: {data}")
-    assert_true(not config.read_bytes().endswith(b"\n"), f"{label}: original missing trailing newline should stay missing")
-    backups = _claude_backups(config)
-    assert_true(len(backups) == 1, f"{label}: exactly one Claude config backup expected, got {backups}")
-    assert_true(re.match(r"^\.claude\.json\.agent-bridge\.bak\.\d{14}\.\d+$", backups[0].name), f"{label}: backup name should match convention: {backups[0].name}")
-    assert_true(backups[0].read_bytes() == original, f"{label}: backup must preserve original bytes")
-    assert_true(not _claude_temps(config), f"{label}: no temp files should remain after update")
-    assert_true("set Claude Code editorMode=normal for reliable bridge prompt paste" in proc.stdout, f"{label}: update reason should be announced: {proc.stdout!r}")
-    assert_true('(was "vim")' in proc.stdout, f"{label}: update should show previous value: {proc.stdout!r}")
-    assert_true("JSON whitespace/escape style normalized" in proc.stdout, f"{label}: normalization should be disclosed: {proc.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_updates_global_and_settings(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "claude-mode-two-files"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    env = _fake_install_env(tmpdir)
-    home = Path(env["HOME"])
-    claude_dir = home / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    global_config = home / ".claude.json"
-    settings_config = claude_dir / "settings.json"
-    global_original = b'{\n  "editorMode": "vim",\n  "global": true\n}\n'
-    settings_original = b'{\n  "editorMode": "vim",\n  "settings": true\n}\n'
-    global_config.write_bytes(global_original)
-    settings_config.write_bytes(settings_original)
-
-    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-two-files", env=env)
-    assert_true(proc.returncode == 0, f"{label}: install should update both Claude config files: stdout={proc.stdout!r} stderr={proc.stderr!r}")
-    global_data = json.loads(global_config.read_text(encoding="utf-8"))
-    settings_data = json.loads(settings_config.read_text(encoding="utf-8"))
-    assert_true(global_data.get("editorMode") == "normal", f"{label}: ~/.claude.json should be normal: {global_data}")
-    assert_true(settings_data.get("editorMode") == "normal", f"{label}: ~/.claude/settings.json should be normal: {settings_data}")
-    global_backups = _claude_backups(global_config)
-    settings_backups = _claude_backups(settings_config)
-    assert_true(len(global_backups) == 1 and global_backups[0].read_bytes() == global_original, f"{label}: global backup should preserve original: {global_backups}")
-    assert_true(len(settings_backups) == 1 and settings_backups[0].read_bytes() == settings_original, f"{label}: settings backup should preserve original: {settings_backups}")
-    assert_true(not _claude_temps(global_config), f"{label}: no global temp files should remain")
-    assert_true(not _claude_temps(settings_config), f"{label}: no settings temp files should remain")
-    _assert_ordered_substrings(label, proc.stdout, str(global_config), str(settings_config))
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_missing_global_updates_settings(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "claude-mode-mixed-absent"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    env = _fake_install_env(tmpdir)
-    home = Path(env["HOME"])
-    claude_dir = home / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    global_config = home / ".claude.json"
-    settings_config = claude_dir / "settings.json"
-    settings_original = b'{\n  "editorMode": "vim",\n  "settings": true\n}\n'
-    settings_config.write_bytes(settings_original)
-
-    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-mixed-absent", env=env)
-    assert_true(proc.returncode == 0, f"{label}: missing global should not prevent settings update: stdout={proc.stdout!r} stderr={proc.stderr!r}")
-    assert_true(not global_config.exists(), f"{label}: missing global config must not be created")
-    settings_data = json.loads(settings_config.read_text(encoding="utf-8"))
-    assert_true(settings_data.get("editorMode") == "normal", f"{label}: settings should be normal: {settings_data}")
-    settings_backups = _claude_backups(settings_config)
-    assert_true(len(settings_backups) == 1 and settings_backups[0].read_bytes() == settings_original, f"{label}: settings backup should preserve original: {settings_backups}")
-    _assert_ordered_substrings(
-        label,
-        proc.stdout,
-        f"skip: Claude Code config absent at {global_config}",
-        f"set Claude Code editorMode=normal for reliable bridge prompt paste in {settings_config}",
-    )
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_invalid_global_still_updates_settings(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "claude-mode-cross-file"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    env = _fake_install_env(tmpdir)
-    home = Path(env["HOME"])
-    claude_dir = home / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    global_config = home / ".claude.json"
-    settings_config = claude_dir / "settings.json"
-    global_original = b'{"editorMode": '
-    settings_original = b'{\n  "editorMode": "vim",\n  "settings": true\n}\n'
-    global_config.write_bytes(global_original)
-    settings_config.write_bytes(settings_original)
-
-    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-cross-file", env=env)
-    assert_true(proc.returncode == 0, f"{label}: invalid global should warn-skip and continue: stdout={proc.stdout!r} stderr={proc.stderr!r}")
-    assert_true(global_config.read_bytes() == global_original, f"{label}: invalid global bytes must be unchanged")
-    assert_true(not _claude_backups(global_config), f"{label}: invalid global should not create backup")
-    settings_data = json.loads(settings_config.read_text(encoding="utf-8"))
-    assert_true(settings_data.get("editorMode") == "normal", f"{label}: settings should be normal: {settings_data}")
-    settings_backups = _claude_backups(settings_config)
-    assert_true(len(settings_backups) == 1 and settings_backups[0].read_bytes() == settings_original, f"{label}: settings backup should preserve original: {settings_backups}")
-    assert_true("WARNING:" in proc.stderr and str(global_config) in proc.stderr and "cannot parse Claude Code config JSON" in proc.stderr, f"{label}: global parse warning expected: {proc.stderr!r}")
-    _assert_ordered_substrings(
-        label,
-        proc.stdout,
-        f"skip: Claude Code config parse failed at {global_config}",
-        f"set Claude Code editorMode=normal for reliable bridge prompt paste in {settings_config}",
-    )
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_normal_noop(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "claude-mode-normal"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    env = _fake_install_env(tmpdir)
-    home = Path(env["HOME"])
-    home.mkdir(parents=True, exist_ok=True)
-    config = home / ".claude.json"
-    original = b'{\n  "theme": "light",\n  "editorMode": "normal"\n}\n'
-    config.write_bytes(original)
-
-    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-normal", env=env)
-    assert_true(proc.returncode == 0, f"{label}: normal editorMode should not fail install: {proc.stderr!r}")
-    assert_true(config.read_bytes() == original, f"{label}: already-normal config must be byte-unchanged")
-    assert_true(not _claude_backups(config), f"{label}: no backup expected for no-op")
-    assert_true("skip: Claude Code editorMode already normal" in proc.stdout, f"{label}: no-op should print skip message: {proc.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_absent_adds_root(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "claude-mode-add"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    env = _fake_install_env(tmpdir)
-    home = Path(env["HOME"])
-    home.mkdir(parents=True, exist_ok=True)
-    config = home / ".claude.json"
-    original = b'{\n  "theme": "light",\n  "nested": {\n    "keep": true\n  }\n}\n'
-    config.write_bytes(original)
-
-    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-add", env=env)
-    assert_true(proc.returncode == 0, f"{label}: missing editorMode key should be added: {proc.stderr!r}")
-    text = config.read_text(encoding="utf-8")
-    data = json.loads(text)
-    assert_true(data.get("editorMode") == "normal", f"{label}: editorMode should be added at root: {data}")
-    assert_true(list(data) == ["theme", "nested", "editorMode"], f"{label}: added root key should append without reordering existing keys: {list(data)}")
-    assert_true(text.endswith("\n"), f"{label}: original trailing newline should be preserved")
-    backups = _claude_backups(config)
-    assert_true(len(backups) == 1 and backups[0].read_bytes() == original, f"{label}: add should create exact backup: {backups}")
-    assert_true("add Claude Code editorMode=normal" in proc.stdout, f"{label}: add should be announced: {proc.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_invalid_json_skips(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "claude-mode-invalid"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    env = _fake_install_env(tmpdir)
-    home = Path(env["HOME"])
-    home.mkdir(parents=True, exist_ok=True)
-    config = home / ".claude.json"
-    original = b'{"editorMode": '
-    config.write_bytes(original)
-
-    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-invalid", env=env)
-    assert_true(proc.returncode == 0, f"{label}: invalid Claude JSON should warn and continue: {proc.stderr!r}")
-    assert_true(config.read_bytes() == original, f"{label}: invalid JSON must not be overwritten")
-    assert_true(not _claude_backups(config), f"{label}: invalid JSON should not create backup")
-    assert_true("WARNING:" in proc.stderr and "cannot parse Claude Code config JSON" in proc.stderr, f"{label}: parse warning expected: {proc.stderr!r}")
-    assert_true("skip: Claude Code config parse failed" in proc.stdout, f"{label}: parse skip stdout expected: {proc.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_invalid_utf8_skips(label: str, tmpdir: Path) -> None:
-    config = tmpdir / ".claude.json"
-    original = b"\xff\xfe{\x00"
-    config.write_bytes(original)
-
-    proc = _run_bridge_set_editor_mode(config)
-    assert_true(proc.returncode == 0, f"{label}: invalid UTF-8 should warn and continue: {proc.stderr!r}")
-    assert_true(config.read_bytes() == original, f"{label}: invalid UTF-8 bytes must not be overwritten")
-    assert_true(not _claude_backups(config), f"{label}: invalid UTF-8 should not create backup")
-    assert_true("WARNING:" in proc.stderr and "cannot read Claude Code config as UTF-8" in proc.stderr, f"{label}: UTF-8 warning expected: {proc.stderr!r}")
-    assert_true("skip: Claude Code config unreadable" in proc.stdout, f"{label}: UTF-8 skip stdout expected: {proc.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_bom_skips(label: str, tmpdir: Path) -> None:
-    config = tmpdir / ".claude.json"
-    original = b'\xef\xbb\xbf{\n  "editorMode": "vim"\n}\n'
-    config.write_bytes(original)
-
-    proc = _run_bridge_set_editor_mode(config)
-    assert_true(proc.returncode == 0, f"{label}: BOM JSON should warn and continue: {proc.stderr!r}")
-    assert_true(config.read_bytes() == original, f"{label}: BOM JSON must not be rewritten")
-    assert_true(not _claude_backups(config), f"{label}: BOM JSON should not create backup")
-    assert_true("WARNING:" in proc.stderr and "cannot parse Claude Code config JSON" in proc.stderr, f"{label}: BOM should stay strict JSON parse warning: {proc.stderr!r}")
-    assert_true("skip: Claude Code config parse failed" in proc.stdout, f"{label}: BOM parse skip stdout expected: {proc.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_non_object_skips(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "claude-mode-non-object"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    env = _fake_install_env(tmpdir)
-    home = Path(env["HOME"])
-    home.mkdir(parents=True, exist_ok=True)
-    config = home / ".claude.json"
-    original = b'["editorMode", "vim"]\n'
-    config.write_bytes(original)
-
-    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-non-object", env=env)
-    assert_true(proc.returncode == 0, f"{label}: non-object Claude JSON should warn and continue: {proc.stderr!r}")
-    assert_true(config.read_bytes() == original, f"{label}: non-object JSON must not be overwritten")
-    assert_true(not _claude_backups(config), f"{label}: non-object JSON should not create backup")
-    assert_true("WARNING:" in proc.stderr and "root is not an object" in proc.stderr, f"{label}: non-object warning expected: {proc.stderr!r}")
-    assert_true("skip: Claude Code config root is not an object" in proc.stdout, f"{label}: non-object skip stdout expected: {proc.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_dry_run_no_write(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "claude-mode-dry-run"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    env = _fake_install_env(tmpdir)
-    home = Path(env["HOME"])
-    home.mkdir(parents=True, exist_ok=True)
-    config = home / ".claude.json"
-    original = b'{\n  "editorMode": "vim"\n}\n'
-    config.write_bytes(original)
-
-    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-dry-run", env=env, extra_args=["--dry-run"])
-    assert_true(proc.returncode == 0, f"{label}: dry-run Claude editorMode update should succeed: {proc.stderr!r}")
-    assert_true(config.read_bytes() == original, f"{label}: dry-run must not update Claude config")
-    assert_true(not _claude_backups(config), f"{label}: dry-run must not create backup")
-    assert_true(not _claude_temps(config), f"{label}: dry-run must not leave temp files")
-    assert_true("dry-run: would set Claude Code editorMode=normal" in proc.stdout, f"{label}: dry-run should preview update: {proc.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_preserves_mode(label: str, tmpdir: Path) -> None:
-    config = tmpdir / ".claude.json"
-    config.write_text('{\n  "editorMode": "vim"\n}\n', encoding="utf-8")
-    os.chmod(config, 0o600)
-
-    proc = _run_bridge_set_editor_mode(config)
-    assert_true(proc.returncode == 0, f"{label}: helper should update config: {proc.stderr!r}")
-    mode = config.stat().st_mode & 0o777
-    assert_true(mode == 0o600, f"{label}: helper should preserve file mode 0600, got {oct(mode)}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_symlink_preserved(label: str, tmpdir: Path) -> None:
-    target_dir = tmpdir / "dotfiles"
-    target_dir.mkdir()
-    target = target_dir / "claude.json"
-    target.write_text('{\n  "editorMode": "vim",\n  "name": "keep"\n}\n', encoding="utf-8")
-    link = tmpdir / ".claude.json"
-    link.symlink_to(target)
-    original = target.read_bytes()
-
-    proc = _run_bridge_set_editor_mode(link)
-    assert_true(proc.returncode == 0, f"{label}: helper should update symlink target: {proc.stderr!r}")
-    assert_true(link.is_symlink(), f"{label}: ~/.claude.json symlink object must be preserved")
-    data = json.loads(target.read_text(encoding="utf-8"))
-    assert_true(data.get("editorMode") == "normal" and data.get("name") == "keep", f"{label}: symlink target should be updated semantically: {data}")
-    backups = _claude_backups(target)
-    assert_true(len(backups) == 1 and backups[0].read_bytes() == original, f"{label}: backup should be taken beside resolved target: {backups}")
-    assert_true(not _claude_backups(link), f"{label}: link directory should not receive backup for resolved target")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_nested_root_absent_warns_skips(label: str, tmpdir: Path) -> None:
-    config = tmpdir / ".claude.json"
-    original = b'{\n  "settings": {\n    "editorMode": "vim"\n  }\n}\n'
-    config.write_bytes(original)
-
-    proc = _run_bridge_set_editor_mode(config)
-    assert_true(proc.returncode == 0, f"{label}: nested-only editorMode should be warning-skip: {proc.stderr!r}")
-    assert_true(config.read_bytes() == original, f"{label}: nested-only editorMode must not be overwritten")
-    assert_true(not _claude_backups(config), f"{label}: nested-only skip should not create backup")
-    assert_true("WARNING:" in proc.stderr and "$.settings.editorMode" in proc.stderr, f"{label}: nested warning should name path: {proc.stderr!r}")
-    assert_true("skip: root editorMode absent and nested editorMode found" in proc.stdout, f"{label}: nested-only skip stdout expected: {proc.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_nested_with_root_warns_updates_root_only(label: str, tmpdir: Path) -> None:
-    config = tmpdir / ".claude.json"
-    config.write_text('{\n  "editorMode": "vim",\n  "settings": {\n    "editorMode": "emacs"\n  }\n}\n', encoding="utf-8")
-
-    proc = _run_bridge_set_editor_mode(config)
-    assert_true(proc.returncode == 0, f"{label}: helper should update root despite nested warning: {proc.stderr!r}")
-    data = json.loads(config.read_text(encoding="utf-8"))
-    assert_true(data.get("editorMode") == "normal", f"{label}: root editorMode should update: {data}")
-    assert_true(data.get("settings", {}).get("editorMode") == "emacs", f"{label}: nested editorMode must not be mutated: {data}")
-    assert_true("WARNING:" in proc.stderr and "$.settings.editorMode" in proc.stderr, f"{label}: nested warning should name path: {proc.stderr!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_skip_flag_no_write(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "claude-mode-skip-flag"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    env = _fake_install_env(tmpdir)
-    home = Path(env["HOME"])
-    home.mkdir(parents=True, exist_ok=True)
-    claude_dir = home / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    config = home / ".claude.json"
-    settings_config = claude_dir / "settings.json"
-    original = b'{\n  "editorMode": "vim"\n}\n'
-    config.write_bytes(original)
-    settings_config.write_bytes(original)
-
-    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-skip-flag", env=env, extra_args=["--skip-claude-editor-mode"])
-    assert_true(proc.returncode == 0, f"{label}: skip flag should not fail install: {proc.stderr!r}")
-    assert_true(config.read_bytes() == original, f"{label}: skip flag must leave config byte-identical")
-    assert_true(settings_config.read_bytes() == original, f"{label}: skip flag must leave settings config byte-identical")
-    assert_true(not _claude_backups(config), f"{label}: skip flag must not create backup")
-    assert_true(not _claude_backups(settings_config), f"{label}: skip flag must not create settings backup")
-    assert_true(proc.stdout.count("skip: --skip-claude-editor-mode; Claude Code editorMode unchanged") == 1, f"{label}: skip flag should print exactly one global skip line: {proc.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_broken_symlink_warns(label: str, tmpdir: Path) -> None:
-    link = tmpdir / ".claude.json"
-    missing_target = tmpdir / "missing" / "claude.json"
-    link.symlink_to(missing_target)
-
-    proc = _run_bridge_set_editor_mode(link)
-    assert_true(proc.returncode == 0, f"{label}: broken symlink should warn and continue: {proc.stderr!r}")
-    assert_true(link.is_symlink(), f"{label}: broken symlink should remain a symlink")
-    assert_true(not missing_target.exists(), f"{label}: missing target must not be created")
-    assert_true("WARNING:" in proc.stderr and "symlink target is missing" in proc.stderr and str(missing_target) in proc.stderr, f"{label}: broken symlink warning expected: {proc.stderr!r}")
-    assert_true("skip: Claude Code config absent" in proc.stdout, f"{label}: broken symlink skip stdout expected: {proc.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_claude_editor_mode_concurrent_change_aborts(label: str, tmpdir: Path) -> None:
-    config = tmpdir / ".claude.json"
-    original = b'{\n  "editorMode": "vim",\n  "counter": 1\n}\n'
-    racer = b'{\n  "editorMode": "vim",\n  "counter": 2\n}\n'
-    race_file = tmpdir / "race-bytes.json"
-    config.write_bytes(original)
-    race_file.write_bytes(racer)
-
-    proc = _run_bridge_set_editor_mode(config, env_extra={"BRIDGE_EDITOR_MODE_TEST_RACE_FILE": str(race_file)})
-    assert_true(proc.returncode == 0, f"{label}: concurrent change should warn-skip, not fail: {proc.stderr!r}")
-    assert_true(config.read_bytes() == racer, f"{label}: concurrent writer bytes must win unchanged")
-    assert_true(not _claude_backups(config), f"{label}: concurrent-change guard must not create backup")
-    assert_true(not _claude_temps(config), f"{label}: concurrent-change guard must clean temp file")
-    assert_true("WARNING:" in proc.stderr and "concurrent change detected" in proc.stderr and "Re-run install.sh after closing Claude Code" in proc.stderr, f"{label}: concurrent warning expected: {proc.stderr!r}")
-    assert_true("skip: concurrent change detected" in proc.stdout, f"{label}: concurrent skip stdout expected: {proc.stdout!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_hook_failure_hard_fails(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "hook-hard-fail"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    argv_file = tmpdir / "hook-hard-fail.argv"
-    _write_fake_hook_installer(root, exit_code=42, argv_file=argv_file)
-    proc = _run_fake_install(root, tmpdir / "shims-hook-hard-fail", skip_hooks=False, env=_fake_install_env(tmpdir))
-    assert_true(proc.returncode == 42, f"{label}: hook installer status must pass through, got {proc.returncode}: {proc.stderr!r}")
-    assert_true("install.sh: hook config install failed" in proc.stderr, f"{label}: hard-fail stderr should name hook failure: {proc.stderr!r}")
-    assert_true("shims may have been written" in proc.stderr, f"{label}: hard-fail stderr should mention partial shims: {proc.stderr!r}")
-    assert_true("Agent Bridge will not receive hook events until fixed" in proc.stderr, f"{label}: hard-fail stderr should explain hook impact: {proc.stderr!r}")
-    assert_true("bridge_healthcheck" in proc.stderr, f"{label}: hard-fail stderr should recommend healthcheck: {proc.stderr!r}")
-    assert_true("--ignore-hook-failure" in proc.stderr, f"{label}: hard-fail stderr should mention explicit escape hatch: {proc.stderr!r}")
-    assert_true("run: " not in proc.stdout, f"{label}: hard-fail stdout must not show final success hint: {proc.stdout!r}")
-    assert_true("tmux not found" not in proc.stderr, f"{label}: hard-fail must stop before tmux warning: {proc.stderr!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_hook_failure_ignore_flag_allows_success(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "hook-ignore"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    _write_fake_hook_installer(root, exit_code=42, argv_file=tmpdir / "hook-ignore.argv")
-    bin_dir = tmpdir / "shims-hook-ignore"
-    proc = _run_fake_install(
-        root,
-        bin_dir,
-        skip_hooks=False,
-        env=_fake_install_env(tmpdir),
-        extra_args=["--ignore-hook-failure"],
-    )
-    assert_true(proc.returncode == 0, f"{label}: ignore flag should allow success, got {proc.returncode}: {proc.stderr!r}")
-    assert_true("override was used" in proc.stderr, f"{label}: warning must say override was used: {proc.stderr!r}")
-    assert_true("shims were installed but hook events will not work until fixed" in proc.stderr, f"{label}: warning must explain broken hook events: {proc.stderr!r}")
-    assert_true("bridge_healthcheck" in proc.stderr, f"{label}: warning should recommend healthcheck: {proc.stderr!r}")
-    assert_true(f"run: {bin_dir}/bridge_healthcheck" in proc.stdout, f"{label}: success hint should remain after override: {proc.stdout!r}")
-    assert_true(os.access(bin_dir / "agent_alarm", os.X_OK), f"{label}: shims should be installed under override")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_hook_dry_run_failure_hard_fails(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "hook-dry-run-fail"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    argv_file = tmpdir / "hook-dry-run-fail.argv"
-    _write_fake_hook_installer(root, exit_code=42, argv_file=argv_file)
-    proc = _run_fake_install(
-        root,
-        tmpdir / "shims-hook-dry-run-fail",
-        skip_hooks=False,
-        env=_fake_install_env(tmpdir),
-        extra_args=["--dry-run"],
-    )
-    argv_text = argv_file.read_text(encoding="utf-8")
-    assert_true(proc.returncode == 42, f"{label}: dry-run hook failure must hard-fail, got {proc.returncode}: {proc.stderr!r}")
-    assert_true("--dry-run" in argv_text, f"{label}: install.sh must forward --dry-run to hook installer: {argv_text!r}")
-    assert_true("install.sh: hook config install failed" in proc.stderr, f"{label}: dry-run hard-fail should use targeted error: {proc.stderr!r}")
-    assert_true("run: " not in proc.stdout, f"{label}: dry-run hard-fail must not show final success hint: {proc.stdout!r}")
-
-    argv_override = tmpdir / "hook-dry-run-override.argv"
-    _write_fake_hook_installer(root, exit_code=42, argv_file=argv_override)
-    proc_override = _run_fake_install(
-        root,
-        tmpdir / "shims-hook-dry-run-override",
-        skip_hooks=False,
-        env=_fake_install_env(tmpdir),
-        extra_args=["--dry-run", "--ignore-hook-failure"],
-    )
-    assert_true(proc_override.returncode == 0, f"{label}: dry-run override should continue, got {proc_override.returncode}: {proc_override.stderr!r}")
-    assert_true("override was used" in proc_override.stderr, f"{label}: dry-run override warning expected: {proc_override.stderr!r}")
-    assert_true("--dry-run" in argv_override.read_text(encoding="utf-8"), f"{label}: dry-run override must still forward --dry-run")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_hook_success_succeeds(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "hook-success"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    argv_file = tmpdir / "hook-success.argv"
-    _write_fake_hook_installer(root, exit_code=0, argv_file=argv_file)
-    bin_dir = tmpdir / "shims-hook-success"
-    proc = _run_fake_install(root, bin_dir, skip_hooks=False, env=_fake_install_env(tmpdir))
-    argv_lines = argv_file.read_text(encoding="utf-8").splitlines()
-    assert_true(proc.returncode == 0, f"{label}: hook success should keep install success, got {proc.returncode}: {proc.stderr!r}")
-    assert_true("--hook-command" in argv_lines, f"{label}: hook installer should receive --hook-command: {argv_lines}")
-    assert_true(argv_lines[argv_lines.index("--hook-command") + 1] == str(root / "hooks" / "bridge-hook"), f"{label}: hook command path incorrect: {argv_lines}")
-    assert_true("--dry-run" not in argv_lines, f"{label}: non-dry-run install should not pass --dry-run: {argv_lines}")
-    assert_true(os.access(bin_dir / "agent_send_peer", os.X_OK), f"{label}: shims should be installed on hook success")
-
-    argv_dry = tmpdir / "hook-success-dry.argv"
-    _write_fake_hook_installer(root, exit_code=0, argv_file=argv_dry)
-    proc_dry = _run_fake_install(
-        root,
-        tmpdir / "shims-hook-success-dry",
-        skip_hooks=False,
-        env=_fake_install_env(tmpdir),
-        extra_args=["--dry-run"],
-    )
-    assert_true(proc_dry.returncode == 0, f"{label}: hook dry-run success should pass: {proc_dry.stderr!r}")
-    assert_true("--dry-run" in argv_dry.read_text(encoding="utf-8").splitlines(), f"{label}: dry-run should reach hook installer")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_shim_failure_still_hard_fails_under_override(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "shim-fail-override"
-    root.mkdir()
-    _write_fake_install_tree(root, omit=Path("model-bin/agent_alarm"))
-    argv_file = tmpdir / "shim-fail-override.argv"
-    _write_fake_hook_installer(root, exit_code=0, argv_file=argv_file)
-    proc = _run_fake_install(
-        root,
-        tmpdir / "shims-shim-fail-override",
-        skip_hooks=False,
-        env=_fake_install_env(tmpdir),
-        extra_args=["--ignore-hook-failure"],
-    )
-    assert_true(proc.returncode != 0, f"{label}: override must not suppress shim target failures")
-    assert_true("missing shim target for agent_alarm" in proc.stderr, f"{label}: missing shim error expected: {proc.stderr!r}")
-    assert_true("override was used" not in proc.stderr, f"{label}: hook override warning must not fire for shim failure: {proc.stderr!r}")
-    assert_true(not argv_file.exists(), f"{label}: hook installer should not run after shim failure")
-    print(f"  PASS  {label}")
-
-
-def scenario_install_sh_skip_hooks_with_ignore_flag_is_noop(label: str, tmpdir: Path) -> None:
-    root = tmpdir / "skip-hooks-ignore"
-    root.mkdir()
-    _write_fake_install_tree(root)
-    argv_file = tmpdir / "skip-hooks-ignore.argv"
-    _write_fake_hook_installer(root, exit_code=42, argv_file=argv_file)
-    proc = _run_fake_install(
-        root,
-        tmpdir / "shims-skip-hooks-ignore",
-        skip_hooks=True,
-        env=_fake_install_env(tmpdir),
-        extra_args=["--ignore-hook-failure"],
-    )
-    assert_true(proc.returncode == 0, f"{label}: skip-hooks + ignore should remain a no-op success: {proc.stderr!r}")
-    assert_true(not argv_file.exists(), f"{label}: --skip-hooks must not invoke hook installer")
-    assert_true("hook config install failed" not in proc.stderr, f"{label}: no hook failure warning expected when hooks skipped: {proc.stderr!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_rejects_malformed_json_without_overwrite(label: str, tmpdir: Path) -> None:
-    settings = tmpdir / "claude-malformed" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    settings.write_bytes(b'{"hooks": [')
-    before = settings.read_bytes()
-    proc = _run_bridge_install_hooks(tmpdir, claude_settings=settings, skip_codex=True)
-    _assert_hook_config_unchanged(
-        label,
-        settings,
-        before,
-        proc,
-        str(settings),
-        "invalid JSON",
-        "refusing to overwrite",
-        "Fix or move aside",
-    )
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_rejects_non_object_json_without_overwrite(label: str, tmpdir: Path) -> None:
-    for suffix, content in (("array", b"[1, 2, 3]"), ("null", b"null")):
-        settings = tmpdir / f"claude-non-object-{suffix}" / "settings.json"
-        settings.parent.mkdir(parents=True)
-        settings.write_bytes(content)
-        before = settings.read_bytes()
-        proc = _run_bridge_install_hooks(tmpdir / suffix, claude_settings=settings, skip_codex=True)
-        _assert_hook_config_unchanged(
-            f"{label}:{suffix}",
-            settings,
-            before,
-            proc,
-            str(settings),
-            "must be a JSON object",
-            "refusing to overwrite",
-        )
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_dry_run_invalid_json_fails_without_overwrite(label: str, tmpdir: Path) -> None:
-    settings = tmpdir / "dry-run-invalid" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    settings.write_bytes(b'{"hooks":')
-    before = settings.read_bytes()
-    before_entries = sorted(p.name for p in settings.parent.iterdir())
-    proc = _run_bridge_install_hooks(tmpdir, claude_settings=settings, skip_codex=True, dry_run=True)
-    _assert_hook_config_unchanged(
-        label,
-        settings,
-        before,
-        proc,
-        "invalid JSON",
-        "refusing to overwrite",
-    )
-    after_entries = sorted(p.name for p in settings.parent.iterdir())
-    assert_true(after_entries == before_entries, f"{label}: dry-run invalid config should not create files: {after_entries}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_missing_json_still_creates(label: str, tmpdir: Path) -> None:
-    settings = tmpdir / "new-claude" / "settings.json"
-    proc = _run_bridge_install_hooks(tmpdir, claude_settings=settings, skip_codex=True)
-    assert_true(proc.returncode == 0, f"{label}: missing config should be created, got {proc.returncode}: {proc.stderr!r}")
-    data = json.loads(settings.read_text(encoding="utf-8"))
-    hooks = data.get("hooks") or {}
-    assert_true("SessionStart" in hooks and "Stop" in hooks, f"{label}: bridge hook events should be written: {data!r}")
-    stop_blocks = hooks.get("Stop") or []
-    assert_true(any("--agent claude" in ((block.get("hooks") or [{}])[0].get("command", "")) for block in stop_blocks if isinstance(block, dict)), f"{label}: claude hook command should be present: {data!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_invalid_utf8_fails_without_overwrite(label: str, tmpdir: Path) -> None:
-    settings = tmpdir / "invalid-utf8" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    settings.write_bytes(b'{"hooks": "\xff"}')
-    before = settings.read_bytes()
-    proc = _run_bridge_install_hooks(tmpdir, claude_settings=settings, skip_codex=True)
-    _assert_hook_config_unchanged(
-        label,
-        settings,
-        before,
-        proc,
-        str(settings),
-        "invalid JSON",
-        "refusing to overwrite",
-        "Fix or move aside",
-    )
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_existing_valid_json_object_merges_correctly(label: str, tmpdir: Path) -> None:
-    settings = tmpdir / "valid-claude" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    settings.write_text(
-        json.dumps({
-            "custom": {"preserve": True},
-            "hooks": {
-                "Stop": [
-                    {
-                        "matcher": "user-custom",
-                        "hooks": [{"type": "command", "command": "echo user hook"}],
-                    }
-                ]
-            },
-        }),
-        encoding="utf-8",
-    )
-    proc = _run_bridge_install_hooks(tmpdir, claude_settings=settings, skip_codex=True)
-    assert_true(proc.returncode == 0, f"{label}: valid config should merge, got {proc.returncode}: {proc.stderr!r}")
-    data = json.loads(settings.read_text(encoding="utf-8"))
-    assert_true(data.get("custom", {}).get("preserve") is True, f"{label}: user fields must be preserved: {data!r}")
-    stop_blocks = data.get("hooks", {}).get("Stop") or []
-    assert_true(any("echo user hook" in str(block) for block in stop_blocks), f"{label}: existing user hook should remain: {data!r}")
-    assert_true(any("--agent claude" in str(block) for block in stop_blocks), f"{label}: bridge Stop hook should be merged: {data!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_codex_hooks_rejects_malformed_json_without_overwrite(label: str, tmpdir: Path) -> None:
-    hooks = tmpdir / "codex-malformed" / "hooks.json"
-    hooks.parent.mkdir(parents=True)
-    hooks.write_bytes(b'{"hooks": [')
-    before = hooks.read_bytes()
-    proc = _run_bridge_install_hooks(tmpdir, codex_hooks=hooks, skip_claude=True)
-    _assert_hook_config_unchanged(
-        label,
-        hooks,
-        before,
-        proc,
-        str(hooks),
-        "invalid JSON",
-        "refusing to overwrite",
-        "Fix or move aside",
-    )
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_codex_config_ignores_nested_codex_hooks(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-nested-hooks.toml"
-    nested_block = '[codex_hooks]\nkind = "keep"\n'
-    config.write_text(nested_block, encoding="utf-8")
-    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
-    text = config.read_text(encoding="utf-8")
-    assert_true(nested_block in text, f"{label}: [codex_hooks] table content must be preserved: {text!r}")
-    assert_true("[features]\ncodex_hooks = true\n" in text, f"{label}: [features].codex_hooks should be added: {text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_codex_config_ignores_nested_disable_paste_burst(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-nested-disable.toml"
-    config.write_text("[profile]\ndisable_paste_burst = true\n", encoding="utf-8")
-    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
-    text = config.read_text(encoding="utf-8")
-    assert_true(text.startswith("disable_paste_burst = true\n[profile]\n"), f"{label}: top-level disable_paste_burst should be inserted before first table: {text!r}")
-    assert_true("[profile]\ndisable_paste_burst = true\n" in text, f"{label}: nested disable_paste_burst should remain unchanged: {text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_codex_config_updates_only_scoped_keys(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-scoped-update.toml"
-    config.write_text(
-        "disable_paste_burst = false  # was off\n"
-        "\n"
-        "[features]\n"
-        "  codex_hooks = false  # was off\n"
-        "\n"
-        "[profile]\n"
-        "disable_paste_burst = false  # profile scoped\n"
-        "codex_hooks = false  # profile scoped\n",
-        encoding="utf-8",
-    )
-    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
-    text = config.read_text(encoding="utf-8")
-    assert_true("disable_paste_burst = true  # was off\n" in text, f"{label}: top-level disable line/comment should update: {text!r}")
-    assert_true("  codex_hooks = true  # was off\n" in text, f"{label}: [features] line indentation/comment should update: {text!r}")
-    assert_true("disable_paste_burst = false  # profile scoped\n" in text, f"{label}: profile disable must stay false: {text!r}")
-    assert_true("codex_hooks = false  # profile scoped\n" in text, f"{label}: profile codex_hooks must stay false: {text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_codex_config_inserts_features_key_before_next_table(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-features-insert.toml"
-    config.write_text(
-        "[features]\n"
-        "experimental = true\n"
-        "\n"
-        "[profile]\n"
-        "codex_hooks = false\n",
-        encoding="utf-8",
-    )
-    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
-    text = config.read_text(encoding="utf-8")
-    features_index = text.index("[features]")
-    inserted_index = text.index("codex_hooks = true")
-    profile_index = text.index("[profile]")
-    assert_true(features_index < inserted_index < profile_index, f"{label}: codex_hooks=true should land inside [features]: {text!r}")
-    assert_true("[profile]\ncodex_hooks = false\n" in text, f"{label}: profile codex_hooks must remain unchanged: {text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_codex_config_dry_run_no_write(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-dry-run.toml"
-    config.write_text("[features]\ncodex_hooks = false\n[profile]\ndisable_paste_burst = true\n", encoding="utf-8")
-    before = config.read_bytes()
-    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True, dry_run=True)
-    assert_true(proc.returncode == 0, f"{label}: dry-run should succeed: {proc.stderr!r}")
-    assert_true("codex_hooks enabled" in proc.stdout and "disable_paste_burst enabled" in proc.stdout, f"{label}: dry-run stdout should report computed actions: {proc.stdout!r}")
-    assert_true(config.read_bytes() == before, f"{label}: dry-run must not alter config bytes")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_codex_config_empty_features_section_inserts(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-empty-features.toml"
-    config.write_text("[features]\n[profile]\nname = \"p\"\n", encoding="utf-8")
-    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
-    text = config.read_text(encoding="utf-8")
-    assert_true("[features]\ncodex_hooks = true\n[profile]\n" in text, f"{label}: empty features section should receive key before next table: {text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_codex_config_first_table_is_array_table(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-array-first.toml"
-    config.write_text("[[features_array]]\nname = \"first\"\n", encoding="utf-8")
-    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
-    text = config.read_text(encoding="utf-8")
-    assert_true(text.startswith("disable_paste_burst = true\n[[features_array]]\n"), f"{label}: top-level disable should be inserted before first array table: {text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_codex_config_table_header_with_trailing_comment(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-header-comment.toml"
-    config.write_text("[features]  # primary features section\nother = true\n", encoding="utf-8")
-    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
-    text = config.read_text(encoding="utf-8")
-    assert_true("[features]  # primary features section\nother = true\ncodex_hooks = true\n" in text, f"{label}: [features] with trailing comment should be recognized: {text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_codex_config_commented_out_assignments_ignored(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-comments.toml"
-    config.write_text(
-        "# disable_paste_burst = true\n"
-        "# codex_hooks = true\n"
-        "[features]\n"
-        "# codex_hooks = true\n",
-        encoding="utf-8",
-    )
-    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
-    text = config.read_text(encoding="utf-8")
-    assert_true("# disable_paste_burst = true\n" in text and "# codex_hooks = true\n" in text, f"{label}: commented assignments should remain comments: {text!r}")
-    live_disable_index = text.index("disable_paste_burst = true\n")
-    features_index = text.index("[features]")
-    assert_true(live_disable_index < features_index, f"{label}: live top-level disable should be inserted before first table: {text!r}")
-    assert_true("[features]\n# codex_hooks = true\ncodex_hooks = true\n" in text, f"{label}: live features codex_hooks should be inserted despite comment: {text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_codex_config_no_trailing_newline_handled(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-no-newline.toml"
-    config.write_text("[features]\nother = true", encoding="utf-8")
-    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
-    text = config.read_text(encoding="utf-8")
-    assert_true("other = true\ncodex_hooks = true\n" in text, f"{label}: no-newline config should not concatenate inserted key: {text!r}")
-    assert_true(text.startswith("disable_paste_burst = true\n[features]\n"), f"{label}: top-level disable should still be inserted cleanly: {text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_install_hooks_codex_config_already_enabled_is_byte_unchanged(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-already.toml"
-    config.write_text(
-        "disable_paste_burst = true\n"
-        "\n"
-        "[features]\n"
-        "codex_hooks = true\n"
-        "\n"
-        "[profile]\n"
-        "codex_hooks = false\n",
-        encoding="utf-8",
-    )
-    before = config.read_bytes()
-    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(proc.returncode == 0, f"{label}: install should succeed: {proc.stderr!r}")
-    assert_true("codex_hooks already enabled" in proc.stdout and "disable_paste_burst already enabled" in proc.stdout, f"{label}: stdout should report already-enabled actions: {proc.stdout!r}")
-    assert_true(config.read_bytes() == before, f"{label}: already-enabled scoped config must remain byte-identical")
-    print(f"  PASS  {label}")
-
-
-def _read_managed_marker(path: Path) -> dict:
-    return json.loads(_managed_marker(path).read_text(encoding="utf-8"))
-
-
-def scenario_codex_config_marker_records_and_uninstall_restores_updated_values(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-marker-updated.toml"
-    original = (
-        "disable_paste_burst = false  # old top-level value\n"
-        "\n"
-        "[features]\n"
-        "  codex_hooks = false  # old feature value\n"
-    )
-    config.write_text(original, encoding="utf-8")
-
-    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
-    text = config.read_text(encoding="utf-8")
-    assert_true("disable_paste_burst = true  # old top-level value\n" in text, f"{label}: top-level flag should flip true: {text!r}")
-    assert_true("  codex_hooks = true  # old feature value\n" in text, f"{label}: feature flag should flip true: {text!r}")
-    marker = _read_managed_marker(config)
-    assert_true(marker.get("codex_config") == bridge_codex_config.normalize_config_path(config), f"{label}: marker path should be normalized: {marker!r}")
-    flags = marker.get("flags") or {}
-    assert_true(flags.get(bridge_codex_config.DISABLE_PASTE_FLAG, {}).get("original_line") == "disable_paste_burst = false  # old top-level value\n", f"{label}: marker should record exact top-level line: {marker!r}")
-    assert_true(flags.get(bridge_codex_config.CODEX_HOOKS_FLAG, {}).get("original_line") == "  codex_hooks = false  # old feature value\n", f"{label}: marker should record exact feature line: {marker!r}")
-
-    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(uninstall.returncode == 0, f"{label}: uninstall should succeed: {uninstall.stderr!r}")
-    assert_true(config.read_text(encoding="utf-8") == original, f"{label}: uninstall should restore original bytes")
-    assert_true(not _managed_marker(config).exists(), f"{label}: uninstall should remove managed marker")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_marker_records_inserted_keys_and_uninstall_removes_them(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-marker-inserted.toml"
-    original = 'title = "keep"\n[profile]\nname = "p"\n\n'
-    config.write_text(original, encoding="utf-8")
-
-    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
-    marker = _read_managed_marker(config)
-    flags = marker.get("flags") or {}
-    assert_true(flags.get(bridge_codex_config.CODEX_HOOKS_FLAG, {}).get("operation") == "inserted", f"{label}: codex_hooks should be marked inserted: {marker!r}")
-    assert_true(flags.get(bridge_codex_config.CODEX_HOOKS_FLAG, {}).get("section_inserted") is True, f"{label}: inserted [features] section should be recorded: {marker!r}")
-    assert_true(flags.get(bridge_codex_config.DISABLE_PASTE_FLAG, {}).get("operation") == "inserted", f"{label}: disable flag should be marked inserted: {marker!r}")
-
-    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(uninstall.returncode == 0, f"{label}: uninstall should succeed: {uninstall.stderr!r}")
-    assert_true(config.read_text(encoding="utf-8") == original, f"{label}: uninstall should remove inserted bridge keys only")
-    assert_true(not _managed_marker(config).exists(), f"{label}: uninstall should remove marker")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_missing_created_by_install_removed_on_uninstall_when_bridge_only(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "missing-codex" / "config.toml"
-    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(install.returncode == 0, f"{label}: install should create missing config: {install.stderr!r}")
-    assert_true(config.exists(), f"{label}: config should exist after install")
-    marker = _read_managed_marker(config)
-    assert_true(marker.get("config_existed") is False, f"{label}: marker should record bridge-created config: {marker!r}")
-
-    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(uninstall.returncode == 0, f"{label}: uninstall should succeed: {uninstall.stderr!r}")
-    assert_true(not config.exists(), f"{label}: bridge-created config should be removed")
-    assert_true(not _managed_marker(config).exists(), f"{label}: marker should be removed")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_already_enabled_keys_create_no_marker(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-no-marker.toml"
-    original = "disable_paste_burst = true\n[features]\ncodex_hooks = true\n"
-    config.write_text(original, encoding="utf-8")
-
-    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
-    assert_true("already enabled" in install.stdout, f"{label}: install should report already-enabled flags: {install.stdout!r}")
-    assert_true(config.read_text(encoding="utf-8") == original, f"{label}: config should remain unchanged")
-    assert_true(not _managed_marker(config).exists(), f"{label}: already-enabled flags should not create marker")
-
-    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(uninstall.returncode == 0, f"{label}: uninstall should no-op cleanly: {uninstall.stderr!r}")
-    assert_true(config.read_text(encoding="utf-8") == original, f"{label}: uninstall without marker should leave config unchanged")
-    assert_true(not _managed_marker(config).exists(), f"{label}: marker should still be absent")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_reinstall_preserves_original_marker(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-reinstall.toml"
-    original = "disable_paste_burst = false\n[features]\ncodex_hooks = false\n"
-    config.write_text(original, encoding="utf-8")
-
-    first = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(first.returncode == 0, f"{label}: first install should succeed: {first.stderr!r}")
-    marker_after_first = _read_managed_marker(config)
-    second = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(second.returncode == 0, f"{label}: reinstall should succeed: {second.stderr!r}")
-    marker_after_second = _read_managed_marker(config)
-    assert_true(marker_after_second == marker_after_first, f"{label}: reinstall must preserve original marker entries: first={marker_after_first!r} second={marker_after_second!r}")
-
-    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(uninstall.returncode == 0, f"{label}: uninstall should succeed: {uninstall.stderr!r}")
-    assert_true(config.read_text(encoding="utf-8") == original, f"{label}: original false values should be restored")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_user_changed_after_install_is_not_clobbered(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-user-change.toml"
-    original = "disable_paste_burst = false\n[features]\ncodex_hooks = false\n"
-    config.write_text(original, encoding="utf-8")
-    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
-
-    config.write_text("disable_paste_burst = false\n[features]\ncodex_hooks = true\n", encoding="utf-8")
-    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(uninstall.returncode == 0, f"{label}: uninstall should succeed despite user edit: {uninstall.stderr!r}")
-    text = config.read_text(encoding="utf-8")
-    assert_true("disable_paste_burst = false\n" in text, f"{label}: user-changed top-level key should remain false: {text!r}")
-    assert_true("codex_hooks = false\n" in text, f"{label}: untouched bridge-managed feature key should restore: {text!r}")
-    assert_true("skipping disable_paste_burst restore" in uninstall.stdout, f"{label}: uninstall should report skipped user-changed key: {uninstall.stdout!r}")
-    assert_true(not _managed_marker(config).exists(), f"{label}: marker should be removed after uninstall")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_dry_run_install_writes_no_marker_or_config(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-dry-marker.toml"
-    original = "disable_paste_burst = false\n[features]\ncodex_hooks = false\n"
-    config.write_text(original, encoding="utf-8")
-    proc = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True, dry_run=True)
-    assert_true(proc.returncode == 0, f"{label}: dry-run install should succeed: {proc.stderr!r}")
-    assert_true("codex_hooks enabled" in proc.stdout and "disable_paste_burst enabled" in proc.stdout, f"{label}: dry-run should report planned actions: {proc.stdout!r}")
-    assert_true(config.read_text(encoding="utf-8") == original, f"{label}: dry-run install must not write config")
-    assert_true(not _managed_marker(config).exists(), f"{label}: dry-run install must not write marker")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_dry_run_uninstall_with_marker_writes_no_config_or_marker(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-dry-uninstall.toml"
-    config.write_text("disable_paste_burst = false\n[features]\ncodex_hooks = false\n", encoding="utf-8")
-    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
-    before_config = config.read_bytes()
-    marker_path = _managed_marker(config)
-    before_marker = marker_path.read_bytes()
-
-    proc = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True, dry_run=True)
-    assert_true(proc.returncode == 0, f"{label}: dry-run uninstall should succeed: {proc.stderr!r}")
-    assert_true("would remove managed marker" in proc.stdout, f"{label}: dry-run uninstall should report marker retention: {proc.stdout!r}")
-    assert_true(config.read_bytes() == before_config, f"{label}: dry-run uninstall must not write config")
-    assert_true(marker_path.read_bytes() == before_marker, f"{label}: dry-run uninstall must not remove or rewrite marker")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_skip_codex_does_not_touch_config_or_marker(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-skip-codex.toml"
-    config.write_text("disable_paste_burst = false\n[features]\ncodex_hooks = false\n", encoding="utf-8")
-    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
-    before_config = config.read_bytes()
-    marker_path = _managed_marker(config)
-    before_marker = marker_path.read_bytes()
-
-    proc = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True, skip_codex=True)
-    assert_true(proc.returncode == 0, f"{label}: --skip-codex uninstall should succeed: {proc.stderr!r}")
-    assert_true(config.read_bytes() == before_config, f"{label}: --skip-codex must not touch config")
-    assert_true(marker_path.read_bytes() == before_marker, f"{label}: --skip-codex must not touch marker")
-    print(f"  PASS  {label}")
-
-
-def _write_valid_marker(config: Path, *, version: int = 1, codex_config: str | None = None, flags: dict | None = None) -> Path:
-    marker = _managed_marker(config)
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(
-        json.dumps({
-            "version": version,
-            "codex_config": codex_config if codex_config is not None else bridge_codex_config.normalize_config_path(config),
-            "config_existed": True,
-            "flags": flags if flags is not None else {},
-        }, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    return marker
-
-
-def scenario_codex_config_uninstall_with_malformed_marker_aborts_clean(label: str, tmpdir: Path) -> None:
-    home = tmpdir / "malformed-home"
-    claude, codex_hooks = _write_seed_hook_configs(home)
-    config = home / ".codex" / "config.toml"
-    config.write_text("disable_paste_burst = true\n[features]\ncodex_hooks = true\n", encoding="utf-8")
-    marker = _managed_marker(config)
-    marker.write_bytes(b'{"version":')
-    before_claude = claude.read_bytes()
-    before_hooks = codex_hooks.read_bytes()
-    before_config = config.read_bytes()
-    before_marker = marker.read_bytes()
-
-    proc = _run_bridge_uninstall_hooks(tmpdir, claude_settings=claude, codex_hooks=codex_hooks, codex_config=config)
-    assert_true(proc.returncode != 0, f"{label}: malformed marker should abort")
-    assert_true("invalid managed marker" in proc.stderr and "refusing to restore" in proc.stderr, f"{label}: targeted marker error expected: {proc.stderr!r}")
-    assert_true(claude.read_bytes() == before_claude, f"{label}: Claude hooks must be unchanged after preflight failure")
-    assert_true(codex_hooks.read_bytes() == before_hooks, f"{label}: Codex hooks must be unchanged after preflight failure")
-    assert_true(config.read_bytes() == before_config, f"{label}: Codex config must be unchanged after preflight failure")
-    assert_true(marker.read_bytes() == before_marker, f"{label}: malformed marker bytes should remain for inspection")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_uninstall_with_unknown_marker_version_aborts(label: str, tmpdir: Path) -> None:
-    home = tmpdir / "unknown-version-home"
-    claude, codex_hooks = _write_seed_hook_configs(home)
-    config = home / ".codex" / "config.toml"
-    config.write_text("disable_paste_burst = true\n[features]\ncodex_hooks = true\n", encoding="utf-8")
-    _write_valid_marker(config, version=99)
-    before_claude = claude.read_bytes()
-    before_hooks = codex_hooks.read_bytes()
-    before_config = config.read_bytes()
-
-    proc = _run_bridge_uninstall_hooks(tmpdir, claude_settings=claude, codex_hooks=codex_hooks, codex_config=config)
-    assert_true(proc.returncode != 0, f"{label}: unknown marker version should abort")
-    assert_true("unsupported marker schema version 99" in proc.stderr and "Manually inspect" in proc.stderr, f"{label}: unsupported-version guidance expected: {proc.stderr!r}")
-    assert_true(claude.read_bytes() == before_claude, f"{label}: Claude hooks must remain unchanged")
-    assert_true(codex_hooks.read_bytes() == before_hooks, f"{label}: Codex hooks must remain unchanged")
-    assert_true(config.read_bytes() == before_config, f"{label}: config must remain unchanged")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_uninstall_with_marker_path_mismatch_aborts(label: str, tmpdir: Path) -> None:
-    home = tmpdir / "path-mismatch-home"
-    claude, codex_hooks = _write_seed_hook_configs(home)
-    config = home / ".codex" / "config.toml"
-    config.write_text("disable_paste_burst = true\n[features]\ncodex_hooks = true\n", encoding="utf-8")
-    _write_valid_marker(config, codex_config=str(tmpdir / "other" / "config.toml"))
-    before_claude = claude.read_bytes()
-    before_hooks = codex_hooks.read_bytes()
-    before_config = config.read_bytes()
-
-    proc = _run_bridge_uninstall_hooks(tmpdir, claude_settings=claude, codex_hooks=codex_hooks, codex_config=config)
-    assert_true(proc.returncode != 0, f"{label}: marker path mismatch should abort")
-    assert_true("belongs to" in proc.stderr and "refusing to restore" in proc.stderr, f"{label}: path mismatch error expected: {proc.stderr!r}")
-    assert_true(claude.read_bytes() == before_claude, f"{label}: Claude hooks must remain unchanged")
-    assert_true(codex_hooks.read_bytes() == before_hooks, f"{label}: Codex hooks must remain unchanged")
-    assert_true(config.read_bytes() == before_config, f"{label}: config must remain unchanged")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_uninstall_with_unknown_flag_key_aborts(label: str, tmpdir: Path) -> None:
-    home = tmpdir / "unknown-flag-home"
-    claude, codex_hooks = _write_seed_hook_configs(home)
-    config = home / ".codex" / "config.toml"
-    config.write_text("disable_paste_burst = true\n[features]\ncodex_hooks = true\n", encoding="utf-8")
-    marker = _write_valid_marker(config, flags={"unknown.flag": {"operation": "inserted"}})
-    before_claude = claude.read_bytes()
-    before_hooks = codex_hooks.read_bytes()
-    before_config = config.read_bytes()
-    before_marker = marker.read_bytes()
-
-    proc = _run_bridge_uninstall_hooks(tmpdir, claude_settings=claude, codex_hooks=codex_hooks, codex_config=config)
-    assert_true(proc.returncode != 0, f"{label}: unknown flag key should abort")
-    assert_true("unknown flag key 'unknown.flag'" in proc.stderr and "refusing to restore" in proc.stderr, f"{label}: unknown-flag error expected: {proc.stderr!r}")
-    assert_true(claude.read_bytes() == before_claude, f"{label}: Claude hooks must remain unchanged")
-    assert_true(codex_hooks.read_bytes() == before_hooks, f"{label}: Codex hooks must remain unchanged")
-    assert_true(config.read_bytes() == before_config, f"{label}: config must remain unchanged")
-    assert_true(marker.read_bytes() == before_marker, f"{label}: marker must remain unchanged for inspection")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_uninstall_with_invalid_operation_aborts(label: str, tmpdir: Path) -> None:
-    home = tmpdir / "invalid-operation-home"
-    claude, codex_hooks = _write_seed_hook_configs(home)
-    config = home / ".codex" / "config.toml"
-    config.write_text("disable_paste_burst = true\n[features]\ncodex_hooks = true\n", encoding="utf-8")
-    marker = _write_valid_marker(config, flags={bridge_codex_config.DISABLE_PASTE_FLAG: {"operation": "delete"}})
-    before_claude = claude.read_bytes()
-    before_hooks = codex_hooks.read_bytes()
-    before_config = config.read_bytes()
-    before_marker = marker.read_bytes()
-
-    proc = _run_bridge_uninstall_hooks(tmpdir, claude_settings=claude, codex_hooks=codex_hooks, codex_config=config)
-    assert_true(proc.returncode != 0, f"{label}: invalid marker operation should abort")
-    assert_true("unsupported marker operation 'delete'" in proc.stderr and bridge_codex_config.DISABLE_PASTE_FLAG in proc.stderr, f"{label}: invalid-operation error expected: {proc.stderr!r}")
-    assert_true(claude.read_bytes() == before_claude, f"{label}: Claude hooks must remain unchanged")
-    assert_true(codex_hooks.read_bytes() == before_hooks, f"{label}: Codex hooks must remain unchanged")
-    assert_true(config.read_bytes() == before_config, f"{label}: config must remain unchanged")
-    assert_true(marker.read_bytes() == before_marker, f"{label}: marker must remain unchanged for inspection")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_uninstall_with_updated_missing_original_line_aborts(label: str, tmpdir: Path) -> None:
-    home = tmpdir / "missing-original-line-home"
-    claude, codex_hooks = _write_seed_hook_configs(home)
-    config = home / ".codex" / "config.toml"
-    config.write_text("disable_paste_burst = true\n[features]\ncodex_hooks = true\n", encoding="utf-8")
-    marker = _write_valid_marker(config, flags={bridge_codex_config.DISABLE_PASTE_FLAG: {"operation": "updated"}})
-    before_claude = claude.read_bytes()
-    before_hooks = codex_hooks.read_bytes()
-    before_config = config.read_bytes()
-    before_marker = marker.read_bytes()
-
-    proc = _run_bridge_uninstall_hooks(tmpdir, claude_settings=claude, codex_hooks=codex_hooks, codex_config=config)
-    assert_true(proc.returncode != 0, f"{label}: updated entry missing original_line should abort")
-    assert_true("missing/non-string original_line" in proc.stderr and bridge_codex_config.DISABLE_PASTE_FLAG in proc.stderr, f"{label}: original_line error expected: {proc.stderr!r}")
-    assert_true(claude.read_bytes() == before_claude, f"{label}: Claude hooks must remain unchanged")
-    assert_true(codex_hooks.read_bytes() == before_hooks, f"{label}: Codex hooks must remain unchanged")
-    assert_true(config.read_bytes() == before_config, f"{label}: config must remain unchanged")
-    assert_true(marker.read_bytes() == before_marker, f"{label}: marker must remain unchanged for inspection")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_marker_write_failure_aborts_before_config_write(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-marker-write-failure.toml"
-    original = "disable_paste_burst = false\n[features]\ncodex_hooks = false\n"
-    config.write_text(original, encoding="utf-8")
-    old_write_marker = bridge_codex_config._write_marker
-
-    def fail_marker_write(_marker_path: Path, _marker: dict) -> None:
-        raise SystemExit("agent-bridge: failed to write managed marker (simulated)")
-
-    bridge_codex_config._write_marker = fail_marker_write
-    try:
-        try:
-            bridge_codex_config.ensure_codex_config_flags(config, dry_run=False)
-        except SystemExit as exc:
-            message = str(exc)
-        else:
-            raise AssertionError(f"{label}: simulated marker write failure should abort")
-    finally:
-        bridge_codex_config._write_marker = old_write_marker
-    assert_true("failed to write managed marker" in message, f"{label}: targeted marker-write error expected: {message!r}")
-    assert_true(config.read_text(encoding="utf-8") == original, f"{label}: config write must not happen after marker write failure")
-    assert_true(not _managed_marker(config).exists(), f"{label}: marker should not be created after simulated write failure")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_inserted_features_section_with_user_added_keys_keeps_section(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-user-features.toml"
-    config.write_text('title = "keep"\n', encoding="utf-8")
-    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
-    text = config.read_text(encoding="utf-8")
-    config.write_text(text.replace("codex_hooks = true\n", "codex_hooks = true\nfoo = \"bar\"\n"), encoding="utf-8")
-
-    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(uninstall.returncode == 0, f"{label}: uninstall should succeed: {uninstall.stderr!r}")
-    text = config.read_text(encoding="utf-8")
-    assert_true("[features]\nfoo = \"bar\"\n" in text, f"{label}: user-added features key should keep section alive: {text!r}")
-    assert_true("codex_hooks = true" not in text, f"{label}: bridge-managed codex_hooks should be removed: {text!r}")
-    assert_true("disable_paste_burst = true" not in text, f"{label}: bridge-managed top-level disable should be removed: {text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_existing_empty_config_records_existed_true_and_uninstall_keeps_it(label: str, tmpdir: Path) -> None:
-    config = tmpdir / "codex-config-empty-existing.toml"
-    config.write_text("", encoding="utf-8")
-    install = _run_bridge_install_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(install.returncode == 0, f"{label}: install should populate empty existing config: {install.stderr!r}")
-    marker = _read_managed_marker(config)
-    assert_true(marker.get("config_existed") is True, f"{label}: marker should record existing empty config: {marker!r}")
-
-    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config, skip_claude=True)
-    assert_true(uninstall.returncode == 0, f"{label}: uninstall should succeed: {uninstall.stderr!r}")
-    assert_true(config.exists(), f"{label}: pre-existing empty config should not be deleted")
-    assert_true(config.read_bytes() == b"", f"{label}: pre-existing empty config should return to empty bytes")
-    assert_true(not _managed_marker(config).exists(), f"{label}: marker should be removed")
-    print(f"  PASS  {label}")
-
-
-def scenario_codex_config_marker_normalized_path_accepts_equivalent_path(label: str, tmpdir: Path) -> None:
-    codex_dir = tmpdir / "codex-normalized"
-    subdir = codex_dir / "subdir"
-    subdir.mkdir(parents=True)
-    config_alias = subdir / ".." / "config.toml"
-    config_resolved = codex_dir / "config.toml"
-    original = "disable_paste_burst = false\n[features]\ncodex_hooks = false\n"
-    config_alias.write_text(original, encoding="utf-8")
-
-    install = _run_bridge_install_hooks(tmpdir, codex_config=config_alias, skip_claude=True)
-    assert_true(install.returncode == 0, f"{label}: install via alias path should succeed: {install.stderr!r}")
-    marker = _read_managed_marker(config_resolved)
-    assert_true(marker.get("codex_config") == bridge_codex_config.normalize_config_path(config_resolved), f"{label}: marker should store normalized path: {marker!r}")
-
-    uninstall = _run_bridge_uninstall_hooks(tmpdir, codex_config=config_resolved, skip_claude=True)
-    assert_true(uninstall.returncode == 0, f"{label}: uninstall via equivalent normalized path should succeed: {uninstall.stderr!r}")
-    assert_true(config_resolved.read_text(encoding="utf-8") == original, f"{label}: config should restore through normalized path comparison")
-    assert_true(not _managed_marker(config_resolved).exists(), f"{label}: marker should be removed")
-    print(f"  PASS  {label}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # ---------- v1.5.x P1 follow-up: dry-run safety + orphan delivered + concurrent prune ----------
@@ -8555,1728 +6754,134 @@ def scenario_prune_concurrent_stat_safe(label: str, tmpdir: Path) -> None:
 
 # ---------- v1.5.x: list_peers model-safe view ----------
 
-def _model_state(aliases_with_extras: dict) -> dict:
-    """Build a state with full participant records (including pane/target/hook_session_id)."""
-    return {
-        "session": "test-session",
-        "participants": {
-            alias: {
-                "alias": alias,
-                "agent_type": rec.get("agent_type", "codex"),
-                "pane": rec.get("pane", "%99"),
-                "target": rec.get("target", "0:1.99"),
-                "hook_session_id": rec.get("hook_session_id", "uuid-secret"),
-                "model": rec.get("model", "gpt-test"),
-                "cwd": rec.get("cwd", "/tmp/x"),
-                "status": "active",
-            }
-            for alias, rec in aliases_with_extras.items()
-        },
-        "hook_session_ids": {alias: "uuid-secret" for alias in aliases_with_extras},
-    }
-
-
-def scenario_format_peer_list_model_safe_default(label: str, tmpdir: Path) -> None:
-    libexec = LIBEXEC
-    if str(libexec) not in sys.path:
-        sys.path.insert(0, str(libexec))
-    import importlib
-    bp = importlib.import_module("bridge_participants")
-    importlib.reload(bp)
-    state = _model_state({"codex1": {}, "codex2": {}})
-    out = bp.format_peer_list(state, "codex1")
-    assert_true("pane=" not in out, f"{label}: text mode default must NOT include pane=, got: {out!r}")
-    assert_true("target=" not in out, f"{label}: text mode default must NOT include target=, got: {out!r}")
-    assert_true("hook_session_id" not in out, f"{label}: never expose hook_session_id")
-    # Should still include type, model, cwd
-    assert_true("type=" in out, f"{label}: type still present")
-    assert_true("model=" in out, f"{label}: model still present")
-    assert_true("cwd=" in out, f"{label}: cwd still present (operator confirmed)")
-    print(f"  PASS  {label}")
-
-
-def scenario_format_peer_list_full_includes_operator_fields(label: str, tmpdir: Path) -> None:
-    libexec = LIBEXEC
-    if str(libexec) not in sys.path:
-        sys.path.insert(0, str(libexec))
-    import importlib
-    bp = importlib.import_module("bridge_participants")
-    importlib.reload(bp)
-    state = _model_state({"codex1": {}})
-    out = bp.format_peer_list(state, "codex1", full=True)
-    assert_true("pane=" in out, f"{label}: full mode includes pane=, got: {out!r}")
-    assert_true("target=" in out, f"{label}: full mode includes target=")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_manage_summary_concise(label: str, tmpdir: Path) -> None:
-    import importlib
-    bms = importlib.import_module("bridge_manage_summary")
-    importlib.reload(bms)
-    state = {
-        "session": "test-session",
-        "participants": {
-            "z-codex": {
-                "alias": "z-codex",
-                "agent_type": "codex",
-                "pane": "%9",
-                "target": "0:1.9",
-                "status": "active",
-                "model": "gpt-test",
-            },
-            "a-claude": {
-                "alias": "a-claude",
-                "agent_type": "claude",
-                "pane": "%1",
-                "target": "0:1.1",
-                "status": "active",
-                "model": "",
-            },
-            "inactive": {
-                "alias": "inactive",
-                "agent_type": "codex",
-                "pane": "%8",
-                "target": "0:1.8",
-                "status": "left",
-            },
-        },
-    }
-    out1 = bms.format_room_summary(state)
-    out2 = bms.format_room_summary(state)
-    assert_true(out1 == out2, f"{label}: output must be deterministic")
-    lines = out1.splitlines()
-    assert_true(lines[0] == "Agents:", f"{label}: starts with Agents:, got {out1!r}")
-    assert_true(lines[1].startswith("- a-claude claude active target=0:1.1 pane=%1"), f"{label}: sorted a-claude first: {out1!r}")
-    assert_true(lines[2].startswith("- z-codex codex active target=0:1.9 pane=%9 model=gpt-test"), f"{label}: z-codex fields/model: {out1!r}")
-    assert_true("inactive" not in out1, f"{label}: inactive participants omitted: {out1!r}")
-    assert_true("model=" not in lines[1], f"{label}: empty model omitted: {lines[1]!r}")
-    forbidden = ("agent_send_peer", "Commands:", "Kinds and routing contract", "Reply normally")
-    for needle in forbidden:
-        assert_true(needle not in out1, f"{label}: summary must not include cheat sheet text {needle!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_manage_summary_defaults(label: str, tmpdir: Path) -> None:
-    import importlib
-    bms = importlib.import_module("bridge_manage_summary")
-    importlib.reload(bms)
-    state = {
-        "session": "test-session",
-        "participants": {
-            "loose": {
-                "alias": "loose",
-                "agent_type": "",
-                "pane": "",
-                "target": "",
-                "status": "",
-            }
-        },
-    }
-    out = bms.format_room_summary(state)
-    assert_true("- loose unknown unknown target=? pane=?" in out, f"{label}: missing fields use stable defaults: {out!r}")
-    assert_true("model=" not in out, f"{label}: missing model omitted: {out!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_manage_summary_legacy_state_fallback(label: str, tmpdir: Path) -> None:
-    import importlib
-    bms = importlib.import_module("bridge_manage_summary")
-    importlib.reload(bms)
-    state = {
-        "session": "test-session",
-        "panes": {"claude": "%1", "codex": "%2"},
-        "targets": {"claude": "0:1.1", "codex": "0:1.2"},
-    }
-    out = bms.format_room_summary(state)
-    assert_true("- claude claude active target=0:1.1 pane=%1" in out, f"{label}: legacy claude rendered: {out!r}")
-    assert_true("- codex codex active target=0:1.2 pane=%2" in out, f"{label}: legacy codex rendered: {out!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_bridge_manage_summary_missing_session_exits(label: str, tmpdir: Path) -> None:
-    script = ROOT / "libexec" / "agent-bridge" / "bridge_manage_summary.py"
-    env = os.environ.copy()
-    env["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
-    proc = subprocess.run(
-        [sys.executable, str(script), "--session", "missing-room"],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=10,
-    )
-    assert_true(proc.returncode == 2, f"{label}: missing session should exit 2, got {proc.returncode}")
-    assert_true(proc.stdout == "", f"{label}: missing session should not print summary: {proc.stdout!r}")
-    assert_true("not active or was stopped" in proc.stderr, f"{label}: stderr should explain missing room: {proc.stderr!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_model_safe_participants_uses_active_only(label: str, tmpdir: Path) -> None:
-    """JSON view should match text view: only active participants."""
-    libexec = LIBEXEC
-    if str(libexec) not in sys.path:
-        sys.path.insert(0, str(libexec))
-    import importlib
-    bp = importlib.import_module("bridge_participants")
-    importlib.reload(bp)
-    state = {
-        "session": "test-session",
-        "participants": {
-            "codex1": {"alias": "codex1", "agent_type": "codex", "pane": "%0", "model": "m", "cwd": "/x", "status": "active"},
-            "stale": {"alias": "stale", "agent_type": "codex", "pane": "%99", "model": "m", "cwd": "/y", "status": "left"},
-        },
-    }
-    safe = bp.model_safe_participants(state)
-    assert_true("codex1" in safe, f"{label}: active codex1 included")
-    assert_true("stale" not in safe, f"{label}: inactive 'stale' must NOT be exposed: {safe}")
-    print(f"  PASS  {label}")
-
-
-def scenario_list_peers_json_daemon_status_strips_pid(label: str, tmpdir: Path) -> None:
-    """Default JSON output's daemon_status must not contain pid; --full does."""
-    helper = str(LIBEXEC / "bridge_list_peers.py")
-    # Use existing live session to drive the CLI
-    proc = subprocess.run(
-        [sys.executable, helper, "--session", "agent-bridge-auto", "--json"],
-        capture_output=True, text=True, timeout=10,
-    )
-    if proc.returncode != 0:
-        # If live session not present (CI or fresh checkout), skip silently
-        print(f"  SKIP  {label}: no live session ({proc.stderr.strip()[:60]})")
-        return
-    data = json.loads(proc.stdout)
-    ds = data.get("daemon_status") or {}
-    assert_true("pid" not in ds, f"{label}: default JSON daemon_status must NOT include pid, got {ds}")
-    proc_full = subprocess.run(
-        [sys.executable, helper, "--session", "agent-bridge-auto", "--json", "--full"],
-        capture_output=True, text=True, timeout=10,
-    )
-    data_full = json.loads(proc_full.stdout)
-    ds_full = data_full.get("daemon_status") or {}
-    # pid is in the full view (may be None when not available, but the key should be present)
-    assert_true("pid" in ds_full, f"{label}: --full JSON daemon_status must include pid key: {ds_full}")
-    print(f"  PASS  {label}")
-
-
-def scenario_model_safe_participants_strips_endpoints(label: str, tmpdir: Path) -> None:
-    libexec = LIBEXEC
-    if str(libexec) not in sys.path:
-        sys.path.insert(0, str(libexec))
-    import importlib
-    bp = importlib.import_module("bridge_participants")
-    importlib.reload(bp)
-    state = _model_state({"codex1": {}, "codex2": {}})
-    safe = bp.model_safe_participants(state)
-    for alias, record in safe.items():
-        assert_true("pane" not in record, f"{label}: {alias} record must not include pane")
-        assert_true("target" not in record, f"{label}: {alias} record must not include target")
-        assert_true("hook_session_id" not in record, f"{label}: {alias} record must not include hook_session_id")
-        assert_true(record.get("agent_type"), f"{label}: agent_type retained")
-        assert_true(record.get("cwd"), f"{label}: cwd retained")
-    print(f"  PASS  {label}")
-
-
-def _import_view_peer():
-    import importlib
-    bv = importlib.import_module("bridge_view_peer")
-    return importlib.reload(bv)
-
-
-class ViewPeerValidationSentinel(RuntimeError):
-    pass
-
-
-def _run_view_peer_main_with_sentinels(bv, argv: list[str]) -> tuple[str, bool]:
-    old_argv = sys.argv[:]
-    old_validate_caller = bv.validate_caller
-    old_handlers = {
-        "handle_live": bv.handle_live,
-        "handle_onboard": bv.handle_onboard,
-        "handle_older": bv.handle_older,
-        "handle_since_last": bv.handle_since_last,
-        "handle_search": bv.handle_search,
-    }
-    reached_validation = False
-
-    def sentinel_validate(_args):
-        nonlocal reached_validation
-        reached_validation = True
-        raise ViewPeerValidationSentinel("validate_caller reached")
-
-    def handler_sentinel(*_args, **_kwargs):
-        raise ViewPeerValidationSentinel("handler reached")
-
-    try:
-        sys.argv = ["agent_view_peer", *argv]
-        bv.validate_caller = sentinel_validate
-        for name in old_handlers:
-            setattr(bv, name, handler_sentinel)
-        try:
-            bv.main()
-        except SystemExit as exc:
-            return str(exc), reached_validation
-        except ViewPeerValidationSentinel as exc:
-            return str(exc), reached_validation
-        raise AssertionError(f"agent_view_peer main returned normally for argv {argv!r}")
-    finally:
-        sys.argv = old_argv
-        bv.validate_caller = old_validate_caller
-        for name, value in old_handlers.items():
-            setattr(bv, name, value)
-
-
-def scenario_view_peer_rejects_snapshot_without_snapshot_mode(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    cases = [
-        ["codex1", "--snapshot", "snap-X"],
-        ["codex1", "--onboard", "--snapshot", "snap-X"],
-        ["codex1", "--since-last", "--snapshot", "snap-X"],
-        ["codex1", "--snapshot", ""],
-        ["codex1", "--since-last", "--snapshot", "snap-X", "--page", "1"],
-    ]
-    for idx, argv in enumerate(cases):
-        msg, reached_validation = _run_view_peer_main_with_sentinels(bv, argv)
-        assert_true("--snapshot is only valid with --older or --search" in msg, f"{label}:{idx}: targeted snapshot error expected for {argv!r}: {msg!r}")
-        assert_true(not reached_validation, f"{label}:{idx}: validation/session lookup must not run for invalid snapshot argv {argv!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_rejects_page_with_since_last_or_search(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    cases = [
-        ["codex1", "--since-last", "--page", "0"],
-        ["codex1", "--since-last", "--page", "1"],
-        ["codex1", "--search", "needle", "--page", "0"],
-        ["codex1", "--search", "needle", "--page", "1"],
-        ["codex1", "--search", "needle", "--snapshot", "snap-X", "--page", "1"],
-    ]
-    for idx, argv in enumerate(cases):
-        msg, reached_validation = _run_view_peer_main_with_sentinels(bv, argv)
-        assert_true("--page is only valid with live view, --onboard, or --older" in msg, f"{label}:{idx}: targeted page error expected for {argv!r}: {msg!r}")
-        assert_true(not reached_validation, f"{label}:{idx}: validation/session lookup must not run for invalid page argv {argv!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_allows_page_in_live_onboard_older_and_snapshot_in_older_search(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    cases = [
-        ["codex1", "--page", "1"],
-        ["codex1", "--onboard", "--page", "1"],
-        ["codex1", "--older", "--page", "1"],
-        ["codex1", "--older", "--snapshot", "snap-X"],
-        ["codex1", "--search", "needle", "--snapshot", "snap-X"],
-    ]
-    for idx, argv in enumerate(cases):
-        msg, reached_validation = _run_view_peer_main_with_sentinels(bv, argv)
-        assert_true(msg == "validate_caller reached", f"{label}:{idx}: valid flag shape should reach validation sentinel for {argv!r}, got {msg!r}")
-        assert_true(reached_validation, f"{label}:{idx}: validation sentinel should be reached for valid flag shape {argv!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_rejects_empty_search_before_session_lookup(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    cases = [
-        ["codex1", "--search", ""],
-        ["codex1", "--search", "   "],
-        ["codex1", "--search", "\t\n"],
-    ]
-    for idx, argv in enumerate(cases):
-        msg, reached_validation = _run_view_peer_main_with_sentinels(bv, argv)
-        assert_true("--search query must be non-empty" in msg, f"{label}:{idx}: targeted empty-search error expected for {argv!r}: {msg!r}")
-        assert_true(not reached_validation, f"{label}:{idx}: validation/session lookup must not run for empty-search argv {argv!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_empty_search_counts_as_search_for_mode_errors(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    cases = [
-        (["codex1", "--onboard", "--search", ""], "choose only one of --onboard, --older, --since-last, or --search"),
-        (["codex1", "--live"], "--live is only valid with --search"),
-        (["codex1", "--live", "--search", ""], "--search query must be non-empty"),
-        (["codex1", "--search", "", "--page", "0"], "--search query must be non-empty"),
-    ]
-    for idx, (argv, expected) in enumerate(cases):
-        msg, reached_validation = _run_view_peer_main_with_sentinels(bv, argv)
-        assert_true(expected in msg, f"{label}:{idx}: expected {expected!r} for {argv!r}, got {msg!r}")
-        assert_true(not reached_validation, f"{label}:{idx}: validation/session lookup must not run for invalid search-shape argv {argv!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_nonempty_search_still_reaches_validation(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    msg, reached_validation = _run_view_peer_main_with_sentinels(bv, ["codex1", "--search", " needle "])
-    assert_true(msg == "validate_caller reached", f"{label}: non-empty query with surrounding spaces should reach validation sentinel, got {msg!r}")
-    assert_true(reached_validation, f"{label}: validation sentinel should be reached for non-empty query")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_search_with_page_after_a19_reports_page_error(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    cases = [
-        ["codex1", "--search", " needle ", "--page", "0"],
-        ["codex1", "--search", "needle", "--page", "0"],
-    ]
-    for idx, argv in enumerate(cases):
-        msg, reached_validation = _run_view_peer_main_with_sentinels(bv, argv)
-        assert_true("--page is only valid with live view, --onboard, or --older" in msg, f"{label}:{idx}: non-empty search with page should report A18 page error for {argv!r}: {msg!r}")
-        assert_true(not reached_validation, f"{label}:{idx}: validation/session lookup must not run for invalid search+page argv {argv!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_doc_surfaces_disclose_search_semantics(label: str, tmpdir: Path) -> None:
-    phrase = "case-insensitive literal substring (no regex)"
-    search_shape = "agent_view_peer <alias> --search 'text' [--live]"
-
-    search_lines = [line for line in bridge_instructions.model_cheat_sheet() if search_shape in line]
-    assert_true(len(search_lines) == 1, f"{label}: expected one cheat-sheet search line, got {search_lines!r}")
-    assert_true(phrase in search_lines[0], f"{label}: cheat-sheet search line must disclose search semantics: {search_lines[0]!r}")
-
-    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
-    assert_true("agent_view_peer" in probe, f"{label}: probe prompt must keep compact view command reference")
-    assert_true("debug surfaces" in probe and "do not poll" in probe.lower(), f"{label}: probe prompt must frame view/status commands as debug, not polling: {probe!r}")
-
-    help_result = subprocess.run(
-        [sys.executable, str(LIBEXEC / "bridge_view_peer.py"), "--help"],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    help_text = help_result.stdout + help_result.stderr
-    normalized_help = " ".join(help_text.split())
-    assert_true(help_result.returncode == 0, f"{label}: agent_view_peer --help should exit 0, got {help_result.returncode}: {help_text!r}")
-    assert_true("--search" in help_text, f"{label}: --help output must include --search")
-    assert_true(phrase in normalized_help, f"{label}: --help output must disclose search semantics: {help_text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_interrupt_peer_doc_surfaces_disclose_no_op_race(label: str, tmpdir: Path) -> None:
-    phrase = "interrupt can be a no-op: the response and queued follow-ups still flow"
-    key_sequence_phrase = "Claude"
-    ctrl_c_phrase = "Ctrl-C"
-    command_shape = "agent_interrupt_peer <alias>"
-    boundary_tokens = [
-        "agent_cancel_message",
-        "pending",
-        "inflight pre-pane-touch/pre-paste",
-        "pane-mode-deferred",
-        "active/post-pane-touch",
-        "submitted",
-        "delivered",
-        "not other pending queued messages",
-    ]
-    trigger_tokens = ["wrong prompt", "stuck peer"]
-    clear_hold_tokens = [
-        "held=true",
-        "interrupt_partial_failure_blocked=true",
-        "busy=false",
-        "current_prompt_id=null",
-        "inflight_count=0",
-        "delivered_count=0",
-        "idle",
-        "dirty input",
-        "turn in progress",
-        "active delivered/inflight work",
-    ]
-
-    interrupt_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith(f"- {command_shape} :")]
-    assert_true(len(interrupt_lines) == 1, f"{label}: expected one default interrupt cheat-sheet line, got {interrupt_lines!r}")
-    assert_true(phrase in interrupt_lines[0], f"{label}: cheat-sheet interrupt line must disclose no-op race: {interrupt_lines[0]!r}")
-    assert_true(key_sequence_phrase in interrupt_lines[0] and ctrl_c_phrase in interrupt_lines[0], f"{label}: cheat-sheet interrupt line must disclose Claude C-c sequence: {interrupt_lines[0]!r}")
-    assert_true("force-cancel" not in interrupt_lines[0], f"{label}: default interrupt line must not imply force-cancel: {interrupt_lines[0]!r}")
-    for token in boundary_tokens:
-        assert_true(token.lower() in interrupt_lines[0].lower(), f"{label}: interrupt cheat line missing boundary token {token!r}: {interrupt_lines[0]!r}")
-    for token in trigger_tokens:
-        assert_true(token in interrupt_lines[0].lower(), f"{label}: interrupt cheat line missing trigger token {token!r}: {interrupt_lines[0]!r}")
-    assert_true(
-        "replacement waiting behind active/post-pane-touch work" in interrupt_lines[0].lower(),
-        f"{label}: interrupt cheat line missing active-only replacement trigger: {interrupt_lines[0]!r}",
-    )
-    assert_true("Use --json" in interrupt_lines[0], f"{label}: interrupt cheat line should document JSON opt-in: {interrupt_lines[0]!r}")
-    cancel_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_cancel_message <message_id> :")]
-    assert_true(len(cancel_lines) == 1, f"{label}: expected one cancel cheat-sheet line, got {cancel_lines!r}")
-    for token in ("pending", "inflight pre-pane-touch/pre-paste", "pane-mode-deferred", "agent_interrupt_peer", "submitted", "delivered"):
-        assert_true(token.lower() in cancel_lines[0].lower(), f"{label}: cancel cheat line missing symmetric token {token!r}: {cancel_lines[0]!r}")
-    assert_true("Use --json" in cancel_lines[0], f"{label}: cancel cheat line should document JSON opt-in: {cancel_lines[0]!r}")
-    clear_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_interrupt_peer <alias> --clear-hold :")]
-    assert_true(len(clear_lines) == 1, f"{label}: expected one clear-hold cheat-sheet line, got {clear_lines!r}")
-    for token in clear_hold_tokens:
-        assert_true(token.lower() in clear_lines[0].lower(), f"{label}: clear-hold cheat line missing token {token!r}: {clear_lines[0]!r}")
-    assert_true("Use --json" in clear_lines[0], f"{label}: clear-hold cheat line should document JSON opt-in: {clear_lines[0]!r}")
-    status_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_interrupt_peer [<alias>] --status :")]
-    assert_true(len(status_lines) == 1 and "JSON" in status_lines[0], f"{label}: status cheat line should keep JSON inspection wording: {status_lines!r}")
-
-    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
-    assert_true(command_shape in probe, f"{label}: probe prompt must keep compact interrupt command shape")
-    assert_true("force-cancel" not in probe, f"{label}: probe prompt must not imply force-cancel")
-    for token in ("agent_cancel_message", "pending", "inflight pre-pane-touch/pre-paste", "pane-mode-deferred", "agent_interrupt_peer", "active/post-pane-touch"):
-        assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing boundary token {token!r}")
-    for token in ("--json", "--status is JSON"):
-        assert_true(token in probe, f"{label}: probe prompt missing action JSON token {token!r}")
-    for token in trigger_tokens:
-        assert_true(token in probe.lower(), f"{label}: probe prompt missing trigger token {token!r}")
-    assert_true(
-        "replacement waiting behind active/post-pane-touch work" in probe.lower(),
-        f"{label}: probe prompt missing active-only replacement trigger",
-    )
-
-    help_result = subprocess.run(
-        [sys.executable, str(LIBEXEC / "bridge_interrupt_peer.py"), "--help"],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    help_text = help_result.stdout + help_result.stderr
-    normalized_help = " ".join(help_text.split())
-    normalized_help_tokens = normalized_help.replace("- ", "-")
-    normalized_help_noop_ok = phrase in normalized_help or phrase.replace("no-op", "no- op") in normalized_help
-    assert_true(help_result.returncode == 0, f"{label}: agent_interrupt_peer --help should exit 0, got {help_result.returncode}: {help_text!r}")
-    assert_true("--clear-hold" in help_text, f"{label}: --help output must include interrupt-specific options")
-    assert_true(normalized_help_noop_ok, f"{label}: --help output must disclose no-op race: {help_text!r}")
-    assert_true(key_sequence_phrase in normalized_help and ctrl_c_phrase in normalized_help, f"{label}: --help output must disclose Claude C-c sequence: {help_text!r}")
-    assert_true("force-cancel" not in normalized_help, f"{label}: --help output must not imply force-cancel: {help_text!r}")
-    for token in boundary_tokens:
-        assert_true(token.lower() in normalized_help_tokens.lower(), f"{label}: --help missing boundary token {token!r}: {help_text!r}")
-    for token in clear_hold_tokens:
-        assert_true(token.lower() in normalized_help_tokens.lower(), f"{label}: --help missing clear-hold token {token!r}: {help_text!r}")
-    assert_true("--json" in normalized_help, f"{label}: --help should document action JSON opt-in: {help_text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_interrupt_peer_doc_surfaces_no_queued_active_directive(label: str, tmpdir: Path) -> None:
-    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
-    interrupt_lines = [
-        line for line in bridge_instructions.model_cheat_sheet()
-        if line.startswith("- agent_interrupt_peer <alias> :")
-    ]
-    assert_true(len(interrupt_lines) == 1, f"{label}: expected one interrupt cheat-sheet line, got {interrupt_lines!r}")
-    interrupt_line = interrupt_lines[0]
-    for surface_name, surface in (("probe", probe), ("cheat sheet", interrupt_line)):
-        lowered = surface.lower()
-        assert_true("queued/active turn" not in lowered, f"{label}: {surface_name} must not direct interrupt at queued/active turn wording: {surface!r}")
-        assert_true(
-            "replacement waiting behind active/post-pane-touch work" in lowered,
-            f"{label}: {surface_name} must keep active-only replacement wording: {surface!r}",
-        )
-    print(f"  PASS  {label}")
-
-
-def scenario_prompt_intercepted_doc_surfaces_disclose_user_typing_collision(label: str, tmpdir: Path) -> None:
-    phrase = (
-        "If a human types into a pane while a bridge prompt is delivered but unsubmitted, "
-        "the bridge cancels that delivered message, emits [bridge:interrupted] "
-        "prompt_intercepted to the original sender, and drops that turn; expect "
-        "model-driven retries."
-    )
-    critical_substrings = [
-        "delivered but unsubmitted",
-        "[bridge:interrupted] prompt_intercepted",
-        "drops that turn",
-        "expect model-driven retries",
-    ]
-
-    matching_lines = [
-        line for line in bridge_instructions.model_cheat_sheet()
-        if "prompt_intercepted" in line or "delivered but unsubmitted" in line
-    ]
-    assert_true(len(matching_lines) == 1, f"{label}: expected one prompt_intercepted cheat-sheet bullet, got {matching_lines!r}")
-    assert_true(phrase in matching_lines[0], f"{label}: cheat-sheet bullet must disclose user-typing collision exactly: {matching_lines[0]!r}")
-
-    for needle in critical_substrings:
-        assert_true(needle in matching_lines[0], f"{label}: cheat-sheet bullet missing critical substring {needle!r}: {matching_lines[0]!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_response_send_guard_doc_surfaces_are_precise(label: str, tmpdir: Path) -> None:
-    required_doc_tokens = [
-        "response-time send guard",
-        "auto-return peer request",
-        "requester",
-        "current_prompt.from",
-        "blocked/rejected",
-        "target list containing that requester",
-        "third-party peer sends",
-        "review/collaboration",
-        "other validations still apply",
-    ]
-    forbidden_fragments = [
-        "do not call agent_send_peer",
-        "cannot send peer messages during response",
-        "no agent_send_peer during response",
-    ]
-    cheat = "\n".join(bridge_instructions.model_cheat_sheet())
-    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
-    lowered_cheat = cheat.lower()
-    for token in required_doc_tokens:
-        assert_true(token.lower() in lowered_cheat, f"{label}: cheat sheet missing response guard token {token!r}")
-    compact_probe_tokens = [
-        "response-time send guard",
-        "auto-return peer request",
-        "requester",
-        "current_prompt.from",
-        "blocked/rejected",
-        "third-party",
-        "review/collaboration",
-        "other validations still apply",
-    ]
-    lowered_probe = probe.lower()
-    for token in compact_probe_tokens:
-        assert_true(token.lower() in lowered_probe, f"{label}: probe prompt missing compact response guard token {token!r}")
-    for surface_name, surface in (("cheat sheet", cheat), ("probe prompt", probe)):
-        lowered = surface.lower()
-        for fragment in forbidden_fragments:
-            assert_true(fragment.lower() not in lowered, f"{label}: {surface_name} must not contain overbroad guard wording {fragment!r}")
-
-    text = bridge_response_guard.format_response_send_violation(
-        bridge_response_guard.ResponseSendViolation(
-            sender="bob",
-            requester="alice",
-            message_id="msg-guard-doc",
-            outgoing_kind="request",
-            blocked_targets=("alice", "carol"),
-            source="test",
-        )
-    )
-    lowered_error = text.lower()
-    for token in (
-        "requester",
-        "current_prompt.from=alice",
-        "separate agent_send_peer",
-        "blocked/rejected",
-        "target list includes that requester",
-        "third-party",
-        "review/collaboration",
-        "other validations still apply",
-    ):
-        assert_true(token.lower() in lowered_error, f"{label}: guard error missing token {token!r}: {text!r}")
-    for fragment in forbidden_fragments:
-        assert_true(fragment.lower() not in lowered_error, f"{label}: guard error must not contain overbroad wording {fragment!r}: {text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_probe_prompt_is_compact_quickstart(label: str, tmpdir: Path) -> None:
-    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
-    lines = probe.splitlines()
-    assert_true(len(lines) <= 20, f"{label}: probe should stay compact (<=20 lines), got {len(lines)} lines")
-    assert_true(len(probe) <= 3750, f"{label}: probe should stay compact (<=3750 chars), got {len(probe)} chars")
-    compact_tokens = [
-        "AGGREGATE_ID",
-        "agent_aggregate_status",
-        "--watchdog 0",
-        "AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC=300",
-        "auto-cancelled by any incoming peer request/notice from another agent",
-        "per-phase",
-        "not a queue timer",
-        "pending -> inflight",
-        "inflight -> delivered",
-        "agent_cancel_message",
-        "agent_interrupt_peer",
-        "--json",
-        "current_prompt.from",
-        "one inline argument",
-        "--stdin heredoc",
-        "not both",
-        "missing_body",
-        "empty_stdin",
-        "unexpected_positional_after_stdin",
-        "stdin_inline_conflict",
-        "piped_stdin_inline_conflict",
-        "do not poll",
-        "debug surfaces",
-        "suspected stuck peer",
-        "(view_peer)",
-        "11000",
-        "Never read bridge state files",
-        "agent_list_peers",
-        "full cheat sheet",
-    ]
-    lowered = probe.lower()
-    for token in compact_tokens:
-        assert_true(token.lower() in lowered, f"{label}: compact probe missing required token {token!r}: {probe!r}")
-    assert_true("Run agent_list_peers for the full cheat sheet" in lines[-2], f"{label}: full-reference pointer should be final visible guidance before exact reply: {lines[-2:]!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_wait_doc_surfaces_name_blocking_consequence(label: str, tmpdir: Path) -> None:
-    request_tokens = ["result arrives later as a new [bridge:*] prompt", "Do independent work", "do not sleep/poll"]
-    alarm_tokens = ["[bridge:*] notice prompt", "do not sleep/poll"]
-    body_input_tokens = [
-        "one inline argument",
-        "--stdin heredoc",
-        "not both",
-        "missing_body",
-        "empty_stdin",
-        "unexpected_positional_after_stdin",
-        "stdin_inline_conflict",
-        "piped_stdin_inline_conflict",
-        "self-recovery guidance",
-    ]
-    forbidden_fragments = ["End your turn; sleep/polling blocks the wake you await.", "do not sleep or poll"]
-
-    cheat = "\n".join(bridge_instructions.model_cheat_sheet())
-    cheat_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- After sending a request,")]
-    assert_true(len(cheat_lines) == 1, f"{label}: expected one cheat-sheet request-wait rule, got {cheat_lines!r}")
-    cheat_line = cheat_lines[0]
-    for token in request_tokens:
-        assert_true(token in cheat_line, f"{label}: cheat-sheet request-wait rule missing token {token!r}: {cheat_line!r}")
-    for forbidden in forbidden_fragments:
-        assert_true(forbidden not in cheat_line, f"{label}: cheat-sheet request-wait rule should drop old wording {forbidden!r}: {cheat_line!r}")
-    notice_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_send_peer --kind notice")]
-    assert_true(len(notice_lines) == 1, f"{label}: expected one cheat-sheet notice rule, got {notice_lines!r}")
-    assert_true("no reply auto-routes" in notice_lines[0].lower(), f"{label}: notice rule must mention no auto-route: {notice_lines[0]!r}")
-    assert_true("Set agent_alarm if a follow-up matters" in notice_lines[0], f"{label}: notice rule should use direct follow-up wording: {notice_lines[0]!r}")
-    assert_true("only if a follow-up matters" not in notice_lines[0], f"{label}: notice rule should drop old only-if wording: {notice_lines[0]!r}")
-    alarm_lines = [line for line in bridge_instructions.model_cheat_sheet() if line.startswith("- agent_alarm <sec>")]
-    assert_true(len(alarm_lines) == 1, f"{label}: expected one cheat-sheet alarm rule, got {alarm_lines!r}")
-    for token in alarm_tokens:
-        assert_true(token.lower() in alarm_lines[0].lower(), f"{label}: alarm rule missing token {token!r}: {alarm_lines[0]!r}")
-    assert_true("[bridge:alarm_cancelled]" in alarm_lines[0] and "re-arm" in alarm_lines[0].lower(), f"{label}: alarm rule must mention cancellation marker and re-arm guidance: {alarm_lines[0]!r}")
-
-    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
-    for token in body_input_tokens:
-        assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing body-input token {token!r}")
-        assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing body-input token {token!r}")
-    for token in request_tokens:
-        assert_true(token.lower() in probe.lower(), f"{label}: compact probe missing request token {token!r}")
-    for forbidden in forbidden_fragments:
-        assert_true(forbidden not in probe, f"{label}: compact probe should drop old wording {forbidden!r}")
-    assert_true("no reply auto-routes" in probe.lower(), f"{label}: probe notice text must mention no auto-route")
-    assert_true("Set agent_alarm if a follow-up matters" in probe, f"{label}: probe should use direct follow-up wording: {probe!r}")
-    assert_true("only if a follow-up matters" not in probe, f"{label}: probe should drop old only-if wording: {probe!r}")
-    assert_true("agent_alarm <sec>" in probe and "[bridge:*] notice" in probe, f"{label}: compact probe should retain alarm command and wake shape")
-    print(f"  PASS  {label}")
-
-
-def scenario_watchdog_phase_doc_surfaces_are_consistent(label: str, tmpdir: Path) -> None:
-    def _line_containing(lines: list[str], token: str) -> str:
-        matches = [line for line in lines if token in line]
-        assert_true(len(matches) == 1, f"{label}: expected one line containing {token!r}, got {matches!r}")
-        return matches[0]
-
-    canonical_watchdog_tokens = [
-        "AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC",
-        "300",
-        "phase",
-        "delivery",
-        "response",
-        "pending",
-        "inflight",
-        "delivered",
-        "not a queue timer",
-        "same <sec> per phase",
-        "up to two phase intervals",
-        "request",
-        "--watchdog 0",
-    ]
-    model_watchdog_forbidden_tokens = [
-        "--no-auto-return",
-        "no-auto-return",
-        "no auto-return",
-        "requires auto-return",
-        "auto-return",
-    ]
-    forbidden_bare_default_fragments = [
-        "for example default 300s",
-        "default 300s delivery",
-        "default 300s response",
-    ]
-    extend_tokens = ["inflight/submitted delivery", "delivered aggregate response", "stale watchdog wakes", "[bridge:result]", "queued/arriving"]
-
-    cheat_lines = bridge_instructions.model_cheat_sheet()
-    cheat = "\n".join(cheat_lines)
-    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
-    probe_lines = probe.splitlines()
-    cheat_watchdog_line = _line_containing(cheat_lines, "--watchdog <sec>")
-    probe_watchdog_line = _line_containing(probe_lines, "--watchdog <sec>")
-    response_guard_line = _line_containing(cheat_lines, "Response-time send guard")
-    probe_response_guard_line = _line_containing(probe_lines, "Response-time send guard")
-
-    send_help = subprocess.run(
-        [sys.executable, str(LIBEXEC / "bridge_send_peer.py"), "--help"],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    send_help_text = " ".join((send_help.stdout + send_help.stderr).split())
-    assert_true(send_help.returncode == 0, f"{label}: agent_send_peer --help should exit 0, got {send_help.returncode}: {send_help_text!r}")
-    for surface_name, surface in (("cheat sheet", cheat), ("bridge_send_peer help", send_help_text)):
-        lowered = surface.lower()
-        for token in canonical_watchdog_tokens:
-            assert_true(token.lower() in lowered, f"{label}: {surface_name} missing watchdog token {token!r}: {surface!r}")
-        for forbidden in forbidden_bare_default_fragments:
-            assert_true(forbidden not in lowered, f"{label}: {surface_name} has bare hard-coded default wording {forbidden!r}: {surface!r}")
-    compact_probe_watchdog_tokens = [
-        "AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC=300",
-        "per-phase",
-        "not a queue timer",
-        "pending -> inflight",
-        "inflight -> delivered",
-        "300s delivery + 300s response",
-        "--watchdog 0",
-    ]
-    lowered_probe = probe.lower()
-    for token in compact_probe_watchdog_tokens:
-        assert_true(token.lower() in lowered_probe, f"{label}: compact probe missing watchdog token {token!r}: {probe!r}")
-    for forbidden in forbidden_bare_default_fragments:
-        assert_true(forbidden not in lowered_probe, f"{label}: compact probe has bare hard-coded default wording {forbidden!r}: {probe!r}")
-    for surface_name, surface in (("cheat sheet watchdog line", cheat_watchdog_line), ("probe watchdog line", probe_watchdog_line), ("bridge_send_peer help", send_help_text)):
-        lowered = surface.lower()
-        for forbidden in model_watchdog_forbidden_tokens:
-            assert_true(forbidden not in lowered, f"{label}: {surface_name} should not expose model-facing no-auto-return wording {forbidden!r}: {surface!r}")
-    assert_true("Request only" in cheat_watchdog_line, f"{label}: cheat sheet watchdog line must keep request-only boundary: {cheat_watchdog_line!r}")
-    assert_true("request" in probe_watchdog_line.lower(), f"{label}: probe watchdog line must keep request boundary: {probe_watchdog_line!r}")
-    assert_true("Request only" in send_help_text, f"{label}: help watchdog text must keep request-only boundary: {send_help_text!r}")
-    assert_true("auto-return peer request" in response_guard_line, f"{label}: cheat sheet response guard must keep auto-return wording: {response_guard_line!r}")
-    assert_true("auto-return peer request" in probe_response_guard_line, f"{label}: probe response guard must keep auto-return wording: {probe_response_guard_line!r}")
-    assert_true("pending -> inflight" in cheat and "inflight -> delivered" in cheat, f"{label}: cheat sheet missing exact phase transitions")
-    assert_true("pending -> inflight" in probe and "inflight -> delivered" in probe, f"{label}: probe prompt missing exact phase transitions")
-    assert_true("pending -> inflight" in send_help_text and "inflight -> delivered" in send_help_text, f"{label}: help missing exact phase transitions: {send_help_text!r}")
-    for token in extend_tokens:
-        assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing extend token {token!r}")
-
-    extend_help = subprocess.run(
-        [sys.executable, str(LIBEXEC / "bridge_extend_wait.py"), "--help"],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    extend_help_text = " ".join((extend_help.stdout + extend_help.stderr).split())
-    assert_true(extend_help.returncode == 0, f"{label}: agent_extend_wait --help should exit 0, got {extend_help.returncode}: {extend_help_text!r}")
-    for token in ("delivery", "response"):
-        assert_true(token in extend_help_text, f"{label}: bridge_extend_wait help missing {token!r}: {extend_help_text!r}")
-
-    send_no_auto = subprocess.run(
-        [sys.executable, str(LIBEXEC / "bridge_send_peer.py"), "--no-auto-return", "--to", "bob", "hello"],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    assert_true(send_no_auto.returncode == 2, f"{label}: model-facing --no-auto-return should reject, got {send_no_auto.returncode}: {send_no_auto.stderr!r}")
-    assert_true(send_no_auto.stdout == "", f"{label}: rejected --no-auto-return should not print stdout: {send_no_auto.stdout!r}")
-    assert_true("--no-auto-return" in send_no_auto.stderr and "unrecognized" in send_no_auto.stderr, f"{label}: --no-auto-return rejection should be explicit: {send_no_auto.stderr!r}")
-
-    enqueue_help = subprocess.run(
-        [sys.executable, str(LIBEXEC / "bridge_enqueue.py"), "--help"],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    enqueue_help_text = enqueue_help.stdout + enqueue_help.stderr
-    assert_true(enqueue_help.returncode == 0, f"{label}: bridge_enqueue --help should exit 0, got {enqueue_help.returncode}: {enqueue_help_text!r}")
-    assert_true("--no-auto-return" in enqueue_help_text, f"{label}: internal enqueue surface must preserve --no-auto-return: {enqueue_help_text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_wait_status_doc_surfaces_anti_polling(label: str, tmpdir: Path) -> None:
-    cheat = "\n".join(bridge_instructions.model_cheat_sheet())
-    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
-    cheat_tokens = [
-        "agent_wait_status",
-        "do not poll",
-        "human-prompted",
-        "watchdog",
-        "agent_view_peer",
-        "peer pane debugging",
-    ]
-    for token in cheat_tokens:
-        assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing wait_status token {token!r}")
-    compact_probe_tokens = ["agent_wait_status", "debug surfaces", "do not poll", "human prompt", "watchdog", "bridge-state debug"]
-    for token in compact_probe_tokens:
-        assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing wait_status token {token!r}")
-
-    help_result = subprocess.run(
-        [sys.executable, str(LIBEXEC / "bridge_wait_status.py"), "--help"],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    help_text = " ".join((help_result.stdout + help_result.stderr).split())
-    assert_true(help_result.returncode == 0, f"{label}: agent_wait_status --help should exit 0, got {help_result.returncode}: {help_text!r}")
-    for token in ("human-prompted", "watchdog", "do not poll", "[bridge:*]"):
-        assert_true(token.lower() in help_text.lower(), f"{label}: help missing anti-polling token {token!r}: {help_text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_aggregate_status_doc_surfaces_leg_level_and_anti_polling(label: str, tmpdir: Path) -> None:
-    cheat = "\n".join(bridge_instructions.model_cheat_sheet())
-    probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
-    cheat_tokens = [
-        "agent_aggregate_status",
-        "leg-level",
-        "agent_wait_status",
-        "one aggregate",
-        "AGGREGATE_ID",
-        "aggregate_id",
-        "human prompt",
-        "watchdog",
-        "do not poll",
-    ]
-    compact_probe_tokens = ["agent_aggregate_status", "leg-level", "AGGREGATE_ID", "watchdog", "do not poll", "debug surfaces"]
-    forbidden_tokens = ["track progress", "monitor progress"]
-    for token in cheat_tokens:
-        assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing aggregate_status token {token!r}")
-    for token in compact_probe_tokens:
-        assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing aggregate_status token {token!r}")
-    for token in forbidden_tokens:
-        assert_true(token.lower() not in cheat.lower(), f"{label}: cheat sheet should avoid polling-like token {token!r}")
-        assert_true(token.lower() not in probe.lower(), f"{label}: probe prompt should avoid polling-like token {token!r}")
-
-    help_result = subprocess.run(
-        [sys.executable, str(LIBEXEC / "bridge_aggregate_status.py"), "--help"],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    help_text = " ".join((help_result.stdout + help_result.stderr).split())
-    assert_true(help_result.returncode == 0, f"{label}: agent_aggregate_status --help should exit 0, got {help_result.returncode}: {help_text!r}")
-    for token in ("leg-level", "agent_wait_status", "do not poll"):
-        assert_true(token.lower() in help_text.lower(), f"{label}: help missing token {token!r}: {help_text!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_render_output_model_safe(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    import contextlib
-    import io
-    full_snapshot_id = "20260425T000000Z-abcdef12"
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        bv.render_output(
-            room="room-secret",
-            caller="viewer-secret",
-            target="codex1",
-            target_record={"agent_type": "codex", "pane": "%99"},
-            mode="onboard",
-            lines=["hello"],
-            total_lines=1,
-            max_chars=12000,
-            snapshot_id=full_snapshot_id,
-            page=2,
-            confidence="high",
-        )
-    out = buf.getvalue()
-    assert_true("Peer view: codex1 (codex)" in out, f"{label}: header keeps alias/type: {out!r}")
-    for forbidden in ("pane=", "%99", "room-secret", "viewer=", "viewer-secret", full_snapshot_id):
-        assert_true(forbidden not in out, f"{label}: output must not expose {forbidden!r}: {out!r}")
-    assert_true("snapshot=cdef12" in out, f"{label}: short snapshot ref retained: {out!r}")
-    assert_true("page=2" in out and "confidence=high" in out, f"{label}: public paging fields retained: {out!r}")
-    assert_true("Next: agent_view_peer codex1 --older" in out, f"{label}: next hint retained: {out!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_search_explicit_snapshot_uses_safe_ref(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    import contextlib
-    import io
-    saved = os.environ.get("AGENT_BRIDGE_STATE_DIR")
-    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
-    try:
-        full_snapshot_id = "20260425T000000Z-abcdef12"
-        text_path, meta_path = bv.snapshot_paths("test-session", "codex1", full_snapshot_id)
-        text_path.parent.mkdir(parents=True, exist_ok=True)
-        text_path.write_text("alpha\nneedle\nomega\n", encoding="utf-8")
-        meta_path.write_text(json.dumps({"snapshot_id": full_snapshot_id, "created_at": bv.utc_now()}), encoding="utf-8")
-        args = argparse.Namespace(live=False, snapshot="cdef12", search="needle", context=0, raw=False, capture_file=None)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            bv.handle_search(
-                args,
-                "test-session",
-                "viewer",
-                "codex1",
-                {},
-                {"agent_type": "codex", "pane": "%99"},
-                20,
-                12000,
-            )
-        out = buf.getvalue()
-        assert_true(full_snapshot_id not in out, f"{label}: full snapshot id must stay hidden: {out!r}")
-        assert_true("source=saved snapshot cdef12" in out, f"{label}: search source uses short ref: {out!r}")
-        assert_true("source=snapshot=" not in out, f"{label}: search note must not expose raw snapshot source: {out!r}")
-        assert_true("needle" in out, f"{label}: match content shown: {out!r}")
-    finally:
-        if saved is None:
-            os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
-        else:
-            os.environ["AGENT_BRIDGE_STATE_DIR"] = saved
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_snapshot_ref_collision_unique(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    import contextlib
-    import io
-    saved = os.environ.get("AGENT_BRIDGE_STATE_DIR")
-    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
-    try:
-        ids = ["20260425T000000Z-xaaaaaa", "20260425T000001Z-yaaaaaa"]
-        for idx, snapshot_id in enumerate(ids):
-            text_path, meta_path = bv.snapshot_paths("test-session", "codex1", snapshot_id)
-            text_path.parent.mkdir(parents=True, exist_ok=True)
-            text_path.write_text(f"snapshot {idx}\n", encoding="utf-8")
-            meta_path.write_text(json.dumps({"snapshot_id": snapshot_id, "created_at": bv.utc_now()}), encoding="utf-8")
-
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            bv.render_output(
-                room="test-session",
-                caller="viewer",
-                target="codex1",
-                target_record={"agent_type": "codex", "pane": "%99"},
-                mode="onboard",
-                lines=["hello"],
-                total_lines=1,
-                max_chars=12000,
-                snapshot_id=ids[0],
-            )
-        out = buf.getvalue()
-        assert_true("snapshot=xaaaaaa" in out, f"{label}: displayed ref expands past colliding 6-char suffix: {out!r}")
-        assert_true("snapshot=aaaaaa" not in out, f"{label}: colliding 6-char ref must not be displayed: {out!r}")
-        assert_true(bv.resolve_snapshot_id("test-session", "codex1", "xaaaaaa") == ids[0], f"{label}: expanded ref resolves")
-        assert_true(bv.resolve_snapshot_id("test-session", "codex1", "") == "", f"{label}: empty ref does not match every snapshot")
-        try:
-            bv.resolve_snapshot_id("test-session", "codex1", "aaaaaa")
-        except SystemExit as exc:
-            msg = str(exc)
-        else:
-            raise AssertionError(f"{label}: ambiguous 6-char suffix must fail")
-        assert_true("ambiguous snapshot ref" in msg, f"{label}: ambiguous error explains issue: {msg!r}")
-        assert_true("xaaaaaa" in msg and "yaaaaaa" in msg, f"{label}: ambiguous error lists actionable refs: {msg!r}")
-        assert_true(ids[0] not in msg and ids[1] not in msg, f"{label}: ambiguous error hides full ids: {msg!r}")
-    finally:
-        if saved is None:
-            os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
-        else:
-            os.environ["AGENT_BRIDGE_STATE_DIR"] = saved
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_capture_errors_sanitized(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    saved = os.environ.get("AGENT_BRIDGE_STATE_DIR")
-    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
-    old_short_id = bv.short_id
-    old_room_status = bv.room_status
-    try:
-        safe = bv.model_safe_capture_error("can't find pane %99\nrelated pane %12" + ("x" * 300), "%99")
-        assert_true("%99" not in safe and "%12" not in safe and "\n" not in safe, f"{label}: pane ids/newlines redacted: {safe!r}")
-        assert_true("<target-pane>" in safe and "<pane>" in safe, f"{label}: redaction markers present: {safe!r}")
-        assert_true(len(safe) <= 200, f"{label}: error capped: {len(safe)}")
-
-        bv.short_id = lambda prefix: "cap-fixed"
-        bv.room_status = lambda session: argparse.Namespace(state="alive", reason="ok")
-        response_file = bv.capture_response_dir("test-session") / "cap-fixed.json"
-        response_file.parent.mkdir(parents=True, exist_ok=True)
-        response_file.write_text(json.dumps({"ok": False, "error": "can't find pane %99\nother pane %12"}), encoding="utf-8")
-        args = argparse.Namespace(capture_timeout=0.1)
-        try:
-            bv.capture_via_daemon(
-                args,
-                session="test-session",
-                caller="viewer",
-                target="codex1",
-                state={"state_file": str(tmpdir / "state" / "test-session" / "events.raw.jsonl")},
-                pane="%99",
-                start=-10,
-            )
-        except SystemExit as exc:
-            msg = str(exc)
-        else:
-            raise AssertionError(f"{label}: daemon error response must raise")
-        assert_true("target codex1" in msg, f"{label}: target alias used: {msg!r}")
-        assert_true("%99" not in msg and "%12" not in msg and "\n" not in msg, f"{label}: daemon response error sanitized: {msg!r}")
-    finally:
-        bv.short_id = old_short_id
-        bv.room_status = old_room_status
-        if saved is None:
-            os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
-        else:
-            os.environ["AGENT_BRIDGE_STATE_DIR"] = saved
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_snapshot_not_found_hides_full_id(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    saved = os.environ.get("AGENT_BRIDGE_STATE_DIR")
-    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
-    try:
-        full_snapshot_id = "20260425T000000Z-hidden12"
-        try:
-            bv.load_snapshot("test-session", "codex1", full_snapshot_id)
-        except SystemExit as exc:
-            msg = str(exc)
-        else:
-            raise AssertionError(f"{label}: missing snapshot must raise")
-        assert_true(full_snapshot_id not in msg, f"{label}: full id hidden: {msg!r}")
-        assert_true("hidden12"[-6:] in msg, f"{label}: short ref retained: {msg!r}")
-    finally:
-        if saved is None:
-            os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
-        else:
-            os.environ["AGENT_BRIDGE_STATE_DIR"] = saved
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_matches_changed_volatile_chrome(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    stable = [
-        "Review finding HIGH-1 process identity validation keeps endpoint safe",
-        "Implementation note bridge_view_peer stable anchor cursor stores unique windows",
-        "Validation command python3 scripts/regression_interrupt.py completed cleanly",
-        "Reviewer summary msg-abc123 confirms since-last behavior is stable",
-    ]
-    previous = ["old output before cursor", *stable, "\u273b Churned for 4m 1s", "\u2500" * 40, "\u276f", "  \u23f5\u23f5 bypass permissions on (shift+tab to cycle)"]
-    current = [*stable, "New semantic output from peer after onboard should be shown", "\u273b Churned for 4m 8s", "  \u23f5\u23f5 bypass permissions on (shift+tab to cycle)"]
-    cursor = {"since_anchors": bv.build_since_anchors(previous), "last_tail_lines": previous[-30:]}
-    delta, confidence, note = bv.compute_since_delta(cursor, current)
-    assert_true(confidence == "high", f"{label}: expected high confidence, got {confidence} note={note!r}")
-    assert_true(delta == ["New semantic output from peer after onboard should be shown"], f"{label}: volatile suffix trimmed from delta: {delta!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_legacy_tail_derives_stable_anchor(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    stable = [
-        "Legacy cursor retained useful file path /tmp/agent-bridge-share/review.md",
-        "Secondary reviewer response msg-legacy confirms stable matching can recover",
-        "Bridge command agent_view_peer codex-reviewer --since-last should advance",
-        "Regression note python3 scripts/regression_interrupt.py covers legacy tails",
-    ]
-    previous_tail = [*stable, "\u273b Churned for 56s", "\u2500" * 40, "\u276f"]
-    current = [*stable, "Fresh line after legacy cursor should appear", "\u273b Churned for 1m 2s"]
-    delta, confidence, note = bv.compute_since_delta({"last_tail_lines": previous_tail}, current)
-    assert_true(confidence == "high", f"{label}: legacy stable anchor should match, got {confidence} note={note!r}")
-    assert_true(delta == ["Fresh line after legacy cursor should appear"], f"{label}: expected fresh legacy delta, got {delta!r}")
-    assert_true("legacy anchor" in note, f"{label}: note should identify legacy anchor: {note!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_ambiguous_current_anchor_skips_to_unique(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    ambiguous_anchor = [
-        "Common reviewer paragraph explains repeated process identity issue alpha",
-        "Common reviewer paragraph explains repeated process identity issue beta",
-        "Common reviewer paragraph explains repeated process identity issue gamma",
-        "Common reviewer paragraph explains repeated process identity issue delta",
-    ]
-    unique_anchor = [
-        "Unique cursor anchor line one includes msg-unique-001 for disambiguation",
-        "Unique cursor anchor line two references bridge_view_peer.py implementation",
-        "Unique cursor anchor line three references scripts/regression_interrupt.py",
-        "Unique cursor anchor line four references agent_view_peer since-last",
-    ]
-    cursor = {
-        "since_anchors": [
-            {"lines": ambiguous_anchor, "stable_count": 4},
-            {"lines": unique_anchor, "stable_count": 4},
-        ]
-    }
-    current = [*ambiguous_anchor, "unrelated middle output", *ambiguous_anchor, *unique_anchor, "Only this unique-match delta should be shown"]
-    delta, confidence, note = bv.compute_since_delta(cursor, current)
-    assert_true(confidence == "high", f"{label}: unique fallback anchor should match, got {confidence} note={note!r}")
-    assert_true(delta == ["Only this unique-match delta should be shown"], f"{label}: ambiguous anchor must not be used: {delta!r}")
-    assert_true("skipping 1 newer anchor" in note, f"{label}: note should mention skipped ambiguous anchor: {note!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_matches_anchor_before_long_delta(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    anchor = [
-        "Long delta anchor line one includes msg-long-001 and detail",
-        "Long delta anchor line two references bridge_view_peer.py implementation",
-        "Long delta anchor line three references scripts/regression_interrupt.py",
-        "Long delta anchor line four references agent_view_peer since-last",
-    ]
-    current = [
-        *anchor,
-        *[f"Semantic output line {idx:03d} after anchor with enough detail for matching" for idx in range(bv.SINCE_ANCHOR_SCAN_RAW_LINES + 1)],
-    ]
-    delta, confidence, note = bv.compute_since_delta({"since_anchors": [{"lines": anchor, "stable_count": 4}]}, current)
-    assert_true(confidence == "high", f"{label}: full match projection should find old anchor, got {confidence} note={note!r}")
-    assert_true(len(delta) == bv.SINCE_ANCHOR_SCAN_RAW_LINES + 1, f"{label}: full long delta should be returned, got {len(delta)}")
-    assert_true(delta[0].startswith("Semantic output line 000"), f"{label}: delta should begin right after anchor: {delta[:2]!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_build_rejects_duplicate_previous_window(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    repeated = [
-        "Repeated anchor candidate line one has enough information for matching",
-        "Repeated anchor candidate line two has enough information for matching",
-        "Repeated anchor candidate line three has enough information for matching",
-        "Repeated anchor candidate line four has enough information for matching",
-    ]
-    anchors = bv.build_since_anchors([*repeated, *repeated])
-    anchor_lines = [anchor.get("lines") for anchor in anchors]
-    assert_true(repeated not in anchor_lines, f"{label}: duplicate previous window must not be stored: {anchor_lines!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_uncertain_does_not_advance_cursor(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    import contextlib
-    import io
-    saved = os.environ.get("AGENT_BRIDGE_STATE_DIR")
-    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
-    old_capture_text = bv.capture_text
-    try:
-        cursor = {
-            "cursor_version": 2,
-            "caller": "viewer",
-            "target": "codex1",
-            "since_anchors": [
-                {
-                    "lines": [
-                        "Missing anchor one contains msg-missing-001 and enough detail",
-                        "Missing anchor two contains bridge_view_peer.py and enough detail",
-                        "Missing anchor three contains regression_interrupt.py and detail",
-                        "Missing anchor four contains agent_view_peer --since-last detail",
-                    ],
-                    "stable_count": 4,
-                }
-            ],
-            "last_tail_lines": ["old"],
-            "sentinel": "keep-me",
-        }
-        path = bv.cursor_path("test-session", "viewer", "codex1")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(path, cursor)
-        bv.capture_text = lambda *args, **kwargs: "\n".join([
-            "Current output has a different stable line with msg-current-001",
-            "Another unrelated stable line references bridge stable anchors",
-            "Third unrelated stable line references python3 scripts regression",
-            "Fourth unrelated stable line references cursor not advanced",
-        ])  # type: ignore[assignment]
-        args = argparse.Namespace(raw=False, capture_file=None, capture_timeout=0.1)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            bv.handle_since_last(args, "test-session", "viewer", "codex1", {}, {"agent_type": "codex", "pane": "%99"}, 20, 12000, True)
-        out = buf.getvalue()
-        after = read_json(path, {})
-        assert_true(after.get("sentinel") == "keep-me", f"{label}: uncertain cursor should not be overwritten: {after!r}")
-        assert_true(after.get("since_anchors") == cursor["since_anchors"], f"{label}: uncertain anchors should stay unchanged")
-        assert_true("cursor not advanced" in out, f"{label}: output should explain cursor preservation: {out!r}")
-    finally:
-        bv.capture_text = old_capture_text  # type: ignore[assignment]
-        if saved is None:
-            os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
-        else:
-            os.environ["AGENT_BRIDGE_STATE_DIR"] = saved
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_upgrade_reset_when_no_legacy_anchor(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    import contextlib
-    import io
-    saved = os.environ.get("AGENT_BRIDGE_STATE_DIR")
-    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
-    old_capture_text = bv.capture_text
-    try:
-        path = bv.cursor_path("test-session", "viewer", "codex1")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(path, {"caller": "viewer", "target": "codex1", "last_tail_lines": ["\u2500" * 40, "\u276f", "  \u23f5\u23f5 bypass permissions on (shift+tab to cycle)"]})
-        bv.capture_text = lambda *args, **kwargs: "\n".join([
-            "Upgrade reset current line one includes msg-reset-001 detail",
-            "Upgrade reset current line two references bridge_view_peer.py detail",
-            "Upgrade reset current line three references regression_interrupt.py",
-            "Upgrade reset current line four references agent_view_peer cursor v2",
-        ])  # type: ignore[assignment]
-        args = argparse.Namespace(raw=False, capture_file=None, capture_timeout=0.1)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            bv.handle_since_last(args, "test-session", "viewer", "codex1", {}, {"agent_type": "codex", "pane": "%99"}, 20, 12000, True)
-        out = buf.getvalue()
-        after = read_json(path, {})
-        assert_true(after.get("cursor_version") == 2, f"{label}: upgrade reset should write v2 cursor: {after!r}")
-        assert_true(after.get("since_anchors"), f"{label}: upgrade reset should store fresh anchors: {after!r}")
-        assert_true("cursor reset from current capture" in out, f"{label}: reset note expected: {out!r}")
-    finally:
-        bv.capture_text = old_capture_text  # type: ignore[assignment]
-        if saved is None:
-            os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
-        else:
-            os.environ["AGENT_BRIDGE_STATE_DIR"] = saved
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_low_info_lines_do_not_anchor(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    lines = [
-        "\u2500" * 80,
-        "\u276f",
-        "  \u23f5\u23f5 bypass permissions on (shift+tab to cycle)",
-        "",
-        "\u273b Churned for 56s",
-    ]
-    assert_true(bv.build_since_anchors(lines) == [], f"{label}: low-info TUI chrome must not produce anchors")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_claude_status_variants_are_volatile(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    volatile_lines = [
-        "\u273b Baked for 1s",
-        "\u273b Cogitated for 3m 33s",
-        "\u273b Cooked for 1m 3s",
-        "\u273b Brewed for 4s",
-        "\u273b Crunched for 1m 41s",
-        "\u2500 Worked for 1m 07s \u2500\u2500\u2500\u2500\u2500",
-        "\u273b Quantumizing\u2026 (6s \u00b7 thinking with high effort)",
-        "\u273d Embellishing\u2026 (4s \u00b7 thinking with high effort)",
-        "\u273d Saut\u00e9ing\u2026 (running stop hook \u00b7 13s \u00b7 \u2193 326 tokens)",
-        "* Befuddling\u2026 (20s \u00b7 still thinking with high effort)",
-        "\u2502 \u2022 Running Stop hook \u2502",
-        "\u273b Baked for <n> \u00b7 <n> shell still running",
-    ]
-    for line in volatile_lines:
-        assert_true(bv.is_since_volatile_line(line), f"{label}: expected volatile Claude status: {line!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_status_classifier_preserves_prose(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    prose_lines = [
-        "* Worked for 3 hours on this bug",
-        "Working... (4h overtime today)",
-        "* Running Stop hook should be tested in test_view_peer.py",
-        "The implementation worked for this bridge_view_peer.py scenario and should remain visible",
-        "I was thinking with high effort about the review plan and wrote this note",
-        "The baked fixture output is a real semantic line with enough detail",
-        "* Implementing... (using tokens for auth)",
-        "Implementing... (using tokens for auth)",
-        "* Working... (auth tokens are valid)",
-        "* Tokenizing... (input has 100 tokens for processing)",
-        "Tokenizing... (input has 100 tokens for processing)",
-        "Working... (thought for the day)",
-        "Implementing... (running stop hook command in test setup)",
-    ]
-    for line in prose_lines:
-        assert_true(not bv.is_since_volatile_line(line), f"{label}: semantic prose must remain visible: {line!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_claude_status_lines_do_not_anchor(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    stable = [
-        "Claude status anchor test line one references bridge_view_peer.py msg-status-001",
-        "Claude status anchor test line two references scripts/regression_interrupt.py",
-        "Claude status anchor test line three references agent_view_peer since-last",
-        "Claude status anchor test line four references volatile filtering behavior",
-    ]
-    status_lines = [
-        "\u273b Baked for 1s",
-        "\u273b Cogitated for 3m 33s",
-        "\u273d Saut\u00e9ing\u2026 (running stop hook \u00b7 13s \u00b7 \u2193 326 tokens)",
-        "* Befuddling\u2026 (20s \u00b7 still thinking with high effort)",
-    ]
-    anchors = bv.build_since_anchors([stable[0], status_lines[0], stable[1], status_lines[1], stable[2], status_lines[2], stable[3], status_lines[3]])
-    assert_true(anchors, f"{label}: stable lines should still form anchors")
-    for anchor in anchors:
-        for line in anchor.get("lines", []):
-            assert_true(not bv.is_since_volatile_line(line), f"{label}: anchor retained volatile status line: {line!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_filters_stored_volatile_anchor_lines(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    status = "\u273d Saut\u00e9ing\u2026 (running stop hook \u00b7 <n> \u00b7 \u2193 <n>)"
-    stable = [
-        "Stored filtered anchor stable line one includes msg-filter-001 and enough detail",
-        "Stored filtered anchor stable line two references bridge_view_peer.py details",
-        "Stored filtered anchor stable line three references scripts/regression_interrupt.py details",
-    ]
-    cursor = {"since_anchors": [{"lines": [status, *stable], "stable_count": 4}]}
-    current = [*stable, "Fresh semantic output after filtered stored anchor should appear"]
-    delta, confidence, note = bv.compute_since_delta(cursor, current)
-    assert_true(confidence == "medium", f"{label}: filtered 3-line stored anchor should match as medium, got {confidence} note={note!r}")
-    assert_true(delta == ["Fresh semantic output after filtered stored anchor should appear"], f"{label}: expected filtered-anchor delta, got {delta!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_skips_shortened_stored_anchor_that_fails_quality(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    status = "\u273b Baked for <n>"
-    weak = [
-        "Weak anchor line alpha x1",
-        "Weak anchor line beta x2",
-        "Weak anchor line gamma x3",
-    ]
-    valid = [
-        "Valid fallback anchor line one includes msg-valid-001 and detail",
-        "Valid fallback anchor line two references bridge_view_peer.py behavior",
-        "Valid fallback anchor line three references scripts/regression_interrupt.py",
-        "Valid fallback anchor line four references agent_view_peer since-last",
-    ]
-    cursor = {
-        "since_anchors": [
-            {"lines": [status, *weak], "stable_count": 4},
-            {"lines": valid, "stable_count": 4},
-        ]
-    }
-    current = [*weak, "Bad delta from weak anchor must not be used", *valid, "Good semantic delta from valid anchor"]
-    delta, confidence, note = bv.compute_since_delta(cursor, current)
-    assert_true(confidence == "high", f"{label}: valid fallback anchor should match, got {confidence} note={note!r}")
-    assert_true(delta == ["Good semantic delta from valid anchor"], f"{label}: weak shortened anchor must be skipped: {delta!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_volatile_only_claude_status_delta(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    stable = [
-        "Claude volatile delta anchor one includes msg-claude-volatile-001 detail",
-        "Claude volatile delta anchor two references bridge_view_peer.py detail",
-        "Claude volatile delta anchor three references regression_interrupt.py",
-        "Claude volatile delta anchor four references agent_view_peer since-last",
-    ]
-    current = [*stable, "\u273d Saut\u00e9ing\u2026 (running stop hook \u00b7 13s \u00b7 \u2193 326 tokens)"]
-    delta, confidence, note = bv.compute_since_delta({"since_anchors": bv.build_since_anchors(stable)}, current)
-    assert_true(confidence == "high", f"{label}: anchor should match, got {confidence} note={note!r}")
-    assert_true(delta == [], f"{label}: Claude volatile-only delta should be hidden: {delta!r}")
-    assert_true("only volatile TUI status changed" in note, f"{label}: volatile status note expected: {note!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_codex_status_variants_preserved(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    volatile_lines = [
-        "\u2022 Working (1m 42s \u2022 esc to interrupt)",
-        "\u25e6 Working (4s \u2022 esc to interrupt)",
-        "\u2502 \u2022 Working (15s \u2022 esc to interrupt) \u2502",
-        "\u23f5\u23f5 bypass permissions on (shift+tab to cycle)",
-        "\u2502 gpt-5.5 xhigh \u00b7 /data/sembench-hard \u2502",
-        "Remote Control active \u2502",
-    ]
-    for line in volatile_lines:
-        assert_true(bv.is_since_volatile_line(line), f"{label}: expected volatile Codex chrome: {line!r}")
-    prose_lines = [
-        "\u2022 Reviewed bridge_view_peer.py and kept this semantic bullet visible",
-        "The gpt-5.5 model string appears in this semantic sentence and should remain visible",
-    ]
-    for line in prose_lines:
-        assert_true(not bv.is_since_volatile_line(line), f"{label}: semantic Codex/prose line must remain visible: {line!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_volatile_only_delta(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    stable = [
-        "Volatile only test anchor one includes msg-volatile-001 detail",
-        "Volatile only test anchor two references bridge_view_peer.py detail",
-        "Volatile only test anchor three references regression_interrupt.py",
-        "Volatile only test anchor four references agent_view_peer since-last",
-    ]
-    previous = [*stable, "\u273b Churned for 10s"]
-    current = [*stable, "\u273b Churned for 40s", "  \u23f5\u23f5 bypass permissions on (shift+tab to cycle)"]
-    delta, confidence, note = bv.compute_since_delta({"since_anchors": bv.build_since_anchors(previous)}, current)
-    assert_true(confidence == "high", f"{label}: anchor should match, got {confidence} note={note!r}")
-    assert_true(delta == [], f"{label}: volatile-only delta should be hidden: {delta!r}")
-    assert_true("only volatile TUI status changed" in note, f"{label}: volatile status note expected: {note!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_short_delta_consumed_once(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    stable = [
-        "Short consumed anchor one includes msg-short-001 and bridge_view_peer.py",
-        "Short consumed anchor two references scripts/regression_interrupt.py",
-        "Short consumed anchor three references agent_view_peer since-last behavior",
-        "Short consumed anchor four references causal-short-consumed detail",
-    ]
-    current = [*stable, "\u25cf - ACK claude-reviewer", "  - 12"]
-    cursor = {"since_anchors": bv.build_since_anchors(stable)}
-    first = bv.compute_since_delta_detail(cursor, current)
-    assert_true(first["delta"] == ["\u25cf - ACK claude-reviewer", "  - 12"], f"{label}: first short delta should be visible: {first!r}")
-    cursor["since_consumed_tail"] = bv.build_since_consumed_tail(str(first["matched_anchor_identity"]), list(first["consumed_raw_delta"]))
-    second_delta, second_confidence, second_note = bv.compute_since_delta(cursor, current)
-    assert_true(second_confidence == "high", f"{label}: second view should still match anchor: {second_confidence} {second_note!r}")
-    assert_true(second_delta == [], f"{label}: consumed short delta should not repeat: {second_delta!r}")
-    assert_true("skipped previously consumed" in second_note, f"{label}: note should mention consumed skip: {second_note!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_request_plus_short_reply_consumed_after_cursor_update(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    import contextlib
-    import io
-    saved = os.environ.get("AGENT_BRIDGE_STATE_DIR")
-    os.environ["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
-    old_capture_text = bv.capture_text
-    try:
-        stable = [
-            "Request consumed base anchor one includes msg-request-consumed-001 bridge_view_peer.py",
-            "Request consumed base anchor two references scripts/regression_interrupt.py",
-            "Request consumed base anchor three references agent_view_peer since-last behavior",
-            "Request consumed base anchor four references causal-request-consumed detail",
-        ]
-        request = [
-            "\u203a [bridge:20260426T000000Z-x] from=codex-worker kind=request causal_id=causal-request-consumed",
-            "aggregate_id=agg-request-consumed. Reply normally; do not call agent_send_peer",
-            "Request: [FINAL-VERIFY-SHORT] Reply with exactly two short bullet lines",
-            "first line says ACK <your-alias>; second line says 3+4=7",
-        ]
-        reply = ["\u2022 - ACK codex-reviewer", "  - 3+4=7"]
-        current = [*stable, *request, "", *reply, "\u203a Improve documentation in @filename", "  gpt-5.5 xhigh \u00b7 ~/agent-bridge"]
-        path = bv.cursor_path("test-session", "viewer", "codex1")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(path, {"caller": "viewer", "target": "codex1", "since_anchors": bv.build_since_anchors(stable)})
-        bv.capture_text = lambda *args, **kwargs: "\n".join(current)  # type: ignore[assignment]
-        args = argparse.Namespace(raw=False, capture_file=None, capture_timeout=0.1)
-        first_buf = io.StringIO()
-        with contextlib.redirect_stdout(first_buf):
-            bv.handle_since_last(args, "test-session", "viewer", "codex1", {}, {"agent_type": "codex", "pane": "%99"}, 40, 12000, True)
-        first_out = first_buf.getvalue()
-        assert_true("ACK codex-reviewer" in first_out and "FINAL-VERIFY-SHORT" in first_out, f"{label}: first view should show request and reply: {first_out!r}")
-        second_buf = io.StringIO()
-        with contextlib.redirect_stdout(second_buf):
-            bv.handle_since_last(args, "test-session", "viewer", "codex1", {}, {"agent_type": "codex", "pane": "%99"}, 40, 12000, True)
-        second_out = second_buf.getvalue()
-        assert_true("ACK codex-reviewer" not in second_out, f"{label}: short reply must not repeat after cursor update: {second_out!r}")
-        assert_true("skipped previously consumed" in second_out, f"{label}: consumed skip note expected: {second_out!r}")
-    finally:
-        bv.capture_text = old_capture_text  # type: ignore[assignment]
-        if saved is None:
-            os.environ.pop("AGENT_BRIDGE_STATE_DIR", None)
-        else:
-            os.environ["AGENT_BRIDGE_STATE_DIR"] = saved
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_consumed_tail_does_not_hide_new_duplicate(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    stable = [
-        "Duplicate consumed anchor one includes msg-dup-001 and bridge_view_peer.py",
-        "Duplicate consumed anchor two references scripts/regression_interrupt.py",
-        "Duplicate consumed anchor three references agent_view_peer since-last behavior",
-        "Duplicate consumed anchor four references causal-duplicate detail",
-    ]
-    old_reply = ["\u2022 - ACK codex-reviewer", "  - 12"]
-    cursor = {"since_anchors": bv.build_since_anchors(stable)}
-    first = bv.compute_since_delta_detail(cursor, [*stable, *old_reply])
-    cursor["since_consumed_tail"] = bv.build_since_consumed_tail(str(first["matched_anchor_identity"]), list(first["consumed_raw_delta"]))
-    current = [
-        *stable,
-        *old_reply,
-        "\u203a [bridge:20260426T000000Z-x] from=codex-worker kind=request causal_id=causal-dup",
-        "\u2022 - ACK codex-reviewer",
-        "  - 12",
-    ]
-    delta, confidence, note = bv.compute_since_delta(cursor, current)
-    assert_true(confidence == "high", f"{label}: expected high confidence, got {confidence} note={note!r}")
-    assert_true(delta == current[len(stable) + len(old_reply) :], f"{label}: duplicate new reply must remain visible: {delta!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_consumed_tail_anchor_change_resets(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    stable = [
-        "Anchor change line one includes msg-anchor-change-001 bridge_view_peer.py",
-        "Anchor change line two references scripts/regression_interrupt.py",
-        "Anchor change line three references agent_view_peer since-last behavior",
-        "Anchor change line four references causal-anchor-change detail",
-    ]
-    current = [*stable, "\u2022 New output after changed anchor should remain visible"]
-    cursor = {
-        "since_anchors": bv.build_since_anchors(stable),
-        "since_consumed_tail": {"anchor_identity": "sha256:not-the-current-anchor", "lines": ["\u2022 New output after changed anchor should remain visible"], "truncated": False},
-    }
-    detail = bv.compute_since_delta_detail(cursor, current)
-    assert_true(detail["delta"] == ["\u2022 New output after changed anchor should remain visible"], f"{label}: changed-anchor memo must not hide output: {detail!r}")
-    assert_true("reset stale consumed-tail" in str(detail["note"]), f"{label}: note should mention reset: {detail!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_consumed_tail_mismatch_clears(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    stable = [
-        "Mismatch consumed anchor one includes msg-mismatch-001 bridge_view_peer.py",
-        "Mismatch consumed anchor two references scripts/regression_interrupt.py",
-        "Mismatch consumed anchor three references agent_view_peer since-last behavior",
-        "Mismatch consumed anchor four references causal-mismatch detail",
-    ]
-    anchor_identity = bv.since_anchor_identity(list(bv.build_since_anchors(stable)[0]["lines"]))
-    current = [*stable, "\u2022 Different output should remain visible"]
-    cursor = {
-        "since_anchors": bv.build_since_anchors(stable),
-        "since_consumed_tail": {"anchor_identity": anchor_identity, "lines": ["\u2022 Previous output"], "truncated": False},
-    }
-    detail = bv.compute_since_delta_detail(cursor, current)
-    assert_true(detail["delta"] == ["\u2022 Different output should remain visible"], f"{label}: mismatched memo must not hide output: {detail!r}")
-    assert_true("reset stale consumed-tail" in str(detail["note"]), f"{label}: mismatch should clear memo: {detail!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_consumed_tail_cap(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    identity = bv.since_anchor_identity(["Cap anchor one", "Cap anchor two", "Cap anchor three", "Cap anchor four"])
-    raw_delta = [f"Consumed cap line {idx:02d} has enough text to count but not anchor" for idx in range(bv.SINCE_CONSUMED_TAIL_MAX_LINES + 5)]
-    memo = bv.build_since_consumed_tail(identity, raw_delta)
-    assert_true(memo.get("anchor_identity") == identity, f"{label}: identity should be stored: {memo!r}")
-    assert_true(len(memo.get("lines") or []) == bv.SINCE_CONSUMED_TAIL_MAX_LINES, f"{label}: line cap expected: {memo!r}")
-    assert_true(memo.get("truncated") is True, f"{label}: truncated flag expected: {memo!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_consumed_tail_ignores_volatile_churn(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    stable = [
-        "Volatile consumed anchor one includes msg-volatile-consumed-001 bridge_view_peer.py",
-        "Volatile consumed anchor two references scripts/regression_interrupt.py",
-        "Volatile consumed anchor three references agent_view_peer since-last behavior",
-        "Volatile consumed anchor four references causal-volatile-consumed detail",
-    ]
-    current = [*stable, "\u25cf - ACK claude-reviewer", "  - 12"]
-    cursor = {"since_anchors": bv.build_since_anchors(stable)}
-    first = bv.compute_since_delta_detail(cursor, current)
-    cursor["since_consumed_tail"] = bv.build_since_consumed_tail(str(first["matched_anchor_identity"]), list(first["consumed_raw_delta"]))
-    churned = [*stable, "\u273b Churning\u2026 (4s \u00b7 \u2193 1 tokens)", "\u25cf - ACK claude-reviewer", "\u273b Churning\u2026 (5s \u00b7 \u2193 2 tokens)", "  - 12"]
-    delta, confidence, note = bv.compute_since_delta(cursor, churned)
-    assert_true(confidence == "high", f"{label}: expected high confidence, got {confidence} note={note!r}")
-    assert_true(delta == [], f"{label}: volatile churn should not defeat consumed prefix: {delta!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_codex_prompt_placeholder_not_anchor(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    stable = [
-        "Codex prompt anchor one includes msg-codex-prompt-001 bridge_view_peer.py",
-        "Codex prompt anchor two references scripts/regression_interrupt.py",
-        "Codex prompt anchor three references agent_view_peer since-last behavior",
-        "Codex prompt anchor four references causal-codex-prompt detail",
-    ]
-    prompt = "\u203a Improve documentation in @filename"
-    footer = "  gpt-5.5 xhigh \u00b7 ~/agent-bridge"
-    previous = [*stable, prompt, "", footer]
-    cursor = {"since_anchors": bv.build_since_anchors(previous)}
-    current = [
-        *stable,
-        "\u203a [bridge:20260426T000000Z-x] from=codex-worker kind=request causal_id=causal-codex-prompt",
-        "\u2022 - ACK codex-reviewer",
-        "  - 12",
-        prompt,
-        "",
-        footer,
-    ]
-    delta, confidence, note = bv.compute_since_delta(cursor, current)
-    assert_true(confidence == "high", f"{label}: stable anchor should match, got {confidence} note={note!r}")
-    assert_true(delta == current[len(stable) : len(stable) + 3], f"{label}: prompt anchor must not hide response above it: {delta!r}")
-    for anchor in cursor["since_anchors"]:
-        assert_true(prompt not in anchor.get("lines", []), f"{label}: prompt placeholder must not be stored as anchor: {cursor!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_filters_stored_codex_prompt_placeholder_anchor(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    prompt = "\u203a Improve documentation in @filename"
-    stable = [
-        "Stored codex prompt stable one includes msg-stored-codex-001 bridge_view_peer.py",
-        "Stored codex prompt stable two references scripts/regression_interrupt.py",
-        "Stored codex prompt stable three references agent_view_peer since-last behavior",
-    ]
-    cursor = {"since_anchors": [{"lines": [prompt, *stable], "stable_count": 4}]}
-    current = [*stable, "Fresh output after stored codex prompt cleanup should appear"]
-    delta, confidence, note = bv.compute_since_delta(cursor, current)
-    assert_true(confidence == "medium", f"{label}: shortened stored anchor should match, got {confidence} note={note!r}")
-    assert_true(delta == ["Fresh output after stored codex prompt cleanup should appear"], f"{label}: polluted prompt line should be filtered: {delta!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_preserves_codex_bridge_prompt_lines(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    bridge_line = "\u203a [bridge:20260426T000000Z-x] from=codex-worker kind=request causal_id=causal-bridge-line"
-    stable = [
-        bridge_line,
-        "Bridge prompt preserve stable two references bridge_view_peer.py detail",
-        "Bridge prompt preserve stable three references scripts/regression_interrupt.py",
-        "Bridge prompt preserve stable four references agent_view_peer since-last",
-    ]
-    anchors = bv.build_since_anchors(stable)
-    assert_true(any(bridge_line in anchor.get("lines", []) for anchor in anchors), f"{label}: bridge prompt line should remain anchor-eligible: {anchors!r}")
-    assert_true(bv.cursor_anchors({"since_anchors": [{"lines": stable, "stable_count": 4}]})[0], f"{label}: stored bridge prompt line should remain usable")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_preserves_trailing_semantic_codex_arrow(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    stable = [
-        "Semantic codex arrow anchor one includes msg-arrow-001 bridge_view_peer.py",
-        "Semantic codex arrow anchor two references scripts/regression_interrupt.py",
-        "Semantic codex arrow anchor three references agent_view_peer since-last behavior",
-        "Semantic codex arrow anchor four references causal-arrow detail",
-    ]
-    semantic = "\u203a This semantic blockquote-like output should remain visible"
-    cursor = {"since_anchors": bv.build_since_anchors(stable)}
-    delta, confidence, note = bv.compute_since_delta(cursor, [*stable, semantic])
-    assert_true(confidence == "high", f"{label}: expected high confidence, got {confidence} note={note!r}")
-    assert_true(delta == [semantic], f"{label}: trailing semantic arrow output must remain visible: {delta!r}")
-    assert_true(len(stable) not in bv.since_context_volatile_indexes([*stable, semantic]), f"{label}: semantic arrow should not be context-volatile")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_preserves_semantic_codex_arrow_before_footer(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    stable = [
-        "Semantic codex footer anchor one includes msg-arrow-footer-001 bridge_view_peer.py",
-        "Semantic codex footer anchor two references scripts/regression_interrupt.py",
-        "Semantic codex footer anchor three references agent_view_peer since-last behavior",
-        "Semantic codex footer anchor four references causal-arrow-footer detail",
-    ]
-    semantic = "\u203a This semantic blockquote-like output should remain visible"
-    footer = "  gpt-5.5 xhigh \u00b7 ~/agent-bridge"
-    cursor = {"since_anchors": bv.build_since_anchors(stable)}
-    delta, confidence, note = bv.compute_since_delta(cursor, [*stable, semantic, "", footer])
-    assert_true(confidence == "high", f"{label}: expected high confidence, got {confidence} note={note!r}")
-    assert_true(delta == [semantic], f"{label}: semantic arrow before footer must remain visible: {delta!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_claude_partial_status_fragments_are_volatile(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    assert_true(bv.is_since_volatile_line("\u273b Precipitating\u2026"), f"{label}: rare glyph partial should be volatile")
-    assert_true(bv.is_since_volatile_line("\u00b7 Precipitating\u2026 (5s \u00b7 \u2193 1 tokens)"), f"{label}: middle-dot payload status should be volatile")
-    stable = [
-        "Partial status anchor one includes msg-partial-001 bridge_view_peer.py",
-        "Partial status anchor two references scripts/regression_interrupt.py",
-        "Partial status anchor three references agent_view_peer since-last behavior",
-        "Partial status anchor four references causal-partial detail",
-    ]
-    current = [*stable, "\u00b7 Unraveling\u2026", "\u2500" * 40]
-    delta, confidence, note = bv.compute_since_delta({"since_anchors": bv.build_since_anchors(stable)}, current)
-    assert_true(confidence == "high", f"{label}: expected high confidence, got {confidence} note={note!r}")
-    assert_true(delta == [], f"{label}: contextual middle-dot fragment should be hidden: {delta!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_view_peer_since_last_partial_status_preserves_prose(label: str, tmpdir: Path) -> None:
-    bv = _import_view_peer()
-    prose = [
-        "\u00b7 Unraveling\u2026 additional content",
-        "\u00b7 Unraveling the parser behavior took time",
-        "\u273b Precipitating",
-    ]
-    for line in prose:
-        assert_true(not bv.is_since_volatile_line(line), f"{label}: prose/no-ellipsis line must remain visible: {line!r}")
-    stable = [
-        "Partial prose anchor one includes msg-partial-prose-001 bridge_view_peer.py",
-        "Partial prose anchor two references scripts/regression_interrupt.py",
-        "Partial prose anchor three references agent_view_peer since-last behavior",
-        "Partial prose anchor four references causal-partial-prose detail",
-    ]
-    current = [*stable, prose[0], "\u2500" * 40]
-    delta, confidence, note = bv.compute_since_delta({"since_anchors": bv.build_since_anchors(stable)}, current)
-    assert_true(confidence == "high", f"{label}: expected high confidence, got {confidence} note={note!r}")
-    assert_true(delta == [prose[0]], f"{label}: prose should survive adjacent TUI chrome: {delta!r}")
-    bare_fragment = "\u00b7 Unraveling\u2026"
-    bare_delta, bare_confidence, bare_note = bv.compute_since_delta({"since_anchors": bv.build_since_anchors(stable)}, [*stable, bare_fragment])
-    assert_true(bare_confidence == "high", f"{label}: expected high confidence for bare fragment, got {bare_confidence} note={bare_note!r}")
-    assert_true(bare_delta == [bare_fragment], f"{label}: middle-dot fragment without TUI evidence must remain visible: {bare_delta!r}")
-    print(f"  PASS  {label}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def scenario_endpoint_rejects_stale_pane_lock_without_live(label: str, tmpdir: Path) -> None:
@@ -11590,26 +8195,6 @@ def scenario_direct_notices_suppress_unverified_endpoint(label: str, tmpdir: Pat
     print(f"  PASS  {label}")
 
 
-def scenario_view_peer_unverified_endpoint_uses_daemon_not_local_capture(label: str, tmpdir: Path) -> None:
-    import bridge_view_peer as bv
-
-    state = {"participants": {"bob": {"alias": "bob", "agent_type": "codex", "pane": "%2", "hook_session_id": "sess-bob", "status": "active"}}}
-    args = argparse.Namespace(capture_file=None, capture_timeout=0.1)
-    calls: list[str] = []
-    old_resolve = bv.resolve_participant_endpoint_detail
-    old_capture = bv.run_tmux_capture
-    old_daemon = bv.capture_via_daemon
-    bv.resolve_participant_endpoint_detail = lambda *args, **kwargs: {"ok": False, "reason": "process_mismatch"}  # type: ignore[assignment]
-    bv.run_tmux_capture = lambda *args, **kwargs: calls.append("local") or ""  # type: ignore[assignment]
-    bv.capture_via_daemon = lambda *args, **kwargs: "daemon-capture"  # type: ignore[assignment]
-    try:
-        text = bv.capture_text(args, session="test-session", caller="alice", target="bob", state=state, pane="%2", start=-10)
-    finally:
-        bv.resolve_participant_endpoint_detail = old_resolve  # type: ignore[assignment]
-        bv.run_tmux_capture = old_capture  # type: ignore[assignment]
-        bv.capture_via_daemon = old_daemon  # type: ignore[assignment]
-    assert_true(text == "daemon-capture" and calls == [], f"{label}: unverified endpoint must not use local capture")
-    print(f"  PASS  {label}")
 
 
 def scenario_daemon_startup_backfill_summary_logs_repair_hint(label: str, tmpdir: Path) -> None:
@@ -11624,16 +8209,8 @@ def scenario_daemon_startup_backfill_summary_logs_repair_hint(label: str, tmpdir
     print(f"  PASS  {label}")
 
 
-def _import_enqueue_module():
-    import importlib
-    be = importlib.import_module("bridge_enqueue")
-    return importlib.reload(be)
 
 
-def _import_send_peer_module():
-    import importlib
-    bs = importlib.import_module("bridge_send_peer")
-    return importlib.reload(bs)
 
 
 def _import_extend_wait_module():
@@ -11660,25 +8237,6 @@ def _import_alarm_module():
     return importlib.reload(ba)
 
 
-def _run_enqueue_main(be, argv: list[str], stdin_text: str = "") -> tuple[int, str, str]:
-    import contextlib
-    import io
-    old_argv = sys.argv[:]
-    old_stdin = sys.stdin
-    out = io.StringIO()
-    err = io.StringIO()
-    try:
-        sys.argv = ["bridge_enqueue.py", *argv]
-        sys.stdin = io.StringIO(stdin_text)
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            try:
-                code = be.main()
-            except SystemExit as exc:
-                code = exc.code if isinstance(exc.code, int) else 1
-    finally:
-        sys.argv = old_argv
-        sys.stdin = old_stdin
-    return int(code), out.getvalue(), err.getvalue()
 
 
 def _run_extend_wait_main(bew, argv: list[str]) -> tuple[int, str, str]:
@@ -11753,484 +8311,68 @@ def _run_alarm_main(ba, argv: list[str]) -> tuple[int, str, str]:
     return int(code), out.getvalue(), err.getvalue()
 
 
-def _run_send_peer_main(bs, argv: list[str], stdin_text: str = "", stdin_isatty: bool | None = None) -> tuple[int, str, str]:
-    import contextlib
-    import io
-
-    class FakeStdin(io.StringIO):
-        def __init__(self, text: str, is_tty: bool):
-            super().__init__(text)
-            self._is_tty = is_tty
-
-        def isatty(self) -> bool:
-            return self._is_tty
-
-    old_argv = sys.argv[:]
-    old_stdin = sys.stdin
-    out = io.StringIO()
-    err = io.StringIO()
-    try:
-        sys.argv = ["agent_send_peer", *argv]
-        sys.stdin = FakeStdin(stdin_text, stdin_text == "" if stdin_isatty is None else stdin_isatty)
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            try:
-                code = bs.main()
-            except SystemExit as exc:
-                code = exc.code if isinstance(exc.code, int) else 1
-    finally:
-        sys.argv = old_argv
-        sys.stdin = old_stdin
-    return int(code), out.getvalue(), err.getvalue()
-
-
-def _run_send_peer_script(argv: list[str], stdin_text: str = "") -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, str(LIBEXEC / "bridge_send_peer.py"), *argv],
-        cwd=str(ROOT),
-        input=stdin_text,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=5,
-    )
-
-
-def _patch_enqueue_for_unit(be, state: dict, *, socket_error: str = "") -> None:
-    be.ensure_daemon_running = lambda session: ""
-    be.room_status = lambda session: argparse.Namespace(active_enough_for_enqueue=True, reason="ok")
-    be.sender_matches_caller = lambda args, session: True
-    be.load_session = lambda session: state
-    be.enqueue_via_daemon_socket = lambda session, messages, **kwargs: (False, [], [], socket_error, "")
-
-
-def _write_json(path: Path, data) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
-
-
-def _stdout_lines(text: str) -> list[str]:
-    return [line for line in text.splitlines() if line]
-
-
-def _aggregate_id_from_stdout(text: str) -> str:
-    lines = [line for line in _stdout_lines(text) if line.startswith("AGGREGATE_ID: ")]
-    assert_true(len(lines) == 1, f"expected exactly one AGGREGATE_ID line, got {lines!r} in {text!r}")
-    aggregate_id = lines[0].split(": ", 1)[1]
-    assert_true(aggregate_id.startswith("agg-"), f"aggregate id line should carry agg- id: {lines[0]!r}")
-    return aggregate_id
-
-
-def _assert_aggregate_stdout_order(label: str, text: str, expected_ids: list[str], expected_aggregate_id: str) -> None:
-    lines = _stdout_lines(text)
-    assert_true(lines == [*expected_ids, f"AGGREGATE_ID: {expected_aggregate_id}"], f"{label}: aggregate stdout order mismatch: {lines!r}")
-
-
-def scenario_enqueue_rejects_body_and_stdin_before_session_lookup(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    calls = {"read": 0, "ensure": 0}
-
-    def fail_read(_stream):
-        calls["read"] += 1
-        raise AssertionError("stdin must not be consumed when --body and --stdin conflict")
-
-    def fail_ensure(_session: str) -> str:
-        calls["ensure"] += 1
-        raise AssertionError("daemon ensure must not run when --body and --stdin conflict")
-
-    be.read_limited_text = fail_read
-    be.ensure_daemon_running = fail_ensure
-    code, out, err = _run_enqueue_main(be, ["--from", "alice", "--body", "inline", "--stdin"], stdin_text="stdin body")
-    assert_true(code == 2, f"{label}: body+stdin conflict exits 2, got {code}")
-    assert_true(out == "", f"{label}: conflict has no stdout: {out!r}")
-    assert_true("use either --body or --stdin, not both" in err, f"{label}: conflict error missing: {err!r}")
-    assert_true("cannot infer bridge session" not in err, f"{label}: conflict must win before session lookup: {err!r}")
-    assert_true("--body or --stdin content is required" not in err, f"{label}: conflict must win before empty-body check: {err!r}")
-    assert_true(calls == {"read": 0, "ensure": 0}, f"{label}: conflict must not consume stdin or ensure daemon: {calls}")
-    print(f"  PASS  {label}")
-
-
-def scenario_enqueue_rejects_empty_body_and_stdin(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    be.read_limited_text = lambda _stream: (_ for _ in ()).throw(AssertionError("stdin must not be consumed"))
-    be.ensure_daemon_running = lambda _session: (_ for _ in ()).throw(AssertionError("daemon ensure must not run"))
-    code, out, err = _run_enqueue_main(be, ["--from", "alice", "--body", "", "--stdin"], stdin_text="stdin body")
-    assert_true(code == 2, f"{label}: empty body+stdin conflict exits 2, got {code}")
-    assert_true(out == "", f"{label}: conflict has no stdout: {out!r}")
-    assert_true("use either --body or --stdin, not both" in err, f"{label}: conflict error expected: {err!r}")
-    assert_true("--body or --stdin content is required" not in err, f"{label}: empty-body error must not mask explicit conflict: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_enqueue_rejects_body_and_stdin_argv_order_independent(label: str, tmpdir: Path) -> None:
-    for suffix in (["--body", "inline", "--stdin"], ["--stdin", "--body", "inline"]):
-        be = _import_enqueue_module()
-        be.read_limited_text = lambda _stream: (_ for _ in ()).throw(AssertionError("stdin must not be consumed"))
-        be.ensure_daemon_running = lambda _session: (_ for _ in ()).throw(AssertionError("daemon ensure must not run"))
-        code, out, err = _run_enqueue_main(be, ["--from", "alice", *suffix], stdin_text="stdin body")
-        assert_true(code == 2 and out == "", f"{label}: conflict {suffix} exits 2 with no stdout: code={code} out={out!r}")
-        assert_true("use either --body or --stdin, not both" in err, f"{label}: order {suffix} should use conflict error: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_enqueue_body_only_still_works(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    queue_file = tmpdir / "pending.json"
-    code, out, err = _run_enqueue_main(
-        be,
-        [
-            "--session", "test-session",
-            "--from", "alice",
-            "--to", "bob",
-            "--body", "inline",
-            "--queue-file", str(queue_file),
-            "--state-file", str(tmpdir / "events.raw.jsonl"),
-            "--public-state-file", str(tmpdir / "events.jsonl"),
-        ],
-    )
-    assert_true(code == 0, f"{label}: body-only enqueue should succeed, got {code}, err={err!r}")
-    assert_true(out.strip().startswith("msg-"), f"{label}: body-only enqueue returns id: {out!r}")
-    queue = json.loads(queue_file.read_text(encoding="utf-8"))
-    assert_true(queue and queue[0].get("body") == "inline", f"{label}: inline body preserved: {queue}")
-    print(f"  PASS  {label}")
-
-
-def scenario_enqueue_stdin_only_still_works(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    queue_file = tmpdir / "pending.json"
-    code, out, err = _run_enqueue_main(
-        be,
-        [
-            "--session", "test-session",
-            "--from", "alice",
-            "--to", "bob",
-            "--stdin",
-            "--queue-file", str(queue_file),
-            "--state-file", str(tmpdir / "events.raw.jsonl"),
-            "--public-state-file", str(tmpdir / "events.jsonl"),
-        ],
-        stdin_text="stdin body",
-    )
-    assert_true(code == 0, f"{label}: stdin-only enqueue should succeed, got {code}, err={err!r}")
-    assert_true(out.strip().startswith("msg-"), f"{label}: stdin-only enqueue returns id: {out!r}")
-    queue = json.loads(queue_file.read_text(encoding="utf-8"))
-    assert_true(queue and queue[0].get("body") == "stdin body", f"{label}: stdin body preserved: {queue}")
-    print(f"  PASS  {label}")
-
-
-def scenario_enqueue_aggregate_stdout_socket_and_fallback(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob", "carol"])
-
-    _patch_enqueue_for_unit(be, state)
-    socket_messages: list[dict] = []
-
-    def fake_socket(_session: str, messages: list[dict], **_kwargs):
-        socket_messages[:] = [dict(message) for message in messages]
-        return True, [str(message["id"]) for message in messages], [], "", ""
-
-    be.enqueue_via_daemon_socket = fake_socket
-    code, out, err = _run_enqueue_main(
-        be,
-        [
-            "--session", "test-session",
-            "--from", "alice",
-            "--to", "bob,carol",
-            "--body", "socket aggregate",
-            "--queue-file", str(tmpdir / "socket-pending.json"),
-            "--state-file", str(tmpdir / "socket-events.raw.jsonl"),
-            "--public-state-file", str(tmpdir / "socket-events.jsonl"),
-        ],
-    )
-    assert_true(code == 0 and err == "", f"{label}: socket aggregate should succeed: code={code} err={err!r}")
-    socket_ids = [str(message["id"]) for message in socket_messages]
-    socket_aggregate_id = str(socket_messages[0].get("aggregate_id") or "")
-    assert_true(socket_aggregate_id and all(message.get("aggregate_id") == socket_aggregate_id for message in socket_messages), f"{label}: socket messages must share aggregate_id: {socket_messages}")
-    _assert_aggregate_stdout_order(label, out, socket_ids, socket_aggregate_id)
-    assert_true("AGGREGATE_ID:" not in err, f"{label}: aggregate id must not go to stderr: {err!r}")
-
-    be = _import_enqueue_module()
-    _patch_enqueue_for_unit(be, state)
-    queue_file = tmpdir / "fallback-pending.json"
-    state_file = tmpdir / "fallback-events.raw.jsonl"
-    code, out, err = _run_enqueue_main(
-        be,
-        [
-            "--session", "test-session",
-            "--from", "alice",
-            "--to", "bob,carol",
-            "--body", "fallback aggregate",
-            "--queue-file", str(queue_file),
-            "--state-file", str(state_file),
-            "--public-state-file", str(tmpdir / "fallback-events.jsonl"),
-        ],
-    )
-    assert_true(code == 0 and err == "", f"{label}: fallback aggregate should succeed: code={code} err={err!r}")
-    queue = json.loads(queue_file.read_text(encoding="utf-8"))
-    fallback_ids = [str(message["id"]) for message in queue]
-    fallback_aggregate_id = str(queue[0].get("aggregate_id") or "")
-    assert_true(fallback_aggregate_id and all(message.get("aggregate_id") == fallback_aggregate_id for message in queue), f"{label}: fallback queue rows must share aggregate_id: {queue}")
-    _assert_aggregate_stdout_order(label, out, fallback_ids, fallback_aggregate_id)
-    events = read_events(state_file)
-    event_aggregate_ids = {event.get("aggregate_id") for event in events if event.get("event") == "message_queued"}
-    assert_true(event_aggregate_ids == {fallback_aggregate_id}, f"{label}: queued events must use printed aggregate_id: {events}")
-    print(f"  PASS  {label}")
-
-
-def scenario_enqueue_aggregate_stdout_all_and_negative_cases(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob", "carol"])
-    _patch_enqueue_for_unit(be, state)
-    queue_file = tmpdir / "all-pending.json"
-    code, out, err = _run_enqueue_main(
-        be,
-        [
-            "--session", "test-session",
-            "--from", "alice",
-            "--all",
-            "--body", "all aggregate",
-            "--queue-file", str(queue_file),
-            "--state-file", str(tmpdir / "all-events.raw.jsonl"),
-            "--public-state-file", str(tmpdir / "all-events.jsonl"),
-        ],
-    )
-    assert_true(code == 0 and err == "", f"{label}: --all aggregate should succeed: code={code} err={err!r}")
-    queue = json.loads(queue_file.read_text(encoding="utf-8"))
-    aggregate_id = _aggregate_id_from_stdout(out)
-    _assert_aggregate_stdout_order(label, out, [str(message["id"]) for message in queue], aggregate_id)
-    assert_true(all(message.get("aggregate_id") == aggregate_id for message in queue), f"{label}: --all queue rows must match stdout aggregate_id: {queue}")
-
-    negative_cases = [
-        ("single-target", ["--to", "bob"]),
-        ("no-auto-return", ["--to", "bob,carol", "--no-auto-return"]),
-        ("notice", ["--kind", "notice", "--to", "bob,carol"]),
-        ("dedup-to-single", ["--to", "bob,bob"]),
-    ]
-    for case, target_args in negative_cases:
-        be = _import_enqueue_module()
-        _patch_enqueue_for_unit(be, state)
-        case_queue = tmpdir / f"{case}-pending.json"
-        code, out, err = _run_enqueue_main(
-            be,
-            [
-                "--session", "test-session",
-                "--from", "alice",
-                *target_args,
-                "--body", f"{case} body",
-                "--queue-file", str(case_queue),
-                "--state-file", str(tmpdir / f"{case}-events.raw.jsonl"),
-                "--public-state-file", str(tmpdir / f"{case}-events.jsonl"),
-            ],
-        )
-        assert_true(code == 0 and err == "", f"{label}: {case} should succeed without aggregate: code={code} err={err!r}")
-        assert_true("AGGREGATE_ID:" not in out, f"{label}: {case} must not print aggregate id: {out!r}")
-        rows = json.loads(case_queue.read_text(encoding="utf-8"))
-        assert_true(not any(row.get("aggregate_id") for row in rows), f"{label}: {case} rows must not carry aggregate_id: {rows}")
-    print(f"  PASS  {label}")
-
-
-def scenario_enqueue_bare_body_without_value_remains_argparse_owned(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    code, out, err = _run_enqueue_main(be, ["--from", "alice", "--body"])
-    assert_true(code == 2, f"{label}: bare --body should exit 2, got {code}")
-    assert_true(out == "", f"{label}: argparse error has no stdout: {out!r}")
-    assert_true("argument --body: expected one argument" in err, f"{label}: argparse should own bare --body error: {err!r}")
-    assert_true("use either --body or --stdin" not in err, f"{label}: custom conflict must not mask bare --body argparse error: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def _enqueue_watchdog_argv(tmpdir: Path, *extra: str, kind: str = "request") -> list[str]:
-    return [
-        "--session", "test-session",
-        "--from", "alice",
-        "--to", "bob",
-        "--kind", kind,
-        "--body", "hello",
-        "--queue-file", str(tmpdir / "pending.json"),
-        "--state-file", str(tmpdir / "events.raw.jsonl"),
-        "--public-state-file", str(tmpdir / "events.jsonl"),
-        *extra,
-    ]
-
-
-def _assert_send_peer_watchdog_rejected(label: str, tmpdir: Path, raw: str, expected_value: str) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    watchdog_args = (f"--watchdog={raw}",) if raw.startswith("-") else ("--watchdog", raw)
-    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, *watchdog_args))
-    assert_true(code == 2, f"{label}: invalid watchdog {raw!r} exits 2, got {code}, err={err!r}")
-    assert_true(out == "", f"{label}: invalid watchdog has no stdout: {out!r}")
-    assert_true("finite non-negative" in err and f"got {expected_value}" in err, f"{label}: error should explain rule and value: {err!r}")
-    assert_true(not (tmpdir / "pending.json").exists(), f"{label}: invalid watchdog must not enqueue")
-
-
-def scenario_send_peer_watchdog_negative_one_rejected(label: str, tmpdir: Path) -> None:
-    _assert_send_peer_watchdog_rejected(label, tmpdir, "-1", "-1")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_watchdog_nan_rejected(label: str, tmpdir: Path) -> None:
-    _assert_send_peer_watchdog_rejected(label, tmpdir, "nan", "nan")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_watchdog_inf_rejected(label: str, tmpdir: Path) -> None:
-    _assert_send_peer_watchdog_rejected(label, tmpdir, "inf", "inf")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_watchdog_minus_inf_rejected(label: str, tmpdir: Path) -> None:
-    _assert_send_peer_watchdog_rejected(label, tmpdir, "-inf", "-inf")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_watchdog_zero_disables_for_request(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--watchdog", "0"))
-    assert_true(code == 0, f"{label}: watchdog 0 should succeed, got {code}, err={err!r}")
-    assert_true(out.strip().startswith("msg-"), f"{label}: stdout should contain queued id: {out!r}")
-    queue = json.loads((tmpdir / "pending.json").read_text(encoding="utf-8"))
-    assert_true("watchdog_delay_sec" not in queue[0], f"{label}: watchdog 0 should disable metadata: {queue}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_watchdog_finite_positive_succeeds(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--watchdog", "1.5"))
-    assert_true(code == 0, f"{label}: finite watchdog should succeed, got {code}, err={err!r}")
-    assert_true(out.strip().startswith("msg-"), f"{label}: stdout should contain queued id: {out!r}")
-    queue = json.loads((tmpdir / "pending.json").read_text(encoding="utf-8"))
-    assert_true(queue[0].get("watchdog_delay_sec") == 1.5, f"{label}: finite watchdog preserved: {queue}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_no_auto_return_explicit_watchdog_rejected(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--no-auto-return", "--watchdog", "10"))
-    assert_true(code == 2, f"{label}: no-auto-return + watchdog should exit 2, got {code}, err={err!r}")
-    assert_true(out == "", f"{label}: rejected enqueue has no stdout: {out!r}")
-    assert_true("watchdog requires auto_return" in err and "--watchdog 0" in err, f"{label}: error should guide disable/use: {err!r}")
-    assert_true(not (tmpdir / "pending.json").exists(), f"{label}: rejected enqueue must write zero rows")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_no_auto_return_watchdog_zero_succeeds(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--no-auto-return", "--watchdog", "0"))
-    assert_true(code == 0, f"{label}: no-auto-return + watchdog 0 should succeed, got {code}, err={err!r}")
-    queue = json.loads((tmpdir / "pending.json").read_text(encoding="utf-8"))
-    assert_true(queue[0].get("auto_return") is False, f"{label}: row should disable auto_return: {queue}")
-    assert_true("watchdog_delay_sec" not in queue[0], f"{label}: watchdog 0 should leave no metadata: {queue}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_no_auto_return_invalid_watchdog_value_precedence(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    for raw, expected in [("-1", "-1"), ("nan", "nan"), ("inf", "inf")]:
-        case_dir = tmpdir / raw.replace("-", "minus_")
-        case_dir.mkdir(parents=True, exist_ok=True)
-        _patch_enqueue_for_unit(be, state)
-        watchdog_args = (f"--watchdog={raw}",) if raw.startswith("-") else ("--watchdog", raw)
-        code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(case_dir, "--no-auto-return", *watchdog_args))
-        assert_true(code == 2 and out == "", f"{label}: invalid {raw!r} should fail before auto_return check: code={code} out={out!r} err={err!r}")
-        assert_true("finite non-negative" in err and f"got {expected}" in err, f"{label}: value diagnostic should win for {raw!r}: {err!r}")
-        assert_true("watchdog requires auto_return" not in err, f"{label}: auto_return error must not mask invalid value: {err!r}")
-        assert_true(not (case_dir / "pending.json").exists(), f"{label}: invalid watchdog must not enqueue for {raw!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_no_auto_return_skips_default_watchdog(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    with patched_environ(AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC="42"):
-        code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--no-auto-return"))
-    assert_true(code == 0, f"{label}: no-auto-return should succeed with default watchdog env, got {code}, err={err!r}")
-    queue = json.loads((tmpdir / "pending.json").read_text(encoding="utf-8"))
-    assert_true(queue[0].get("auto_return") is False, f"{label}: row should have auto_return false: {queue}")
-    assert_true("watchdog_delay_sec" not in queue[0], f"{label}: default watchdog must be skipped: {queue}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_auto_return_default_watchdog_still_attaches(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    with patched_environ(AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC="42"):
-        code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir))
-    assert_true(code == 0, f"{label}: normal request should succeed with default watchdog, got {code}, err={err!r}")
-    queue = json.loads((tmpdir / "pending.json").read_text(encoding="utf-8"))
-    assert_true(queue[0].get("auto_return") is True, f"{label}: row should have auto_return true: {queue}")
-    assert_true(queue[0].get("watchdog_delay_sec") == 42.0, f"{label}: default watchdog should attach: {queue}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_no_auto_return_broadcast_watchdog_rejected(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob", "carol"])
-    _patch_enqueue_for_unit(be, state)
-    argv = [
-        "--session", "test-session",
-        "--from", "alice",
-        "--all",
-        "--kind", "request",
-        "--body", "hello",
-        "--queue-file", str(tmpdir / "pending.json"),
-        "--state-file", str(tmpdir / "events.raw.jsonl"),
-        "--public-state-file", str(tmpdir / "events.jsonl"),
-        "--no-auto-return",
-        "--watchdog", "10",
-    ]
-    code, out, err = _run_enqueue_main(be, argv)
-    assert_true(code == 2 and out == "", f"{label}: broadcast no-auto watchdog should reject: code={code} out={out!r} err={err!r}")
-    assert_true("watchdog requires auto_return" in err, f"{label}: error should explain auto_return requirement: {err!r}")
-    assert_true(not (tmpdir / "pending.json").exists(), f"{label}: rejected broadcast must write zero rows")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_watchdog_inf_with_notice_reports_finite_error_first(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--watchdog", "inf", kind="notice"))
-    assert_true(code == 2 and out == "", f"{label}: notice+inf should fail cleanly: code={code} out={out!r}")
-    assert_true("finite non-negative" in err and "got inf" in err, f"{label}: malformed value should win precedence: {err!r}")
-    assert_true("--watchdog only applies" not in err, f"{label}: kind error must not mask malformed value: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_watchdog_zero_with_notice_still_rejects_request_only(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--watchdog", "0", kind="notice"))
-    assert_true(code == 2 and out == "", f"{label}: notice+0 should fail cleanly: code={code} out={out!r}")
-    assert_true("--watchdog only applies" in err and "finite non-negative" not in err, f"{label}: finite 0 should reach kind check: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_watchdog_abc_argparse_error(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    code, out, err = _run_enqueue_main(be, _enqueue_watchdog_argv(tmpdir, "--watchdog", "abc"))
-    assert_true(code == 2, f"{label}: argparse invalid float exits 2, got {code}")
-    assert_true(out == "", f"{label}: argparse error has no stdout: {out!r}")
-    assert_true("invalid float value" in err and "abc" in err, f"{label}: argparse diagnostic preserved: {err!r}")
-    print(f"  PASS  {label}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def scenario_extend_wait_zero_negative_nan_inf_rejected(label: str, tmpdir: Path) -> None:
@@ -13444,965 +9586,104 @@ def scenario_peer_body_size_helper_boundaries(label: str, tmpdir: Path) -> None:
     print(f"  PASS  {label}")
 
 
-def scenario_send_peer_rejects_oversized_body_before_subprocess(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    bs.validate_caller_identity = lambda args, session, sender: (session or "test-session", sender or "alice")
-    bs.load_session = lambda session: _participants_state(["alice", "bob"])
-    called = {"subprocess": False}
-    old_run = bs.subprocess.run
-
-    def fail_subprocess(_cmd):
-        called["subprocess"] = True
-        raise AssertionError("bridge_enqueue subprocess must not be spawned for oversized body")
-
-    try:
-        bs.subprocess.run = fail_subprocess
-        code, out, err = _run_send_peer_main(
-            bs,
-            ["--session", "test-session", "--from", "alice", "--to", "bob"],
-            stdin_text="x" * (MAX_INLINE_SEND_BODY_CHARS + 1),
-        )
-    finally:
-        bs.subprocess.run = old_run
-    assert_true(code == 2, f"{label}: wrapper rejects oversized body, got {code}")
-    assert_true(out == "", f"{label}: rejection has no stdout: {out!r}")
-    assert_true(not called["subprocess"], f"{label}: enqueue subprocess was not spawned")
-    assert_true(str(MAX_INLINE_SEND_BODY_CHARS) in err and "/tmp/agent-bridge-share" in err, f"{label}: stderr explains limit: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def _patch_send_peer_for_unit(bs) -> None:
-    bs.validate_caller_identity = lambda args, session, sender: (session or "test-session", sender or "alice")
-    bs.load_session = lambda session: _participants_state(["alice", "bob", "carol"])
-
-
-def _run_send_peer_with_fake_subprocess(
-    bs,
-    argv: list[str],
-    *,
-    stdin_text: str = "",
-    stdin_isatty: bool | None = None,
-    stdout_text: str = "",
-    stderr_text: str = "",
-    returncode: int = 0,
-):
-    calls: list[tuple[list[str], dict]] = []
-    old_run = bs.subprocess.run
-
-    def fake_run(cmd, **kwargs):
-        calls.append((list(cmd), dict(kwargs)))
-        if stdout_text:
-            print(stdout_text, end="")
-        if stderr_text:
-            print(stderr_text, end="", file=sys.stderr)
-        return argparse.Namespace(returncode=returncode)
-
-    try:
-        bs.subprocess.run = fake_run
-        code, out, err = _run_send_peer_main(bs, argv, stdin_text=stdin_text, stdin_isatty=stdin_isatty)
-    finally:
-        bs.subprocess.run = old_run
-    return code, out, err, calls
-
-
-def scenario_send_peer_watchdog_notice_inf_reports_finite_error_first_at_shim(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--watchdog", "inf", "--to", "bob", "body"],
-        stdin_isatty=True,
-    )
-    assert_true(code == 2 and out == "" and calls == [], f"{label}: notice+inf should reject before subprocess: code={code} out={out!r} calls={calls}")
-    assert_true("finite non-negative" in err and "got inf" in err, f"{label}: malformed watchdog value should win at shim: {err!r}")
-    assert_true("only applies to --kind request" not in err, f"{label}: kind error must not mask malformed value: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_watchdog_notice_zero_still_rejects_request_only_at_shim(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--watchdog", "0", "--to", "bob", "body"],
-        stdin_isatty=True,
-    )
-    assert_true(code == 2 and out == "" and calls == [], f"{label}: notice+0 should reject before subprocess: code={code} out={out!r} calls={calls}")
-    assert_true("only applies to --kind request" in err and "finite non-negative" not in err, f"{label}: finite zero should reach kind check: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_watchdog_bare_minus_inf_argparse_error_at_shim(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--watchdog", "-inf", "--to", "bob", "body"],
-        stdin_isatty=True,
-    )
-    assert_true(code == 2 and out == "" and calls == [], f"{label}: bare -inf should fail in shim argparse: code={code} out={out!r} calls={calls}")
-    assert_true("argument --watchdog" in err and "expected one argument" in err, f"{label}: argparse should own bare -inf diagnostic: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_watchdog_equals_minus_inf_reports_finite_error_at_shim(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--watchdog=-inf", "--to", "bob", "body"],
-        stdin_isatty=True,
-    )
-    assert_true(code == 2 and out == "" and calls == [], f"{label}: equals -inf should reject before subprocess: code={code} out={out!r} calls={calls}")
-    assert_true("finite non-negative" in err and "got -inf" in err, f"{label}: equals -inf should reach shim finite validator: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_watchdog_finite_value_forwarded_with_equals(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--watchdog", "1.5", "--to", "bob", "body"],
-        stdin_isatty=True,
-    )
-    assert_true(code == 0 and len(calls) == 1, f"{label}: wrapper should invoke enqueue once: code={code} err={err!r}")
-    cmd, _kwargs = calls[0]
-    assert_true("--watchdog=1.5" in cmd, f"{label}: watchdog value should be forwarded with equals: {cmd}")
-    assert_true("--watchdog" not in cmd, f"{label}: wrapper must not forward watchdog as a separate argv token: {cmd}")
-    print(f"  PASS  {label}")
-
-
-def _assert_send_peer_body_error(
-    label: str,
-    case: str,
-    argv: list[str],
-    *,
-    code: str,
-    stdin_text: str = "",
-    tokens: tuple[str, ...],
-) -> None:
-    proc = _run_send_peer_script(
-        ["--allow-spoof", "--session", "test-session", "--from", "alice", *argv],
-        stdin_text=stdin_text,
-    )
-    assert_true(proc.returncode == 2, f"{label}: {case} should exit 2, got {proc.returncode}, stderr={proc.stderr!r}")
-    assert_true(proc.stdout == "", f"{label}: {case} should not print stdout: {proc.stdout!r}")
-    assert_true(proc.stderr.startswith(f"agent_send_peer: {code}: "), f"{label}: {case} missing stable code {code!r}: {proc.stderr!r}")
-    for token in tokens:
-        assert_true(token in proc.stderr, f"{label}: {case} missing token {token!r}: {proc.stderr!r}")
-
-
-def scenario_send_peer_body_input_diagnostics_are_specific(label: str, tmpdir: Path) -> None:
-    _assert_send_peer_body_error(
-        label,
-        "missing body",
-        ["--to", "bob"],
-        code="missing_body",
-        tokens=(
-            "message body is required",
-            "single inline argument",
-            "agent_send_peer <alias> 'hello'",
-            "agent_send_peer <alias> --stdin <<'EOF' ... EOF",
-        ),
-    )
-    for case, stdin_text in (("empty stdin", ""), ("whitespace stdin", " \n\t")):
-        _assert_send_peer_body_error(
-            label,
-            case,
-            ["--to", "bob", "--stdin"],
-            code="empty_stdin",
-            stdin_text=stdin_text,
-            tokens=("--stdin received an empty body", "heredoc body was empty", "non-empty body lines"),
-        )
-    _assert_send_peer_body_error(
-        label,
-        "positional after stdin",
-        ["--to", "bob", "--stdin", "some-body"],
-        code="unexpected_positional_after_stdin",
-        stdin_text="stdin body",
-        tokens=("--stdin reads body from stdin", "extra positional argument", "drop --stdin", "pipe via heredoc"),
-    )
-    _assert_send_peer_body_error(
-        label,
-        "stdin plus inline body",
-        ["--to", "bob", "inline body", "--stdin"],
-        code="stdin_inline_conflict",
-        stdin_text="stdin body",
-        tokens=("--stdin and an inline body cannot be combined", "Pick one", "single argument", "stdin/heredoc"),
-    )
-    _assert_send_peer_body_error(
-        label,
-        "piped stdin plus inline body",
-        ["--to", "bob", "inline body"],
-        code="piped_stdin_inline_conflict",
-        stdin_text="piped body",
-        tokens=("piped stdin and an inline body cannot be combined", "remove the pipe", "inline body", "--stdin", "heredoc"),
-    )
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_rejects_split_inline_body(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--to", "bob", "hello", "world"],
-        stdin_isatty=True,
-    )
-    assert_true(code == 2 and not calls and out == "", f"{label}: split explicit body must reject before enqueue")
-    assert_true("multiple shell arguments" in err and "--stdin" in err, f"{label}: stderr must explain heredoc path: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_rejects_implicit_split_inline_body(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "bob", "hello", "world"],
-        stdin_isatty=True,
-    )
-    assert_true(code == 2 and not calls and out == "", f"{label}: split implicit-target body must reject")
-    assert_true("multiple shell arguments" in err and "--stdin" in err, f"{label}: stderr must explain stdin: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_accepts_option_after_destination_with_stdin(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    for argv in (
-        ["--session", "test-session", "--from", "alice", "--to", "bob", "--watchdog", "1800", "--stdin"],
-        ["--session", "test-session", "--from", "alice", "--to", "bob", "--watchdog=1800", "--stdin"],
-        ["--session", "test-session", "--from", "alice", "--all", "--watchdog", "1800", "--stdin"],
-    ):
-        code, out, err, calls = _run_send_peer_with_fake_subprocess(
-            bs,
-            argv,
-            stdin_text="stdin body",
-            stdin_isatty=False,
-        )
-        assert_true(code == 0 and len(calls) == 1, f"{label}: option after destination before stdin should succeed for {argv}: code={code} err={err!r}")
-        cmd, kwargs = calls[0]
-        if "--all" in argv:
-            assert_true("--all" in cmd and "--to" not in cmd, f"{label}: broadcast destination preserved: {cmd}")
-        else:
-            assert_true(cmd[cmd.index("--to") + 1] == "bob", f"{label}: target preserved: {cmd}")
-        assert_true("--watchdog=1800.0" in cmd and "--stdin" in cmd, f"{label}: watchdog and stdin forwarded: {cmd}")
-        assert_true(kwargs.get("input") == b"stdin body", f"{label}: stdin body preserved: {kwargs}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_accepts_option_after_implicit_target_with_stdin(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "bob", "--watchdog", "1800", "--stdin"],
-        stdin_text="stdin body",
-        stdin_isatty=False,
-    )
-    assert_true(code == 0 and len(calls) == 1, f"{label}: option after implicit target before stdin should succeed: code={code} err={err!r}")
-    cmd, kwargs = calls[0]
-    assert_true(cmd[cmd.index("--to") + 1] == "bob", f"{label}: implicit target forwarded: {cmd}")
-    assert_true("--watchdog=1800.0" in cmd and "--stdin" in cmd, f"{label}: watchdog and stdin forwarded: {cmd}")
-    assert_true(kwargs.get("input") == b"stdin body", f"{label}: stdin body preserved: {kwargs}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_accepts_options_after_destination_before_inline_body(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--to", "bob", "--kind", "request", "--watchdog", "0", "hello world"],
-        stdin_isatty=True,
-    )
-    assert_true(code == 0 and len(calls) == 1, f"{label}: options after destination before inline body should succeed: code={code} err={err!r}")
-    cmd, kwargs = calls[0]
-    assert_true(cmd[cmd.index("--to") + 1] == "bob", f"{label}: target preserved: {cmd}")
-    assert_true("--kind" in cmd and cmd[cmd.index("--kind") + 1] == "request", f"{label}: kind forwarded: {cmd}")
-    assert_true("--watchdog=0.0" in cmd, f"{label}: watchdog 0 forwarded: {cmd}")
-    assert_true(kwargs.get("input") == b"hello world", f"{label}: inline body preserved via stdin handoff: {kwargs}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_rejects_option_after_inline_body(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--to", "bob", "hello", "--watchdog", "1800"],
-        stdin_isatty=True,
-    )
-    assert_true(code == 2 and not calls and out == "", f"{label}: option after body must reject")
-    assert_true("after the inline body" in err and "--watchdog" in err, f"{label}: stderr explains option position: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_rejects_duplicate_destination_after_destination(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    for argv in (
-        ["--session", "test-session", "--from", "alice", "--to", "bob", "--to", "carol", "--stdin"],
-        ["--session", "test-session", "--from", "alice", "--to", "bob", "--to", "carol"],
-        ["--session", "test-session", "--from", "alice", "--to", "bob", "--all"],
-    ):
-        code, out, err, calls = _run_send_peer_with_fake_subprocess(
-            bs,
-            argv,
-            stdin_text="stdin body",
-            stdin_isatty=False,
-        )
-        assert_true(code == 2 and not calls and out == "", f"{label}: duplicate destination must reject for {argv}")
-        assert_true("use exactly one destination selector" in err, f"{label}: duplicate destination diagnostic for {argv}: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_implicit_target_option_without_body_reports_body_required(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "bob", "--watchdog", "1800"],
-        stdin_isatty=True,
-    )
-    assert_true(code == 2 and not calls and out == "", f"{label}: implicit target with options but no body should reject")
-    assert_true("missing_body" in err and "message body is required" in err and "after the inline body" not in err, f"{label}: missing-body diagnostic should stay clear: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_rejects_allow_spoof_after_implicit_target(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "bob", "--allow-spoof", "--stdin"],
-        stdin_text="stdin body",
-        stdin_isatty=False,
-    )
-    assert_true(code == 2 and not calls and out == "", f"{label}: --allow-spoof after implicit target must reject")
-    assert_true("--allow-spoof" in err and "before the destination" in err, f"{label}: placement diagnostic should be clear: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_single_inline_body_uses_stdin_handoff(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    body = "  can't stop"
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--to", "bob", body],
-        stdin_isatty=True,
-    )
-    assert_true(code == 0 and len(calls) == 1, f"{label}: single argv body should enqueue once: code={code} err={err!r}")
-    cmd, kwargs = calls[0]
-    assert_true("--stdin" in cmd and "--body" not in cmd, f"{label}: wrapper must hand body to enqueue via stdin: {cmd}")
-    assert_true(cmd[cmd.index("--to") + 1] == "bob", f"{label}: target preserved: {cmd}")
-    assert_true(kwargs.get("input") == body.encode("utf-8"), f"{label}: body encoded as utf-8 bytes: {kwargs}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_request_success_prints_anti_wait_hint(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--to", "bob", "hello world"],
-        stdin_isatty=True,
-        stdout_text="msg-test123\n",
-    )
-    assert_true(code == 0 and len(calls) == 1, f"{label}: request should succeed: code={code} err={err!r}")
-    assert_true(out == "msg-test123\n", f"{label}: enqueue stdout must be preserved exactly: {out!r}")
-    assert_true("AGGREGATE_ID:" not in out and "AGGREGATE_ID:" not in err, f"{label}: single target must not expose aggregate id: out={out!r} err={err!r}")
-    for token in ("REQUEST_SENT", "[bridge:*]", "do not sleep/poll"):
-        assert_true(token in err, f"{label}: request hint missing token {token!r}: {err!r}")
-    assert_true("notice sent" not in err and "Safety wake" not in err and "NOTICE_SENT" not in err, f"{label}: request must not print notice hint: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_prior_hint_precedes_success_hint(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    prior_hint = "PRIOR_MESSAGE_HINT: bob is processing your earlier message msg-old (status: delivered).\n"
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--to", "bob", "hello world"],
-        stdin_isatty=True,
-        stdout_text="msg-new\n",
-        stderr_text=prior_hint,
-    )
-    assert_true(code == 0 and len(calls) == 1, f"{label}: request should succeed: code={code} err={err!r}")
-    assert_true(out == "msg-new\n", f"{label}: enqueue stdout must be preserved exactly: {out!r}")
-    assert_true("PRIOR_MESSAGE_HINT" in err and "REQUEST_SENT" in err, f"{label}: stderr should include prior and success hints: {err!r}")
-    assert_true(
-        err.index("PRIOR_MESSAGE_HINT") < err.index("REQUEST_SENT"),
-        f"{label}: prior hint should appear before wrapper success hint: {err!r}",
-    )
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_notice_success_prints_alarm_and_anti_wait_hints(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--to", "bob", "hello world"],
-        stdin_isatty=True,
-        stdout_text="msg-notice123\n",
-    )
-    assert_true(code == 0 and len(calls) == 1, f"{label}: notice should succeed: code={code} err={err!r}")
-    assert_true(out == "msg-notice123\n", f"{label}: enqueue stdout must be preserved exactly: {out!r}")
-    for token in ("NOTICE_SENT", "no reply auto-routes"):
-        assert_true(token in err, f"{label}: notice hint missing token {token!r}: {err!r}")
-    assert_true("notice sent. Safety wake" not in err, f"{label}: legacy notice safety line must stay absent: {err!r}")
-    assert_true("REQUEST_SENT" not in err and "sleep/polling blocks" not in err, f"{label}: notice must not print request/legacy hint: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_aggregate_request_success_prints_result_hint(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    for argv, stdout_text in (
-        (["--session", "test-session", "--from", "alice", "--to", "bob,carol", "hello world"], "msg-bob\nmsg-carol\nAGGREGATE_ID: agg-wrapper-partial\n"),
-        (["--session", "test-session", "--from", "alice", "--all", "hello world"], "msg-bob\nmsg-carol\nAGGREGATE_ID: agg-wrapper-all\n"),
-    ):
-        code, out, err, calls = _run_send_peer_with_fake_subprocess(
-            bs,
-            argv,
-            stdin_isatty=True,
-            stdout_text=stdout_text,
-        )
-        assert_true(code == 0 and len(calls) == 1, f"{label}: aggregate request should succeed for {argv}: code={code} err={err!r}")
-        assert_true(out == stdout_text, f"{label}: enqueue stdout must be preserved exactly for {argv}: {out!r}")
-        assert_true(out.count("AGGREGATE_ID: agg-") == 1, f"{label}: aggregate stdout should include exactly one aggregate id for {argv}: {out!r}")
-        assert_true("AGGREGATE_ID:" not in err, f"{label}: aggregate id belongs on stdout, not stderr: {err!r}")
-        for token in ("REQUEST_SENT", "result arrives later", "[bridge:*]", "do not sleep/poll"):
-            assert_true(token in err, f"{label}: aggregate request hint missing token {token!r} for {argv}: {err!r}")
-        assert_true("reply arrives later" not in err, f"{label}: aggregate hint must say result, not reply: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_subprocess_failure_prints_no_success_hint(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--to", "bob", "hello world"],
-        stdin_isatty=True,
-        stdout_text="enqueue failed details\n",
-        returncode=1,
-    )
-    assert_true(code == 1 and len(calls) == 1, f"{label}: subprocess failure should propagate: code={code}")
-    assert_true(out == "enqueue failed details\n", f"{label}: failure stdout still comes from subprocess: {out!r}")
-    assert_true("notice sent" not in err and "Safety wake" not in err and "sleep/polling blocks" not in err, f"{label}: legacy success hints must not print on failure: {err!r}")
-    assert_true("REQUEST_SENT" not in err and "NOTICE_SENT" not in err, f"{label}: success hints must not print on failure: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_ambient_socket_stdin_does_not_block(label: str, tmpdir: Path) -> None:
-    script = f"""
-import argparse
-import json
-import os
-import socket
-import sys
-sys.path.insert(0, {str(LIBEXEC)!r})
-import bridge_send_peer as bs
-
-case = sys.argv[1]
-left, right = socket.socketpair()
-if case == "partial-inline":
-    right.sendall(b"x")
-sys.stdin = os.fdopen(left.detach(), "r", encoding="utf-8", buffering=1)
-try:
-    if case == "idle-empty":
-        args = argparse.Namespace(target="bob", target_all=False, message=[], stdin_body=False)
-    else:
-        args = argparse.Namespace(target="bob", target_all=False, message=["hello"], stdin_body=False)
-    target, body = bs.parse_body_and_target(args, "")
-    print(json.dumps({{"ok": True, "target": target, "body": body, "target_all": args.target_all}}, ensure_ascii=True))
-except Exception as exc:
-    print(json.dumps({{"ok": False, "type": type(exc).__name__, "error": str(exc)}}, ensure_ascii=True))
-"""
-    cases = {
-        "idle-inline": {"ok": True, "target": "bob", "body": "hello"},
-        "idle-empty": {"ok": False, "error_contains": "missing_body"},
-        "partial-inline": {"ok": False, "error_contains": "piped_stdin_inline_conflict"},
-    }
-    for case, expected in cases.items():
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-c", script, case],
-                cwd=str(ROOT),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=3,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise AssertionError(f"{label}: {case} must not block on ambient socket stdin") from exc
-        assert_true(proc.returncode == 0, f"{label}: {case} child exited {proc.returncode}, stderr={proc.stderr!r}")
-        result = json.loads(proc.stdout.strip())
-        assert_true(result.get("ok") is expected["ok"], f"{label}: {case} ok mismatch: {result}")
-        if expected["ok"]:
-            assert_true(result.get("target") == expected["target"], f"{label}: {case} target mismatch: {result}")
-            assert_true(result.get("body") == expected["body"], f"{label}: {case} body mismatch: {result}")
-        else:
-            assert_true(expected["error_contains"] in str(result.get("error") or ""), f"{label}: {case} expected pipe collision error: {result}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_inline_body_accepts_empty_non_tty_stdin(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--to", "bob", "hello world"],
-        stdin_text="",
-        stdin_isatty=False,
-    )
-    assert_true(code == 0 and len(calls) == 1, f"{label}: empty non-tty stdin must not look like a pipe collision: code={code} err={err!r}")
-    cmd, kwargs = calls[0]
-    assert_true("--stdin" in cmd and "--body" not in cmd, f"{label}: enqueue still uses --stdin: {cmd}")
-    assert_true(kwargs.get("input") == b"hello world", f"{label}: inline body preserved: {kwargs}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_explicit_stdin_multibyte_body(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    body = "  first line\ncan't --kind request `x`\n"
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--kind", "notice", "--to", "bob", "--stdin"],
-        stdin_text=body,
-        stdin_isatty=False,
-    )
-    assert_true(code == 0 and len(calls) == 1, f"{label}: explicit stdin should enqueue once: code={code} err={err!r}")
-    cmd, kwargs = calls[0]
-    assert_true("--stdin" in cmd and "--body" not in cmd, f"{label}: enqueue subprocess uses --stdin: {cmd}")
-    assert_true(kwargs.get("input") == body.encode("utf-8"), f"{label}: multibyte body must be utf-8 bytes: {kwargs}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_implicit_target_allows_stdin(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "bob", "--stdin"],
-        stdin_text="stdin body",
-        stdin_isatty=False,
-    )
-    assert_true(code == 0 and len(calls) == 1, f"{label}: implicit target + --stdin should work: code={code} err={err!r}")
-    cmd, kwargs = calls[0]
-    assert_true(cmd[cmd.index("--to") + 1] == "bob", f"{label}: implicit target passed to enqueue: {cmd}")
-    assert_true(kwargs.get("input") == b"stdin body", f"{label}: stdin body forwarded: {kwargs}")
-    print(f"  PASS  {label}")
-
-
-def _write_send_peer_precheck_identity(state_root_path: Path, *, pane: str = "%20") -> list[Path]:
-    write_identity_fixture(state_root_path, alias="alice", agent="codex", session_id="sess-a", pane=pane)
-    live_record = {
-        "agent": "codex",
-        "session_id": "sess-a",
-        "pane": pane,
-        "target": "tmux:1.0",
-        "last_seen_at": utc_now(),
-    }
-    _write_json(
-        Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]),
-        {
-            "version": 1,
-            "panes": {pane: live_record},
-            "sessions": {bridge_identity.identity_key("codex", "sess-a"): live_record},
-        },
-    )
-    return [
-        Path(os.environ["AGENT_BRIDGE_ATTACH_REGISTRY"]),
-        Path(os.environ["AGENT_BRIDGE_PANE_LOCKS"]),
-        Path(os.environ["AGENT_BRIDGE_LIVE_SESSIONS"]),
-    ]
-
-
-def scenario_send_peer_implicit_target_resolves_session_from_pane(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    with isolated_identity_env(tmpdir) as state_root_path:
-        identity_files = _write_send_peer_precheck_identity(state_root_path, pane="%20")
-        before = {path: path.read_bytes() for path in identity_files}
-        with patched_environ(AGENT_BRIDGE_SESSION=None, AGENT_BRIDGE_AGENT=None, TMUX_PANE="%20"):
-            code, out, err, calls = _run_send_peer_with_fake_subprocess(
-                bs,
-                ["--kind", "notice", "bob", "hello world"],
-                stdin_isatty=True,
-            )
-        after = {path: path.read_bytes() for path in identity_files}
-    assert_true(before == after, f"{label}: precheck pane lookup must be read-only")
-    assert_true(code == 0 and len(calls) == 1, f"{label}: implicit target should succeed without env session: code={code} err={err!r}")
-    cmd, kwargs = calls[0]
-    assert_true(cmd[cmd.index("--to") + 1] == "bob", f"{label}: implicit target forwarded as --to bob: {cmd}")
-    assert_true(kwargs.get("input") == b"hello world", f"{label}: body forwarded via stdin bytes: {kwargs}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_implicit_target_stdin_resolves_session_from_pane(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    with isolated_identity_env(tmpdir) as state_root_path:
-        _write_send_peer_precheck_identity(state_root_path, pane="%21")
-        with patched_environ(AGENT_BRIDGE_SESSION=None, AGENT_BRIDGE_AGENT=None, TMUX_PANE="%21"):
-            code, out, err, calls = _run_send_peer_with_fake_subprocess(
-                bs,
-                ["bob", "--stdin"],
-                stdin_text="stdin body",
-                stdin_isatty=False,
-            )
-    assert_true(code == 0 and len(calls) == 1, f"{label}: implicit target + stdin should succeed without env session: code={code} err={err!r}")
-    cmd, kwargs = calls[0]
-    assert_true(cmd[cmd.index("--to") + 1] == "bob", f"{label}: implicit target forwarded as --to bob: {cmd}")
-    assert_true(kwargs.get("input") == b"stdin body", f"{label}: stdin body forwarded: {kwargs}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_precheck_fails_open_identity_errors_owned_by_validator(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    parser = bs.build_parser()
-    bs._precheck_lookup_session_for_pane = lambda pane: ""  # type: ignore[attr-defined]
-    split_error = bs.validate_send_peer_argv(["bob", "hello"], parser)
-    assert_true("multiple shell arguments" in split_error, f"{label}: unresolved implicit target should fail closed: {split_error!r}")
-
-    def identity_error(args, session, sender):
-        print("agent_send_peer: duplicate resume identity error", file=sys.stderr)
-        return None
-
-    bs.validate_caller_identity = identity_error
-    bs.load_session = lambda session: _participants_state(["alice", "bob"])
-    with patched_environ(AGENT_BRIDGE_SESSION=None, AGENT_BRIDGE_AGENT=None, TMUX_PANE="%99"):
-        code, out, err = _run_send_peer_main(bs, ["--to", "bob", "hello"], stdin_isatty=True)
-    assert_true(code == 2 and out == "", f"{label}: validator identity error should reject: code={code} out={out!r}")
-    assert_true("duplicate resume identity error" in err and "multiple shell arguments" not in err, f"{label}: identity error should be authoritative: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_allow_spoof_requires_explicit_destination_without_session(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    bs._precheck_lookup_session_for_pane = lambda pane: ""  # type: ignore[attr-defined]
-    with patched_environ(AGENT_BRIDGE_SESSION=None, AGENT_BRIDGE_AGENT=None, TMUX_PANE=None):
-        code, out, err, calls = _run_send_peer_with_fake_subprocess(
-            bs,
-            ["--allow-spoof", "bob", "hello world"],
-            stdin_isatty=True,
-        )
-    assert_true(code == 2 and not calls and out == "", f"{label}: allow-spoof shorthand without session should reject before enqueue")
-    assert_true("leading-alias shorthand" in err and "--to <alias>" in err and "multiple shell arguments" not in err, f"{label}: error should require explicit destination: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_rejects_allow_spoof_attached_value(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--allow-spoof=1", "--to", "bob", "hello world"],
-        stdin_isatty=True,
-    )
-    assert_true(code == 2 and not calls and out == "", f"{label}: attached value on flag must reject")
-    assert_true("unrecognized option" in err and "--allow-spoof=1" in err, f"{label}: stderr identifies bad flag form: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_all_rejects_leading_alias_body(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--all", "bob"],
-        stdin_isatty=True,
-    )
-    assert_true(code == 2 and not calls and out == "", f"{label}: --all with leading alias body must reject")
-    assert_true("remove leading alias" in err and "use --to bob" in err, f"{label}: stderr should explain --all alias confusion: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_rejects_stdin_with_positional_body(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--to", "bob", "--stdin", "body"],
-        stdin_text="stdin body",
-        stdin_isatty=False,
-    )
-    assert_true(code == 2 and not calls and out == "", f"{label}: --stdin + positional body must reject")
-    assert_true("unexpected_positional_after_stdin" in err and "extra positional argument" in err, f"{label}: stderr explains collision: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_rejects_pipe_with_positional_body(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--to", "bob", "body"],
-        stdin_text="pipe body",
-        stdin_isatty=False,
-    )
-    assert_true(code == 2 and not calls and out == "", f"{label}: pipe + positional body must reject")
-    assert_true(err.startswith("agent_send_peer: piped_stdin_inline_conflict: "), f"{label}: stderr includes stable pipe collision code: {err!r}")
-    for token in ("piped stdin and an inline body cannot be combined", "remove the pipe", "--stdin", "heredoc"):
-        assert_true(token in err, f"{label}: stderr explains pipe collision with token {token!r}: {err!r}")
-    assert_true("cannot combine piped stdin with a positional inline body" not in err, f"{label}: legacy un-coded phrase must stay absent: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_pipe_only_body_still_supported(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    _patch_send_peer_for_unit(bs)
-    code, out, err, calls = _run_send_peer_with_fake_subprocess(
-        bs,
-        ["--session", "test-session", "--from", "alice", "--to", "bob"],
-        stdin_text="pipe body",
-        stdin_isatty=False,
-    )
-    assert_true(code == 0 and len(calls) == 1, f"{label}: pipe-only body remains supported: code={code} err={err!r}")
-    cmd, kwargs = calls[0]
-    assert_true("--stdin" in cmd and kwargs.get("input") == b"pipe body", f"{label}: pipe body forwarded via stdin: {cmd} {kwargs}")
-    print(f"  PASS  {label}")
-
-
-def scenario_send_peer_precheck_option_table_matches_parser(label: str, tmpdir: Path) -> None:
-    bs = _import_send_peer_module()
-    parser = bs.build_parser()
-    value_options, flag_options = bs.option_kinds_from_parser(parser)
-    covered = value_options | flag_options
-    parser_options = {
-        opt
-        for action in parser._actions
-        for opt in (getattr(action, "option_strings", []) or [])
-        if opt not in {"-h", "--help"}
-    }
-    assert_true(parser_options <= covered, f"{label}: precheck option table missing {sorted(parser_options - covered)}")
-    assert_true("--stdin" in flag_options and "--to" in value_options and "-t" in value_options, f"{label}: expected key options classified")
-    print(f"  PASS  {label}")
-
-
-def scenario_enqueue_rejects_oversized_body_unchanged(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    queue_file = tmpdir / "pending.json"
-    state_file = tmpdir / "events.raw.jsonl"
-    public_file = tmpdir / "events.jsonl"
-    queue_file.write_text("[]", encoding="utf-8")
-    state_file.write_text(json.dumps({"event": "initial_raw"}) + "\n", encoding="utf-8")
-    public_file.write_text(json.dumps({"event": "initial_public"}) + "\n", encoding="utf-8")
-    before = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
-    be.enqueue_via_daemon_socket = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("socket enqueue must not run"))
-
-    code, out, err = _run_enqueue_main(
-        be,
-        [
-            "--session", "test-session",
-            "--from", "alice",
-            "--to", "bob",
-            "--body", "x" * (MAX_INLINE_SEND_BODY_CHARS + 1),
-            "--queue-file", str(queue_file),
-            "--state-file", str(state_file),
-            "--public-state-file", str(public_file),
-        ],
-    )
-    assert_true(code == 2, f"{label}: enqueue rejects oversized body, got {code}")
-    assert_true(out == "", f"{label}: rejection has no stdout: {out!r}")
-    assert_true(str(MAX_INLINE_SEND_BODY_CHARS) in err and "/tmp/agent-bridge-share" in err, f"{label}: stderr explains limit: {err!r}")
-    after = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
-    assert_true(before == after, f"{label}: rejection must not mutate queue or events")
-    print(f"  PASS  {label}")
-
-
-def scenario_enqueue_stdin_rejects_oversized_body_unchanged(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    queue_file = tmpdir / "pending.json"
-    state_file = tmpdir / "events.raw.jsonl"
-    public_file = tmpdir / "events.jsonl"
-    queue_file.write_text("[]", encoding="utf-8")
-    state_file.write_text(json.dumps({"event": "initial_raw"}) + "\n", encoding="utf-8")
-    public_file.write_text(json.dumps({"event": "initial_public"}) + "\n", encoding="utf-8")
-    before = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
-    be.enqueue_via_daemon_socket = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("socket enqueue must not run"))
-
-    code, out, err = _run_enqueue_main(
-        be,
-        [
-            "--session", "test-session",
-            "--from", "alice",
-            "--to", "bob",
-            "--stdin",
-            "--queue-file", str(queue_file),
-            "--state-file", str(state_file),
-            "--public-state-file", str(public_file),
-        ],
-        stdin_text="x" * (MAX_INLINE_SEND_BODY_CHARS + 100),
-    )
-    assert_true(code == 2, f"{label}: enqueue --stdin rejects oversized body, got {code}")
-    assert_true(out == "", f"{label}: rejection has no stdout: {out!r}")
-    assert_true(str(MAX_INLINE_SEND_BODY_CHARS) in err and "/tmp/agent-bridge-share" in err, f"{label}: stderr explains limit: {err!r}")
-    after = {path: path.read_bytes() for path in (queue_file, state_file, public_file)}
-    assert_true(before == after, f"{label}: rejection must not mutate queue or events")
-    print(f"  PASS  {label}")
-
-
-def _enqueue_prior_hint_argv(tmpdir: Path, *, kind: str = "request") -> list[str]:
-    return [
-        "--session", "test-session",
-        "--from", "alice",
-        "--to", "bob",
-        "--kind", kind,
-        "--body", "replacement",
-        "--queue-file", str(tmpdir / "pending.json"),
-        "--state-file", str(tmpdir / "events.raw.jsonl"),
-        "--public-state-file", str(tmpdir / "events.jsonl"),
-    ]
-
-
-def scenario_enqueue_socket_success_hints_stderr_stdout_unchanged(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    be.enqueue_via_daemon_socket = lambda session, messages, **kwargs: (  # type: ignore[assignment]
-        True,
-        ["msg-socket-hint"],
-        [{"text": "PRIOR_MESSAGE_HINT: bob still has your earlier message msg-prior queued (status: pending)."}],
-        "",
-        "",
-    )
-
-    code, out, err = _run_enqueue_main(be, _enqueue_prior_hint_argv(tmpdir))
-
-    assert_true(code == 0, f"{label}: socket enqueue should succeed: code={code} err={err!r}")
-    assert_true(out == "msg-socket-hint\n", f"{label}: stdout must contain ids only: {out!r}")
-    assert_true("PRIOR_MESSAGE_HINT:" in err and "PRIOR_MESSAGE_HINT:" not in out, f"{label}: hints must go to stderr only: out={out!r} err={err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_enqueue_fallback_prior_hint_pending_cancel(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    _write_json(tmpdir / "pending.json", [test_message("msg-fb-prior-pending", frm="alice", to="bob", status="pending")])
-
-    code, out, err = _run_enqueue_main(be, _enqueue_prior_hint_argv(tmpdir))
-
-    assert_true(code == 0, f"{label}: fallback enqueue should succeed: code={code} err={err!r}")
-    assert_true(out.startswith("msg-") and "PRIOR_MESSAGE_HINT" not in out, f"{label}: stdout should contain ids only: {out!r}")
-    assert_true("PRIOR_MESSAGE_HINT:" in err and "agent_cancel_message msg-fb-prior-pending" in err, f"{label}: cancel hint missing: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_enqueue_fallback_prior_hint_submitted_interrupt(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    _write_json(tmpdir / "pending.json", [test_message("msg-fb-prior-submitted", frm="alice", to="bob", status="submitted")])
-
-    code, out, err = _run_enqueue_main(be, _enqueue_prior_hint_argv(tmpdir))
-
-    assert_true(code == 0, f"{label}: fallback enqueue should succeed: code={code} err={err!r}")
-    assert_true("agent_interrupt_peer bob --status" in err and "msg-fb-prior-submitted" in err, f"{label}: interrupt hint missing: {err!r}")
-    assert_true("so this new message can deliver" not in err, f"{label}: unsafe wording absent: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_enqueue_fallback_prior_hint_plain_inflight_omitted(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    _write_json(tmpdir / "pending.json", [test_message("msg-fb-prior-inflight", frm="alice", to="bob", status="inflight")])
-
-    code, out, err = _run_enqueue_main(be, _enqueue_prior_hint_argv(tmpdir))
-
-    assert_true(code == 0, f"{label}: fallback enqueue should succeed: code={code} err={err!r}")
-    assert_true(out.startswith("msg-"), f"{label}: stdout should contain id: {out!r}")
-    assert_true("PRIOR_MESSAGE_HINT" not in err, f"{label}: plain inflight fallback must omit hint: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_enqueue_fallback_prior_hint_pane_mode_inflight_cancel(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    prior = test_message("msg-fb-prior-pane-mode", frm="alice", to="bob", status="inflight")
-    prior["pane_mode_enter_deferred_since_ts"] = time.time()
-    _write_json(tmpdir / "pending.json", [prior])
-
-    code, out, err = _run_enqueue_main(be, _enqueue_prior_hint_argv(tmpdir))
-
-    assert_true(code == 0, f"{label}: fallback enqueue should succeed: code={code} err={err!r}")
-    assert_true("agent_cancel_message msg-fb-prior-pane-mode" in err, f"{label}: pane-mode inflight should get cancel hint: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_enqueue_fallback_prior_hint_write_failure_suppresses_hint(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    _write_json(tmpdir / "pending.json", [test_message("msg-fb-prior-write-fail", frm="alice", to="bob", status="pending")])
-    old_update_queue = be.update_queue
-
-    def fail_update_queue(_path, _message):
-        raise OSError(errno.EACCES, "denied")
-
-    try:
-        be.update_queue = fail_update_queue  # type: ignore[assignment]
-        code, out, err = _run_enqueue_main(be, _enqueue_prior_hint_argv(tmpdir))
-    finally:
-        be.update_queue = old_update_queue  # type: ignore[assignment]
-
-    assert_true(code == 1 and out == "", f"{label}: write failure should fail before stdout: code={code} out={out!r}")
-    assert_true("not writable" in err or "failed to write" in err, f"{label}: write failure error missing: {err!r}")
-    assert_true("PRIOR_MESSAGE_HINT" not in err, f"{label}: failed enqueue must not print prior hint: {err!r}")
-    print(f"  PASS  {label}")
-
-
-def scenario_enqueue_fallback_response_send_guard_no_hint(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-    queue_file = tmpdir / "pending.json"
-    state_file = tmpdir / "events.raw.jsonl"
-    public_file = tmpdir / "events.jsonl"
-    _write_json(
-        queue_file,
-        [
-            _delivered_request("msg-guard-active", "alice", "bob"),
-            test_message("msg-prior-would-hint", frm="bob", to="alice", status="pending"),
-        ],
-    )
-    state_file.write_text("raw-before\n", encoding="utf-8")
-    public_file.write_text("public-before\n", encoding="utf-8")
-
-    code, out, err = _run_enqueue_main(
-        be,
-        [
-            "--session", "test-session",
-            "--from", "bob",
-            "--to", "alice",
-            "--body", "guarded replacement",
-            "--queue-file", str(queue_file),
-            "--state-file", str(state_file),
-            "--public-state-file", str(public_file),
-        ],
-    )
-
-    assert_true(code == 2, f"{label}: response-send guard should reject: code={code} err={err!r}")
-    assert_true(out == "", f"{label}: rejected fallback send must have no stdout: {out!r}")
-    assert_true("response-time guard" in err and "current_prompt.from=alice" in err, f"{label}: response-send guard text missing: {err!r}")
-    assert_true("PRIOR_MESSAGE_HINT" not in err, f"{label}: rejected fallback send must not print prior hint: {err!r}")
-    print(f"  PASS  {label}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def scenario_alarm_cancel_preserves_at_limit_body(label: str, tmpdir: Path) -> None:
@@ -17805,689 +13086,638 @@ def scenario_clear_marker_ttl_expiry_removes_marker(label: str, tmpdir: Path) ->
     print(f"  PASS  {label}")
 
 
-def scenario_enqueue_fallback_success_silent_with_raw_diagnostic(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state, socket_error="/tmp/secret.sock: permission denied\nextra line")
-    queue_file = tmpdir / "pending.json"
-    state_file = tmpdir / "events.raw.jsonl"
-    public_file = tmpdir / "events.jsonl"
-    queue_file.write_text("[]", encoding="utf-8")
-    code, out, err = _run_enqueue_main(
-        be,
-        [
-            "--session", "test-session",
-            "--from", "alice",
-            "--to", "bob",
-            "--body", "hello",
-            "--queue-file", str(queue_file),
-            "--state-file", str(state_file),
-            "--public-state-file", str(public_file),
-        ],
-    )
-    assert_true(code == 0, f"{label}: enqueue succeeds: code={code}, stderr={err!r}")
-    assert_true(out.strip().startswith("msg-"), f"{label}: stdout contains message id: {out!r}")
-    assert_true(err == "", f"{label}: successful fallback must be silent on stderr: {err!r}")
-    assert_true("daemon socket unavailable" not in err and "falling back to direct file" not in err, f"{label}: warning suppressed")
-    queue = json.loads(queue_file.read_text(encoding="utf-8"))
-    assert_true(queue and queue[0].get("status") == "ingressing", f"{label}: queue item is ingressing: {queue}")
-    raw_events = read_events(state_file)
-    public_events = read_events(public_file)
-    assert_true(any(item.get("event") == "message_queued" for item in raw_events), f"{label}: message_queued raw event present")
-    fallback_events = [item for item in raw_events if item.get("event") == "enqueue_file_fallback"]
-    assert_true(len(fallback_events) == 1, f"{label}: one raw fallback diagnostic: {raw_events}")
-    assert_true(all(item.get("event") != "enqueue_file_fallback" for item in public_events), f"{label}: fallback diagnostic not public: {public_events}")
-    socket_error = str(fallback_events[0].get("socket_error") or "")
-    assert_true("\n" not in socket_error and len(socket_error) <= 200, f"{label}: socket_error sanitized: {socket_error!r}")
-    print(f"  PASS  {label}")
 
 
-def scenario_enqueue_fallback_write_failure_preserves_stderr(label: str, tmpdir: Path) -> None:
-    be = _import_enqueue_module()
-    state = _participants_state(["alice", "bob"])
-    _patch_enqueue_for_unit(be, state)
-
-    def fail_update_queue(path: Path, message: dict) -> None:
-        raise OSError(errno.EACCES, "denied")
-
-    be.update_queue = fail_update_queue
-    code, out, err = _run_enqueue_main(
-        be,
-        [
-            "--session", "test-session",
-            "--from", "alice",
-            "--to", "bob",
-            "--body", "hello",
-            "--queue-file", str(tmpdir / "pending.json"),
-            "--state-file", str(tmpdir / "events.raw.jsonl"),
-            "--public-state-file", str(tmpdir / "events.jsonl"),
-        ],
-    )
-    assert_true(code == 1, f"{label}: write failure exits 1, got {code}")
-    assert_true(out == "", f"{label}: no stdout on write failure: {out!r}")
-    assert_true("cannot enqueue message" in err or "failed to write bridge queue" in err, f"{label}: stderr preserves failure: {err!r}")
-    print(f"  PASS  {label}")
 
 
 def scenarios() -> list[tuple[str, object]]:
-    return [
-            ("lifecycle_delivered_terminal", scenario_lifecycle),
-            ("held_interrupt_does_not_block_delivery", scenario_held_interrupt_does_not_block_delivery),
-            ("reserve_next_ignores_held_marker", scenario_reserve_next_ignores_held_marker),
-            ("held_marker_persists_through_delivery", scenario_held_marker_persists_through_delivery),
-            ("esc_fail_no_state_change", scenario_esc_fail_no_state_change),
-            ("clear_hold_logs_event", scenario_clear_hold),
-            ("clear_hold_socket_still_pops_held", scenario_clear_hold_socket_still_pops_held),
-            ("aggregate_interrupt_synthetic_reply", scenario_aggregate_interrupt_synthetic),
-            ("interrupt_pending_replacement_delivers", scenario_interrupt_pending_replacement_delivers),
-            ("interrupt_new_replacement_after_interrupt_delivers", scenario_interrupt_new_replacement_after_interrupt_delivers),
-            ("interrupt_claude_with_active_sends_esc_then_cc", scenario_interrupt_claude_with_active_sends_esc_then_cc),
-            ("interrupt_codex_sends_only_esc", scenario_interrupt_codex_sends_only_esc),
-            ("interrupt_unknown_type_falls_back_to_esc", scenario_interrupt_unknown_type_falls_back_to_esc),
-            ("interrupt_claude_idle_skips_cc", scenario_interrupt_claude_idle_skips_cc),
-            ("interrupt_claude_cc_failure_does_not_revert_state", scenario_interrupt_claude_cc_failure_does_not_revert_state),
-            ("interrupt_holds_state_lock_through_sequence", scenario_interrupt_holds_state_lock_through_sequence),
-            ("interrupt_no_try_deliver_between_keys", scenario_interrupt_no_try_deliver_between_keys),
-            ("interrupt_env_override_disables_cc", scenario_interrupt_env_override_disables_cc),
-            ("interrupt_key_delay_env_nonfinite_uses_default", scenario_interrupt_key_delay_env_nonfinite_uses_default),
-            ("interrupt_key_delay_env_clamps_out_of_range", scenario_interrupt_key_delay_env_clamps_out_of_range),
-            ("claude_interrupt_keys_invalid_uses_default", scenario_claude_interrupt_keys_invalid_uses_default),
-            ("claude_interrupt_keys_empty_uses_default", scenario_claude_interrupt_keys_empty_uses_default),
-            ("send_interrupt_key_timeout_returns_false", scenario_send_interrupt_key_timeout_returns_false),
-            ("clear_hold_clears_interrupt_partial_failure_gate", scenario_clear_hold_clears_interrupt_partial_failure_gate),
-            ("interrupt_double_within_no_active_skips_cc", scenario_interrupt_double_within_no_active_skips_cc),
-            ("interrupt_double_with_fresh_delivery_sends_cc_again", scenario_interrupt_double_with_fresh_delivery_sends_cc_again),
-            ("interrupt_peer_cli_exit_nonzero_on_partial_key_failure", scenario_interrupt_peer_cli_exit_nonzero_on_partial_key_failure),
-            ("interrupt_peer_action_text_and_json_modes", scenario_interrupt_peer_action_text_and_json_modes),
-            ("interrupt_peer_clear_hold_text_and_json_modes", scenario_interrupt_peer_clear_hold_text_and_json_modes),
-            ("interrupt_peer_status_json_unchanged_and_json_rejected", scenario_interrupt_peer_status_json_unchanged_and_json_rejected),
-            ("interrupted_late_prompt_submitted_before_replacement", scenario_interrupted_late_prompt_submitted_before_replacement),
-            ("interrupted_late_prompt_submitted_after_replacement", scenario_interrupted_late_prompt_submitted_after_replacement),
-            ("interrupted_late_turn_stop_preserves_replacement", scenario_interrupted_late_turn_stop_preserves_replacement),
-            ("interrupted_no_turn_stop_no_context_suppressed", scenario_interrupted_no_turn_stop_no_context_suppressed),
-            ("interrupted_no_turn_race_routes_replacement_then_suppresses_old", scenario_interrupted_no_turn_race_routes_replacement_then_suppresses_old),
-            ("interrupted_inflight_tombstone_retains_on_unrelated_stop", scenario_interrupted_inflight_tombstone_retains_on_unrelated_stop),
-            ("interrupted_empty_values_do_not_match_tombstone", scenario_interrupted_empty_values_do_not_match_tombstone),
-            ("interrupted_tombstone_current_ctx_id_match_cleans", scenario_interrupted_tombstone_current_ctx_id_match_cleans),
-            ("interrupted_tombstone_current_ctx_turn_match_cleans", scenario_interrupted_tombstone_current_ctx_turn_match_cleans),
-            ("interrupted_tombstone_stale_stop_preserves_replacement_watchdog", scenario_interrupted_tombstone_stale_stop_preserves_replacement_watchdog),
-            ("interrupted_tombstone_aggregate_ctx_does_not_cancel_aggregate_watchdog", scenario_interrupted_tombstone_aggregate_ctx_does_not_cancel_aggregate_watchdog),
-            ("aggregate_late_real_stop_after_interrupt_does_not_overwrite", scenario_aggregate_late_real_stop_after_interrupt_does_not_overwrite),
-            ("watchdog_cancel_on_empty_response", scenario_watchdog_cancel_on_empty_response),
-            ("alarm_cancelled_by_qualifying_request", scenario_alarm_cancelled_by_qualifying_request),
-            ("socket_path_alarm_cancel", scenario_socket_path_alarm_cancel),
-            ("response_send_guard_socket_request_notice", scenario_response_send_guard_socket_request_notice),
-            ("response_send_guard_socket_force_and_other_peer", scenario_response_send_guard_socket_force_and_other_peer),
-            ("response_send_guard_socket_no_auto_return_allowed", scenario_response_send_guard_socket_no_auto_return_allowed),
-            ("response_send_guard_socket_atomic_multi", scenario_response_send_guard_socket_atomic_multi),
-            ("response_send_guard_socket_aggregate_and_held", scenario_response_send_guard_socket_aggregate_and_held),
-            ("response_send_guard_after_response_finished_allowed", scenario_response_send_guard_after_response_finished_allowed),
-            ("fallback_path_alarm_cancel", scenario_fallback_path_alarm_cancel),
-            ("ingressing_not_delivered_before_finalize", scenario_ingressing_not_delivered_before_finalize),
-            ("replay_does_not_cancel_later_alarm", scenario_replay_does_not_cancel_later_alarm),
-            ("bridge_origin_fallback_ingressing_promoted", scenario_bridge_origin_fallback_ingressing_promoted),
-            ("socket_normalizes_non_ingressing_status", scenario_socket_normalizes_non_ingressing_status),
-            ("aggregate_fallback_finalize", scenario_aggregate_fallback_finalize),
-            ("aged_ingressing_promoted_by_maintenance", scenario_aged_ingressing_promoted_by_maintenance),
-            ("aged_ingressing_does_not_cancel_alarms", scenario_aged_ingressing_does_not_cancel_alarms),
-            ("aged_ingressing_malformed_timestamp_promoted", scenario_aged_ingressing_malformed_timestamp_promoted),
-            ("fresh_ingressing_not_promoted_by_maintenance", scenario_fresh_ingressing_not_promoted_by_maintenance),
-            ("alarm_not_cancelled_by_result", scenario_alarm_not_cancelled_by_result),
-            ("alarm_not_cancelled_by_bridge", scenario_alarm_not_cancelled_by_bridge),
-            ("user_prompt_does_not_cancel_alarm", scenario_user_prompt_does_not_cancel_alarm),
-            ("extend_wait_upserts_watchdog", scenario_extend_wait_upserts_watchdog),
-            ("extend_wait_aggregate_rejected", scenario_extend_wait_aggregate_rejected),
-            ("extend_wait_unknown_message", scenario_extend_wait_unknown_message),
-            ("extend_wait_terminal_tombstone_classification", scenario_extend_wait_terminal_tombstone_classification),
-            ("extend_wait_pending_rejected", scenario_extend_wait_pending_rejected),
-            ("extend_wait_not_owner", scenario_extend_wait_not_owner),
-            ("cancel_message_pending_removes_row", scenario_cancel_message_pending_removes_row),
-            ("cancel_message_inflight_pre_paste", scenario_cancel_message_inflight_pre_paste),
-            ("cancel_message_pane_mode_deferred_inflight_cancellable", scenario_cancel_message_pane_mode_deferred_inflight_cancellable),
-            ("cancel_message_inflight_after_enter_rejects_with_interrupt_guidance", scenario_cancel_message_inflight_after_enter_rejects_with_interrupt_guidance),
-            ("cancel_message_submitted_rejects_with_interrupt_guidance", scenario_cancel_message_submitted_rejects_with_interrupt_guidance),
-            ("cancel_message_delivered_rejects_with_interrupt_guidance", scenario_cancel_message_delivered_rejects_with_interrupt_guidance),
-            ("cancel_message_ownership_violation", scenario_cancel_message_ownership_violation),
-            ("cancel_message_idempotent_after_terminal", scenario_cancel_message_idempotent_after_terminal),
-            ("cancel_message_aggregate_per_leg_keeps_other_legs", scenario_cancel_message_aggregate_per_leg_keeps_other_legs),
-            ("cancel_message_action_text_and_json_modes", scenario_cancel_message_action_text_and_json_modes),
-            ("cancel_message_action_error_text_modes", scenario_cancel_message_action_error_text_modes),
-            ("aggregate_status_open_from_queue_and_reply", scenario_aggregate_status_open_from_queue_and_reply),
-            ("aggregate_status_zero_reply_from_queue", scenario_aggregate_status_zero_reply_from_queue),
-            ("aggregate_status_cancelled_and_timeout_synthetic_reasons", scenario_aggregate_status_cancelled_and_timeout_synthetic_reasons),
-            ("aggregate_status_legacy_synthetic_reply_uses_tombstone", scenario_aggregate_status_legacy_synthetic_reply_uses_tombstone),
-            ("aggregate_status_foreign_and_unknown_indistinguishable", scenario_aggregate_status_foreign_and_unknown_indistinguishable),
-            ("aggregate_status_source_conflict_fails_closed", scenario_aggregate_status_source_conflict_fails_closed),
-            ("aggregate_status_legacy_fallback_and_cap", scenario_aggregate_status_legacy_fallback_and_cap),
-            ("aggregate_status_watchdog_only_anchor", scenario_aggregate_status_watchdog_only_anchor),
-            ("wait_status_empty_self_view", scenario_wait_status_empty_self_view),
-            ("wait_status_outstanding_watchdogs_alarms_pending_inbound", scenario_wait_status_outstanding_watchdogs_alarms_pending_inbound),
-            ("wait_status_aggregate_waits_privacy_and_completed_result", scenario_wait_status_aggregate_waits_privacy_and_completed_result),
-            ("wait_status_caps_and_summary_counts", scenario_wait_status_caps_and_summary_counts),
-            ("delivery_watchdog_arms_on_reserve", scenario_delivery_watchdog_arms_on_reserve),
-            ("delivery_watchdog_fire_inflight_notice", scenario_delivery_watchdog_fire_inflight_notice),
-            ("watchdog_fire_after_terminal_suppresses_notice", scenario_watchdog_fire_after_terminal_suppresses_notice),
-            ("pending_watchdog_wake_removed_on_terminal", scenario_pending_watchdog_wake_removed_on_terminal),
-            ("delivery_watchdog_extend_replaces_wake", scenario_delivery_watchdog_extend_replaces_wake),
-            ("delivery_watchdog_submitted_extend_and_text", scenario_delivery_watchdog_submitted_extend_and_text),
-            ("delivery_watchdog_aggregate_pending_extend_rejected", scenario_delivery_watchdog_aggregate_pending_extend_rejected),
-            ("delivery_watchdog_replaced_by_response_on_delivered", scenario_delivery_watchdog_replaced_by_response_on_delivered),
-            ("delivery_watchdog_requeue_cancels", scenario_delivery_watchdog_requeue_cancels),
-            ("delivery_watchdog_mark_pending_cancels", scenario_delivery_watchdog_mark_pending_cancels),
-            ("delivery_watchdog_pane_mode_reverts_cancel", scenario_delivery_watchdog_pane_mode_reverts_cancel),
-            ("delivery_watchdog_phase_mismatch_skipped", scenario_delivery_watchdog_phase_mismatch_skipped),
-            ("watchdog_phase_legacy_default_response", scenario_watchdog_phase_legacy_default_response),
-            ("delivery_watchdog_aggregate_leg_coexists_with_response", scenario_delivery_watchdog_aggregate_leg_coexists_with_response),
-            ("delivery_watchdog_aggregate_interrupt_cancels_leg_only", scenario_delivery_watchdog_aggregate_interrupt_cancels_leg_only),
-            ("aggregate_response_watchdog_text_uses_progress", scenario_aggregate_response_watchdog_text_uses_progress),
-            ("aggregate_completion_suppresses_pending_watchdog_wake", scenario_aggregate_completion_suppresses_pending_watchdog_wake),
-            ("duplicate_enqueue_does_not_cancel_alarm", scenario_duplicate_enqueue_does_not_cancel_alarm),
-            ("alarm_op_invalid_delay_is_rejected", scenario_alarm_op_invalid_delay_is_rejected_not_crashed),
-            ("send_peer_watchdog_negative_one_rejected", scenario_send_peer_watchdog_negative_one_rejected),
-            ("send_peer_watchdog_nan_rejected", scenario_send_peer_watchdog_nan_rejected),
-            ("send_peer_watchdog_inf_rejected", scenario_send_peer_watchdog_inf_rejected),
-            ("send_peer_watchdog_minus_inf_rejected", scenario_send_peer_watchdog_minus_inf_rejected),
-            ("send_peer_watchdog_zero_disables_for_request", scenario_send_peer_watchdog_zero_disables_for_request),
-            ("send_peer_watchdog_finite_positive_succeeds", scenario_send_peer_watchdog_finite_positive_succeeds),
-            ("send_peer_no_auto_return_explicit_watchdog_rejected", scenario_send_peer_no_auto_return_explicit_watchdog_rejected),
-            ("send_peer_no_auto_return_watchdog_zero_succeeds", scenario_send_peer_no_auto_return_watchdog_zero_succeeds),
-            ("send_peer_no_auto_return_invalid_watchdog_value_precedence", scenario_send_peer_no_auto_return_invalid_watchdog_value_precedence),
-            ("send_peer_no_auto_return_skips_default_watchdog", scenario_send_peer_no_auto_return_skips_default_watchdog),
-            ("send_peer_auto_return_default_watchdog_still_attaches", scenario_send_peer_auto_return_default_watchdog_still_attaches),
-            ("send_peer_no_auto_return_broadcast_watchdog_rejected", scenario_send_peer_no_auto_return_broadcast_watchdog_rejected),
-            ("send_peer_watchdog_inf_with_notice_reports_finite_error_first", scenario_send_peer_watchdog_inf_with_notice_reports_finite_error_first),
-            ("send_peer_watchdog_zero_with_notice_still_rejects_request_only", scenario_send_peer_watchdog_zero_with_notice_still_rejects_request_only),
-            ("send_peer_watchdog_abc_argparse_error", scenario_send_peer_watchdog_abc_argparse_error),
-            ("extend_wait_zero_negative_nan_inf_rejected", scenario_extend_wait_zero_negative_nan_inf_rejected),
-            ("extend_wait_finite_positive_calls_request_extend", scenario_extend_wait_finite_positive_calls_request_extend),
-            ("extend_wait_terminal_error_texts", scenario_extend_wait_terminal_error_texts),
-            ("wait_status_cli_summary_and_json", scenario_wait_status_cli_summary_and_json),
-            ("wait_status_cli_unsupported_old_daemon", scenario_wait_status_cli_unsupported_old_daemon),
-            ("wait_status_cli_rejects_inactive_sender", scenario_wait_status_cli_rejects_inactive_sender),
-            ("aggregate_status_cli_summary_and_json", scenario_aggregate_status_cli_summary_and_json),
-            ("aggregate_status_cli_unsupported_and_not_found_text", scenario_aggregate_status_cli_unsupported_and_not_found_text),
-            ("aggregate_status_cli_rejects_inactive_sender", scenario_aggregate_status_cli_rejects_inactive_sender),
-            ("alarm_negative_nan_inf_minus_inf_rejected", scenario_alarm_negative_nan_inf_minus_inf_rejected),
-            ("alarm_zero_and_finite_positive_call_request_alarm", scenario_alarm_zero_and_finite_positive_call_request_alarm),
-            ("alarm_request_failure_prints_no_success_hint", scenario_alarm_request_failure_prints_no_success_hint),
-            ("alarm_request_retries_timeout_with_stable_wake_id", scenario_alarm_request_retries_timeout_with_stable_wake_id),
-            ("alarm_request_retry_exhaustion_is_bounded", scenario_alarm_request_retry_exhaustion_is_bounded),
-            ("alarm_request_retries_lock_wait_with_stable_wake_id", scenario_alarm_request_retries_lock_wait_with_stable_wake_id),
-            ("alarm_request_lock_wait_retry_exhaustion_is_bounded", scenario_alarm_request_lock_wait_retry_exhaustion_is_bounded),
-            ("alarm_request_non_retryable_daemon_error_is_immediate", scenario_alarm_request_non_retryable_daemon_error_is_immediate),
-            ("alarm_request_rejects_mismatched_daemon_wake_id", scenario_alarm_request_rejects_mismatched_daemon_wake_id),
-            ("resolve_default_watchdog_seconds_env_table", scenario_resolve_default_watchdog_seconds_env_table),
-            ("daemon_socket_alarm_op_rejects_non_finite", scenario_daemon_socket_alarm_op_rejects_non_finite),
-            ("daemon_socket_alarm_op_idempotent_wake_id", scenario_daemon_socket_alarm_op_idempotent_wake_id),
-            ("daemon_socket_alarm_op_rejects_invalid_conflicting_wake_id", scenario_daemon_socket_alarm_op_rejects_invalid_conflicting_wake_id),
-            ("daemon_socket_alarm_op_idempotent_after_cancelled_or_fired", scenario_daemon_socket_alarm_op_idempotent_after_cancelled_or_fired),
-            ("daemon_socket_extend_watchdog_op_rejects_non_finite", scenario_daemon_socket_extend_watchdog_op_rejects_non_finite),
-            ("daemon_upsert_message_watchdog_rejects_non_finite", scenario_daemon_upsert_message_watchdog_rejects_non_finite),
-            ("daemon_enqueue_rejects_no_auto_return_watchdog_atomically", scenario_daemon_enqueue_rejects_no_auto_return_watchdog_atomically),
-            ("daemon_enqueue_no_auto_return_watchdog_zero_normalized", scenario_daemon_enqueue_no_auto_return_watchdog_zero_normalized),
-            ("daemon_prior_hint_pending_cancel", scenario_daemon_prior_hint_pending_cancel),
-            ("daemon_prior_hint_delivered_interrupt", scenario_daemon_prior_hint_delivered_interrupt),
-            ("daemon_prior_hint_inflight_pane_mode_cancel", scenario_daemon_prior_hint_inflight_pane_mode_cancel),
-            ("daemon_prior_hint_inflight_after_enter_interrupt", scenario_daemon_prior_hint_inflight_after_enter_interrupt),
-            ("daemon_prior_hint_terminal_or_absent_no_hint", scenario_daemon_prior_hint_terminal_or_absent_no_hint),
-            ("daemon_prior_hint_rejections_have_no_hints", scenario_daemon_prior_hint_rejections_have_no_hints),
-            ("daemon_prior_hint_aggregate_suffix", scenario_daemon_prior_hint_aggregate_suffix),
-            ("daemon_prior_hint_notice_safe_wording", scenario_daemon_prior_hint_notice_safe_wording),
-            ("daemon_prior_hint_same_pair_only", scenario_daemon_prior_hint_same_pair_only),
-            ("daemon_prior_hint_multi_target_partial", scenario_daemon_prior_hint_multi_target_partial),
-            ("daemon_prior_hint_current_prompt_only", scenario_daemon_prior_hint_current_prompt_only),
-            ("daemon_prior_hint_active_ctx_beats_pending_queue_row", scenario_daemon_prior_hint_active_ctx_beats_pending_queue_row),
-            ("prior_hint_classifier_drift_invariant", scenario_prior_hint_classifier_drift_invariant),
-            ("daemon_upsert_no_auto_return_watchdog_rejected", scenario_daemon_upsert_no_auto_return_watchdog_rejected),
-            ("daemon_register_alarm_rejects_non_finite_and_negative", scenario_daemon_register_alarm_rejects_non_finite_and_negative),
-            ("daemon_mark_message_delivered_ignores_non_finite_watchdog", scenario_daemon_mark_message_delivered_ignores_non_finite_watchdog),
-            ("daemon_no_auto_return_watchdog_arm_guard_strips", scenario_daemon_no_auto_return_watchdog_arm_guard_strips),
-            ("daemon_no_auto_return_watchdog_ingress_sanitizers", scenario_daemon_no_auto_return_watchdog_ingress_sanitizers),
-            ("daemon_socket_ack_message_unsupported_does_not_delete_queue", scenario_daemon_socket_ack_message_unsupported_does_not_delete_queue),
-            ("daemon_ack_message_helper_removed", scenario_daemon_ack_message_helper_removed),
-            ("stale_watchdog_skipped", scenario_stale_watchdog_skipped),
-            ("alarm_fire_text_includes_rearm_hint", scenario_alarm_fire_text_includes_rearm_hint),
-            ("watchdog_pending_text_omits_held_interrupt", scenario_watchdog_pending_text_omits_held_interrupt),
-            ("pane_mode_pending_defers_without_attempt", scenario_pane_mode_pending_defers_without_attempt),
-            ("pane_mode_clears_then_delivers", scenario_pane_mode_clears_then_delivers),
-            ("pane_mode_force_cancel_after_grace", scenario_pane_mode_force_cancel_after_grace),
-            ("pane_mode_nonforce_mode_stays_pending", scenario_pane_mode_nonforce_mode_stays_pending),
-            ("pane_mode_busy_target_does_not_start_timer", scenario_pane_mode_busy_target_does_not_start_timer),
-            ("retry_enter_skips_pane_mode", scenario_retry_enter_skips_pane_mode),
-            ("pane_mode_probe_failure_defers_pending", scenario_pane_mode_probe_failure_defers_pending),
-            ("pane_mode_force_cancel_failure_stays_pending", scenario_pane_mode_force_cancel_failure_stays_pending),
-            ("enter_deferred_survives_stale_requeue_and_restart", scenario_enter_deferred_survives_stale_requeue_and_restart),
-            ("pre_enter_probe_failure_defers_enter", scenario_pre_enter_probe_failure_defers_enter),
-            ("pane_mode_grace_zero_disables_cancel", scenario_pane_mode_grace_zero_disables_cancel),
-            ("wait_for_probe_retries_enter_with_pane_id", scenario_wait_for_probe_retries_enter_with_pane_id),
-            ("wait_for_probe_no_retry_without_pane_id", scenario_wait_for_probe_no_retry_without_pane_id),
-            ("detached_leave_explicit_cleanup", scenario_detached_leave_explicit_cleanup),
-            ("detached_leave_no_notice_when_only_inactive_remain", scenario_detached_leave_no_notice_when_only_inactive_remain),
-            ("detached_join_same_alias_same_pane", scenario_detached_join_same_alias_same_pane),
-            ("detached_join_same_alias_different_pane", scenario_detached_join_same_alias_different_pane),
-            ("detached_join_different_alias_same_pane_allowed", scenario_detached_join_different_alias_same_pane_allowed),
-            ("active_join_same_alias_still_rejected", scenario_active_join_same_alias_still_rejected),
-            ("join_blank_status_same_pane_still_rejected", scenario_join_blank_status_same_pane_still_rejected),
-            ("join_other_session_pane_lock_still_rejected", scenario_join_other_session_pane_lock_still_rejected),
-            ("join_probe_passes_pane_id_to_wait", scenario_join_probe_passes_pane_id_to_wait),
-            ("bridge_attach_start_daemon_argv_includes_from_start", scenario_bridge_attach_start_daemon_argv_includes_from_start),
-            ("bridge_daemon_ctl_start_subparser_accepts_from_start", scenario_bridge_daemon_ctl_start_subparser_accepts_from_start),
-            ("daemon_command_forwards_from_start", scenario_daemon_command_forwards_from_start),
-            ("daemon_command_ignores_legacy_max_hops", scenario_daemon_command_ignores_legacy_max_hops),
-            ("bridge_daemon_ctl_subcommands_reject_max_hops", scenario_bridge_daemon_ctl_subcommands_reject_max_hops),
-            ("bridge_daemon_rejects_max_hops_cli", scenario_bridge_daemon_rejects_max_hops_cli),
-            ("bridge_daemon_ctl_start_argv_includes_from_start_end_to_end", scenario_bridge_daemon_ctl_start_argv_includes_from_start_end_to_end),
-            ("daemon_follow_from_start_replays_prompt_submitted", scenario_daemon_follow_from_start_replays_prompt_submitted),
-            ("daemon_follow_from_start_false_skips_pre_existing_record", scenario_daemon_follow_from_start_false_skips_pre_existing_record),
-            ("daemon_follow_from_start_handles_self_daemon_started_safely", scenario_daemon_follow_from_start_handles_self_daemon_started_safely),
-            ("orphan_nonce_in_user_prompt", scenario_orphan_nonce_in_user_prompt),
-            ("prompt_intercept_request_notice_body", scenario_prompt_intercept_request_notice_body),
-            ("prompt_intercept_bridge_notice_no_source_notice", scenario_prompt_intercept_bridge_notice_no_source_notice),
-            ("prompt_intercept_response_guard_queue_allows", scenario_prompt_intercept_response_guard_queue_allows),
-            ("prompt_intercept_mixed_inflight_requeues", scenario_prompt_intercept_mixed_inflight_requeues),
-            ("prompt_submitted_duplicate_noop", scenario_prompt_submitted_duplicate_noop),
-            ("prompt_submitted_duplicate_without_nonce_noop", scenario_prompt_submitted_duplicate_without_nonce_noop),
-            ("prompt_intercept_aggregate_completes", scenario_prompt_intercept_aggregate_completes),
-            ("prompt_intercept_held_drain_noop", scenario_prompt_intercept_held_drain_noop),
-            ("held_drain_stale_stop_preserves_new_ctx", scenario_held_drain_stale_stop_preserves_new_ctx),
-            ("held_drain_missing_identity_does_not_clear_active_ctx", scenario_held_drain_missing_identity_does_not_clear_active_ctx),
-            ("held_drain_matching_prior_id_without_turn_still_clears_ctx", scenario_held_drain_matching_prior_id_without_turn_still_clears_ctx),
-            ("stale_hold_ignored_active_context_routes_normally", scenario_stale_hold_ignored_active_context_routes_normally),
-            ("stale_hold_old_stop_with_active_ctx_applies_a4_mismatch", scenario_stale_hold_old_stop_with_active_ctx_applies_a4_mismatch),
-            ("held_no_prior_id_with_active_ctx_classified_stale", scenario_held_no_prior_id_with_active_ctx_classified_stale),
-            ("held_matching_prior_id_turn_id_mismatch_falls_through_to_a4", scenario_held_matching_prior_id_turn_id_mismatch_falls_through_to_a4),
-            ("held_with_no_context_drain_still_works", scenario_held_with_no_context_drain_still_works),
-            ("held_matching_prior_id_with_matching_turn_drain_still_works", scenario_held_matching_prior_id_with_matching_turn_drain_still_works),
-            ("held_with_interrupted_tombstone_match_classify_first", scenario_held_with_interrupted_tombstone_match_classify_first),
-            ("aggregate_leg_unaffected_by_held_marker", scenario_aggregate_leg_unaffected_by_held_marker),
-            ("prompt_intercept_inflight_only_requeues", scenario_prompt_intercept_inflight_only_requeues),
-            ("consume_once_basic", scenario_consume_once_basic),
-            ("consume_once_empty_response", scenario_consume_once_empty_response),
-            ("empty_response_whitespace_only_routes_sentinel", scenario_empty_response_whitespace_only_routes_sentinel),
-            ("empty_response_preserves_nonempty_with_surrounding_whitespace", scenario_empty_response_preserves_nonempty_with_surrounding_whitespace),
-            ("empty_response_self_return_still_skipped", scenario_empty_response_self_return_still_skipped),
-            ("empty_response_auto_return_false_still_skipped", scenario_empty_response_auto_return_false_still_skipped),
-            ("empty_response_inactive_requester_still_skipped", scenario_empty_response_inactive_requester_still_skipped),
-            ("empty_response_unicode_whitespace_routes_sentinel", scenario_empty_response_unicode_whitespace_routes_sentinel),
-            ("nonce_mismatch_fail_closed", scenario_nonce_mismatch_fail_closed),
-            ("no_observed_nonce_with_candidate_fail_closed", scenario_no_observed_nonce_with_candidate_fail_closed),
-            ("daemon_restart_queue_scan", scenario_daemon_restart_queue_scan),
-            ("daemon_reload_inflight_idempotent", scenario_daemon_reload_inflight_idempotent),
-            ("ambiguous_inflight_fail_closed", scenario_ambiguous_inflight_fail_closed),
-            ("stale_reserved_orphan_swept", scenario_stale_reserved_orphan_swept),
-            ("held_drain_skips_consume_once", scenario_held_drain_skips_consume_once),
-            ("matching_nonce_contaminated_body_residual", scenario_matching_nonce_contaminated_body_documents_residual),
-            ("aggregate_consume_once_no_overwrite", scenario_aggregate_consume_once_no_overwrite),
-            ("empty_response_in_aggregate_path_unchanged", scenario_empty_response_in_aggregate_path_unchanged),
-            ("nonce_mismatch_stops_enter_retry", scenario_nonce_mismatch_stops_enter_retry),
-            ("nonce_missing_stops_enter_retry", scenario_nonce_missing_stops_enter_retry),
-            ("hook_logger_anchored_regex", scenario_hook_logger_anchored_regex),
-            ("turn_id_mismatch_preserves_ctx", scenario_turn_id_mismatch_preserves_ctx),
-            ("turn_id_mismatch_annotation_is_idempotent", scenario_turn_id_mismatch_annotation_is_idempotent),
-            ("turn_id_mismatch_matching_stop_before_expiry_cleans_normally", scenario_turn_id_mismatch_matching_stop_before_expiry_cleans_normally),
-            ("turn_id_mismatch_expiry_unblocks_target", scenario_turn_id_mismatch_expiry_unblocks_target),
-            ("turn_id_mismatch_expiry_waits_for_watchdog_deadline", scenario_turn_id_mismatch_expiry_waits_for_watchdog_deadline),
-            ("turn_id_mismatch_watchdog_fire_preserves_post_grace", scenario_turn_id_mismatch_watchdog_fire_preserves_post_grace),
-            ("turn_id_mismatch_aggregate_watchdog_fire_preserves_post_grace", scenario_turn_id_mismatch_aggregate_watchdog_fire_preserves_post_grace),
-            ("turn_id_mismatch_post_watchdog_grace_zero_allows_same_tick_expiry", scenario_turn_id_mismatch_post_watchdog_grace_zero_allows_same_tick_expiry),
-            ("turn_id_mismatch_extend_wait_before_fire_defers_without_stamp", scenario_turn_id_mismatch_extend_wait_before_fire_defers_without_stamp),
-            ("turn_id_mismatch_expiry_does_not_remove_non_delivered_queue_rows", scenario_turn_id_mismatch_expiry_does_not_remove_non_delivered_queue_rows),
-            ("turn_id_mismatch_aggregate_leg_expiry_no_synthetic_reply", scenario_turn_id_mismatch_aggregate_leg_expiry_no_synthetic_reply),
-            ("turn_id_mismatch_sweep_no_op_without_annotation", scenario_turn_id_mismatch_sweep_no_op_without_annotation),
-            ("turn_id_mismatch_sweep_no_op_after_normal_pop", scenario_turn_id_mismatch_sweep_no_op_after_normal_pop),
-            ("turn_id_mismatch_notice_ctx_follows_same_expiry", scenario_turn_id_mismatch_notice_ctx_follows_same_expiry),
-            ("short_id_format", scenario_short_id_format),
-            ("resolve_targets_single", scenario_resolve_targets_single),
-            ("resolve_targets_multi_basic", scenario_resolve_targets_multi_basic),
-            ("resolve_targets_order_preserved", scenario_resolve_targets_order_preserved),
-            ("resolve_targets_dedup", scenario_resolve_targets_dedup),
-            ("resolve_targets_strip_empties", scenario_resolve_targets_strip_empties),
-            ("resolve_targets_reserved_alone", scenario_resolve_targets_reserved_alone),
-            ("resolve_targets_reserved_mix_rejected", scenario_resolve_targets_reserved_mix_rejected),
-            ("resolve_targets_unknown_rejected", scenario_resolve_targets_unknown_rejected),
-            ("resolve_targets_sender_in_list_rejected", scenario_resolve_targets_sender_in_list_rejected),
-            ("resolve_targets_empty_after_strip_rejected", scenario_resolve_targets_empty_after_strip_rejected),
-            ("aggregate_trigger_request_multi", scenario_aggregate_trigger_request_multi),
-            ("aggregate_trigger_single_no", scenario_aggregate_trigger_single_no),
-            ("aggregate_trigger_notice_no", scenario_aggregate_trigger_notice_no),
-            ("aggregate_trigger_bridge_sender_no", scenario_aggregate_trigger_bridge_sender_no),
-            ("aggregate_trigger_no_auto_return_no", scenario_aggregate_trigger_no_auto_return_no),
-            ("enqueue_aggregate_metadata_modes", scenario_enqueue_aggregate_metadata_modes),
-            ("prune_keeps_recent_n", scenario_prune_keeps_recent_n),
-            ("prune_disabled_retention_zero", scenario_prune_disabled_retention_zero),
-            ("prune_below_retention", scenario_prune_below_retention),
-            ("prune_missing_forgotten_dir_safe", scenario_prune_missing_forgotten_dir_safe),
-            ("resolve_forgotten_retention_invalid_env", scenario_resolve_forgotten_retention_invalid_env),
-            ("queue_status_counts", scenario_queue_status_counts),
-            ("queue_status_counts_missing_file", scenario_queue_status_counts_missing_file),
-            ("uninstall_helper_print_paths", scenario_uninstall_helper_print_paths),
-            ("uninstall_helper_refuses_dangerous_path", scenario_uninstall_helper_refuses_dangerous_path),
-            ("uninstall_sh_dry_run_invokes_hook_helper_with_dry_run", scenario_uninstall_sh_dry_run_invokes_hook_helper_with_dry_run),
-            ("uninstall_sh_non_dry_run_removes_hook_entries", scenario_uninstall_sh_non_dry_run_removes_hook_entries),
-            ("uninstall_sh_keep_hooks_skips_helper_under_dry_run", scenario_uninstall_sh_keep_hooks_skips_helper_under_dry_run),
-            ("uninstall_sh_hook_helper_failure_aborts", scenario_uninstall_sh_hook_helper_failure_aborts),
-            ("direct_exec_targets_executable", scenario_direct_exec_targets_executable),
-            ("healthcheck_executable_helper_distinguishes_states", scenario_healthcheck_executable_helper_distinguishes_states),
-            ("python_env_override_removed_from_tracked_files", scenario_python_env_override_removed_from_tracked_files),
-            ("install_sh_python_version_gate", scenario_install_sh_python_version_gate),
-            ("bridge_healthcheck_sh_python_version_gate", scenario_bridge_healthcheck_sh_python_version_gate),
-            ("install_sh_chmods_target_or_fails", scenario_install_sh_chmods_target_or_fails),
-            ("install_sh_default_updates_shell_rc", scenario_install_sh_default_updates_shell_rc),
-            ("install_sh_shell_rc_dry_run_and_opt_out", scenario_install_sh_shell_rc_dry_run_and_opt_out),
-            ("install_sh_shell_rc_target_selection", scenario_install_sh_shell_rc_target_selection),
-            ("install_sh_shell_rc_backup_and_path_short_circuit", scenario_install_sh_shell_rc_backup_and_path_short_circuit),
-            ("install_sh_shell_quotes_bin_dir_metacharacters", scenario_install_sh_shell_quotes_bin_dir_metacharacters),
-            ("install_sh_shell_rc_replaces_existing_marker_block", scenario_install_sh_shell_rc_replaces_existing_marker_block),
-            ("install_sh_claude_editor_mode_missing_skips", scenario_install_sh_claude_editor_mode_missing_skips),
-            ("install_sh_claude_editor_mode_updates_with_backup", scenario_install_sh_claude_editor_mode_updates_with_backup),
-            ("install_sh_claude_editor_mode_updates_global_and_settings", scenario_install_sh_claude_editor_mode_updates_global_and_settings),
-            ("install_sh_claude_editor_mode_missing_global_updates_settings", scenario_install_sh_claude_editor_mode_missing_global_updates_settings),
-            ("install_sh_claude_editor_mode_invalid_global_still_updates_settings", scenario_install_sh_claude_editor_mode_invalid_global_still_updates_settings),
-            ("install_sh_claude_editor_mode_normal_noop", scenario_install_sh_claude_editor_mode_normal_noop),
-            ("install_sh_claude_editor_mode_absent_adds_root", scenario_install_sh_claude_editor_mode_absent_adds_root),
-            ("install_sh_claude_editor_mode_invalid_json_skips", scenario_install_sh_claude_editor_mode_invalid_json_skips),
-            ("install_sh_claude_editor_mode_invalid_utf8_skips", scenario_install_sh_claude_editor_mode_invalid_utf8_skips),
-            ("install_sh_claude_editor_mode_bom_skips", scenario_install_sh_claude_editor_mode_bom_skips),
-            ("install_sh_claude_editor_mode_non_object_skips", scenario_install_sh_claude_editor_mode_non_object_skips),
-            ("install_sh_claude_editor_mode_dry_run_no_write", scenario_install_sh_claude_editor_mode_dry_run_no_write),
-            ("install_sh_claude_editor_mode_preserves_mode", scenario_install_sh_claude_editor_mode_preserves_mode),
-            ("install_sh_claude_editor_mode_symlink_preserved", scenario_install_sh_claude_editor_mode_symlink_preserved),
-            ("install_sh_claude_editor_mode_nested_root_absent_warns_skips", scenario_install_sh_claude_editor_mode_nested_root_absent_warns_skips),
-            ("install_sh_claude_editor_mode_nested_with_root_warns_updates_root_only", scenario_install_sh_claude_editor_mode_nested_with_root_warns_updates_root_only),
-            ("install_sh_claude_editor_mode_skip_flag_no_write", scenario_install_sh_claude_editor_mode_skip_flag_no_write),
-            ("install_sh_claude_editor_mode_broken_symlink_warns", scenario_install_sh_claude_editor_mode_broken_symlink_warns),
-            ("install_sh_claude_editor_mode_concurrent_change_aborts", scenario_install_sh_claude_editor_mode_concurrent_change_aborts),
-            ("install_sh_hook_failure_hard_fails", scenario_install_sh_hook_failure_hard_fails),
-            ("install_sh_hook_failure_ignore_flag_allows_success", scenario_install_sh_hook_failure_ignore_flag_allows_success),
-            ("install_sh_hook_dry_run_failure_hard_fails", scenario_install_sh_hook_dry_run_failure_hard_fails),
-            ("install_sh_hook_success_succeeds", scenario_install_sh_hook_success_succeeds),
-            ("install_sh_shim_failure_still_hard_fails_under_override", scenario_install_sh_shim_failure_still_hard_fails_under_override),
-            ("install_sh_skip_hooks_with_ignore_flag_is_noop", scenario_install_sh_skip_hooks_with_ignore_flag_is_noop),
-            ("bridge_install_hooks_rejects_malformed_json_without_overwrite", scenario_bridge_install_hooks_rejects_malformed_json_without_overwrite),
-            ("bridge_install_hooks_rejects_non_object_json_without_overwrite", scenario_bridge_install_hooks_rejects_non_object_json_without_overwrite),
-            ("bridge_install_hooks_dry_run_invalid_json_fails_without_overwrite", scenario_bridge_install_hooks_dry_run_invalid_json_fails_without_overwrite),
-            ("bridge_install_hooks_missing_json_still_creates", scenario_bridge_install_hooks_missing_json_still_creates),
-            ("bridge_install_hooks_invalid_utf8_fails_without_overwrite", scenario_bridge_install_hooks_invalid_utf8_fails_without_overwrite),
-            ("bridge_install_hooks_existing_valid_json_object_merges_correctly", scenario_bridge_install_hooks_existing_valid_json_object_merges_correctly),
-            ("bridge_install_hooks_codex_hooks_rejects_malformed_json_without_overwrite", scenario_bridge_install_hooks_codex_hooks_rejects_malformed_json_without_overwrite),
-            ("bridge_install_hooks_codex_config_ignores_nested_codex_hooks", scenario_bridge_install_hooks_codex_config_ignores_nested_codex_hooks),
-            ("bridge_install_hooks_codex_config_ignores_nested_disable_paste_burst", scenario_bridge_install_hooks_codex_config_ignores_nested_disable_paste_burst),
-            ("bridge_install_hooks_codex_config_updates_only_scoped_keys", scenario_bridge_install_hooks_codex_config_updates_only_scoped_keys),
-            ("bridge_install_hooks_codex_config_inserts_features_key_before_next_table", scenario_bridge_install_hooks_codex_config_inserts_features_key_before_next_table),
-            ("bridge_install_hooks_codex_config_dry_run_no_write", scenario_bridge_install_hooks_codex_config_dry_run_no_write),
-            ("bridge_install_hooks_codex_config_empty_features_section_inserts", scenario_bridge_install_hooks_codex_config_empty_features_section_inserts),
-            ("bridge_install_hooks_codex_config_first_table_is_array_table", scenario_bridge_install_hooks_codex_config_first_table_is_array_table),
-            ("bridge_install_hooks_codex_config_table_header_with_trailing_comment", scenario_bridge_install_hooks_codex_config_table_header_with_trailing_comment),
-            ("bridge_install_hooks_codex_config_commented_out_assignments_ignored", scenario_bridge_install_hooks_codex_config_commented_out_assignments_ignored),
-            ("bridge_install_hooks_codex_config_no_trailing_newline_handled", scenario_bridge_install_hooks_codex_config_no_trailing_newline_handled),
-            ("bridge_install_hooks_codex_config_already_enabled_is_byte_unchanged", scenario_bridge_install_hooks_codex_config_already_enabled_is_byte_unchanged),
-            ("codex_config_marker_records_and_uninstall_restores_updated_values", scenario_codex_config_marker_records_and_uninstall_restores_updated_values),
-            ("codex_config_marker_records_inserted_keys_and_uninstall_removes_them", scenario_codex_config_marker_records_inserted_keys_and_uninstall_removes_them),
-            ("codex_config_missing_created_by_install_removed_on_uninstall_when_bridge_only", scenario_codex_config_missing_created_by_install_removed_on_uninstall_when_bridge_only),
-            ("codex_config_already_enabled_keys_create_no_marker", scenario_codex_config_already_enabled_keys_create_no_marker),
-            ("codex_config_reinstall_preserves_original_marker", scenario_codex_config_reinstall_preserves_original_marker),
-            ("codex_config_user_changed_after_install_is_not_clobbered", scenario_codex_config_user_changed_after_install_is_not_clobbered),
-            ("codex_config_dry_run_install_writes_no_marker_or_config", scenario_codex_config_dry_run_install_writes_no_marker_or_config),
-            ("codex_config_dry_run_uninstall_with_marker_writes_no_config_or_marker", scenario_codex_config_dry_run_uninstall_with_marker_writes_no_config_or_marker),
-            ("codex_config_skip_codex_does_not_touch_config_or_marker", scenario_codex_config_skip_codex_does_not_touch_config_or_marker),
-            ("codex_config_uninstall_with_malformed_marker_aborts_clean", scenario_codex_config_uninstall_with_malformed_marker_aborts_clean),
-            ("codex_config_uninstall_with_unknown_marker_version_aborts", scenario_codex_config_uninstall_with_unknown_marker_version_aborts),
-            ("codex_config_uninstall_with_marker_path_mismatch_aborts", scenario_codex_config_uninstall_with_marker_path_mismatch_aborts),
-            ("codex_config_uninstall_with_unknown_flag_key_aborts", scenario_codex_config_uninstall_with_unknown_flag_key_aborts),
-            ("codex_config_uninstall_with_invalid_operation_aborts", scenario_codex_config_uninstall_with_invalid_operation_aborts),
-            ("codex_config_uninstall_with_updated_missing_original_line_aborts", scenario_codex_config_uninstall_with_updated_missing_original_line_aborts),
-            ("codex_config_marker_write_failure_aborts_before_config_write", scenario_codex_config_marker_write_failure_aborts_before_config_write),
-            ("codex_config_inserted_features_section_with_user_added_keys_keeps_section", scenario_codex_config_inserted_features_section_with_user_added_keys_keeps_section),
-            ("codex_config_existing_empty_config_records_existed_true_and_uninstall_keeps_it", scenario_codex_config_existing_empty_config_records_existed_true_and_uninstall_keeps_it),
-            ("codex_config_marker_normalized_path_accepts_equivalent_path", scenario_codex_config_marker_normalized_path_accepts_equivalent_path),
-            ("restart_dry_run_no_side_effect", scenario_restart_dry_run_no_side_effect),
-            ("recover_orphan_delivered", scenario_recover_orphan_delivered),
-            ("recover_orphan_delivered_aggregate_member", scenario_recover_orphan_delivered_aggregate_member),
-            ("prune_concurrent_stat_safe", scenario_prune_concurrent_stat_safe),
-            ("format_peer_list_model_safe_default", scenario_format_peer_list_model_safe_default),
-            ("format_peer_list_full_includes_operator_fields", scenario_format_peer_list_full_includes_operator_fields),
-            ("bridge_manage_summary_concise", scenario_bridge_manage_summary_concise),
-            ("bridge_manage_summary_defaults", scenario_bridge_manage_summary_defaults),
-            ("bridge_manage_summary_legacy_state_fallback", scenario_bridge_manage_summary_legacy_state_fallback),
-            ("bridge_manage_summary_missing_session_exits", scenario_bridge_manage_summary_missing_session_exits),
-            ("model_safe_participants_strips_endpoints", scenario_model_safe_participants_strips_endpoints),
-            ("model_safe_participants_uses_active_only", scenario_model_safe_participants_uses_active_only),
-            ("list_peers_json_daemon_status_strips_pid", scenario_list_peers_json_daemon_status_strips_pid),
-            ("view_peer_rejects_snapshot_without_snapshot_mode", scenario_view_peer_rejects_snapshot_without_snapshot_mode),
-            ("view_peer_rejects_page_with_since_last_or_search", scenario_view_peer_rejects_page_with_since_last_or_search),
-            ("view_peer_allows_page_in_live_onboard_older_and_snapshot_in_older_search", scenario_view_peer_allows_page_in_live_onboard_older_and_snapshot_in_older_search),
-            ("view_peer_rejects_empty_search_before_session_lookup", scenario_view_peer_rejects_empty_search_before_session_lookup),
-            ("view_peer_empty_search_counts_as_search_for_mode_errors", scenario_view_peer_empty_search_counts_as_search_for_mode_errors),
-            ("view_peer_nonempty_search_still_reaches_validation", scenario_view_peer_nonempty_search_still_reaches_validation),
-            ("view_peer_search_with_page_after_a19_reports_page_error", scenario_view_peer_search_with_page_after_a19_reports_page_error),
-            ("view_peer_doc_surfaces_disclose_search_semantics", scenario_view_peer_doc_surfaces_disclose_search_semantics),
-            ("interrupt_peer_doc_surfaces_disclose_no_op_race", scenario_interrupt_peer_doc_surfaces_disclose_no_op_race),
-            ("interrupt_peer_doc_surfaces_no_queued_active_directive", scenario_interrupt_peer_doc_surfaces_no_queued_active_directive),
-            ("prompt_intercepted_doc_surfaces_disclose_user_typing_collision", scenario_prompt_intercepted_doc_surfaces_disclose_user_typing_collision),
-            ("response_send_guard_doc_surfaces_are_precise", scenario_response_send_guard_doc_surfaces_are_precise),
-            ("probe_prompt_is_compact_quickstart", scenario_probe_prompt_is_compact_quickstart),
-            ("send_peer_wait_doc_surfaces_name_blocking_consequence", scenario_send_peer_wait_doc_surfaces_name_blocking_consequence),
-            ("watchdog_phase_doc_surfaces_are_consistent", scenario_watchdog_phase_doc_surfaces_are_consistent),
-            ("wait_status_doc_surfaces_anti_polling", scenario_wait_status_doc_surfaces_anti_polling),
-            ("aggregate_status_doc_surfaces_leg_level_and_anti_polling", scenario_aggregate_status_doc_surfaces_leg_level_and_anti_polling),
-            ("view_peer_render_output_model_safe", scenario_view_peer_render_output_model_safe),
-            ("view_peer_search_explicit_snapshot_uses_safe_ref", scenario_view_peer_search_explicit_snapshot_uses_safe_ref),
-            ("view_peer_snapshot_ref_collision_unique", scenario_view_peer_snapshot_ref_collision_unique),
-            ("view_peer_capture_errors_sanitized", scenario_view_peer_capture_errors_sanitized),
-            ("view_peer_snapshot_not_found_hides_full_id", scenario_view_peer_snapshot_not_found_hides_full_id),
-            ("view_peer_since_last_matches_changed_volatile_chrome", scenario_view_peer_since_last_matches_changed_volatile_chrome),
-            ("view_peer_since_last_legacy_tail_derives_stable_anchor", scenario_view_peer_since_last_legacy_tail_derives_stable_anchor),
-            ("view_peer_since_last_ambiguous_current_anchor_skips_to_unique", scenario_view_peer_since_last_ambiguous_current_anchor_skips_to_unique),
-            ("view_peer_since_last_matches_anchor_before_long_delta", scenario_view_peer_since_last_matches_anchor_before_long_delta),
-            ("view_peer_since_last_build_rejects_duplicate_previous_window", scenario_view_peer_since_last_build_rejects_duplicate_previous_window),
-            ("view_peer_since_last_uncertain_does_not_advance_cursor", scenario_view_peer_since_last_uncertain_does_not_advance_cursor),
-            ("view_peer_since_last_upgrade_reset_when_no_legacy_anchor", scenario_view_peer_since_last_upgrade_reset_when_no_legacy_anchor),
-            ("view_peer_since_last_low_info_lines_do_not_anchor", scenario_view_peer_since_last_low_info_lines_do_not_anchor),
-            ("view_peer_since_last_claude_status_variants_are_volatile", scenario_view_peer_since_last_claude_status_variants_are_volatile),
-            ("view_peer_since_last_status_classifier_preserves_prose", scenario_view_peer_since_last_status_classifier_preserves_prose),
-            ("view_peer_since_last_claude_status_lines_do_not_anchor", scenario_view_peer_since_last_claude_status_lines_do_not_anchor),
-            ("view_peer_since_last_filters_stored_volatile_anchor_lines", scenario_view_peer_since_last_filters_stored_volatile_anchor_lines),
-            ("view_peer_since_last_skips_shortened_stored_anchor_that_fails_quality", scenario_view_peer_since_last_skips_shortened_stored_anchor_that_fails_quality),
-            ("view_peer_since_last_volatile_only_claude_status_delta", scenario_view_peer_since_last_volatile_only_claude_status_delta),
-            ("view_peer_since_last_codex_status_variants_preserved", scenario_view_peer_since_last_codex_status_variants_preserved),
-            ("view_peer_since_last_volatile_only_delta", scenario_view_peer_since_last_volatile_only_delta),
-            ("view_peer_since_last_short_delta_consumed_once", scenario_view_peer_since_last_short_delta_consumed_once),
-            ("view_peer_since_last_request_plus_short_reply_consumed_after_cursor_update", scenario_view_peer_since_last_request_plus_short_reply_consumed_after_cursor_update),
-            ("view_peer_since_last_consumed_tail_does_not_hide_new_duplicate", scenario_view_peer_since_last_consumed_tail_does_not_hide_new_duplicate),
-            ("view_peer_since_last_consumed_tail_anchor_change_resets", scenario_view_peer_since_last_consumed_tail_anchor_change_resets),
-            ("view_peer_since_last_consumed_tail_mismatch_clears", scenario_view_peer_since_last_consumed_tail_mismatch_clears),
-            ("view_peer_since_last_consumed_tail_cap", scenario_view_peer_since_last_consumed_tail_cap),
-            ("view_peer_since_last_consumed_tail_ignores_volatile_churn", scenario_view_peer_since_last_consumed_tail_ignores_volatile_churn),
-            ("view_peer_since_last_codex_prompt_placeholder_not_anchor", scenario_view_peer_since_last_codex_prompt_placeholder_not_anchor),
-            ("view_peer_since_last_filters_stored_codex_prompt_placeholder_anchor", scenario_view_peer_since_last_filters_stored_codex_prompt_placeholder_anchor),
-            ("view_peer_since_last_preserves_codex_bridge_prompt_lines", scenario_view_peer_since_last_preserves_codex_bridge_prompt_lines),
-            ("view_peer_since_last_preserves_trailing_semantic_codex_arrow", scenario_view_peer_since_last_preserves_trailing_semantic_codex_arrow),
-            ("view_peer_since_last_preserves_semantic_codex_arrow_before_footer", scenario_view_peer_since_last_preserves_semantic_codex_arrow_before_footer),
-            ("view_peer_since_last_claude_partial_status_fragments_are_volatile", scenario_view_peer_since_last_claude_partial_status_fragments_are_volatile),
-            ("view_peer_since_last_partial_status_preserves_prose", scenario_view_peer_since_last_partial_status_preserves_prose),
-            ("endpoint_rejects_stale_pane_lock_without_live", scenario_endpoint_rejects_stale_pane_lock_without_live),
-            ("endpoint_rejects_same_pane_new_live_identity", scenario_endpoint_rejects_same_pane_new_live_identity),
-            ("endpoint_probe_unknown_does_not_mutate", scenario_endpoint_probe_unknown_does_not_mutate),
-            ("endpoint_accepts_matching_process_fingerprint", scenario_endpoint_accepts_matching_process_fingerprint),
-            ("backfill_refuses_to_mint_without_live_record", scenario_backfill_refuses_to_mint_without_live_record),
-            ("backfill_refuses_other_live_identity", scenario_backfill_refuses_other_live_identity),
-            ("backfill_rejects_changed_process_fingerprint", scenario_backfill_rejects_changed_process_fingerprint),
-            ("backfill_allows_fresh_hook_proof_create", scenario_backfill_allows_fresh_hook_proof_create),
-            ("backfill_fresh_probe_repairs_unscoped_live_mismatch", scenario_backfill_fresh_probe_repairs_unscoped_live_mismatch),
-            ("unscoped_hook_canonicalizes_via_pane_lock", scenario_unscoped_hook_canonicalizes_via_pane_lock),
-            ("unscoped_hook_canonicalizes_during_attach_gap", scenario_unscoped_hook_canonicalizes_during_attach_gap),
-            ("unscoped_hook_canonicalizes_via_attached_registry", scenario_unscoped_hook_canonicalizes_via_attached_registry),
-            ("unscoped_hook_new_process_fails_closed", scenario_unscoped_hook_new_process_fails_closed),
-            ("unscoped_hook_cross_reboot_fails_closed", scenario_unscoped_hook_cross_reboot_fails_closed),
-            ("unscoped_hook_missing_prior_fingerprint_fails_closed", scenario_unscoped_hook_missing_prior_fingerprint_fails_closed),
-            ("unscoped_hook_different_agent_fails_closed", scenario_unscoped_hook_different_agent_fails_closed),
-            ("unscoped_hook_same_session_no_canonicalization_event", scenario_unscoped_hook_same_session_no_canonicalization_event),
-            ("scoped_different_session_no_canonicalization", scenario_scoped_different_session_no_canonicalization),
-            ("session_ended_payload_mismatch_no_canonicalization", scenario_session_ended_payload_mismatch_no_canonicalization),
-            ("resolver_reconnects_exact_mismatch_shape", scenario_resolver_reconnects_exact_mismatch_shape),
-            ("hook_reconnects_exact_mismatch_shape", scenario_hook_reconnects_exact_mismatch_shape),
-            ("cross_pane_candidate_mismatch_blocks_reconnect", scenario_cross_pane_candidate_mismatch_blocks_reconnect),
-            ("codex1_incident_replay_canonicalizes_repeated_unscoped_hooks", scenario_codex1_incident_replay_canonicalizes_repeated_unscoped_hooks),
-            ("target_recovery_reconnects_stale_pane_by_codex_transcript", scenario_target_recovery_reconnects_stale_pane_by_codex_transcript),
-            ("target_recovery_blocks_transcript_session_mismatch", scenario_target_recovery_blocks_transcript_session_mismatch),
-            ("target_recovery_blocks_missing_transcript", scenario_target_recovery_blocks_missing_transcript),
-            ("target_recovery_blocks_wrong_pid_transcript", scenario_target_recovery_blocks_wrong_pid_transcript),
-            ("target_recovery_blocks_different_agent_at_target", scenario_target_recovery_blocks_different_agent_at_target),
-            ("target_recovery_blocks_same_pane_target", scenario_target_recovery_blocks_same_pane_target),
-            ("target_recovery_blocks_unresolvable_target", scenario_target_recovery_blocks_unresolvable_target),
-            ("target_recovery_skips_without_participant_target", scenario_target_recovery_skips_without_participant_target),
-            ("target_recovery_read_purpose_does_not_mutate", scenario_target_recovery_read_purpose_does_not_mutate),
-            ("target_recovery_env_disable_blocks", scenario_target_recovery_env_disable_blocks),
-            ("tmux_display_pane_empty_metadata_is_unavailable", scenario_tmux_display_pane_empty_metadata_is_unavailable),
-            ("codex_rollout_path_regex_is_strict", scenario_codex_rollout_path_regex_is_strict),
-            ("target_recovery_only_matching_alias_recovers", scenario_target_recovery_only_matching_alias_recovers),
-            ("hook_unknown_preserves_verified_process_identity", scenario_hook_unknown_preserves_verified_process_identity),
-            ("probe_tmux_access_failure_unknown", scenario_probe_tmux_access_failure_unknown),
-            ("endpoint_read_mismatch_does_not_mutate", scenario_endpoint_read_mismatch_does_not_mutate),
-            ("verified_candidate_ordering_prefers_pane_then_newest", scenario_verified_candidate_ordering_prefers_pane_then_newest),
-            ("resume_new_pane_reconnects_unknown_old_and_logs", scenario_resume_new_pane_reconnects_unknown_old_and_logs),
-            ("resume_unknown_old_opt_out_blocks_switch", scenario_resume_unknown_old_opt_out_blocks_switch),
-            ("hook_cached_prior_unknown_does_not_reconnect", scenario_hook_cached_prior_unknown_does_not_reconnect),
-            ("resolver_reconnects_to_alternate_verified_live_record", scenario_resolver_reconnects_to_alternate_verified_live_record),
-            ("resolver_candidate_unknown_on_final_probe_does_not_reconnect", scenario_resolver_candidate_unknown_on_final_probe_does_not_reconnect),
-            ("resolver_read_reconnect_logs_distinct_reason", scenario_resolver_read_reconnect_logs_distinct_reason),
-            ("session_end_replacement_uses_verified_candidate", scenario_session_end_replacement_uses_verified_candidate),
-            ("reconnect_rereads_mapping_before_write", scenario_reconnect_rereads_mapping_before_write),
-            ("caller_reconnects_from_resumed_pane", scenario_caller_reconnects_from_resumed_pane),
-            ("no_probe_requires_verified_live_identity", scenario_no_probe_requires_verified_live_identity),
-            ("daemon_undeliverable_request_returns_result", scenario_daemon_undeliverable_request_returns_result),
-            ("interrupt_endpoint_lost_finalizes_delivered_non_aggregate", scenario_interrupt_endpoint_lost_finalizes_delivered_non_aggregate),
-            ("interrupt_endpoint_lost_finalizes_delivered_aggregate", scenario_interrupt_endpoint_lost_finalizes_delivered_aggregate),
-            ("retry_enter_endpoint_lost_does_not_press_enter", scenario_retry_enter_endpoint_lost_does_not_press_enter),
-            ("direct_notices_suppress_unverified_endpoint", scenario_direct_notices_suppress_unverified_endpoint),
-            ("view_peer_unverified_endpoint_uses_daemon_not_local_capture", scenario_view_peer_unverified_endpoint_uses_daemon_not_local_capture),
-            ("daemon_startup_backfill_summary_logs_repair_hint", scenario_daemon_startup_backfill_summary_logs_repair_hint),
-            ("peer_body_size_helper_boundaries", scenario_peer_body_size_helper_boundaries),
-            ("send_peer_rejects_oversized_body_before_subprocess", scenario_send_peer_rejects_oversized_body_before_subprocess),
-            ("send_peer_watchdog_notice_inf_reports_finite_error_first_at_shim", scenario_send_peer_watchdog_notice_inf_reports_finite_error_first_at_shim),
-            ("send_peer_watchdog_notice_zero_still_rejects_request_only_at_shim", scenario_send_peer_watchdog_notice_zero_still_rejects_request_only_at_shim),
-            ("send_peer_watchdog_bare_minus_inf_argparse_error_at_shim", scenario_send_peer_watchdog_bare_minus_inf_argparse_error_at_shim),
-            ("send_peer_watchdog_equals_minus_inf_reports_finite_error_at_shim", scenario_send_peer_watchdog_equals_minus_inf_reports_finite_error_at_shim),
-            ("send_peer_watchdog_finite_value_forwarded_with_equals", scenario_send_peer_watchdog_finite_value_forwarded_with_equals),
-            ("send_peer_body_input_diagnostics_are_specific", scenario_send_peer_body_input_diagnostics_are_specific),
-            ("send_peer_rejects_split_inline_body", scenario_send_peer_rejects_split_inline_body),
-            ("send_peer_rejects_implicit_split_inline_body", scenario_send_peer_rejects_implicit_split_inline_body),
-            ("send_peer_accepts_option_after_destination_with_stdin", scenario_send_peer_accepts_option_after_destination_with_stdin),
-            ("send_peer_accepts_option_after_implicit_target_with_stdin", scenario_send_peer_accepts_option_after_implicit_target_with_stdin),
-            ("send_peer_accepts_options_after_destination_before_inline_body", scenario_send_peer_accepts_options_after_destination_before_inline_body),
-            ("send_peer_rejects_option_after_inline_body", scenario_send_peer_rejects_option_after_inline_body),
-            ("send_peer_rejects_duplicate_destination_after_destination", scenario_send_peer_rejects_duplicate_destination_after_destination),
-            ("send_peer_implicit_target_option_without_body_reports_body_required", scenario_send_peer_implicit_target_option_without_body_reports_body_required),
-            ("send_peer_rejects_allow_spoof_after_implicit_target", scenario_send_peer_rejects_allow_spoof_after_implicit_target),
-            ("send_peer_single_inline_body_uses_stdin_handoff", scenario_send_peer_single_inline_body_uses_stdin_handoff),
-            ("send_peer_request_success_prints_anti_wait_hint", scenario_send_peer_request_success_prints_anti_wait_hint),
-            ("send_peer_prior_hint_precedes_success_hint", scenario_send_peer_prior_hint_precedes_success_hint),
-            ("send_peer_notice_success_prints_alarm_and_anti_wait_hints", scenario_send_peer_notice_success_prints_alarm_and_anti_wait_hints),
-            ("send_peer_aggregate_request_success_prints_result_hint", scenario_send_peer_aggregate_request_success_prints_result_hint),
-            ("send_peer_subprocess_failure_prints_no_success_hint", scenario_send_peer_subprocess_failure_prints_no_success_hint),
-            ("send_peer_ambient_socket_stdin_does_not_block", scenario_send_peer_ambient_socket_stdin_does_not_block),
-            ("send_peer_inline_body_accepts_empty_non_tty_stdin", scenario_send_peer_inline_body_accepts_empty_non_tty_stdin),
-            ("send_peer_explicit_stdin_multibyte_body", scenario_send_peer_explicit_stdin_multibyte_body),
-            ("send_peer_implicit_target_allows_stdin", scenario_send_peer_implicit_target_allows_stdin),
-            ("send_peer_implicit_target_resolves_session_from_pane", scenario_send_peer_implicit_target_resolves_session_from_pane),
-            ("send_peer_implicit_target_stdin_resolves_session_from_pane", scenario_send_peer_implicit_target_stdin_resolves_session_from_pane),
-            ("send_peer_precheck_fails_open_identity_errors_owned_by_validator", scenario_send_peer_precheck_fails_open_identity_errors_owned_by_validator),
-            ("send_peer_allow_spoof_requires_explicit_destination_without_session", scenario_send_peer_allow_spoof_requires_explicit_destination_without_session),
-            ("send_peer_rejects_allow_spoof_attached_value", scenario_send_peer_rejects_allow_spoof_attached_value),
-            ("send_peer_all_rejects_leading_alias_body", scenario_send_peer_all_rejects_leading_alias_body),
-            ("send_peer_rejects_stdin_with_positional_body", scenario_send_peer_rejects_stdin_with_positional_body),
-            ("send_peer_rejects_pipe_with_positional_body", scenario_send_peer_rejects_pipe_with_positional_body),
-            ("send_peer_pipe_only_body_still_supported", scenario_send_peer_pipe_only_body_still_supported),
-            ("send_peer_precheck_option_table_matches_parser", scenario_send_peer_precheck_option_table_matches_parser),
-            ("enqueue_rejects_body_and_stdin_before_session_lookup", scenario_enqueue_rejects_body_and_stdin_before_session_lookup),
-            ("enqueue_rejects_empty_body_and_stdin", scenario_enqueue_rejects_empty_body_and_stdin),
-            ("enqueue_rejects_body_and_stdin_argv_order_independent", scenario_enqueue_rejects_body_and_stdin_argv_order_independent),
-            ("enqueue_body_only_still_works", scenario_enqueue_body_only_still_works),
-            ("enqueue_stdin_only_still_works", scenario_enqueue_stdin_only_still_works),
-            ("enqueue_aggregate_stdout_socket_and_fallback", scenario_enqueue_aggregate_stdout_socket_and_fallback),
-            ("enqueue_aggregate_stdout_all_and_negative_cases", scenario_enqueue_aggregate_stdout_all_and_negative_cases),
-            ("enqueue_bare_body_without_value_remains_argparse_owned", scenario_enqueue_bare_body_without_value_remains_argparse_owned),
-            ("enqueue_rejects_oversized_body_unchanged", scenario_enqueue_rejects_oversized_body_unchanged),
-            ("enqueue_stdin_rejects_oversized_body_unchanged", scenario_enqueue_stdin_rejects_oversized_body_unchanged),
-            ("enqueue_socket_success_hints_stderr_stdout_unchanged", scenario_enqueue_socket_success_hints_stderr_stdout_unchanged),
-            ("enqueue_fallback_prior_hint_pending_cancel", scenario_enqueue_fallback_prior_hint_pending_cancel),
-            ("enqueue_fallback_prior_hint_submitted_interrupt", scenario_enqueue_fallback_prior_hint_submitted_interrupt),
-            ("enqueue_fallback_prior_hint_plain_inflight_omitted", scenario_enqueue_fallback_prior_hint_plain_inflight_omitted),
-            ("enqueue_fallback_prior_hint_pane_mode_inflight_cancel", scenario_enqueue_fallback_prior_hint_pane_mode_inflight_cancel),
-            ("enqueue_fallback_prior_hint_write_failure_suppresses_hint", scenario_enqueue_fallback_prior_hint_write_failure_suppresses_hint),
-            ("enqueue_fallback_response_send_guard_no_hint", scenario_enqueue_fallback_response_send_guard_no_hint),
-            ("alarm_cancel_preserves_at_limit_body", scenario_alarm_cancel_preserves_at_limit_body),
-            ("prompt_body_preserves_multiline_and_sanitizes", scenario_prompt_body_preserves_multiline_and_sanitizes),
-            ("build_peer_prompt_signature_drops_max_hops", scenario_build_peer_prompt_signature_drops_max_hops),
-            ("tmux_paste_buffer_delivery_sequence", scenario_tmux_paste_buffer_delivery_sequence),
-            ("daemon_logs_body_truncated_for_legacy_long_body", scenario_daemon_logs_body_truncated_for_legacy_long_body),
-            ("peer_result_redirect_single_over_limit", scenario_peer_result_redirect_single_over_limit),
-            ("peer_result_redirect_restart_queue_roundtrip", scenario_peer_result_redirect_restart_queue_roundtrip),
-            ("peer_result_redirect_below_limit_inline", scenario_peer_result_redirect_below_limit_inline),
-            ("peer_result_redirect_write_failure_fallback", scenario_peer_result_redirect_write_failure_fallback),
-            ("peer_result_redirect_collision_and_symlink_safe", scenario_peer_result_redirect_collision_and_symlink_safe),
-            ("peer_result_redirect_share_root_owner_mismatch", scenario_peer_result_redirect_share_root_owner_mismatch),
-            ("peer_result_redirect_replies_permission_drift_tightened", scenario_peer_result_redirect_replies_permission_drift_tightened),
-            ("peer_result_redirect_logs_reduced_preview_chars", scenario_peer_result_redirect_logs_reduced_preview_chars),
-            ("peer_result_redirect_malformed_message_id_safe_filename", scenario_peer_result_redirect_malformed_message_id_safe_filename),
-            ("peer_result_redirect_aggregate_unique_once", scenario_peer_result_redirect_aggregate_unique_once),
-            ("response_send_guard_socket_cli_error_kind", scenario_response_send_guard_socket_cli_error_kind),
-            ("response_send_guard_socket_error_kind_parse", scenario_response_send_guard_socket_error_kind_parse),
-            ("enqueue_fallback_success_silent_with_raw_diagnostic", scenario_enqueue_fallback_success_silent_with_raw_diagnostic),
-            ("enqueue_fallback_write_failure_preserves_stderr", scenario_enqueue_fallback_write_failure_preserves_stderr),
-            ("response_send_guard_fallback_blocks_unchanged", scenario_response_send_guard_fallback_blocks_unchanged),
-            ("response_send_guard_fallback_all_blocks_unchanged", scenario_response_send_guard_fallback_all_blocks_unchanged),
-            ("response_send_guard_fallback_partial_blocks_unchanged", scenario_response_send_guard_fallback_partial_blocks_unchanged),
-            ("response_send_guard_fallback_force_allows", scenario_response_send_guard_fallback_force_allows),
-            ("response_send_guard_fallback_no_auto_return_allowed", scenario_response_send_guard_fallback_no_auto_return_allowed),
-            ("response_send_guard_fallback_false_positive_resistance", scenario_response_send_guard_fallback_false_positive_resistance),
-            ("clear_reservation_blocks_delivery", scenario_clear_reservation_blocks_delivery),
-            ("clear_guard_formatter_force_guidance", scenario_clear_guard_formatter_force_guidance),
-            ("clear_guard_force_truth_matches_policy", scenario_clear_guard_force_truth_matches_policy),
-            ("clear_multi_guard_pass_reserves_all", scenario_clear_multi_guard_pass_reserves_all),
-            ("clear_multi_guard_hard_blocker_rejects_all", scenario_clear_multi_guard_hard_blocker_rejects_all),
-            ("clear_multi_guard_soft_blocker_rejects_all", scenario_clear_multi_guard_soft_blocker_rejects_all),
-            ("clear_multi_partial_outcomes_and_cleanup", scenario_clear_multi_partial_outcomes_and_cleanup),
-            ("clear_multi_pre_pane_failure_continues", scenario_clear_multi_pre_pane_failure_continues),
-            ("clear_multi_forced_leave_notice_waits_behind_reservation", scenario_clear_multi_forced_leave_notice_waits_behind_reservation),
-            ("clear_multi_lock_wait_failed_and_rerun", scenario_clear_multi_lock_wait_failed_and_rerun),
-            ("clear_multi_real_post_touch_exception_forces_leave", scenario_clear_multi_real_post_touch_exception_forces_leave),
-            ("clear_multi_real_success_holds_until_batch_end", scenario_clear_multi_real_success_holds_until_batch_end),
-            ("clear_multi_real_pre_pane_failure_holds_until_batch_end", scenario_clear_multi_real_pre_pane_failure_holds_until_batch_end),
-            ("clear_guard_blocks_pending_self_clear", scenario_clear_guard_blocks_pending_self_clear),
-            ("clear_multi_daemon_validation", scenario_clear_multi_daemon_validation),
-            ("clear_peer_cli_multi_and_compatibility", scenario_clear_peer_cli_multi_and_compatibility),
-            ("clear_multi_timeout_and_formatter", scenario_clear_multi_timeout_and_formatter),
-            ("self_clear_force_guidance_and_preserved_force", scenario_self_clear_force_guidance_and_preserved_force),
-            ("requester_cleared_prompt_guard_and_notice", scenario_requester_cleared_prompt_guard_and_notice),
-            ("clear_marker_routes_fast_stop", scenario_clear_marker_routes_fast_stop),
-            ("clear_marker_probe_id_fallback_contracts", scenario_clear_marker_probe_id_fallback_contracts),
-            ("clear_post_clear_first_request_routes_reply", scenario_clear_post_clear_first_request_routes_reply),
-            ("clear_with_existing_inbound_queue_routes_replies", scenario_clear_with_existing_inbound_queue_routes_replies),
-            ("clear_file_fallback_blocked_sender_aged_ingress", scenario_clear_file_fallback_blocked_sender_aged_ingress),
-            ("clear_post_clear_delay_config_and_settle", scenario_clear_post_clear_delay_config_and_settle),
-            ("clear_settle_pane_not_ready_forces_leave", scenario_clear_settle_pane_not_ready_forces_leave),
-            ("clear_identity_helper_preserves_verified_live_identity", scenario_clear_identity_helper_preserves_verified_live_identity),
-            ("clear_requires_verified_process_identity", scenario_clear_requires_verified_process_identity),
-            ("clear_codex_post_clear_endpoint_verify_immediately", scenario_clear_codex_post_clear_endpoint_verify_immediately),
-            ("clear_claude_post_clear_probe_pasted_and_completes", scenario_clear_claude_post_clear_probe_pasted_and_completes),
-            ("clear_session_end_suppression_is_exact", scenario_clear_session_end_suppression_is_exact),
-            ("command_state_lock_timeout_before_mutation", scenario_command_state_lock_timeout_before_mutation),
-            ("clear_success_delivery_defers_near_deadline", scenario_clear_success_delivery_defers_near_deadline),
-            ("clear_success_delivery_lock_wait_does_not_fail_after_commit", scenario_clear_success_delivery_lock_wait_does_not_fail_after_commit),
-            ("clear_probe_subprocess_timeouts", scenario_clear_probe_subprocess_timeouts),
-            ("clear_marker_phase2_missing_forces_leave", scenario_clear_marker_phase2_missing_forces_leave),
-            ("clear_marker_phase2_rejects_record_turn_without_marker_turn", scenario_clear_marker_phase2_rejects_record_turn_without_marker_turn),
-            ("run_clear_peer_phase2_failure_returns_immediately", scenario_run_clear_peer_phase2_failure_returns_immediately),
-            ("clear_force_leave_cleans_identity_stores", scenario_clear_force_leave_cleans_identity_stores),
-            ("clear_force_leave_unowned_lock_serializes_cleanup", scenario_clear_force_leave_unowned_lock_serializes_cleanup),
-            ("clear_identity_helper_success_and_failure", scenario_clear_identity_helper_success_and_failure),
-            ("force_clear_requester_dual_write_queue_and_active", scenario_force_clear_requester_dual_write_queue_and_active),
-            ("clear_aggregate_requester_late_reply_suppressed", scenario_clear_aggregate_requester_late_reply_suppressed),
-            ("self_clear_promotion_and_cancel_notice_ordering", scenario_self_clear_promotion_and_cancel_notice_ordering),
-            ("clear_marker_ttl_expiry_removes_marker", scenario_clear_marker_ttl_expiry_removes_marker),
-        ]
+    from regression import docs_contracts, hook_config, install_uninstall, send_enqueue, view_peer
+    from regression.registry import scenario_index
 
+    phase3 = scenario_index(
+        install_uninstall.SCENARIOS,
+        hook_config.SCENARIOS,
+        view_peer.SCENARIOS,
+        docs_contracts.SCENARIOS,
+        send_enqueue.SCENARIOS,
+    )
+    return [
+        ('lifecycle_delivered_terminal', scenario_lifecycle),
+        ('held_interrupt_does_not_block_delivery', scenario_held_interrupt_does_not_block_delivery),
+        ('reserve_next_ignores_held_marker', scenario_reserve_next_ignores_held_marker),
+        ('held_marker_persists_through_delivery', scenario_held_marker_persists_through_delivery),
+        ('esc_fail_no_state_change', scenario_esc_fail_no_state_change),
+        ('clear_hold_logs_event', scenario_clear_hold),
+        ('clear_hold_socket_still_pops_held', scenario_clear_hold_socket_still_pops_held),
+        ('aggregate_interrupt_synthetic_reply', scenario_aggregate_interrupt_synthetic),
+        ('interrupt_pending_replacement_delivers', scenario_interrupt_pending_replacement_delivers),
+        ('interrupt_new_replacement_after_interrupt_delivers', scenario_interrupt_new_replacement_after_interrupt_delivers),
+        ('interrupt_claude_with_active_sends_esc_then_cc', scenario_interrupt_claude_with_active_sends_esc_then_cc),
+        ('interrupt_codex_sends_only_esc', scenario_interrupt_codex_sends_only_esc),
+        ('interrupt_unknown_type_falls_back_to_esc', scenario_interrupt_unknown_type_falls_back_to_esc),
+        ('interrupt_claude_idle_skips_cc', scenario_interrupt_claude_idle_skips_cc),
+        ('interrupt_claude_cc_failure_does_not_revert_state', scenario_interrupt_claude_cc_failure_does_not_revert_state),
+        ('interrupt_holds_state_lock_through_sequence', scenario_interrupt_holds_state_lock_through_sequence),
+        ('interrupt_no_try_deliver_between_keys', scenario_interrupt_no_try_deliver_between_keys),
+        ('interrupt_env_override_disables_cc', scenario_interrupt_env_override_disables_cc),
+        ('interrupt_key_delay_env_nonfinite_uses_default', scenario_interrupt_key_delay_env_nonfinite_uses_default),
+        ('interrupt_key_delay_env_clamps_out_of_range', scenario_interrupt_key_delay_env_clamps_out_of_range),
+        ('claude_interrupt_keys_invalid_uses_default', scenario_claude_interrupt_keys_invalid_uses_default),
+        ('claude_interrupt_keys_empty_uses_default', scenario_claude_interrupt_keys_empty_uses_default),
+        ('send_interrupt_key_timeout_returns_false', scenario_send_interrupt_key_timeout_returns_false),
+        ('clear_hold_clears_interrupt_partial_failure_gate', scenario_clear_hold_clears_interrupt_partial_failure_gate),
+        ('interrupt_double_within_no_active_skips_cc', scenario_interrupt_double_within_no_active_skips_cc),
+        ('interrupt_double_with_fresh_delivery_sends_cc_again', scenario_interrupt_double_with_fresh_delivery_sends_cc_again),
+        ('interrupt_peer_cli_exit_nonzero_on_partial_key_failure', scenario_interrupt_peer_cli_exit_nonzero_on_partial_key_failure),
+        ('interrupt_peer_action_text_and_json_modes', scenario_interrupt_peer_action_text_and_json_modes),
+        ('interrupt_peer_clear_hold_text_and_json_modes', scenario_interrupt_peer_clear_hold_text_and_json_modes),
+        ('interrupt_peer_status_json_unchanged_and_json_rejected', scenario_interrupt_peer_status_json_unchanged_and_json_rejected),
+        ('interrupted_late_prompt_submitted_before_replacement', scenario_interrupted_late_prompt_submitted_before_replacement),
+        ('interrupted_late_prompt_submitted_after_replacement', scenario_interrupted_late_prompt_submitted_after_replacement),
+        ('interrupted_late_turn_stop_preserves_replacement', scenario_interrupted_late_turn_stop_preserves_replacement),
+        ('interrupted_no_turn_stop_no_context_suppressed', scenario_interrupted_no_turn_stop_no_context_suppressed),
+        ('interrupted_no_turn_race_routes_replacement_then_suppresses_old', scenario_interrupted_no_turn_race_routes_replacement_then_suppresses_old),
+        ('interrupted_inflight_tombstone_retains_on_unrelated_stop', scenario_interrupted_inflight_tombstone_retains_on_unrelated_stop),
+        ('interrupted_empty_values_do_not_match_tombstone', scenario_interrupted_empty_values_do_not_match_tombstone),
+        ('interrupted_tombstone_current_ctx_id_match_cleans', scenario_interrupted_tombstone_current_ctx_id_match_cleans),
+        ('interrupted_tombstone_current_ctx_turn_match_cleans', scenario_interrupted_tombstone_current_ctx_turn_match_cleans),
+        ('interrupted_tombstone_stale_stop_preserves_replacement_watchdog', scenario_interrupted_tombstone_stale_stop_preserves_replacement_watchdog),
+        ('interrupted_tombstone_aggregate_ctx_does_not_cancel_aggregate_watchdog', scenario_interrupted_tombstone_aggregate_ctx_does_not_cancel_aggregate_watchdog),
+        ('aggregate_late_real_stop_after_interrupt_does_not_overwrite', scenario_aggregate_late_real_stop_after_interrupt_does_not_overwrite),
+        ('watchdog_cancel_on_empty_response', scenario_watchdog_cancel_on_empty_response),
+        ('alarm_cancelled_by_qualifying_request', scenario_alarm_cancelled_by_qualifying_request),
+        ('socket_path_alarm_cancel', scenario_socket_path_alarm_cancel),
+        ('response_send_guard_socket_request_notice', scenario_response_send_guard_socket_request_notice),
+        ('response_send_guard_socket_force_and_other_peer', scenario_response_send_guard_socket_force_and_other_peer),
+        ('response_send_guard_socket_no_auto_return_allowed', scenario_response_send_guard_socket_no_auto_return_allowed),
+        ('response_send_guard_socket_atomic_multi', scenario_response_send_guard_socket_atomic_multi),
+        ('response_send_guard_socket_aggregate_and_held', scenario_response_send_guard_socket_aggregate_and_held),
+        ('response_send_guard_after_response_finished_allowed', scenario_response_send_guard_after_response_finished_allowed),
+        ('fallback_path_alarm_cancel', scenario_fallback_path_alarm_cancel),
+        ('ingressing_not_delivered_before_finalize', scenario_ingressing_not_delivered_before_finalize),
+        ('replay_does_not_cancel_later_alarm', scenario_replay_does_not_cancel_later_alarm),
+        ('bridge_origin_fallback_ingressing_promoted', scenario_bridge_origin_fallback_ingressing_promoted),
+        ('socket_normalizes_non_ingressing_status', scenario_socket_normalizes_non_ingressing_status),
+        ('aggregate_fallback_finalize', scenario_aggregate_fallback_finalize),
+        ('aged_ingressing_promoted_by_maintenance', scenario_aged_ingressing_promoted_by_maintenance),
+        ('aged_ingressing_does_not_cancel_alarms', scenario_aged_ingressing_does_not_cancel_alarms),
+        ('aged_ingressing_malformed_timestamp_promoted', scenario_aged_ingressing_malformed_timestamp_promoted),
+        ('fresh_ingressing_not_promoted_by_maintenance', scenario_fresh_ingressing_not_promoted_by_maintenance),
+        ('alarm_not_cancelled_by_result', scenario_alarm_not_cancelled_by_result),
+        ('alarm_not_cancelled_by_bridge', scenario_alarm_not_cancelled_by_bridge),
+        ('user_prompt_does_not_cancel_alarm', scenario_user_prompt_does_not_cancel_alarm),
+        ('extend_wait_upserts_watchdog', scenario_extend_wait_upserts_watchdog),
+        ('extend_wait_aggregate_rejected', scenario_extend_wait_aggregate_rejected),
+        ('extend_wait_unknown_message', scenario_extend_wait_unknown_message),
+        ('extend_wait_terminal_tombstone_classification', scenario_extend_wait_terminal_tombstone_classification),
+        ('extend_wait_pending_rejected', scenario_extend_wait_pending_rejected),
+        ('extend_wait_not_owner', scenario_extend_wait_not_owner),
+        ('cancel_message_pending_removes_row', scenario_cancel_message_pending_removes_row),
+        ('cancel_message_inflight_pre_paste', scenario_cancel_message_inflight_pre_paste),
+        ('cancel_message_pane_mode_deferred_inflight_cancellable', scenario_cancel_message_pane_mode_deferred_inflight_cancellable),
+        ('cancel_message_inflight_after_enter_rejects_with_interrupt_guidance', scenario_cancel_message_inflight_after_enter_rejects_with_interrupt_guidance),
+        ('cancel_message_submitted_rejects_with_interrupt_guidance', scenario_cancel_message_submitted_rejects_with_interrupt_guidance),
+        ('cancel_message_delivered_rejects_with_interrupt_guidance', scenario_cancel_message_delivered_rejects_with_interrupt_guidance),
+        ('cancel_message_ownership_violation', scenario_cancel_message_ownership_violation),
+        ('cancel_message_idempotent_after_terminal', scenario_cancel_message_idempotent_after_terminal),
+        ('cancel_message_aggregate_per_leg_keeps_other_legs', scenario_cancel_message_aggregate_per_leg_keeps_other_legs),
+        ('cancel_message_action_text_and_json_modes', scenario_cancel_message_action_text_and_json_modes),
+        ('cancel_message_action_error_text_modes', scenario_cancel_message_action_error_text_modes),
+        ('aggregate_status_open_from_queue_and_reply', scenario_aggregate_status_open_from_queue_and_reply),
+        ('aggregate_status_zero_reply_from_queue', scenario_aggregate_status_zero_reply_from_queue),
+        ('aggregate_status_cancelled_and_timeout_synthetic_reasons', scenario_aggregate_status_cancelled_and_timeout_synthetic_reasons),
+        ('aggregate_status_legacy_synthetic_reply_uses_tombstone', scenario_aggregate_status_legacy_synthetic_reply_uses_tombstone),
+        ('aggregate_status_foreign_and_unknown_indistinguishable', scenario_aggregate_status_foreign_and_unknown_indistinguishable),
+        ('aggregate_status_source_conflict_fails_closed', scenario_aggregate_status_source_conflict_fails_closed),
+        ('aggregate_status_legacy_fallback_and_cap', scenario_aggregate_status_legacy_fallback_and_cap),
+        ('aggregate_status_watchdog_only_anchor', scenario_aggregate_status_watchdog_only_anchor),
+        ('wait_status_empty_self_view', scenario_wait_status_empty_self_view),
+        ('wait_status_outstanding_watchdogs_alarms_pending_inbound', scenario_wait_status_outstanding_watchdogs_alarms_pending_inbound),
+        ('wait_status_aggregate_waits_privacy_and_completed_result', scenario_wait_status_aggregate_waits_privacy_and_completed_result),
+        ('wait_status_caps_and_summary_counts', scenario_wait_status_caps_and_summary_counts),
+        ('delivery_watchdog_arms_on_reserve', scenario_delivery_watchdog_arms_on_reserve),
+        ('delivery_watchdog_fire_inflight_notice', scenario_delivery_watchdog_fire_inflight_notice),
+        ('watchdog_fire_after_terminal_suppresses_notice', scenario_watchdog_fire_after_terminal_suppresses_notice),
+        ('pending_watchdog_wake_removed_on_terminal', scenario_pending_watchdog_wake_removed_on_terminal),
+        ('delivery_watchdog_extend_replaces_wake', scenario_delivery_watchdog_extend_replaces_wake),
+        ('delivery_watchdog_submitted_extend_and_text', scenario_delivery_watchdog_submitted_extend_and_text),
+        ('delivery_watchdog_aggregate_pending_extend_rejected', scenario_delivery_watchdog_aggregate_pending_extend_rejected),
+        ('delivery_watchdog_replaced_by_response_on_delivered', scenario_delivery_watchdog_replaced_by_response_on_delivered),
+        ('delivery_watchdog_requeue_cancels', scenario_delivery_watchdog_requeue_cancels),
+        ('delivery_watchdog_mark_pending_cancels', scenario_delivery_watchdog_mark_pending_cancels),
+        ('delivery_watchdog_pane_mode_reverts_cancel', scenario_delivery_watchdog_pane_mode_reverts_cancel),
+        ('delivery_watchdog_phase_mismatch_skipped', scenario_delivery_watchdog_phase_mismatch_skipped),
+        ('watchdog_phase_legacy_default_response', scenario_watchdog_phase_legacy_default_response),
+        ('delivery_watchdog_aggregate_leg_coexists_with_response', scenario_delivery_watchdog_aggregate_leg_coexists_with_response),
+        ('delivery_watchdog_aggregate_interrupt_cancels_leg_only', scenario_delivery_watchdog_aggregate_interrupt_cancels_leg_only),
+        ('aggregate_response_watchdog_text_uses_progress', scenario_aggregate_response_watchdog_text_uses_progress),
+        ('aggregate_completion_suppresses_pending_watchdog_wake', scenario_aggregate_completion_suppresses_pending_watchdog_wake),
+        ('duplicate_enqueue_does_not_cancel_alarm', scenario_duplicate_enqueue_does_not_cancel_alarm),
+        ('alarm_op_invalid_delay_is_rejected', scenario_alarm_op_invalid_delay_is_rejected_not_crashed),
+        ('send_peer_watchdog_negative_one_rejected', phase3['send_peer_watchdog_negative_one_rejected']),
+        ('send_peer_watchdog_nan_rejected', phase3['send_peer_watchdog_nan_rejected']),
+        ('send_peer_watchdog_inf_rejected', phase3['send_peer_watchdog_inf_rejected']),
+        ('send_peer_watchdog_minus_inf_rejected', phase3['send_peer_watchdog_minus_inf_rejected']),
+        ('send_peer_watchdog_zero_disables_for_request', phase3['send_peer_watchdog_zero_disables_for_request']),
+        ('send_peer_watchdog_finite_positive_succeeds', phase3['send_peer_watchdog_finite_positive_succeeds']),
+        ('send_peer_no_auto_return_explicit_watchdog_rejected', phase3['send_peer_no_auto_return_explicit_watchdog_rejected']),
+        ('send_peer_no_auto_return_watchdog_zero_succeeds', phase3['send_peer_no_auto_return_watchdog_zero_succeeds']),
+        ('send_peer_no_auto_return_invalid_watchdog_value_precedence', phase3['send_peer_no_auto_return_invalid_watchdog_value_precedence']),
+        ('send_peer_no_auto_return_skips_default_watchdog', phase3['send_peer_no_auto_return_skips_default_watchdog']),
+        ('send_peer_auto_return_default_watchdog_still_attaches', phase3['send_peer_auto_return_default_watchdog_still_attaches']),
+        ('send_peer_no_auto_return_broadcast_watchdog_rejected', phase3['send_peer_no_auto_return_broadcast_watchdog_rejected']),
+        ('send_peer_watchdog_inf_with_notice_reports_finite_error_first', phase3['send_peer_watchdog_inf_with_notice_reports_finite_error_first']),
+        ('send_peer_watchdog_zero_with_notice_still_rejects_request_only', phase3['send_peer_watchdog_zero_with_notice_still_rejects_request_only']),
+        ('send_peer_watchdog_abc_argparse_error', phase3['send_peer_watchdog_abc_argparse_error']),
+        ('extend_wait_zero_negative_nan_inf_rejected', scenario_extend_wait_zero_negative_nan_inf_rejected),
+        ('extend_wait_finite_positive_calls_request_extend', scenario_extend_wait_finite_positive_calls_request_extend),
+        ('extend_wait_terminal_error_texts', scenario_extend_wait_terminal_error_texts),
+        ('wait_status_cli_summary_and_json', scenario_wait_status_cli_summary_and_json),
+        ('wait_status_cli_unsupported_old_daemon', scenario_wait_status_cli_unsupported_old_daemon),
+        ('wait_status_cli_rejects_inactive_sender', scenario_wait_status_cli_rejects_inactive_sender),
+        ('aggregate_status_cli_summary_and_json', scenario_aggregate_status_cli_summary_and_json),
+        ('aggregate_status_cli_unsupported_and_not_found_text', scenario_aggregate_status_cli_unsupported_and_not_found_text),
+        ('aggregate_status_cli_rejects_inactive_sender', scenario_aggregate_status_cli_rejects_inactive_sender),
+        ('alarm_negative_nan_inf_minus_inf_rejected', scenario_alarm_negative_nan_inf_minus_inf_rejected),
+        ('alarm_zero_and_finite_positive_call_request_alarm', scenario_alarm_zero_and_finite_positive_call_request_alarm),
+        ('alarm_request_failure_prints_no_success_hint', scenario_alarm_request_failure_prints_no_success_hint),
+        ('alarm_request_retries_timeout_with_stable_wake_id', scenario_alarm_request_retries_timeout_with_stable_wake_id),
+        ('alarm_request_retry_exhaustion_is_bounded', scenario_alarm_request_retry_exhaustion_is_bounded),
+        ('alarm_request_retries_lock_wait_with_stable_wake_id', scenario_alarm_request_retries_lock_wait_with_stable_wake_id),
+        ('alarm_request_lock_wait_retry_exhaustion_is_bounded', scenario_alarm_request_lock_wait_retry_exhaustion_is_bounded),
+        ('alarm_request_non_retryable_daemon_error_is_immediate', scenario_alarm_request_non_retryable_daemon_error_is_immediate),
+        ('alarm_request_rejects_mismatched_daemon_wake_id', scenario_alarm_request_rejects_mismatched_daemon_wake_id),
+        ('resolve_default_watchdog_seconds_env_table', scenario_resolve_default_watchdog_seconds_env_table),
+        ('daemon_socket_alarm_op_rejects_non_finite', scenario_daemon_socket_alarm_op_rejects_non_finite),
+        ('daemon_socket_alarm_op_idempotent_wake_id', scenario_daemon_socket_alarm_op_idempotent_wake_id),
+        ('daemon_socket_alarm_op_rejects_invalid_conflicting_wake_id', scenario_daemon_socket_alarm_op_rejects_invalid_conflicting_wake_id),
+        ('daemon_socket_alarm_op_idempotent_after_cancelled_or_fired', scenario_daemon_socket_alarm_op_idempotent_after_cancelled_or_fired),
+        ('daemon_socket_extend_watchdog_op_rejects_non_finite', scenario_daemon_socket_extend_watchdog_op_rejects_non_finite),
+        ('daemon_upsert_message_watchdog_rejects_non_finite', scenario_daemon_upsert_message_watchdog_rejects_non_finite),
+        ('daemon_enqueue_rejects_no_auto_return_watchdog_atomically', scenario_daemon_enqueue_rejects_no_auto_return_watchdog_atomically),
+        ('daemon_enqueue_no_auto_return_watchdog_zero_normalized', scenario_daemon_enqueue_no_auto_return_watchdog_zero_normalized),
+        ('daemon_prior_hint_pending_cancel', scenario_daemon_prior_hint_pending_cancel),
+        ('daemon_prior_hint_delivered_interrupt', scenario_daemon_prior_hint_delivered_interrupt),
+        ('daemon_prior_hint_inflight_pane_mode_cancel', scenario_daemon_prior_hint_inflight_pane_mode_cancel),
+        ('daemon_prior_hint_inflight_after_enter_interrupt', scenario_daemon_prior_hint_inflight_after_enter_interrupt),
+        ('daemon_prior_hint_terminal_or_absent_no_hint', scenario_daemon_prior_hint_terminal_or_absent_no_hint),
+        ('daemon_prior_hint_rejections_have_no_hints', scenario_daemon_prior_hint_rejections_have_no_hints),
+        ('daemon_prior_hint_aggregate_suffix', scenario_daemon_prior_hint_aggregate_suffix),
+        ('daemon_prior_hint_notice_safe_wording', scenario_daemon_prior_hint_notice_safe_wording),
+        ('daemon_prior_hint_same_pair_only', scenario_daemon_prior_hint_same_pair_only),
+        ('daemon_prior_hint_multi_target_partial', scenario_daemon_prior_hint_multi_target_partial),
+        ('daemon_prior_hint_current_prompt_only', scenario_daemon_prior_hint_current_prompt_only),
+        ('daemon_prior_hint_active_ctx_beats_pending_queue_row', scenario_daemon_prior_hint_active_ctx_beats_pending_queue_row),
+        ('prior_hint_classifier_drift_invariant', scenario_prior_hint_classifier_drift_invariant),
+        ('daemon_upsert_no_auto_return_watchdog_rejected', scenario_daemon_upsert_no_auto_return_watchdog_rejected),
+        ('daemon_register_alarm_rejects_non_finite_and_negative', scenario_daemon_register_alarm_rejects_non_finite_and_negative),
+        ('daemon_mark_message_delivered_ignores_non_finite_watchdog', scenario_daemon_mark_message_delivered_ignores_non_finite_watchdog),
+        ('daemon_no_auto_return_watchdog_arm_guard_strips', scenario_daemon_no_auto_return_watchdog_arm_guard_strips),
+        ('daemon_no_auto_return_watchdog_ingress_sanitizers', scenario_daemon_no_auto_return_watchdog_ingress_sanitizers),
+        ('daemon_socket_ack_message_unsupported_does_not_delete_queue', scenario_daemon_socket_ack_message_unsupported_does_not_delete_queue),
+        ('daemon_ack_message_helper_removed', scenario_daemon_ack_message_helper_removed),
+        ('stale_watchdog_skipped', scenario_stale_watchdog_skipped),
+        ('alarm_fire_text_includes_rearm_hint', scenario_alarm_fire_text_includes_rearm_hint),
+        ('watchdog_pending_text_omits_held_interrupt', scenario_watchdog_pending_text_omits_held_interrupt),
+        ('pane_mode_pending_defers_without_attempt', scenario_pane_mode_pending_defers_without_attempt),
+        ('pane_mode_clears_then_delivers', scenario_pane_mode_clears_then_delivers),
+        ('pane_mode_force_cancel_after_grace', scenario_pane_mode_force_cancel_after_grace),
+        ('pane_mode_nonforce_mode_stays_pending', scenario_pane_mode_nonforce_mode_stays_pending),
+        ('pane_mode_busy_target_does_not_start_timer', scenario_pane_mode_busy_target_does_not_start_timer),
+        ('retry_enter_skips_pane_mode', scenario_retry_enter_skips_pane_mode),
+        ('pane_mode_probe_failure_defers_pending', scenario_pane_mode_probe_failure_defers_pending),
+        ('pane_mode_force_cancel_failure_stays_pending', scenario_pane_mode_force_cancel_failure_stays_pending),
+        ('enter_deferred_survives_stale_requeue_and_restart', scenario_enter_deferred_survives_stale_requeue_and_restart),
+        ('pre_enter_probe_failure_defers_enter', scenario_pre_enter_probe_failure_defers_enter),
+        ('pane_mode_grace_zero_disables_cancel', scenario_pane_mode_grace_zero_disables_cancel),
+        ('wait_for_probe_retries_enter_with_pane_id', scenario_wait_for_probe_retries_enter_with_pane_id),
+        ('wait_for_probe_no_retry_without_pane_id', scenario_wait_for_probe_no_retry_without_pane_id),
+        ('detached_leave_explicit_cleanup', scenario_detached_leave_explicit_cleanup),
+        ('detached_leave_no_notice_when_only_inactive_remain', scenario_detached_leave_no_notice_when_only_inactive_remain),
+        ('detached_join_same_alias_same_pane', scenario_detached_join_same_alias_same_pane),
+        ('detached_join_same_alias_different_pane', scenario_detached_join_same_alias_different_pane),
+        ('detached_join_different_alias_same_pane_allowed', scenario_detached_join_different_alias_same_pane_allowed),
+        ('active_join_same_alias_still_rejected', scenario_active_join_same_alias_still_rejected),
+        ('join_blank_status_same_pane_still_rejected', scenario_join_blank_status_same_pane_still_rejected),
+        ('join_other_session_pane_lock_still_rejected', scenario_join_other_session_pane_lock_still_rejected),
+        ('join_probe_passes_pane_id_to_wait', scenario_join_probe_passes_pane_id_to_wait),
+        ('bridge_attach_start_daemon_argv_includes_from_start', scenario_bridge_attach_start_daemon_argv_includes_from_start),
+        ('bridge_daemon_ctl_start_subparser_accepts_from_start', scenario_bridge_daemon_ctl_start_subparser_accepts_from_start),
+        ('daemon_command_forwards_from_start', scenario_daemon_command_forwards_from_start),
+        ('daemon_command_ignores_legacy_max_hops', scenario_daemon_command_ignores_legacy_max_hops),
+        ('bridge_daemon_ctl_subcommands_reject_max_hops', scenario_bridge_daemon_ctl_subcommands_reject_max_hops),
+        ('bridge_daemon_rejects_max_hops_cli', scenario_bridge_daemon_rejects_max_hops_cli),
+        ('bridge_daemon_ctl_start_argv_includes_from_start_end_to_end', scenario_bridge_daemon_ctl_start_argv_includes_from_start_end_to_end),
+        ('daemon_follow_from_start_replays_prompt_submitted', scenario_daemon_follow_from_start_replays_prompt_submitted),
+        ('daemon_follow_from_start_false_skips_pre_existing_record', scenario_daemon_follow_from_start_false_skips_pre_existing_record),
+        ('daemon_follow_from_start_handles_self_daemon_started_safely', scenario_daemon_follow_from_start_handles_self_daemon_started_safely),
+        ('orphan_nonce_in_user_prompt', scenario_orphan_nonce_in_user_prompt),
+        ('prompt_intercept_request_notice_body', scenario_prompt_intercept_request_notice_body),
+        ('prompt_intercept_bridge_notice_no_source_notice', scenario_prompt_intercept_bridge_notice_no_source_notice),
+        ('prompt_intercept_response_guard_queue_allows', scenario_prompt_intercept_response_guard_queue_allows),
+        ('prompt_intercept_mixed_inflight_requeues', scenario_prompt_intercept_mixed_inflight_requeues),
+        ('prompt_submitted_duplicate_noop', scenario_prompt_submitted_duplicate_noop),
+        ('prompt_submitted_duplicate_without_nonce_noop', scenario_prompt_submitted_duplicate_without_nonce_noop),
+        ('prompt_intercept_aggregate_completes', scenario_prompt_intercept_aggregate_completes),
+        ('prompt_intercept_held_drain_noop', scenario_prompt_intercept_held_drain_noop),
+        ('held_drain_stale_stop_preserves_new_ctx', scenario_held_drain_stale_stop_preserves_new_ctx),
+        ('held_drain_missing_identity_does_not_clear_active_ctx', scenario_held_drain_missing_identity_does_not_clear_active_ctx),
+        ('held_drain_matching_prior_id_without_turn_still_clears_ctx', scenario_held_drain_matching_prior_id_without_turn_still_clears_ctx),
+        ('stale_hold_ignored_active_context_routes_normally', scenario_stale_hold_ignored_active_context_routes_normally),
+        ('stale_hold_old_stop_with_active_ctx_applies_a4_mismatch', scenario_stale_hold_old_stop_with_active_ctx_applies_a4_mismatch),
+        ('held_no_prior_id_with_active_ctx_classified_stale', scenario_held_no_prior_id_with_active_ctx_classified_stale),
+        ('held_matching_prior_id_turn_id_mismatch_falls_through_to_a4', scenario_held_matching_prior_id_turn_id_mismatch_falls_through_to_a4),
+        ('held_with_no_context_drain_still_works', scenario_held_with_no_context_drain_still_works),
+        ('held_matching_prior_id_with_matching_turn_drain_still_works', scenario_held_matching_prior_id_with_matching_turn_drain_still_works),
+        ('held_with_interrupted_tombstone_match_classify_first', scenario_held_with_interrupted_tombstone_match_classify_first),
+        ('aggregate_leg_unaffected_by_held_marker', scenario_aggregate_leg_unaffected_by_held_marker),
+        ('prompt_intercept_inflight_only_requeues', scenario_prompt_intercept_inflight_only_requeues),
+        ('consume_once_basic', scenario_consume_once_basic),
+        ('consume_once_empty_response', scenario_consume_once_empty_response),
+        ('empty_response_whitespace_only_routes_sentinel', scenario_empty_response_whitespace_only_routes_sentinel),
+        ('empty_response_preserves_nonempty_with_surrounding_whitespace', scenario_empty_response_preserves_nonempty_with_surrounding_whitespace),
+        ('empty_response_self_return_still_skipped', scenario_empty_response_self_return_still_skipped),
+        ('empty_response_auto_return_false_still_skipped', scenario_empty_response_auto_return_false_still_skipped),
+        ('empty_response_inactive_requester_still_skipped', scenario_empty_response_inactive_requester_still_skipped),
+        ('empty_response_unicode_whitespace_routes_sentinel', scenario_empty_response_unicode_whitespace_routes_sentinel),
+        ('nonce_mismatch_fail_closed', scenario_nonce_mismatch_fail_closed),
+        ('no_observed_nonce_with_candidate_fail_closed', scenario_no_observed_nonce_with_candidate_fail_closed),
+        ('daemon_restart_queue_scan', scenario_daemon_restart_queue_scan),
+        ('daemon_reload_inflight_idempotent', scenario_daemon_reload_inflight_idempotent),
+        ('ambiguous_inflight_fail_closed', scenario_ambiguous_inflight_fail_closed),
+        ('stale_reserved_orphan_swept', scenario_stale_reserved_orphan_swept),
+        ('held_drain_skips_consume_once', scenario_held_drain_skips_consume_once),
+        ('matching_nonce_contaminated_body_residual', scenario_matching_nonce_contaminated_body_documents_residual),
+        ('aggregate_consume_once_no_overwrite', scenario_aggregate_consume_once_no_overwrite),
+        ('empty_response_in_aggregate_path_unchanged', scenario_empty_response_in_aggregate_path_unchanged),
+        ('nonce_mismatch_stops_enter_retry', scenario_nonce_mismatch_stops_enter_retry),
+        ('nonce_missing_stops_enter_retry', scenario_nonce_missing_stops_enter_retry),
+        ('hook_logger_anchored_regex', scenario_hook_logger_anchored_regex),
+        ('turn_id_mismatch_preserves_ctx', scenario_turn_id_mismatch_preserves_ctx),
+        ('turn_id_mismatch_annotation_is_idempotent', scenario_turn_id_mismatch_annotation_is_idempotent),
+        ('turn_id_mismatch_matching_stop_before_expiry_cleans_normally', scenario_turn_id_mismatch_matching_stop_before_expiry_cleans_normally),
+        ('turn_id_mismatch_expiry_unblocks_target', scenario_turn_id_mismatch_expiry_unblocks_target),
+        ('turn_id_mismatch_expiry_waits_for_watchdog_deadline', scenario_turn_id_mismatch_expiry_waits_for_watchdog_deadline),
+        ('turn_id_mismatch_watchdog_fire_preserves_post_grace', scenario_turn_id_mismatch_watchdog_fire_preserves_post_grace),
+        ('turn_id_mismatch_aggregate_watchdog_fire_preserves_post_grace', scenario_turn_id_mismatch_aggregate_watchdog_fire_preserves_post_grace),
+        ('turn_id_mismatch_post_watchdog_grace_zero_allows_same_tick_expiry', scenario_turn_id_mismatch_post_watchdog_grace_zero_allows_same_tick_expiry),
+        ('turn_id_mismatch_extend_wait_before_fire_defers_without_stamp', scenario_turn_id_mismatch_extend_wait_before_fire_defers_without_stamp),
+        ('turn_id_mismatch_expiry_does_not_remove_non_delivered_queue_rows', scenario_turn_id_mismatch_expiry_does_not_remove_non_delivered_queue_rows),
+        ('turn_id_mismatch_aggregate_leg_expiry_no_synthetic_reply', scenario_turn_id_mismatch_aggregate_leg_expiry_no_synthetic_reply),
+        ('turn_id_mismatch_sweep_no_op_without_annotation', scenario_turn_id_mismatch_sweep_no_op_without_annotation),
+        ('turn_id_mismatch_sweep_no_op_after_normal_pop', scenario_turn_id_mismatch_sweep_no_op_after_normal_pop),
+        ('turn_id_mismatch_notice_ctx_follows_same_expiry', scenario_turn_id_mismatch_notice_ctx_follows_same_expiry),
+        ('short_id_format', scenario_short_id_format),
+        ('resolve_targets_single', scenario_resolve_targets_single),
+        ('resolve_targets_multi_basic', scenario_resolve_targets_multi_basic),
+        ('resolve_targets_order_preserved', scenario_resolve_targets_order_preserved),
+        ('resolve_targets_dedup', scenario_resolve_targets_dedup),
+        ('resolve_targets_strip_empties', scenario_resolve_targets_strip_empties),
+        ('resolve_targets_reserved_alone', scenario_resolve_targets_reserved_alone),
+        ('resolve_targets_reserved_mix_rejected', scenario_resolve_targets_reserved_mix_rejected),
+        ('resolve_targets_unknown_rejected', scenario_resolve_targets_unknown_rejected),
+        ('resolve_targets_sender_in_list_rejected', scenario_resolve_targets_sender_in_list_rejected),
+        ('resolve_targets_empty_after_strip_rejected', scenario_resolve_targets_empty_after_strip_rejected),
+        ('aggregate_trigger_request_multi', scenario_aggregate_trigger_request_multi),
+        ('aggregate_trigger_single_no', scenario_aggregate_trigger_single_no),
+        ('aggregate_trigger_notice_no', scenario_aggregate_trigger_notice_no),
+        ('aggregate_trigger_bridge_sender_no', scenario_aggregate_trigger_bridge_sender_no),
+        ('aggregate_trigger_no_auto_return_no', scenario_aggregate_trigger_no_auto_return_no),
+        ('enqueue_aggregate_metadata_modes', phase3['enqueue_aggregate_metadata_modes']),
+        ('prune_keeps_recent_n', scenario_prune_keeps_recent_n),
+        ('prune_disabled_retention_zero', scenario_prune_disabled_retention_zero),
+        ('prune_below_retention', scenario_prune_below_retention),
+        ('prune_missing_forgotten_dir_safe', scenario_prune_missing_forgotten_dir_safe),
+        ('resolve_forgotten_retention_invalid_env', scenario_resolve_forgotten_retention_invalid_env),
+        ('queue_status_counts', scenario_queue_status_counts),
+        ('queue_status_counts_missing_file', scenario_queue_status_counts_missing_file),
+        ('uninstall_helper_print_paths', phase3['uninstall_helper_print_paths']),
+        ('uninstall_helper_refuses_dangerous_path', phase3['uninstall_helper_refuses_dangerous_path']),
+        ('uninstall_sh_dry_run_invokes_hook_helper_with_dry_run', phase3['uninstall_sh_dry_run_invokes_hook_helper_with_dry_run']),
+        ('uninstall_sh_non_dry_run_removes_hook_entries', phase3['uninstall_sh_non_dry_run_removes_hook_entries']),
+        ('uninstall_sh_keep_hooks_skips_helper_under_dry_run', phase3['uninstall_sh_keep_hooks_skips_helper_under_dry_run']),
+        ('uninstall_sh_hook_helper_failure_aborts', phase3['uninstall_sh_hook_helper_failure_aborts']),
+        ('direct_exec_targets_executable', phase3['direct_exec_targets_executable']),
+        ('healthcheck_executable_helper_distinguishes_states', phase3['healthcheck_executable_helper_distinguishes_states']),
+        ('python_env_override_removed_from_tracked_files', phase3['python_env_override_removed_from_tracked_files']),
+        ('install_sh_python_version_gate', phase3['install_sh_python_version_gate']),
+        ('bridge_healthcheck_sh_python_version_gate', phase3['bridge_healthcheck_sh_python_version_gate']),
+        ('install_sh_chmods_target_or_fails', phase3['install_sh_chmods_target_or_fails']),
+        ('install_sh_default_updates_shell_rc', phase3['install_sh_default_updates_shell_rc']),
+        ('install_sh_shell_rc_dry_run_and_opt_out', phase3['install_sh_shell_rc_dry_run_and_opt_out']),
+        ('install_sh_shell_rc_target_selection', phase3['install_sh_shell_rc_target_selection']),
+        ('install_sh_shell_rc_backup_and_path_short_circuit', phase3['install_sh_shell_rc_backup_and_path_short_circuit']),
+        ('install_sh_shell_quotes_bin_dir_metacharacters', phase3['install_sh_shell_quotes_bin_dir_metacharacters']),
+        ('install_sh_shell_rc_replaces_existing_marker_block', phase3['install_sh_shell_rc_replaces_existing_marker_block']),
+        ('install_sh_claude_editor_mode_missing_skips', phase3['install_sh_claude_editor_mode_missing_skips']),
+        ('install_sh_claude_editor_mode_updates_with_backup', phase3['install_sh_claude_editor_mode_updates_with_backup']),
+        ('install_sh_claude_editor_mode_updates_global_and_settings', phase3['install_sh_claude_editor_mode_updates_global_and_settings']),
+        ('install_sh_claude_editor_mode_missing_global_updates_settings', phase3['install_sh_claude_editor_mode_missing_global_updates_settings']),
+        ('install_sh_claude_editor_mode_invalid_global_still_updates_settings', phase3['install_sh_claude_editor_mode_invalid_global_still_updates_settings']),
+        ('install_sh_claude_editor_mode_normal_noop', phase3['install_sh_claude_editor_mode_normal_noop']),
+        ('install_sh_claude_editor_mode_absent_adds_root', phase3['install_sh_claude_editor_mode_absent_adds_root']),
+        ('install_sh_claude_editor_mode_invalid_json_skips', phase3['install_sh_claude_editor_mode_invalid_json_skips']),
+        ('install_sh_claude_editor_mode_invalid_utf8_skips', phase3['install_sh_claude_editor_mode_invalid_utf8_skips']),
+        ('install_sh_claude_editor_mode_bom_skips', phase3['install_sh_claude_editor_mode_bom_skips']),
+        ('install_sh_claude_editor_mode_non_object_skips', phase3['install_sh_claude_editor_mode_non_object_skips']),
+        ('install_sh_claude_editor_mode_dry_run_no_write', phase3['install_sh_claude_editor_mode_dry_run_no_write']),
+        ('install_sh_claude_editor_mode_preserves_mode', phase3['install_sh_claude_editor_mode_preserves_mode']),
+        ('install_sh_claude_editor_mode_symlink_preserved', phase3['install_sh_claude_editor_mode_symlink_preserved']),
+        ('install_sh_claude_editor_mode_nested_root_absent_warns_skips', phase3['install_sh_claude_editor_mode_nested_root_absent_warns_skips']),
+        ('install_sh_claude_editor_mode_nested_with_root_warns_updates_root_only', phase3['install_sh_claude_editor_mode_nested_with_root_warns_updates_root_only']),
+        ('install_sh_claude_editor_mode_skip_flag_no_write', phase3['install_sh_claude_editor_mode_skip_flag_no_write']),
+        ('install_sh_claude_editor_mode_broken_symlink_warns', phase3['install_sh_claude_editor_mode_broken_symlink_warns']),
+        ('install_sh_claude_editor_mode_concurrent_change_aborts', phase3['install_sh_claude_editor_mode_concurrent_change_aborts']),
+        ('install_sh_hook_failure_hard_fails', phase3['install_sh_hook_failure_hard_fails']),
+        ('install_sh_hook_failure_ignore_flag_allows_success', phase3['install_sh_hook_failure_ignore_flag_allows_success']),
+        ('install_sh_hook_dry_run_failure_hard_fails', phase3['install_sh_hook_dry_run_failure_hard_fails']),
+        ('install_sh_hook_success_succeeds', phase3['install_sh_hook_success_succeeds']),
+        ('install_sh_shim_failure_still_hard_fails_under_override', phase3['install_sh_shim_failure_still_hard_fails_under_override']),
+        ('install_sh_skip_hooks_with_ignore_flag_is_noop', phase3['install_sh_skip_hooks_with_ignore_flag_is_noop']),
+        ('bridge_install_hooks_rejects_malformed_json_without_overwrite', phase3['bridge_install_hooks_rejects_malformed_json_without_overwrite']),
+        ('bridge_install_hooks_rejects_non_object_json_without_overwrite', phase3['bridge_install_hooks_rejects_non_object_json_without_overwrite']),
+        ('bridge_install_hooks_dry_run_invalid_json_fails_without_overwrite', phase3['bridge_install_hooks_dry_run_invalid_json_fails_without_overwrite']),
+        ('bridge_install_hooks_missing_json_still_creates', phase3['bridge_install_hooks_missing_json_still_creates']),
+        ('bridge_install_hooks_invalid_utf8_fails_without_overwrite', phase3['bridge_install_hooks_invalid_utf8_fails_without_overwrite']),
+        ('bridge_install_hooks_existing_valid_json_object_merges_correctly', phase3['bridge_install_hooks_existing_valid_json_object_merges_correctly']),
+        ('bridge_install_hooks_codex_hooks_rejects_malformed_json_without_overwrite', phase3['bridge_install_hooks_codex_hooks_rejects_malformed_json_without_overwrite']),
+        ('bridge_install_hooks_codex_config_ignores_nested_codex_hooks', phase3['bridge_install_hooks_codex_config_ignores_nested_codex_hooks']),
+        ('bridge_install_hooks_codex_config_ignores_nested_disable_paste_burst', phase3['bridge_install_hooks_codex_config_ignores_nested_disable_paste_burst']),
+        ('bridge_install_hooks_codex_config_updates_only_scoped_keys', phase3['bridge_install_hooks_codex_config_updates_only_scoped_keys']),
+        ('bridge_install_hooks_codex_config_inserts_features_key_before_next_table', phase3['bridge_install_hooks_codex_config_inserts_features_key_before_next_table']),
+        ('bridge_install_hooks_codex_config_dry_run_no_write', phase3['bridge_install_hooks_codex_config_dry_run_no_write']),
+        ('bridge_install_hooks_codex_config_empty_features_section_inserts', phase3['bridge_install_hooks_codex_config_empty_features_section_inserts']),
+        ('bridge_install_hooks_codex_config_first_table_is_array_table', phase3['bridge_install_hooks_codex_config_first_table_is_array_table']),
+        ('bridge_install_hooks_codex_config_table_header_with_trailing_comment', phase3['bridge_install_hooks_codex_config_table_header_with_trailing_comment']),
+        ('bridge_install_hooks_codex_config_commented_out_assignments_ignored', phase3['bridge_install_hooks_codex_config_commented_out_assignments_ignored']),
+        ('bridge_install_hooks_codex_config_no_trailing_newline_handled', phase3['bridge_install_hooks_codex_config_no_trailing_newline_handled']),
+        ('bridge_install_hooks_codex_config_already_enabled_is_byte_unchanged', phase3['bridge_install_hooks_codex_config_already_enabled_is_byte_unchanged']),
+        ('codex_config_marker_records_and_uninstall_restores_updated_values', phase3['codex_config_marker_records_and_uninstall_restores_updated_values']),
+        ('codex_config_marker_records_inserted_keys_and_uninstall_removes_them', phase3['codex_config_marker_records_inserted_keys_and_uninstall_removes_them']),
+        ('codex_config_missing_created_by_install_removed_on_uninstall_when_bridge_only', phase3['codex_config_missing_created_by_install_removed_on_uninstall_when_bridge_only']),
+        ('codex_config_already_enabled_keys_create_no_marker', phase3['codex_config_already_enabled_keys_create_no_marker']),
+        ('codex_config_reinstall_preserves_original_marker', phase3['codex_config_reinstall_preserves_original_marker']),
+        ('codex_config_user_changed_after_install_is_not_clobbered', phase3['codex_config_user_changed_after_install_is_not_clobbered']),
+        ('codex_config_dry_run_install_writes_no_marker_or_config', phase3['codex_config_dry_run_install_writes_no_marker_or_config']),
+        ('codex_config_dry_run_uninstall_with_marker_writes_no_config_or_marker', phase3['codex_config_dry_run_uninstall_with_marker_writes_no_config_or_marker']),
+        ('codex_config_skip_codex_does_not_touch_config_or_marker', phase3['codex_config_skip_codex_does_not_touch_config_or_marker']),
+        ('codex_config_uninstall_with_malformed_marker_aborts_clean', phase3['codex_config_uninstall_with_malformed_marker_aborts_clean']),
+        ('codex_config_uninstall_with_unknown_marker_version_aborts', phase3['codex_config_uninstall_with_unknown_marker_version_aborts']),
+        ('codex_config_uninstall_with_marker_path_mismatch_aborts', phase3['codex_config_uninstall_with_marker_path_mismatch_aborts']),
+        ('codex_config_uninstall_with_unknown_flag_key_aborts', phase3['codex_config_uninstall_with_unknown_flag_key_aborts']),
+        ('codex_config_uninstall_with_invalid_operation_aborts', phase3['codex_config_uninstall_with_invalid_operation_aborts']),
+        ('codex_config_uninstall_with_updated_missing_original_line_aborts', phase3['codex_config_uninstall_with_updated_missing_original_line_aborts']),
+        ('codex_config_marker_write_failure_aborts_before_config_write', phase3['codex_config_marker_write_failure_aborts_before_config_write']),
+        ('codex_config_inserted_features_section_with_user_added_keys_keeps_section', phase3['codex_config_inserted_features_section_with_user_added_keys_keeps_section']),
+        ('codex_config_existing_empty_config_records_existed_true_and_uninstall_keeps_it', phase3['codex_config_existing_empty_config_records_existed_true_and_uninstall_keeps_it']),
+        ('codex_config_marker_normalized_path_accepts_equivalent_path', phase3['codex_config_marker_normalized_path_accepts_equivalent_path']),
+        ('restart_dry_run_no_side_effect', scenario_restart_dry_run_no_side_effect),
+        ('recover_orphan_delivered', scenario_recover_orphan_delivered),
+        ('recover_orphan_delivered_aggregate_member', scenario_recover_orphan_delivered_aggregate_member),
+        ('prune_concurrent_stat_safe', scenario_prune_concurrent_stat_safe),
+        ('format_peer_list_model_safe_default', phase3['format_peer_list_model_safe_default']),
+        ('format_peer_list_full_includes_operator_fields', phase3['format_peer_list_full_includes_operator_fields']),
+        ('bridge_manage_summary_concise', phase3['bridge_manage_summary_concise']),
+        ('bridge_manage_summary_defaults', phase3['bridge_manage_summary_defaults']),
+        ('bridge_manage_summary_legacy_state_fallback', phase3['bridge_manage_summary_legacy_state_fallback']),
+        ('bridge_manage_summary_missing_session_exits', phase3['bridge_manage_summary_missing_session_exits']),
+        ('model_safe_participants_strips_endpoints', phase3['model_safe_participants_strips_endpoints']),
+        ('model_safe_participants_uses_active_only', phase3['model_safe_participants_uses_active_only']),
+        ('list_peers_json_daemon_status_strips_pid', phase3['list_peers_json_daemon_status_strips_pid']),
+        ('view_peer_rejects_snapshot_without_snapshot_mode', phase3['view_peer_rejects_snapshot_without_snapshot_mode']),
+        ('view_peer_rejects_page_with_since_last_or_search', phase3['view_peer_rejects_page_with_since_last_or_search']),
+        ('view_peer_allows_page_in_live_onboard_older_and_snapshot_in_older_search', phase3['view_peer_allows_page_in_live_onboard_older_and_snapshot_in_older_search']),
+        ('view_peer_rejects_empty_search_before_session_lookup', phase3['view_peer_rejects_empty_search_before_session_lookup']),
+        ('view_peer_empty_search_counts_as_search_for_mode_errors', phase3['view_peer_empty_search_counts_as_search_for_mode_errors']),
+        ('view_peer_nonempty_search_still_reaches_validation', phase3['view_peer_nonempty_search_still_reaches_validation']),
+        ('view_peer_search_with_page_after_a19_reports_page_error', phase3['view_peer_search_with_page_after_a19_reports_page_error']),
+        ('view_peer_doc_surfaces_disclose_search_semantics', phase3['view_peer_doc_surfaces_disclose_search_semantics']),
+        ('interrupt_peer_doc_surfaces_disclose_no_op_race', phase3['interrupt_peer_doc_surfaces_disclose_no_op_race']),
+        ('interrupt_peer_doc_surfaces_no_queued_active_directive', phase3['interrupt_peer_doc_surfaces_no_queued_active_directive']),
+        ('prompt_intercepted_doc_surfaces_disclose_user_typing_collision', phase3['prompt_intercepted_doc_surfaces_disclose_user_typing_collision']),
+        ('response_send_guard_doc_surfaces_are_precise', phase3['response_send_guard_doc_surfaces_are_precise']),
+        ('probe_prompt_is_compact_quickstart', phase3['probe_prompt_is_compact_quickstart']),
+        ('send_peer_wait_doc_surfaces_name_blocking_consequence', phase3['send_peer_wait_doc_surfaces_name_blocking_consequence']),
+        ('watchdog_phase_doc_surfaces_are_consistent', phase3['watchdog_phase_doc_surfaces_are_consistent']),
+        ('wait_status_doc_surfaces_anti_polling', phase3['wait_status_doc_surfaces_anti_polling']),
+        ('aggregate_status_doc_surfaces_leg_level_and_anti_polling', phase3['aggregate_status_doc_surfaces_leg_level_and_anti_polling']),
+        ('view_peer_render_output_model_safe', phase3['view_peer_render_output_model_safe']),
+        ('view_peer_search_explicit_snapshot_uses_safe_ref', phase3['view_peer_search_explicit_snapshot_uses_safe_ref']),
+        ('view_peer_snapshot_ref_collision_unique', phase3['view_peer_snapshot_ref_collision_unique']),
+        ('view_peer_capture_errors_sanitized', phase3['view_peer_capture_errors_sanitized']),
+        ('view_peer_snapshot_not_found_hides_full_id', phase3['view_peer_snapshot_not_found_hides_full_id']),
+        ('view_peer_since_last_matches_changed_volatile_chrome', phase3['view_peer_since_last_matches_changed_volatile_chrome']),
+        ('view_peer_since_last_legacy_tail_derives_stable_anchor', phase3['view_peer_since_last_legacy_tail_derives_stable_anchor']),
+        ('view_peer_since_last_ambiguous_current_anchor_skips_to_unique', phase3['view_peer_since_last_ambiguous_current_anchor_skips_to_unique']),
+        ('view_peer_since_last_matches_anchor_before_long_delta', phase3['view_peer_since_last_matches_anchor_before_long_delta']),
+        ('view_peer_since_last_build_rejects_duplicate_previous_window', phase3['view_peer_since_last_build_rejects_duplicate_previous_window']),
+        ('view_peer_since_last_uncertain_does_not_advance_cursor', phase3['view_peer_since_last_uncertain_does_not_advance_cursor']),
+        ('view_peer_since_last_upgrade_reset_when_no_legacy_anchor', phase3['view_peer_since_last_upgrade_reset_when_no_legacy_anchor']),
+        ('view_peer_since_last_low_info_lines_do_not_anchor', phase3['view_peer_since_last_low_info_lines_do_not_anchor']),
+        ('view_peer_since_last_claude_status_variants_are_volatile', phase3['view_peer_since_last_claude_status_variants_are_volatile']),
+        ('view_peer_since_last_status_classifier_preserves_prose', phase3['view_peer_since_last_status_classifier_preserves_prose']),
+        ('view_peer_since_last_claude_status_lines_do_not_anchor', phase3['view_peer_since_last_claude_status_lines_do_not_anchor']),
+        ('view_peer_since_last_filters_stored_volatile_anchor_lines', phase3['view_peer_since_last_filters_stored_volatile_anchor_lines']),
+        ('view_peer_since_last_skips_shortened_stored_anchor_that_fails_quality', phase3['view_peer_since_last_skips_shortened_stored_anchor_that_fails_quality']),
+        ('view_peer_since_last_volatile_only_claude_status_delta', phase3['view_peer_since_last_volatile_only_claude_status_delta']),
+        ('view_peer_since_last_codex_status_variants_preserved', phase3['view_peer_since_last_codex_status_variants_preserved']),
+        ('view_peer_since_last_volatile_only_delta', phase3['view_peer_since_last_volatile_only_delta']),
+        ('view_peer_since_last_short_delta_consumed_once', phase3['view_peer_since_last_short_delta_consumed_once']),
+        ('view_peer_since_last_request_plus_short_reply_consumed_after_cursor_update', phase3['view_peer_since_last_request_plus_short_reply_consumed_after_cursor_update']),
+        ('view_peer_since_last_consumed_tail_does_not_hide_new_duplicate', phase3['view_peer_since_last_consumed_tail_does_not_hide_new_duplicate']),
+        ('view_peer_since_last_consumed_tail_anchor_change_resets', phase3['view_peer_since_last_consumed_tail_anchor_change_resets']),
+        ('view_peer_since_last_consumed_tail_mismatch_clears', phase3['view_peer_since_last_consumed_tail_mismatch_clears']),
+        ('view_peer_since_last_consumed_tail_cap', phase3['view_peer_since_last_consumed_tail_cap']),
+        ('view_peer_since_last_consumed_tail_ignores_volatile_churn', phase3['view_peer_since_last_consumed_tail_ignores_volatile_churn']),
+        ('view_peer_since_last_codex_prompt_placeholder_not_anchor', phase3['view_peer_since_last_codex_prompt_placeholder_not_anchor']),
+        ('view_peer_since_last_filters_stored_codex_prompt_placeholder_anchor', phase3['view_peer_since_last_filters_stored_codex_prompt_placeholder_anchor']),
+        ('view_peer_since_last_preserves_codex_bridge_prompt_lines', phase3['view_peer_since_last_preserves_codex_bridge_prompt_lines']),
+        ('view_peer_since_last_preserves_trailing_semantic_codex_arrow', phase3['view_peer_since_last_preserves_trailing_semantic_codex_arrow']),
+        ('view_peer_since_last_preserves_semantic_codex_arrow_before_footer', phase3['view_peer_since_last_preserves_semantic_codex_arrow_before_footer']),
+        ('view_peer_since_last_claude_partial_status_fragments_are_volatile', phase3['view_peer_since_last_claude_partial_status_fragments_are_volatile']),
+        ('view_peer_since_last_partial_status_preserves_prose', phase3['view_peer_since_last_partial_status_preserves_prose']),
+        ('endpoint_rejects_stale_pane_lock_without_live', scenario_endpoint_rejects_stale_pane_lock_without_live),
+        ('endpoint_rejects_same_pane_new_live_identity', scenario_endpoint_rejects_same_pane_new_live_identity),
+        ('endpoint_probe_unknown_does_not_mutate', scenario_endpoint_probe_unknown_does_not_mutate),
+        ('endpoint_accepts_matching_process_fingerprint', scenario_endpoint_accepts_matching_process_fingerprint),
+        ('backfill_refuses_to_mint_without_live_record', scenario_backfill_refuses_to_mint_without_live_record),
+        ('backfill_refuses_other_live_identity', scenario_backfill_refuses_other_live_identity),
+        ('backfill_rejects_changed_process_fingerprint', scenario_backfill_rejects_changed_process_fingerprint),
+        ('backfill_allows_fresh_hook_proof_create', scenario_backfill_allows_fresh_hook_proof_create),
+        ('backfill_fresh_probe_repairs_unscoped_live_mismatch', scenario_backfill_fresh_probe_repairs_unscoped_live_mismatch),
+        ('unscoped_hook_canonicalizes_via_pane_lock', scenario_unscoped_hook_canonicalizes_via_pane_lock),
+        ('unscoped_hook_canonicalizes_during_attach_gap', scenario_unscoped_hook_canonicalizes_during_attach_gap),
+        ('unscoped_hook_canonicalizes_via_attached_registry', scenario_unscoped_hook_canonicalizes_via_attached_registry),
+        ('unscoped_hook_new_process_fails_closed', scenario_unscoped_hook_new_process_fails_closed),
+        ('unscoped_hook_cross_reboot_fails_closed', scenario_unscoped_hook_cross_reboot_fails_closed),
+        ('unscoped_hook_missing_prior_fingerprint_fails_closed', scenario_unscoped_hook_missing_prior_fingerprint_fails_closed),
+        ('unscoped_hook_different_agent_fails_closed', scenario_unscoped_hook_different_agent_fails_closed),
+        ('unscoped_hook_same_session_no_canonicalization_event', scenario_unscoped_hook_same_session_no_canonicalization_event),
+        ('scoped_different_session_no_canonicalization', scenario_scoped_different_session_no_canonicalization),
+        ('session_ended_payload_mismatch_no_canonicalization', scenario_session_ended_payload_mismatch_no_canonicalization),
+        ('resolver_reconnects_exact_mismatch_shape', scenario_resolver_reconnects_exact_mismatch_shape),
+        ('hook_reconnects_exact_mismatch_shape', scenario_hook_reconnects_exact_mismatch_shape),
+        ('cross_pane_candidate_mismatch_blocks_reconnect', scenario_cross_pane_candidate_mismatch_blocks_reconnect),
+        ('codex1_incident_replay_canonicalizes_repeated_unscoped_hooks', scenario_codex1_incident_replay_canonicalizes_repeated_unscoped_hooks),
+        ('target_recovery_reconnects_stale_pane_by_codex_transcript', scenario_target_recovery_reconnects_stale_pane_by_codex_transcript),
+        ('target_recovery_blocks_transcript_session_mismatch', scenario_target_recovery_blocks_transcript_session_mismatch),
+        ('target_recovery_blocks_missing_transcript', scenario_target_recovery_blocks_missing_transcript),
+        ('target_recovery_blocks_wrong_pid_transcript', scenario_target_recovery_blocks_wrong_pid_transcript),
+        ('target_recovery_blocks_different_agent_at_target', scenario_target_recovery_blocks_different_agent_at_target),
+        ('target_recovery_blocks_same_pane_target', scenario_target_recovery_blocks_same_pane_target),
+        ('target_recovery_blocks_unresolvable_target', scenario_target_recovery_blocks_unresolvable_target),
+        ('target_recovery_skips_without_participant_target', scenario_target_recovery_skips_without_participant_target),
+        ('target_recovery_read_purpose_does_not_mutate', scenario_target_recovery_read_purpose_does_not_mutate),
+        ('target_recovery_env_disable_blocks', scenario_target_recovery_env_disable_blocks),
+        ('tmux_display_pane_empty_metadata_is_unavailable', scenario_tmux_display_pane_empty_metadata_is_unavailable),
+        ('codex_rollout_path_regex_is_strict', scenario_codex_rollout_path_regex_is_strict),
+        ('target_recovery_only_matching_alias_recovers', scenario_target_recovery_only_matching_alias_recovers),
+        ('hook_unknown_preserves_verified_process_identity', scenario_hook_unknown_preserves_verified_process_identity),
+        ('probe_tmux_access_failure_unknown', scenario_probe_tmux_access_failure_unknown),
+        ('endpoint_read_mismatch_does_not_mutate', scenario_endpoint_read_mismatch_does_not_mutate),
+        ('verified_candidate_ordering_prefers_pane_then_newest', scenario_verified_candidate_ordering_prefers_pane_then_newest),
+        ('resume_new_pane_reconnects_unknown_old_and_logs', scenario_resume_new_pane_reconnects_unknown_old_and_logs),
+        ('resume_unknown_old_opt_out_blocks_switch', scenario_resume_unknown_old_opt_out_blocks_switch),
+        ('hook_cached_prior_unknown_does_not_reconnect', scenario_hook_cached_prior_unknown_does_not_reconnect),
+        ('resolver_reconnects_to_alternate_verified_live_record', scenario_resolver_reconnects_to_alternate_verified_live_record),
+        ('resolver_candidate_unknown_on_final_probe_does_not_reconnect', scenario_resolver_candidate_unknown_on_final_probe_does_not_reconnect),
+        ('resolver_read_reconnect_logs_distinct_reason', scenario_resolver_read_reconnect_logs_distinct_reason),
+        ('session_end_replacement_uses_verified_candidate', scenario_session_end_replacement_uses_verified_candidate),
+        ('reconnect_rereads_mapping_before_write', scenario_reconnect_rereads_mapping_before_write),
+        ('caller_reconnects_from_resumed_pane', scenario_caller_reconnects_from_resumed_pane),
+        ('no_probe_requires_verified_live_identity', scenario_no_probe_requires_verified_live_identity),
+        ('daemon_undeliverable_request_returns_result', scenario_daemon_undeliverable_request_returns_result),
+        ('interrupt_endpoint_lost_finalizes_delivered_non_aggregate', scenario_interrupt_endpoint_lost_finalizes_delivered_non_aggregate),
+        ('interrupt_endpoint_lost_finalizes_delivered_aggregate', scenario_interrupt_endpoint_lost_finalizes_delivered_aggregate),
+        ('retry_enter_endpoint_lost_does_not_press_enter', scenario_retry_enter_endpoint_lost_does_not_press_enter),
+        ('direct_notices_suppress_unverified_endpoint', scenario_direct_notices_suppress_unverified_endpoint),
+        ('view_peer_unverified_endpoint_uses_daemon_not_local_capture', phase3['view_peer_unverified_endpoint_uses_daemon_not_local_capture']),
+        ('daemon_startup_backfill_summary_logs_repair_hint', scenario_daemon_startup_backfill_summary_logs_repair_hint),
+        ('peer_body_size_helper_boundaries', scenario_peer_body_size_helper_boundaries),
+        ('send_peer_rejects_oversized_body_before_subprocess', phase3['send_peer_rejects_oversized_body_before_subprocess']),
+        ('send_peer_watchdog_notice_inf_reports_finite_error_first_at_shim', phase3['send_peer_watchdog_notice_inf_reports_finite_error_first_at_shim']),
+        ('send_peer_watchdog_notice_zero_still_rejects_request_only_at_shim', phase3['send_peer_watchdog_notice_zero_still_rejects_request_only_at_shim']),
+        ('send_peer_watchdog_bare_minus_inf_argparse_error_at_shim', phase3['send_peer_watchdog_bare_minus_inf_argparse_error_at_shim']),
+        ('send_peer_watchdog_equals_minus_inf_reports_finite_error_at_shim', phase3['send_peer_watchdog_equals_minus_inf_reports_finite_error_at_shim']),
+        ('send_peer_watchdog_finite_value_forwarded_with_equals', phase3['send_peer_watchdog_finite_value_forwarded_with_equals']),
+        ('send_peer_body_input_diagnostics_are_specific', phase3['send_peer_body_input_diagnostics_are_specific']),
+        ('send_peer_rejects_split_inline_body', phase3['send_peer_rejects_split_inline_body']),
+        ('send_peer_rejects_implicit_split_inline_body', phase3['send_peer_rejects_implicit_split_inline_body']),
+        ('send_peer_accepts_option_after_destination_with_stdin', phase3['send_peer_accepts_option_after_destination_with_stdin']),
+        ('send_peer_accepts_option_after_implicit_target_with_stdin', phase3['send_peer_accepts_option_after_implicit_target_with_stdin']),
+        ('send_peer_accepts_options_after_destination_before_inline_body', phase3['send_peer_accepts_options_after_destination_before_inline_body']),
+        ('send_peer_rejects_option_after_inline_body', phase3['send_peer_rejects_option_after_inline_body']),
+        ('send_peer_rejects_duplicate_destination_after_destination', phase3['send_peer_rejects_duplicate_destination_after_destination']),
+        ('send_peer_implicit_target_option_without_body_reports_body_required', phase3['send_peer_implicit_target_option_without_body_reports_body_required']),
+        ('send_peer_rejects_allow_spoof_after_implicit_target', phase3['send_peer_rejects_allow_spoof_after_implicit_target']),
+        ('send_peer_single_inline_body_uses_stdin_handoff', phase3['send_peer_single_inline_body_uses_stdin_handoff']),
+        ('send_peer_request_success_prints_anti_wait_hint', phase3['send_peer_request_success_prints_anti_wait_hint']),
+        ('send_peer_prior_hint_precedes_success_hint', phase3['send_peer_prior_hint_precedes_success_hint']),
+        ('send_peer_notice_success_prints_alarm_and_anti_wait_hints', phase3['send_peer_notice_success_prints_alarm_and_anti_wait_hints']),
+        ('send_peer_aggregate_request_success_prints_result_hint', phase3['send_peer_aggregate_request_success_prints_result_hint']),
+        ('send_peer_subprocess_failure_prints_no_success_hint', phase3['send_peer_subprocess_failure_prints_no_success_hint']),
+        ('send_peer_ambient_socket_stdin_does_not_block', phase3['send_peer_ambient_socket_stdin_does_not_block']),
+        ('send_peer_inline_body_accepts_empty_non_tty_stdin', phase3['send_peer_inline_body_accepts_empty_non_tty_stdin']),
+        ('send_peer_explicit_stdin_multibyte_body', phase3['send_peer_explicit_stdin_multibyte_body']),
+        ('send_peer_implicit_target_allows_stdin', phase3['send_peer_implicit_target_allows_stdin']),
+        ('send_peer_implicit_target_resolves_session_from_pane', phase3['send_peer_implicit_target_resolves_session_from_pane']),
+        ('send_peer_implicit_target_stdin_resolves_session_from_pane', phase3['send_peer_implicit_target_stdin_resolves_session_from_pane']),
+        ('send_peer_precheck_fails_open_identity_errors_owned_by_validator', phase3['send_peer_precheck_fails_open_identity_errors_owned_by_validator']),
+        ('send_peer_allow_spoof_requires_explicit_destination_without_session', phase3['send_peer_allow_spoof_requires_explicit_destination_without_session']),
+        ('send_peer_rejects_allow_spoof_attached_value', phase3['send_peer_rejects_allow_spoof_attached_value']),
+        ('send_peer_all_rejects_leading_alias_body', phase3['send_peer_all_rejects_leading_alias_body']),
+        ('send_peer_rejects_stdin_with_positional_body', phase3['send_peer_rejects_stdin_with_positional_body']),
+        ('send_peer_rejects_pipe_with_positional_body', phase3['send_peer_rejects_pipe_with_positional_body']),
+        ('send_peer_pipe_only_body_still_supported', phase3['send_peer_pipe_only_body_still_supported']),
+        ('send_peer_precheck_option_table_matches_parser', phase3['send_peer_precheck_option_table_matches_parser']),
+        ('enqueue_rejects_body_and_stdin_before_session_lookup', phase3['enqueue_rejects_body_and_stdin_before_session_lookup']),
+        ('enqueue_rejects_empty_body_and_stdin', phase3['enqueue_rejects_empty_body_and_stdin']),
+        ('enqueue_rejects_body_and_stdin_argv_order_independent', phase3['enqueue_rejects_body_and_stdin_argv_order_independent']),
+        ('enqueue_body_only_still_works', phase3['enqueue_body_only_still_works']),
+        ('enqueue_stdin_only_still_works', phase3['enqueue_stdin_only_still_works']),
+        ('enqueue_aggregate_stdout_socket_and_fallback', phase3['enqueue_aggregate_stdout_socket_and_fallback']),
+        ('enqueue_aggregate_stdout_all_and_negative_cases', phase3['enqueue_aggregate_stdout_all_and_negative_cases']),
+        ('enqueue_bare_body_without_value_remains_argparse_owned', phase3['enqueue_bare_body_without_value_remains_argparse_owned']),
+        ('enqueue_rejects_oversized_body_unchanged', phase3['enqueue_rejects_oversized_body_unchanged']),
+        ('enqueue_stdin_rejects_oversized_body_unchanged', phase3['enqueue_stdin_rejects_oversized_body_unchanged']),
+        ('enqueue_socket_success_hints_stderr_stdout_unchanged', phase3['enqueue_socket_success_hints_stderr_stdout_unchanged']),
+        ('enqueue_fallback_prior_hint_pending_cancel', phase3['enqueue_fallback_prior_hint_pending_cancel']),
+        ('enqueue_fallback_prior_hint_submitted_interrupt', phase3['enqueue_fallback_prior_hint_submitted_interrupt']),
+        ('enqueue_fallback_prior_hint_plain_inflight_omitted', phase3['enqueue_fallback_prior_hint_plain_inflight_omitted']),
+        ('enqueue_fallback_prior_hint_pane_mode_inflight_cancel', phase3['enqueue_fallback_prior_hint_pane_mode_inflight_cancel']),
+        ('enqueue_fallback_prior_hint_write_failure_suppresses_hint', phase3['enqueue_fallback_prior_hint_write_failure_suppresses_hint']),
+        ('enqueue_fallback_response_send_guard_no_hint', phase3['enqueue_fallback_response_send_guard_no_hint']),
+        ('alarm_cancel_preserves_at_limit_body', scenario_alarm_cancel_preserves_at_limit_body),
+        ('prompt_body_preserves_multiline_and_sanitizes', scenario_prompt_body_preserves_multiline_and_sanitizes),
+        ('build_peer_prompt_signature_drops_max_hops', scenario_build_peer_prompt_signature_drops_max_hops),
+        ('tmux_paste_buffer_delivery_sequence', scenario_tmux_paste_buffer_delivery_sequence),
+        ('daemon_logs_body_truncated_for_legacy_long_body', scenario_daemon_logs_body_truncated_for_legacy_long_body),
+        ('peer_result_redirect_single_over_limit', scenario_peer_result_redirect_single_over_limit),
+        ('peer_result_redirect_restart_queue_roundtrip', scenario_peer_result_redirect_restart_queue_roundtrip),
+        ('peer_result_redirect_below_limit_inline', scenario_peer_result_redirect_below_limit_inline),
+        ('peer_result_redirect_write_failure_fallback', scenario_peer_result_redirect_write_failure_fallback),
+        ('peer_result_redirect_collision_and_symlink_safe', scenario_peer_result_redirect_collision_and_symlink_safe),
+        ('peer_result_redirect_share_root_owner_mismatch', scenario_peer_result_redirect_share_root_owner_mismatch),
+        ('peer_result_redirect_replies_permission_drift_tightened', scenario_peer_result_redirect_replies_permission_drift_tightened),
+        ('peer_result_redirect_logs_reduced_preview_chars', scenario_peer_result_redirect_logs_reduced_preview_chars),
+        ('peer_result_redirect_malformed_message_id_safe_filename', scenario_peer_result_redirect_malformed_message_id_safe_filename),
+        ('peer_result_redirect_aggregate_unique_once', scenario_peer_result_redirect_aggregate_unique_once),
+        ('response_send_guard_socket_cli_error_kind', scenario_response_send_guard_socket_cli_error_kind),
+        ('response_send_guard_socket_error_kind_parse', scenario_response_send_guard_socket_error_kind_parse),
+        ('enqueue_fallback_success_silent_with_raw_diagnostic', phase3['enqueue_fallback_success_silent_with_raw_diagnostic']),
+        ('enqueue_fallback_write_failure_preserves_stderr', phase3['enqueue_fallback_write_failure_preserves_stderr']),
+        ('response_send_guard_fallback_blocks_unchanged', scenario_response_send_guard_fallback_blocks_unchanged),
+        ('response_send_guard_fallback_all_blocks_unchanged', scenario_response_send_guard_fallback_all_blocks_unchanged),
+        ('response_send_guard_fallback_partial_blocks_unchanged', scenario_response_send_guard_fallback_partial_blocks_unchanged),
+        ('response_send_guard_fallback_force_allows', scenario_response_send_guard_fallback_force_allows),
+        ('response_send_guard_fallback_no_auto_return_allowed', scenario_response_send_guard_fallback_no_auto_return_allowed),
+        ('response_send_guard_fallback_false_positive_resistance', scenario_response_send_guard_fallback_false_positive_resistance),
+        ('clear_reservation_blocks_delivery', scenario_clear_reservation_blocks_delivery),
+        ('clear_guard_formatter_force_guidance', scenario_clear_guard_formatter_force_guidance),
+        ('clear_guard_force_truth_matches_policy', scenario_clear_guard_force_truth_matches_policy),
+        ('clear_multi_guard_pass_reserves_all', scenario_clear_multi_guard_pass_reserves_all),
+        ('clear_multi_guard_hard_blocker_rejects_all', scenario_clear_multi_guard_hard_blocker_rejects_all),
+        ('clear_multi_guard_soft_blocker_rejects_all', scenario_clear_multi_guard_soft_blocker_rejects_all),
+        ('clear_multi_partial_outcomes_and_cleanup', scenario_clear_multi_partial_outcomes_and_cleanup),
+        ('clear_multi_pre_pane_failure_continues', scenario_clear_multi_pre_pane_failure_continues),
+        ('clear_multi_forced_leave_notice_waits_behind_reservation', scenario_clear_multi_forced_leave_notice_waits_behind_reservation),
+        ('clear_multi_lock_wait_failed_and_rerun', scenario_clear_multi_lock_wait_failed_and_rerun),
+        ('clear_multi_real_post_touch_exception_forces_leave', scenario_clear_multi_real_post_touch_exception_forces_leave),
+        ('clear_multi_real_success_holds_until_batch_end', scenario_clear_multi_real_success_holds_until_batch_end),
+        ('clear_multi_real_pre_pane_failure_holds_until_batch_end', scenario_clear_multi_real_pre_pane_failure_holds_until_batch_end),
+        ('clear_guard_blocks_pending_self_clear', scenario_clear_guard_blocks_pending_self_clear),
+        ('clear_multi_daemon_validation', scenario_clear_multi_daemon_validation),
+        ('clear_peer_cli_multi_and_compatibility', scenario_clear_peer_cli_multi_and_compatibility),
+        ('clear_multi_timeout_and_formatter', scenario_clear_multi_timeout_and_formatter),
+        ('self_clear_force_guidance_and_preserved_force', scenario_self_clear_force_guidance_and_preserved_force),
+        ('requester_cleared_prompt_guard_and_notice', scenario_requester_cleared_prompt_guard_and_notice),
+        ('clear_marker_routes_fast_stop', scenario_clear_marker_routes_fast_stop),
+        ('clear_marker_probe_id_fallback_contracts', scenario_clear_marker_probe_id_fallback_contracts),
+        ('clear_post_clear_first_request_routes_reply', scenario_clear_post_clear_first_request_routes_reply),
+        ('clear_with_existing_inbound_queue_routes_replies', scenario_clear_with_existing_inbound_queue_routes_replies),
+        ('clear_file_fallback_blocked_sender_aged_ingress', scenario_clear_file_fallback_blocked_sender_aged_ingress),
+        ('clear_post_clear_delay_config_and_settle', scenario_clear_post_clear_delay_config_and_settle),
+        ('clear_settle_pane_not_ready_forces_leave', scenario_clear_settle_pane_not_ready_forces_leave),
+        ('clear_identity_helper_preserves_verified_live_identity', scenario_clear_identity_helper_preserves_verified_live_identity),
+        ('clear_requires_verified_process_identity', scenario_clear_requires_verified_process_identity),
+        ('clear_codex_post_clear_endpoint_verify_immediately', scenario_clear_codex_post_clear_endpoint_verify_immediately),
+        ('clear_claude_post_clear_probe_pasted_and_completes', scenario_clear_claude_post_clear_probe_pasted_and_completes),
+        ('clear_session_end_suppression_is_exact', scenario_clear_session_end_suppression_is_exact),
+        ('command_state_lock_timeout_before_mutation', scenario_command_state_lock_timeout_before_mutation),
+        ('clear_success_delivery_defers_near_deadline', scenario_clear_success_delivery_defers_near_deadline),
+        ('clear_success_delivery_lock_wait_does_not_fail_after_commit', scenario_clear_success_delivery_lock_wait_does_not_fail_after_commit),
+        ('clear_probe_subprocess_timeouts', scenario_clear_probe_subprocess_timeouts),
+        ('clear_marker_phase2_missing_forces_leave', scenario_clear_marker_phase2_missing_forces_leave),
+        ('clear_marker_phase2_rejects_record_turn_without_marker_turn', scenario_clear_marker_phase2_rejects_record_turn_without_marker_turn),
+        ('run_clear_peer_phase2_failure_returns_immediately', scenario_run_clear_peer_phase2_failure_returns_immediately),
+        ('clear_force_leave_cleans_identity_stores', scenario_clear_force_leave_cleans_identity_stores),
+        ('clear_force_leave_unowned_lock_serializes_cleanup', scenario_clear_force_leave_unowned_lock_serializes_cleanup),
+        ('clear_identity_helper_success_and_failure', scenario_clear_identity_helper_success_and_failure),
+        ('force_clear_requester_dual_write_queue_and_active', scenario_force_clear_requester_dual_write_queue_and_active),
+        ('clear_aggregate_requester_late_reply_suppressed', scenario_clear_aggregate_requester_late_reply_suppressed),
+        ('self_clear_promotion_and_cancel_notice_ordering', scenario_self_clear_promotion_and_cancel_notice_ordering),
+        ('clear_marker_ttl_expiry_removes_marker', scenario_clear_marker_ttl_expiry_removes_marker),
+    ]
 
 def main(argv: list[str] | None = None) -> int:
     from regression.runner import main as runner_main

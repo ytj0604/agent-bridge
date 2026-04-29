@@ -17,6 +17,19 @@ def load_scenarios(source: ScenarioSource | None = None) -> list[Scenario]:
     return scenarios
 
 
+def scenario_index(*groups: Sequence[Scenario]) -> dict[str, ScenarioFn]:
+    indexed: dict[str, ScenarioFn] = {}
+    duplicate_labels: list[str] = []
+    for group in groups:
+        for label, fn in group:
+            if label in indexed:
+                duplicate_labels.append(label)
+            indexed[label] = fn
+    if duplicate_labels:
+        raise ValueError(f"duplicate moved scenario labels: {', '.join(duplicate_labels)}")
+    return indexed
+
+
 def _legacy_scenarios_source() -> Callable[[], Sequence[Scenario]]:
     main_module = sys.modules.get("__main__")
     main_file = str(getattr(main_module, "__file__", "") or "")
