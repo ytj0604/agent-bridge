@@ -18131,13 +18131,8 @@ def scenario_enqueue_fallback_write_failure_preserves_stderr(label: str, tmpdir:
     print(f"  PASS  {label}")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--keep-tmp", action="store_true")
-    args = parser.parse_args()
-    base = Path(tempfile.mkdtemp(prefix="bridge-regression-"))
-    try:
-        scenarios = [
+def scenarios() -> list[tuple[str, object]]:
+    return [
             ("lifecycle_delivered_terminal", scenario_lifecycle),
             ("held_interrupt_does_not_block_delivery", scenario_held_interrupt_does_not_block_delivery),
             ("reserve_next_ignores_held_marker", scenario_reserve_next_ignores_held_marker),
@@ -18754,25 +18749,12 @@ def main() -> int:
             ("self_clear_promotion_and_cancel_notice_ordering", scenario_self_clear_promotion_and_cancel_notice_ordering),
             ("clear_marker_ttl_expiry_removes_marker", scenario_clear_marker_ttl_expiry_removes_marker),
         ]
-        passes = 0
-        fails = 0
-        for label, fn in scenarios:
-            sub = base / label
-            sub.mkdir(parents=True, exist_ok=True)
-            try:
-                fn(label, sub)
-                passes += 1
-            except AssertionError as exc:
-                print(f"  FAIL  {label}: {exc}", file=sys.stderr)
-                fails += 1
-            except Exception as exc:
-                print(f"  ERROR {label}: {type(exc).__name__}: {exc}", file=sys.stderr)
-                fails += 1
-        print(f"--- {passes} passed, {fails} failed ---")
-        return 0 if fails == 0 else 1
-    finally:
-        if not args.keep_tmp:
-            shutil.rmtree(base, ignore_errors=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    from regression.runner import main as runner_main
+
+    return runner_main(argv, scenarios)
 
 
 if __name__ == "__main__":
