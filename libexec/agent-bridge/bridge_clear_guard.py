@@ -13,6 +13,7 @@ class ClearViolation:
     message: str
     hard: bool = True
     refs: list[str] = field(default_factory=list)
+    target: str = ""
 
 
 @dataclass
@@ -89,18 +90,26 @@ def _force_actions_for(violations: Iterable[ClearViolation]) -> list[str]:
     return actions
 
 
-def format_clear_guard_result(result: ClearGuardResult, *, force_attempted: bool | None = None) -> str:
+def format_clear_guard_result(
+    result: ClearGuardResult,
+    *,
+    force_attempted: bool | None = None,
+    suppress_force_hint: bool = False,
+    include_targets: bool = False,
+) -> str:
     force_was_attempted = result.force_attempted if force_attempted is None else force_attempted
     parts: list[str] = []
     for violation in result.hard_blockers:
         refs = f" refs={','.join(violation.refs)}" if violation.refs else ""
         prefix = "hard" if violation.hard else "soft"
-        parts.append(f"{prefix}:{violation.code}: {violation.message}{refs}")
+        target_prefix = f"{violation.target} " if include_targets and violation.target else ""
+        parts.append(f"{target_prefix}{prefix}:{violation.code}: {violation.message}{refs}")
     for violation in result.soft_blockers:
         refs = f" refs={','.join(violation.refs)}" if violation.refs else ""
         prefix = "hard" if violation.hard else "soft"
-        parts.append(f"{prefix}:{violation.code}: {violation.message}{refs}")
+        target_prefix = f"{violation.target} " if include_targets and violation.target else ""
+        parts.append(f"{target_prefix}{prefix}:{violation.code}: {violation.message}{refs}")
     actions = _force_actions_for(result.soft_blockers)
-    if actions and not force_was_attempted:
+    if actions and not force_was_attempted and not suppress_force_hint:
         parts.append(f"Retry with --force to {'; '.join(actions)}.")
     return "; ".join(parts) if parts else "clear allowed"

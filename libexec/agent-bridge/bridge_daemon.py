@@ -91,7 +91,9 @@ TMUX_DELIVERY_WORST_CASE_SECONDS = 20.0
 CLEAR_PROBE_TIMEOUT_SECONDS = 180.0
 CLEAR_POST_CLEAR_DELAY_DEFAULT_SECONDS = 1.0
 CLEAR_POST_LOCK_WORST_CASE_SECONDS = 75.0
+# Keep in sync with bridge_clear_peer.CLEAR_SOCKET_TIMEOUT_SECONDS.
 CLEAR_CLIENT_TIMEOUT_SECONDS = 180.0
+CLEAR_MULTI_TIMEOUT_MARGIN_SECONDS = 10.0
 CLEAR_LOCK_WAIT_BUDGET_SECONDS = 85.0
 COMMAND_DEFAULT_CLIENT_TIMEOUT_SECONDS = 5.0
 COMMAND_SHORT_CLIENT_TIMEOUT_SECONDS = 2.0
@@ -973,7 +975,7 @@ class BridgeDaemon:
         if not isinstance(request, dict):
             return {"ok": False, "error": "unsupported command"}
         op = request.get("op")
-        self.begin_command_context(str(op or ""))
+        self.begin_command_context(str(op or ""), request)
         if op == "enqueue":
             return self.handle_enqueue_command(
                 request.get("messages"),
@@ -1016,10 +1018,20 @@ class BridgeDaemon:
         if op == "clear_peer":
             self.reload_participants()
             sender = str(request.get("from") or "")
-            target = str(request.get("target") or "")
             force = bool(request.get("force"))
             if sender and sender != "bridge" and sender not in self.participants:
                 return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
+            if request.get("targets") is not None:
+                if str(request.get("target") or ""):
+                    return {"ok": False, "error": "use either target or targets, not both", "error_kind": "malformed_targets"}
+                validation = self.validate_clear_targets_payload(sender or "bridge", request.get("targets"), force=force)
+                if not validation.get("ok"):
+                    return validation
+                targets = list(validation.get("targets") or [])
+                if len(targets) == 1:
+                    return self.handle_clear_peer(sender or "bridge", targets[0], force=force)
+                return self.handle_clear_peers(sender or "bridge", targets, force=force)
+            target = str(request.get("target") or "")
             if target not in self.participants:
                 return {"ok": False, "error": f"target {target!r} is not an active participant"}
             return self.handle_clear_peer(sender or "bridge", target, force=force)
@@ -1192,16 +1204,20 @@ class BridgeDaemon:
         except OSError:
             return None
 
-    def begin_command_context(self, op: str) -> None:
+    def begin_command_context(self, op: str, request: dict | None = None) -> None:
+        request = request if isinstance(request, dict) else {}
         client_timeout = COMMAND_DEFAULT_CLIENT_TIMEOUT_SECONDS
+        clear_target_count = 1
         if op in {"enqueue", "alarm"}:
             client_timeout = COMMAND_SHORT_CLIENT_TIMEOUT_SECONDS
         if op == "clear_peer":
-            client_timeout = CLEAR_CLIENT_TIMEOUT_SECONDS
+            clear_target_count = self.clear_target_count_from_request(request)
+            client_timeout = self.clear_peer_client_timeout_seconds(clear_target_count)
         self.command_context.info = {
             "op": op,
             "started_ts": time.monotonic(),
             "client_timeout": client_timeout,
+            "clear_target_count": clear_target_count,
         }
 
     def command_context_info(self) -> dict:
@@ -1236,6 +1252,12 @@ class BridgeDaemon:
     def command_budget(self, command_class: str = "") -> tuple[float, float]:
         command = str(command_class or self.command_context_info().get("op") or "")
         if command == "clear_peer":
+            try:
+                count = int(self.command_context_info().get("clear_target_count") or 1)
+            except (TypeError, ValueError):
+                count = 1
+            if count > 1:
+                return self.clear_peer_batch_post_lock_worst_case_seconds(count), 20.0
             return self.clear_peer_post_lock_worst_case_seconds(), 20.0
         if command in {"enqueue", "alarm"}:
             return COMMAND_SHORT_POST_LOCK_WORST_CASE_SECONDS, COMMAND_SHORT_SAFETY_MARGIN_SECONDS
@@ -1243,6 +1265,26 @@ class BridgeDaemon:
 
     def clear_peer_post_lock_worst_case_seconds(self) -> float:
         return CLEAR_POST_LOCK_WORST_CASE_SECONDS + max(0.0, float(self.clear_post_clear_delay_seconds or 0.0))
+
+    def clear_peer_batch_post_lock_worst_case_seconds(self, target_count: int) -> float:
+        count = max(1, int(target_count or 1))
+        base = self.clear_peer_post_lock_worst_case_seconds() * count
+        if count > 1:
+            base += CLEAR_MULTI_TIMEOUT_MARGIN_SECONDS
+        return base
+
+    def clear_peer_client_timeout_seconds(self, target_count: int) -> float:
+        count = max(1, int(target_count or 1))
+        if count <= 1:
+            return CLEAR_CLIENT_TIMEOUT_SECONDS
+        settle_extra = max(0.0, float(self.clear_post_clear_delay_seconds or 0.0) - CLEAR_POST_CLEAR_DELAY_DEFAULT_SECONDS)
+        return (CLEAR_CLIENT_TIMEOUT_SECONDS + settle_extra) * count + CLEAR_MULTI_TIMEOUT_MARGIN_SECONDS
+
+    def clear_target_count_from_request(self, request: dict) -> int:
+        targets = request.get("targets")
+        if isinstance(targets, list) and targets:
+            return len(targets)
+        return 1
 
     def _state_lock_owned_by_current_thread(self) -> bool:
         is_owned = getattr(self.state_lock, "_is_owned", None)
@@ -1378,11 +1420,18 @@ class BridgeDaemon:
             return False
         return sender in self.clear_reservations or sender in self.pending_self_clears
 
-    def clear_guard(self, target: str, *, force: bool) -> ClearGuardResult:
-        queue_snapshot = list(self.queue.read())
+    def _clear_guard_from_snapshots(
+        self,
+        target: str,
+        *,
+        force: bool,
+        queue_snapshot: list[dict],
+        aggregates: dict,
+    ) -> ClearGuardResult:
         hard: list[ClearViolation] = []
         soft: list[ClearViolation] = []
         def add_violation(violation: ClearViolation) -> None:
+            violation.target = violation.target or target
             if violation.hard:
                 hard.append(violation)
             else:
@@ -1390,6 +1439,8 @@ class BridgeDaemon:
 
         if target in self.clear_reservations:
             add_violation(ClearViolation("clear_already_pending", f"clear already active for {target}"))
+        if target in self.pending_self_clears:
+            add_violation(ClearViolation("clear_already_pending", f"self-clear already pending for {target}"))
         if self.busy.get(target) or (self.current_prompt_by_agent.get(target) or {}).get("id"):
             add_violation(ClearViolation("target_busy", f"{target} is currently processing a prompt"))
         inbound_active = active_queue_rows(queue_snapshot, target=target, last_enter_ts=self.last_enter_ts)
@@ -1436,7 +1487,6 @@ class BridgeDaemon:
                     refs=target_alarms,
                 )
             )
-        aggregates = read_json(self.aggregate_file, {"version": 1, "aggregates": {}}).get("aggregates") or {}
         requester_aggs = [
             str(agg_id)
             for agg_id, agg in aggregates.items()
@@ -1456,6 +1506,42 @@ class BridgeDaemon:
         if hard or (soft and not force):
             return ClearGuardResult(ok=False, hard_blockers=hard, soft_blockers=soft, force_attempted=force)
         return ClearGuardResult(ok=True, hard_blockers=hard, soft_blockers=soft, force_attempted=force)
+
+    def clear_guard(self, target: str, *, force: bool) -> ClearGuardResult:
+        queue_snapshot = list(self.queue.read())
+        aggregates = read_json(self.aggregate_file, {"version": 1, "aggregates": {}}).get("aggregates") or {}
+        return self._clear_guard_from_snapshots(
+            target,
+            force=force,
+            queue_snapshot=queue_snapshot,
+            aggregates=aggregates if isinstance(aggregates, dict) else {},
+        )
+
+    def clear_guard_multi(
+        self,
+        targets: list[str],
+        *,
+        force: bool,
+        queue_snapshot: list[dict],
+        aggregates: dict,
+    ) -> ClearGuardResult:
+        hard: list[ClearViolation] = []
+        soft: list[ClearViolation] = []
+        for target in targets:
+            result = self._clear_guard_from_snapshots(
+                target,
+                force=force,
+                queue_snapshot=queue_snapshot,
+                aggregates=aggregates,
+            )
+            hard.extend(result.hard_blockers)
+            soft.extend(result.soft_blockers)
+        return ClearGuardResult(
+            ok=not hard and not (soft and not force),
+            hard_blockers=hard,
+            soft_blockers=soft,
+            force_attempted=force,
+        )
 
     def apply_force_clear_invalidation(self, target: str, caller: str) -> dict:
         now_iso = utc_now()
@@ -1577,6 +1663,8 @@ class BridgeDaemon:
                 self.force_leave_after_clear_failure(target, caller=caller, reason=reason, reservation=reservation)
             return
         reservation = reservation or self.clear_reservations.get(target) or {}
+        reservation["forced_leave"] = True
+        reservation["forced_leave_reason"] = reason
         old_session_id = str(reservation.get("old_session_id") or "")
         new_session_id = str(reservation.get("new_session_id") or "")
         participant = self.participants.get(target) or {}
@@ -1697,6 +1785,107 @@ class BridgeDaemon:
                                 continue
                             if live_pane == pane or record.get("alias") == target or record.get("session_id") in {old_session_id, new_session_id}:
                                 del live_panes[live_pane]
+
+    def clear_target_lookup_error(self, target: str) -> dict:
+        all_participants = self.session_state.get("participants") or {}
+        if isinstance(all_participants, dict) and target in all_participants:
+            return {
+                "ok": False,
+                "error": f"target {target!r} is not an active participant",
+                "error_kind": "inactive_target",
+                "target": target,
+            }
+        return {
+            "ok": False,
+            "error": f"unknown target alias {target!r}; active aliases: {', '.join(sorted(self.participants))}",
+            "error_kind": "unknown_target",
+            "target": target,
+        }
+
+    def validate_clear_targets_payload(self, sender: str, targets_payload: object, *, force: bool) -> dict:
+        if not isinstance(targets_payload, list):
+            return {"ok": False, "error": "targets must be a non-empty list of aliases", "error_kind": "malformed_targets"}
+        if not targets_payload:
+            return {"ok": False, "error": "targets must be a non-empty list of aliases", "error_kind": "malformed_targets"}
+        seen: set[str] = set()
+        targets: list[str] = []
+        for raw in targets_payload:
+            if not isinstance(raw, str):
+                return {"ok": False, "error": "targets entries must be aliases", "error_kind": "malformed_targets"}
+            target = raw.strip()
+            if not target:
+                return {"ok": False, "error": "targets entries must be non-empty aliases", "error_kind": "malformed_targets"}
+            if target in seen:
+                continue
+            if target not in self.participants:
+                return self.clear_target_lookup_error(target)
+            seen.add(target)
+            targets.append(target)
+        if not targets:
+            return {"ok": False, "error": "targets must be a non-empty list of aliases", "error_kind": "malformed_targets"}
+        if len(targets) > 1 and force:
+            return {
+                "ok": False,
+                "error": "--force is only supported for single-target clear; specify exactly one alias when using --force",
+                "error_kind": "multi_force_disallowed",
+            }
+        if len(targets) > 1 and sender and sender != "bridge" and sender in targets:
+            return {
+                "ok": False,
+                "error": "self-clear must be the only target; specify only your own alias or omit yourself",
+                "error_kind": "multi_self_disallowed",
+            }
+        return {"ok": True, "targets": targets}
+
+    def clear_batch_summary(self, results: list[dict]) -> dict:
+        by_status: dict[str, list[str]] = {"cleared": [], "forced_leave": [], "failed": []}
+        for result in results:
+            status = str(result.get("status") or "failed")
+            target = str(result.get("target") or "")
+            by_status.setdefault(status, []).append(target)
+        return {
+            "counts": {status: len(targets) for status, targets in by_status.items()},
+            "cleared": by_status.get("cleared", []),
+            "forced_leave": by_status.get("forced_leave", []),
+            "failed": by_status.get("failed", []),
+            "all_cleared": len(by_status.get("cleared", [])) == len(results),
+        }
+
+    def normalize_clear_batch_result(self, target: str, result: dict) -> dict:
+        if result.get("ok") and result.get("cleared"):
+            status = "cleared"
+        elif result.get("forced_leave"):
+            status = "forced_leave"
+        else:
+            status = "failed"
+        normalized = {
+            "target": target,
+            "status": status,
+            "ok": bool(result.get("ok")),
+            "cleared": bool(result.get("cleared")),
+            "forced_leave": bool(result.get("forced_leave")),
+        }
+        if result.get("error"):
+            normalized["error"] = str(result.get("error") or "")
+        if result.get("error_kind"):
+            normalized["error_kind"] = str(result.get("error_kind") or "")
+        if result.get("new_session_id"):
+            normalized["new_session_id"] = result.get("new_session_id")
+        return normalized
+
+    def clear_batch_exception_requires_forced_leave(self, reservation: dict) -> bool:
+        if reservation.get("pane_touched"):
+            return True
+        phase = str(reservation.get("phase") or "")
+        return phase not in {"", "reserved", "pending_prompt"}
+
+    def hold_clear_reservation_for_batch_failure(self, reservation: dict | None, reason: str) -> None:
+        if reservation is None:
+            return
+        reservation["phase"] = "batch_hold_failed"
+        reservation["batch_hold_complete"] = True
+        reservation["batch_hold_failure_reason"] = reason
+
     def handle_clear_peer(self, sender: str, target: str, *, force: bool) -> dict:
         if not target:
             return {"ok": False, "error": "target required"}
@@ -1726,6 +1915,117 @@ class BridgeDaemon:
             self.log("self_clear_deferred", target=target, by_sender=sender, force=bool(force))
             return {"ok": True, "deferred": True, "target": target}
         return self.run_clear_peer(sender, target, force=force)
+
+    def handle_clear_peers(self, sender: str, targets: list[str], *, force: bool) -> dict:
+        validation = self.validate_clear_targets_payload(sender, targets, force=force)
+        if not validation.get("ok"):
+            return validation
+        targets = list(validation.get("targets") or [])
+        if len(targets) == 1:
+            return self.handle_clear_peer(sender, targets[0], force=force)
+
+        reservations: dict[str, dict] = {}
+        try:
+            with self.command_state_lock(
+                post_lock_worst_case=self.clear_peer_batch_post_lock_worst_case_seconds(len(targets)),
+                margin=20.0,
+                command_class="clear_peer",
+            ):
+                if not self.command_deadline_ok(
+                    post_lock_worst_case=self.clear_peer_batch_post_lock_worst_case_seconds(len(targets)),
+                    margin=20.0,
+                    command_class="clear_peer",
+                ):
+                    return self.lock_wait_exceeded_response("clear_peer")
+                self._reload_participants_unlocked()
+                validation = self.validate_clear_targets_payload(sender, targets, force=force)
+                if not validation.get("ok"):
+                    return validation
+                targets = list(validation.get("targets") or [])
+                queue_snapshot = list(self.queue.read())
+                aggregate_data = read_json(self.aggregate_file, {"version": 1, "aggregates": {}})
+                aggregates = aggregate_data.get("aggregates") if isinstance(aggregate_data, dict) else {}
+                guard = self.clear_guard_multi(
+                    targets,
+                    force=False,
+                    queue_snapshot=queue_snapshot,
+                    aggregates=aggregates if isinstance(aggregates, dict) else {},
+                )
+                if not guard.ok:
+                    return {
+                        "ok": False,
+                        "error": format_clear_guard_result(
+                            guard,
+                            suppress_force_hint=True,
+                            include_targets=True,
+                        ),
+                        "error_kind": "clear_blocked",
+                        "hard_blockers": [v.__dict__ for v in guard.hard_blockers],
+                        "soft_blockers": [v.__dict__ for v in guard.soft_blockers],
+                    }
+                for target in targets:
+                    participant = dict(self.participants.get(target) or {})
+                    reservation = self._new_clear_reservation(sender, target, force=False, participant=participant)
+                    reservations[target] = reservation
+                    self.clear_reservations[target] = reservation
+                self.log("clear_peer_batch_reserved", by_sender=sender, targets=targets)
+        except CommandLockWaitExceeded:
+            return self.lock_wait_exceeded_response("clear_peer")
+
+        results: list[dict] = []
+        try:
+            for target in targets:
+                reservation = reservations.get(target) or {}
+                try:
+                    result = self.run_clear_peer(
+                        sender,
+                        target,
+                        force=False,
+                        existing_reservation=reservation,
+                        hold_reservation_after_success=True,
+                    )
+                except Exception as exc:
+                    self.safe_log("clear_peer_batch_target_exception", target=target, by_sender=sender, error=str(exc))
+                    if self.clear_batch_exception_requires_forced_leave(reservation):
+                        self.force_leave_after_clear_failure(
+                            target,
+                            caller=sender,
+                            reason=f"batch_exception:{exc}",
+                            reservation=reservation,
+                        )
+                        result = {
+                            "ok": False,
+                            "error": str(exc),
+                            "error_kind": "exception",
+                            "forced_leave": True,
+                            "target": target,
+                        }
+                    else:
+                        result = {"ok": False, "error": str(exc), "error_kind": "exception", "target": target}
+                        with self.state_lock:
+                            if self.clear_reservations.get(target) is reservation:
+                                marker_id_value = str(reservation.get("identity_marker_id") or "")
+                                if marker_id_value:
+                                    remove_marker(marker_id_value)
+                                self.clear_reservations.pop(target, None)
+                results.append(self.normalize_clear_batch_result(target, result if isinstance(result, dict) else {}))
+        finally:
+            released_targets: list[str] = []
+            with self.state_lock:
+                for target, reservation in reservations.items():
+                    if self.clear_reservations.get(target) is reservation:
+                        marker_id_value = str(reservation.get("identity_marker_id") or "")
+                        if marker_id_value:
+                            remove_marker(marker_id_value)
+                        self.clear_reservations.pop(target, None)
+                        released_targets.append(target)
+                        self.log("clear_peer_batch_reservation_released", target=target, by_sender=sender)
+            for target in released_targets:
+                self.try_deliver_command_aware(target)
+
+        summary = self.clear_batch_summary(results)
+        self.log("clear_peer_batch_completed", by_sender=sender, targets=targets, summary=summary)
+        return {"ok": True, "targets": targets, "results": results, "summary": summary}
 
     def _new_clear_reservation(self, caller: str, target: str, *, force: bool, participant: dict, pane: str = "") -> dict:
         clear_id = short_id("clear")
@@ -1842,7 +2142,15 @@ class BridgeDaemon:
         )
         return {}
 
-    def run_clear_peer(self, caller: str, target: str, *, force: bool, existing_reservation: dict | None = None) -> dict:
+    def run_clear_peer(
+        self,
+        caller: str,
+        target: str,
+        *,
+        force: bool,
+        existing_reservation: dict | None = None,
+        hold_reservation_after_success: bool = False,
+    ) -> dict:
         reservation: dict | None = existing_reservation
         participant: dict = {}
         endpoint_detail: dict = {}
@@ -1854,6 +2162,8 @@ class BridgeDaemon:
             )
             state_lock_ctx.__enter__()
         except CommandLockWaitExceeded:
+            if hold_reservation_after_success:
+                self.hold_clear_reservation_for_batch_failure(reservation, "lock_wait_exceeded")
             return self.lock_wait_exceeded_response("clear_peer")
         try:
             if not self.command_deadline_ok(
@@ -1861,9 +2171,13 @@ class BridgeDaemon:
                 margin=20.0,
                 command_class="clear_peer",
             ):
+                if hold_reservation_after_success:
+                    self.hold_clear_reservation_for_batch_failure(reservation, "lock_wait_exceeded")
                 return self.lock_wait_exceeded_response("clear_peer")
             self._reload_participants_unlocked()
             if target not in self.participants:
+                if hold_reservation_after_success:
+                    self.hold_clear_reservation_for_batch_failure(reservation, "target_inactive")
                 return {"ok": False, "error": f"target {target!r} is not an active participant"}
             participant = dict(self.participants.get(target) or {})
             if reservation is None:
@@ -1888,34 +2202,45 @@ class BridgeDaemon:
             endpoint_detail = self.resolve_endpoint_detail(target, purpose="write")
             pane = str(endpoint_detail.get("pane") or "") if endpoint_detail.get("ok") else ""
             if not pane:
-                self.clear_reservations.pop(target, None)
-                marker_id_existing = str(reservation.get("identity_marker_id") or "")
-                if marker_id_existing:
-                    remove_marker(marker_id_existing)
+                if hold_reservation_after_success:
+                    self.hold_clear_reservation_for_batch_failure(reservation, "endpoint_lost")
+                else:
+                    self.clear_reservations.pop(target, None)
+                    marker_id_existing = str(reservation.get("identity_marker_id") or "")
+                    if marker_id_existing:
+                        remove_marker(marker_id_existing)
                 return {"ok": False, "error": str(endpoint_detail.get("reason") or "endpoint_lost"), "error_kind": "endpoint_lost", "target": target}
             reservation["pane"] = pane
             mode_status = self.pane_mode_status(pane)
             if mode_status.get("error") or mode_status.get("in_mode"):
-                self.clear_reservations.pop(target, None)
-                marker_id_existing = str(reservation.get("identity_marker_id") or "")
-                if marker_id_existing:
-                    remove_marker(marker_id_existing)
+                if hold_reservation_after_success:
+                    self.hold_clear_reservation_for_batch_failure(reservation, "pane_not_ready")
+                else:
+                    self.clear_reservations.pop(target, None)
+                    marker_id_existing = str(reservation.get("identity_marker_id") or "")
+                    if marker_id_existing:
+                        remove_marker(marker_id_existing)
                 return {"ok": False, "error": str(mode_status.get("error") or "pane_in_mode"), "error_kind": "pane_not_ready", "target": target}
 
             marker_id_value = self._write_clear_marker_locked(reservation, participant, pane)
+            reservation["phase"] = "writing_clear"
             clear_status = self._clear_tmux_send(pane, "/clear", target=target, message_id=str(reservation.get("clear_id") or "clear"))
             reservation["pane_touched"] = bool(clear_status.get("pane_touched"))
             if not clear_status.get("ok"):
                 if reservation.get("pane_touched"):
                     self.force_leave_after_clear_failure(target, caller=caller, reason=f"clear_write_failed:{clear_status.get('error')}", reservation=reservation)
                 else:
-                    self.clear_reservations.pop(target, None)
-                    remove_marker(marker_id_value)
+                    if hold_reservation_after_success:
+                        self.hold_clear_reservation_for_batch_failure(reservation, "clear_write_failed")
+                    else:
+                        self.clear_reservations.pop(target, None)
+                        remove_marker(marker_id_value)
                 return {
                     "ok": False,
                     "error": str(clear_status.get("error") or "clear_write_failed"),
                     "error_kind": "clear_write_failed",
                     "pane_touched": bool(clear_status.get("pane_touched")),
+                    "forced_leave": bool(reservation.get("forced_leave")),
                     "target": target,
                 }
 
@@ -1925,6 +2250,7 @@ class BridgeDaemon:
                     "ok": False,
                     "error": str(reservation.get("failure_reason") or "clear_failed"),
                     "error_kind": str(reservation.get("failure_reason") or "clear_failed"),
+                    "forced_leave": bool(reservation.get("forced_leave")),
                     "target": target,
                 }
             settle_mode_status = self.pane_mode_status(pane)
@@ -1932,7 +2258,7 @@ class BridgeDaemon:
                 reason_detail = str(settle_mode_status.get("error") or settle_mode_status.get("mode") or "pane_in_mode")
                 reason = f"clear_settle_pane_not_ready:{reason_detail}"
                 self.force_leave_after_clear_failure(target, caller=caller, reason=reason, reservation=reservation)
-                return {"ok": False, "error": reason, "error_kind": "clear_settle_pane_not_ready", "target": target}
+                return {"ok": False, "error": reason, "error_kind": "clear_settle_pane_not_ready", "forced_leave": True, "target": target}
 
             if force:
                 try:
@@ -1940,13 +2266,14 @@ class BridgeDaemon:
                 except Exception as exc:
                     self.safe_log("clear_force_invalidation_failed", target=target, by_sender=caller, error=str(exc))
                     self.force_leave_after_clear_failure(target, caller=caller, reason=f"force_invalidation_failed:{exc}", reservation=reservation)
-                    return {"ok": False, "error": str(exc), "error_kind": "force_invalidation_failed", "target": target}
+                    return {"ok": False, "error": str(exc), "error_kind": "force_invalidation_failed", "forced_leave": True, "target": target}
 
             probe_text = self._clear_probe_text(target, str(reservation.get("probe_id") or ""))
+            reservation["phase"] = "writing_probe"
             probe_status = self._clear_tmux_send(pane, probe_text, target=target, message_id=str(reservation.get("probe_id") or "probe"))
             if not probe_status.get("ok"):
                 self.force_leave_after_clear_failure(target, caller=caller, reason=f"probe_write_failed:{probe_status.get('error')}", reservation=reservation)
-                return {"ok": False, "error": str(probe_status.get("error") or "probe_write_failed"), "error_kind": "probe_write_failed", "target": target}
+                return {"ok": False, "error": str(probe_status.get("error") or "probe_write_failed"), "error_kind": "probe_write_failed", "forced_leave": True, "target": target}
             reservation["phase"] = "waiting_probe"
             reservation["deadline_ts"] = time.time() + CLEAR_PROBE_TIMEOUT_SECONDS
             self.log("clear_probe_sent", target=target, by_sender=caller, probe_id=reservation.get("probe_id"))
@@ -1965,10 +2292,10 @@ class BridgeDaemon:
                 condition.wait(min(remaining, 1.0))
             failure_reason = str(reservation.get("failure_reason") or "")
             if failure_reason:
-                return {"ok": False, "error": failure_reason, "error_kind": failure_reason, "target": target}
+                return {"ok": False, "error": failure_reason, "error_kind": failure_reason, "forced_leave": bool(reservation.get("forced_leave")), "target": target}
             if not reservation.get("probe_response_finished"):
                 self.force_leave_after_clear_failure(target, caller=caller, reason="probe_timeout", reservation=reservation)
-                return {"ok": False, "error": "probe_timeout", "error_kind": "probe_timeout", "target": target}
+                return {"ok": False, "error": "probe_timeout", "error_kind": "probe_timeout", "forced_leave": True, "target": target}
             reservation["phase"] = "finalizing"
             marker_id_value = str(reservation.get("identity_marker_id") or "")
             if marker_id_value:
@@ -2015,7 +2342,9 @@ class BridgeDaemon:
             final_lock_ctx.__enter__()
         except CommandLockWaitExceeded:
             self.force_leave_after_clear_failure(target, caller=caller, reason="lock_wait_exceeded_after_identity", reservation=reservation)
-            return self.lock_wait_exceeded_response("clear_peer")
+            response = self.lock_wait_exceeded_response("clear_peer")
+            response.update({"forced_leave": True, "target": target})
+            return response
         try:
             if not helper_result.get("ok"):
                 self.force_leave_after_clear_failure(target, caller=caller, reason=f"identity_replace_failed:{helper_result.get('error')}", reservation=reservation)
@@ -2023,6 +2352,7 @@ class BridgeDaemon:
                     "ok": False,
                     "error": str(helper_result.get("error") or "identity_replace_failed"),
                     "error_kind": "identity_replace_failed",
+                    "forced_leave": True,
                     "target": target,
                 }
             if identity_required and not verified_process_identity(helper_result.get("live_record") or {}):
@@ -2031,10 +2361,18 @@ class BridgeDaemon:
                     "ok": False,
                     "error": "clear_process_identity_unverified",
                     "error_kind": "clear_process_identity_unverified",
+                    "forced_leave": True,
                     "target": target,
                 }
-            remove_marker(str(reservation.get("identity_marker_id") or ""))
-            self.clear_reservations.pop(target, None)
+            marker_id_value = str(reservation.get("identity_marker_id") or "")
+            if marker_id_value:
+                remove_marker(marker_id_value)
+                reservation["identity_marker_id"] = ""
+            if hold_reservation_after_success:
+                reservation["phase"] = "batch_hold"
+                reservation["batch_hold_complete"] = True
+            else:
+                self.clear_reservations.pop(target, None)
             self.pending_self_clears.pop(target, None)
             self.busy[target] = False
             self.reserved[target] = None
@@ -2051,7 +2389,8 @@ class BridgeDaemon:
             )
         finally:
             final_lock_ctx.__exit__(None, None, None)
-        self.try_deliver_command_aware(target)
+        if not hold_reservation_after_success:
+            self.try_deliver_command_aware(target)
         return {"ok": True, "target": target, "cleared": True, "force": bool(force), "new_session_id": reservation.get("new_session_id")}
 
     def handle_clear_prompt_submitted_locked(self, agent: str, record: dict) -> bool:

@@ -15559,6 +15559,574 @@ def scenario_clear_guard_force_truth_matches_policy(label: str, tmpdir: Path) ->
     print(f"  PASS  {label}")
 
 
+def _clear_batch_participants() -> dict[str, dict]:
+    return {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91", "status": "active"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "status": "active"},
+        "carol": {"alias": "carol", "agent_type": "codex", "pane": "%93", "status": "active"},
+        "dave": {"alias": "dave", "agent_type": "codex", "pane": "%94", "status": "active"},
+    }
+
+
+def _install_fake_clear_runner(
+    d: bridge_daemon.BridgeDaemon,
+    outcomes: dict[str, dict] | None = None,
+    seen: list[str] | None = None,
+    expected_targets: list[str] | None = None,
+    on_first_touch=None,
+) -> None:
+    outcomes = outcomes or {}
+    seen = seen if seen is not None else []
+
+    def fake_run(
+        caller: str,
+        target: str,
+        *,
+        force: bool,
+        existing_reservation: dict | None = None,
+        hold_reservation_after_success: bool = False,
+    ) -> dict:
+        assert_true(existing_reservation is not None, f"fake clear for {target}: existing reservation required")
+        if not seen:
+            for expected in (expected_targets or ["bob", "carol", "dave"]):
+                assert_true(expected in d.clear_reservations, f"batch should reserve {expected} before first pane touch")
+            if on_first_touch is not None:
+                on_first_touch()
+        seen.append(target)
+        outcome = dict(outcomes.get(target) or {"ok": True, "target": target, "cleared": True, "new_session_id": f"{target}-new"})
+        if outcome.get("forced_leave"):
+            # Keep this scenario local to batch behavior without exercising the
+            # full identity-store cleanup path, which has dedicated coverage.
+            d.clear_reservations.pop(target, None)
+            participant = d.participants.get(target) or {}
+            participant["status"] = "detached"
+            d.participants.pop(target, None)
+            notice_target = next((alias for alias in sorted(d.participants) if alias != target), "")
+            if notice_target:
+                d.queue_message(
+                    bridge_daemon.make_message(
+                        sender="bridge",
+                        target=notice_target,
+                        intent="clear_forced_leave_notice",
+                        body=f"{target} forced leave",
+                        causal_id=bridge_daemon.short_id("causal"),
+                        hop_count=0,
+                        auto_return=False,
+                        kind="notice",
+                        source="clear_forced_leave",
+                    ),
+                    deliver=False,
+                )
+        else:
+            d.clear_reservations.pop(target, None)
+        return outcome
+
+    d.run_clear_peer = fake_run  # type: ignore[method-assign]
+
+
+def scenario_clear_multi_guard_pass_reserves_all(label: str, tmpdir: Path) -> None:
+    d = make_daemon(tmpdir, _clear_batch_participants())
+    guard_calls = 0
+    original_guard_multi = d.clear_guard_multi
+
+    def guard_once(*args, **kwargs):
+        nonlocal guard_calls
+        guard_calls += 1
+        return original_guard_multi(*args, **kwargs)
+
+    d.clear_guard_multi = guard_once  # type: ignore[method-assign]
+    seen: list[str] = []
+
+    def check_status_and_reentry() -> None:
+        status = _daemon_command_result(d, {"op": "status"})
+        try:
+            active = {peer.get("alias"): peer.get("clear_active") for peer in status.get("peers") or []}
+            assert_true(all(active.get(alias) is True for alias in ("bob", "carol", "dave")), f"{label}: status must show all batch targets clear_active: {status}")
+        finally:
+            d.command_context.info = {}
+        reentry = d.handle_clear_peer("alice", "carol", force=False)
+        assert_true(reentry.get("error_kind") == "clear_already_pending", f"{label}: re-entry should see clear_already_pending: {reentry}")
+
+    _install_fake_clear_runner(d, seen=seen, on_first_touch=check_status_and_reentry)
+
+    result = d.handle_clear_peers("alice", ["bob", "carol", "dave"], force=False)
+
+    assert_true(result.get("ok") is True, f"{label}: batch should succeed: {result}")
+    assert_true((result.get("summary") or {}).get("all_cleared") is True, f"{label}: all targets should clear: {result}")
+    assert_true(seen == ["bob", "carol", "dave"], f"{label}: sequential order should be preserved: {seen}")
+    assert_true(guard_calls == 1, f"{label}: multi guard should run once, got {guard_calls}")
+    assert_true(not any(target in d.clear_reservations for target in ("bob", "carol", "dave")), f"{label}: reservations must be gone: {d.clear_reservations}")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_multi_guard_hard_blocker_rejects_all(label: str, tmpdir: Path) -> None:
+    d = make_daemon(tmpdir, _clear_batch_participants())
+    d.queue.update(lambda queue: queue.append(test_message("msg-hard-clear", frm="alice", to="carol", status="submitted")))
+
+    result = d.handle_clear_peers("alice", ["bob", "carol", "dave"], force=False)
+
+    assert_true(result.get("ok") is False and result.get("error_kind") == "clear_blocked", f"{label}: hard blocker should reject: {result}")
+    assert_true("carol hard:target_active_messages" in str(result.get("error") or ""), f"{label}: target-qualified hard blocker expected: {result}")
+    assert_true("Retry with --force" not in str(result.get("error") or ""), f"{label}: multi guard must not suggest force: {result}")
+    assert_true(not d.clear_reservations, f"{label}: rejected batch must not reserve: {d.clear_reservations}")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_multi_guard_soft_blocker_rejects_all(label: str, tmpdir: Path) -> None:
+    d = make_daemon(tmpdir, _clear_batch_participants())
+    d.queue.update(lambda queue: queue.append(test_message("msg-soft-clear", frm="alice", to="carol", status="pending")))
+
+    result = d.handle_clear_peers("alice", ["bob", "carol", "dave"], force=False)
+
+    assert_true(result.get("ok") is False and result.get("error_kind") == "clear_blocked", f"{label}: soft blocker should reject: {result}")
+    assert_true("carol soft:target_cancellable_messages" in str(result.get("error") or ""), f"{label}: target-qualified soft blocker expected: {result}")
+    assert_true("Retry with --force" not in str(result.get("error") or ""), f"{label}: multi guard must not suggest force: {result}")
+    assert_true(not d.clear_reservations, f"{label}: rejected batch must not reserve: {d.clear_reservations}")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_multi_partial_outcomes_and_cleanup(label: str, tmpdir: Path) -> None:
+    d = make_daemon(tmpdir, _clear_batch_participants())
+    _install_fake_clear_runner(
+        d,
+        outcomes={
+            "carol": {"ok": False, "target": "carol", "error": "probe_timeout", "error_kind": "probe_timeout", "forced_leave": True},
+        },
+    )
+
+    result = d.handle_clear_peers("alice", ["bob", "carol", "dave"], force=False)
+
+    statuses = {item.get("target"): item.get("status") for item in result.get("results") or []}
+    assert_true(statuses == {"bob": "cleared", "carol": "forced_leave", "dave": "cleared"}, f"{label}: mixed status mapping wrong: {result}")
+    assert_true("carol" not in d.participants, f"{label}: forced-leave target should be detached from active participants")
+    assert_true(not any(target in d.clear_reservations for target in ("bob", "carol", "dave")), f"{label}: no orphan reservations: {d.clear_reservations}")
+    notices = [item for item in d.queue.read() if item.get("source") == "clear_forced_leave" and item.get("to") == "carol"]
+    assert_true(not notices, f"{label}: forced-leave notice must not target the removed peer")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_multi_pre_pane_failure_continues(label: str, tmpdir: Path) -> None:
+    d = make_daemon(tmpdir, _clear_batch_participants())
+    _install_fake_clear_runner(
+        d,
+        outcomes={
+            "carol": {"ok": False, "target": "carol", "error": "endpoint_lost", "error_kind": "endpoint_lost"},
+        },
+    )
+
+    result = d.handle_clear_peers("alice", ["bob", "carol", "dave"], force=False)
+
+    statuses = {item.get("target"): item.get("status") for item in result.get("results") or []}
+    assert_true(statuses == {"bob": "cleared", "carol": "failed", "dave": "cleared"}, f"{label}: pre-pane failure status wrong: {result}")
+    assert_true("carol" in d.participants, f"{label}: pre-pane failure must not detach target")
+    assert_true(not any(target in d.clear_reservations for target in ("bob", "carol", "dave")), f"{label}: reservations cleaned: {d.clear_reservations}")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_multi_forced_leave_notice_waits_behind_reservation(label: str, tmpdir: Path) -> None:
+    d = make_daemon(tmpdir, _clear_batch_participants())
+    checked = False
+
+    def fake_run(
+        caller: str,
+        target: str,
+        *,
+        force: bool,
+        existing_reservation: dict | None = None,
+        hold_reservation_after_success: bool = False,
+    ) -> dict:
+        nonlocal checked
+        if target == "bob":
+            d.clear_reservations.pop(target, None)
+            d.queue_message(
+                bridge_daemon.make_message(
+                    sender="bridge",
+                    target="carol",
+                    intent="clear_forced_leave_notice",
+                    body="bob removed",
+                    causal_id=bridge_daemon.short_id("causal"),
+                    hop_count=0,
+                    auto_return=False,
+                    kind="notice",
+                    source="clear_forced_leave",
+                ),
+                deliver=True,
+            )
+            row = next(item for item in d.queue.read() if item.get("source") == "clear_forced_leave")
+            assert_true(row.get("status") == "pending", f"{label}: notice to reserved carol must stay pending: {row}")
+            assert_true("carol" in d.clear_reservations, f"{label}: carol reservation must survive bob forced leave")
+            checked = True
+            return {"ok": False, "target": target, "error": "probe_timeout", "error_kind": "probe_timeout", "forced_leave": True}
+        d.clear_reservations.pop(target, None)
+        return {"ok": True, "target": target, "cleared": True}
+
+    d.run_clear_peer = fake_run  # type: ignore[method-assign]
+    result = d.handle_clear_peers("alice", ["bob", "carol", "dave"], force=False)
+    assert_true(checked, f"{label}: forced-leave notice assertion did not run")
+    assert_true(result.get("ok") is True, f"{label}: batch should return summary: {result}")
+    assert_true(not any(target in d.clear_reservations for target in ("bob", "carol", "dave")), f"{label}: reservations cleaned")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_multi_lock_wait_failed_and_rerun(label: str, tmpdir: Path) -> None:
+    d = make_daemon(tmpdir, _clear_batch_participants())
+    _install_fake_clear_runner(
+        d,
+        outcomes={
+            "carol": {"ok": False, "target": "carol", "error": "lock_wait_exceeded", "error_kind": "lock_wait_exceeded"},
+        },
+        expected_targets=["bob", "carol"],
+    )
+    first = d.handle_clear_peers("alice", ["bob", "carol"], force=False)
+    statuses = {item.get("target"): item.get("status") for item in first.get("results") or []}
+    assert_true(statuses == {"bob": "cleared", "carol": "failed"}, f"{label}: lock wait should be failed and returned: {first}")
+    assert_true(not d.clear_reservations, f"{label}: failed run must release reservations")
+
+    _install_fake_clear_runner(d, expected_targets=["bob", "carol"])
+    second = d.handle_clear_peers("alice", ["bob", "carol"], force=False)
+    assert_true((second.get("summary") or {}).get("all_cleared") is True, f"{label}: immediate rerun should pass: {second}")
+    print(f"  PASS  {label}")
+
+
+def _patch_clear_identity_success(d: bridge_daemon.BridgeDaemon):
+    original_replace = bridge_daemon.replace_attached_session_identity_for_clear
+    d.clear_process_identity_for_replacement = lambda **_kwargs: {"status": "verified"}  # type: ignore[method-assign]
+
+    def fake_replace(**kwargs):
+        return {
+            "ok": True,
+            "live_record": {
+                "agent": kwargs.get("agent_type"),
+                "session_id": kwargs.get("new_session_id"),
+                "process_identity": {"status": "verified"},
+            },
+        }
+
+    bridge_daemon.replace_attached_session_identity_for_clear = fake_replace  # type: ignore[assignment]
+    return original_replace
+
+
+def _install_real_clear_fast_path(d: bridge_daemon.BridgeDaemon, *, fail_probe_for: str = "", block_clear_for: str = "", started: threading.Event | None = None, release: threading.Event | None = None) -> None:
+    d.dry_run = False
+    d.clear_post_clear_delay_seconds = 0.0
+    d.resolve_endpoint_detail = lambda target, purpose="write": {"ok": True, "pane": (d.participants.get(target) or {}).get("pane"), "reason": "ok"}  # type: ignore[method-assign]
+    d.pane_mode_status = lambda _pane: {"in_mode": False, "mode": "", "error": ""}  # type: ignore[method-assign]
+
+    def fake_send(_pane: str, text: str, *, target: str, message_id: str) -> dict:
+        if text == "/clear":
+            if target == block_clear_for and started is not None and release is not None:
+                started.set()
+                assert_true(release.wait(2.0), f"release event not set for {target}")
+            return {"ok": True, "pane_touched": True, "error": ""}
+        if target == fail_probe_for:
+            raise RuntimeError("probe send exploded")
+        reservation = d.clear_reservations.get(target) or {}
+        reservation["probe_prompt_submitted"] = True
+        reservation["probe_response_finished"] = True
+        reservation["new_session_id"] = f"{target}-new"
+        return {"ok": True, "pane_touched": True, "error": ""}
+
+    d._clear_tmux_send = fake_send  # type: ignore[method-assign]
+
+
+def scenario_clear_multi_real_post_touch_exception_forces_leave(label: str, tmpdir: Path) -> None:
+    participants = _clear_batch_participants()
+    with patched_environ(AGENT_BRIDGE_CONTROLLED_CLEARS=str(tmpdir / "controlled-clears.json")):
+        d = make_daemon(tmpdir, participants)
+        _install_real_clear_fast_path(d, fail_probe_for="bob")
+        d.try_deliver_command_aware = lambda *args, **kwargs: None  # type: ignore[method-assign]
+        original_replace = _patch_clear_identity_success(d)
+        try:
+            result = d.handle_clear_peers("alice", ["bob", "carol"], force=False)
+        finally:
+            bridge_daemon.replace_attached_session_identity_for_clear = original_replace  # type: ignore[assignment]
+
+    statuses = {item.get("target"): item.get("status") for item in result.get("results") or []}
+    assert_true(statuses == {"bob": "forced_leave", "carol": "cleared"}, f"{label}: post-touch exception should force-leave and continue: {result}")
+    assert_true("bob" not in d.participants, f"{label}: forced-leave target should be removed from active participants")
+    assert_true(not any(target in d.clear_reservations for target in ("bob", "carol")), f"{label}: reservations should clean up: {d.clear_reservations}")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_multi_real_success_holds_until_batch_end(label: str, tmpdir: Path) -> None:
+    participants = _clear_batch_participants()
+    started = threading.Event()
+    release = threading.Event()
+    result: dict[str, object] = {}
+    with patched_environ(AGENT_BRIDGE_CONTROLLED_CLEARS=str(tmpdir / "controlled-clears.json")):
+        d = make_daemon(tmpdir, participants)
+        _install_real_clear_fast_path(d)
+        delivery_calls: list[str] = []
+        d.try_deliver_command_aware = lambda target, **_kwargs: delivery_calls.append(str(target or ""))  # type: ignore[method-assign]
+        original_replace = _patch_clear_identity_success(d)
+
+        def blocking_identity(**kwargs):
+            if kwargs.get("session_id") == "carol-new":
+                started.set()
+                assert_true(release.wait(2.0), f"{label}: release event not set for carol")
+            return {"status": "verified"}
+
+        d.clear_process_identity_for_replacement = blocking_identity  # type: ignore[method-assign]
+
+        def runner() -> None:
+            try:
+                result["value"] = d.handle_clear_peers("alice", ["bob", "carol"], force=False)
+            except Exception as exc:
+                result["error"] = exc
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        assert_true(started.wait(2.0), f"{label}: carol clear did not start")
+        try:
+            with d.state_lock:
+                assert_true("bob" in d.clear_reservations and "carol" in d.clear_reservations, f"{label}: bob must remain held while carol clears: {d.clear_reservations}")
+                assert_true((d.clear_reservations.get("bob") or {}).get("phase") == "batch_hold", f"{label}: bob should be in batch_hold phase: {d.clear_reservations.get('bob')}")
+            status = _daemon_command_result(d, {"op": "status"})
+            active = {peer.get("alias"): peer.get("clear_active") for peer in status.get("peers") or []}
+            assert_true(active.get("bob") is True and active.get("carol") is True, f"{label}: status should show both reserved: {status}")
+            assert_true(delivery_calls == [], f"{label}: delivery must not reopen before batch release: {delivery_calls}")
+        finally:
+            d.command_context.info = {}
+            release.set()
+            thread.join(2.0)
+            bridge_daemon.replace_attached_session_identity_for_clear = original_replace  # type: ignore[assignment]
+
+    assert_true(not thread.is_alive(), f"{label}: batch thread should finish")
+    assert_true("error" not in result, f"{label}: batch thread error: {result.get('error')!r}")
+    value = result.get("value")
+    assert_true(isinstance(value, dict) and (value.get("summary") or {}).get("all_cleared") is True, f"{label}: batch should clear after release: {value}")
+    assert_true(not any(target in d.clear_reservations for target in ("bob", "carol")), f"{label}: final cleanup should release reservations")
+    assert_true(delivery_calls == ["bob", "carol"], f"{label}: delivery should reopen after final release: {delivery_calls}")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_multi_real_pre_pane_failure_holds_until_batch_end(label: str, tmpdir: Path) -> None:
+    participants = _clear_batch_participants()
+    participants["carol"]["hook_session_id"] = "carol-old"
+    started = threading.Event()
+    release = threading.Event()
+    result: dict[str, object] = {}
+    with patched_environ(AGENT_BRIDGE_CONTROLLED_CLEARS=str(tmpdir / "controlled-clears.json")):
+        d = make_daemon(tmpdir, participants)
+        d.dry_run = True
+        d.clear_post_clear_delay_seconds = 0.0
+        d.pane_mode_status = lambda _pane: {"in_mode": False, "mode": "", "error": ""}  # type: ignore[method-assign]
+        bob_endpoint_failed = False
+
+        def fake_resolve(target: str, purpose: str = "write") -> dict:
+            nonlocal bob_endpoint_failed
+            if target == "bob" and not bob_endpoint_failed:
+                bob_endpoint_failed = True
+                d.queue_message(test_message("msg-held-bob", frm="alice", to="bob", status="pending"), deliver=True)
+                return {"ok": False, "pane": "", "reason": "endpoint_lost"}
+            return {"ok": True, "pane": (d.participants.get(target) or {}).get("pane"), "reason": "ok"}
+
+        def fake_send(_pane: str, text: str, *, target: str, message_id: str) -> dict:
+            reservation = d.clear_reservations.get(target) or {}
+            if text != "/clear":
+                reservation["probe_prompt_submitted"] = True
+                reservation["probe_response_finished"] = True
+                reservation["new_session_id"] = f"{target}-new"
+            return {"ok": True, "pane_touched": True, "error": ""}
+
+        d.resolve_endpoint_detail = fake_resolve  # type: ignore[method-assign]
+        d._clear_tmux_send = fake_send  # type: ignore[method-assign]
+        original_replace = _patch_clear_identity_success(d)
+
+        def blocking_identity(**kwargs):
+            if kwargs.get("pane") == "%93" or kwargs.get("session_id") == "carol-old":
+                started.set()
+                assert_true(release.wait(10.0), f"{label}: release event not set for carol")
+            return {"status": "verified"}
+
+        d.clear_process_identity_for_replacement = blocking_identity  # type: ignore[method-assign]
+
+        def runner() -> None:
+            try:
+                result["value"] = d.handle_clear_peers("alice", ["bob", "carol"], force=False)
+            except Exception as exc:
+                result["error"] = exc
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        try:
+            assert_true(started.wait(10.0), f"{label}: carol clear did not start")
+            with d.state_lock:
+                assert_true("bob" in d.clear_reservations and "carol" in d.clear_reservations, f"{label}: failed bob must remain held while carol clears: {d.clear_reservations}")
+                assert_true((d.clear_reservations.get("bob") or {}).get("phase") == "batch_hold_failed", f"{label}: bob should be held as failed: {d.clear_reservations.get('bob')}")
+            held_row = next((item for item in d.queue.read() if item.get("id") == "msg-held-bob"), None)
+            assert_true(held_row is not None and held_row.get("status") == "pending", f"{label}: inbound row should stay pending during batch hold: {held_row}")
+        finally:
+            d.command_context.info = {}
+            release.set()
+            thread.join(10.0)
+            bridge_daemon.replace_attached_session_identity_for_clear = original_replace  # type: ignore[assignment]
+
+    assert_true(not thread.is_alive(), f"{label}: batch thread should finish")
+    assert_true("error" not in result, f"{label}: batch thread error: {result.get('error')!r}")
+    value = result.get("value")
+    statuses = {item.get("target"): item.get("status") for item in (value or {}).get("results") or []} if isinstance(value, dict) else {}
+    assert_true(statuses == {"bob": "failed", "carol": "cleared"}, f"{label}: pre-pane failure should fail and continue: {value}")
+    delivered_row = next((item for item in d.queue.read() if item.get("id") == "msg-held-bob"), None)
+    assert_true(delivered_row is not None and delivered_row.get("status") == "inflight", f"{label}: inbound row should deliver after final release: {delivered_row}")
+    assert_true(not any(target in d.clear_reservations for target in ("bob", "carol")), f"{label}: final cleanup should release reservations")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_guard_blocks_pending_self_clear(label: str, tmpdir: Path) -> None:
+    d = make_daemon(tmpdir, _clear_batch_participants())
+    d.pending_self_clears["bob"] = {"clear_id": "clear-self-bob", "caller": "bob", "target": "bob"}
+
+    result = d.clear_guard("bob", force=False)
+
+    assert_true(not result.ok, f"{label}: pending self-clear should block non-self clear")
+    assert_true([violation.code for violation in result.hard_blockers] == ["clear_already_pending"], f"{label}: expected clear_already_pending hard blocker: {result}")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_multi_daemon_validation(label: str, tmpdir: Path) -> None:
+    participants = _clear_batch_participants()
+    participants["erin"] = {"alias": "erin", "agent_type": "codex", "pane": "%95", "status": "detached"}
+    d = make_daemon(tmpdir, participants)
+    cases = [
+        ({"op": "clear_peer", "from": "alice", "targets": []}, "malformed_targets"),
+        ({"op": "clear_peer", "from": "alice", "target": "bob", "targets": ["carol"]}, "malformed_targets"),
+        ({"op": "clear_peer", "from": "alice", "targets": ["bob", "missing"]}, "unknown_target"),
+        ({"op": "clear_peer", "from": "alice", "targets": ["bob", "erin"]}, "inactive_target"),
+        ({"op": "clear_peer", "from": "alice", "targets": ["alice", "bob"]}, "multi_self_disallowed"),
+        ({"op": "clear_peer", "from": "alice", "targets": ["bob", "carol"], "force": True}, "multi_force_disallowed"),
+    ]
+    for payload, expected in cases:
+        result = _daemon_command_result(d, payload)
+        assert_true(result.get("ok") is False and result.get("error_kind") == expected, f"{label}: {payload} expected {expected}, got {result}")
+
+    seen: list[str] = []
+    _install_fake_clear_runner(d, seen=seen, expected_targets=["bob", "carol"])
+    deduped = _daemon_command_result(d, {"op": "clear_peer", "from": "alice", "targets": ["bob", "carol", "bob"]})
+    assert_true(deduped.get("ok") is True and deduped.get("targets") == ["bob", "carol"], f"{label}: duplicates should dedupe: {deduped}")
+    spoofed = _daemon_command_result(d, {"op": "clear_peer", "from": "bob", "targets": ["bob", "carol"]})
+    assert_true(spoofed.get("error_kind") == "multi_self_disallowed", f"{label}: effective sender must feed self-rule: {spoofed}")
+    print(f"  PASS  {label}")
+
+
+def _run_clear_peer_cli(
+    argv: list[str],
+    response: dict,
+    *,
+    ok: bool = True,
+    error: str = "",
+    state: dict | None = None,
+) -> tuple[int, str, str, list[dict]]:
+    if state is None:
+        state = _participants_state(["alice", "bob", "carol"])
+    calls: list[dict] = []
+    old_argv = sys.argv[:]
+    old_resolve = bridge_clear_peer.resolve_caller_from_pane
+    old_ensure = bridge_clear_peer.ensure_daemon_running
+    old_room_status = bridge_clear_peer.room_status
+    old_load_session = bridge_clear_peer.load_session
+    old_send_command = bridge_clear_peer.send_command
+    out = io.StringIO()
+    err = io.StringIO()
+    try:
+        sys.argv = ["agent_clear_peer", *argv]
+        bridge_clear_peer.resolve_caller_from_pane = lambda **kwargs: argparse.Namespace(
+            ok=True,
+            session=kwargs.get("explicit_session") or "test-session",
+            alias=kwargs.get("explicit_alias") or "alice",
+            error="",
+        )  # type: ignore[assignment]
+        bridge_clear_peer.ensure_daemon_running = lambda _session: ""  # type: ignore[assignment]
+        bridge_clear_peer.room_status = lambda _session: argparse.Namespace(active_enough_for_enqueue=True, reason="ok")  # type: ignore[assignment]
+        bridge_clear_peer.load_session = lambda _session: state  # type: ignore[assignment]
+
+        def fake_send_command(_session: str, payload: dict, *, timeout_seconds: float = bridge_clear_peer.CLEAR_SOCKET_TIMEOUT_SECONDS):
+            calls.append({"payload": dict(payload), "timeout_seconds": timeout_seconds})
+            return ok, dict(response), error
+
+        bridge_clear_peer.send_command = fake_send_command  # type: ignore[assignment]
+        with redirect_stdout(out), redirect_stderr(err):
+            code = bridge_clear_peer.main()
+    finally:
+        sys.argv = old_argv
+        bridge_clear_peer.resolve_caller_from_pane = old_resolve  # type: ignore[assignment]
+        bridge_clear_peer.ensure_daemon_running = old_ensure  # type: ignore[assignment]
+        bridge_clear_peer.room_status = old_room_status  # type: ignore[assignment]
+        bridge_clear_peer.load_session = old_load_session  # type: ignore[assignment]
+        bridge_clear_peer.send_command = old_send_command  # type: ignore[assignment]
+    return code, out.getvalue(), err.getvalue(), calls
+
+
+def scenario_clear_peer_cli_multi_and_compatibility(label: str, tmpdir: Path) -> None:
+    state = _participants_state(["alice", "bob", "carol"])
+    for argv in (["bob", "--to", "carol"], ["--all", "bob"], ["--all", "--to", "bob"]):
+        code, _out, _err, calls = _run_clear_peer_cli(argv, {"ok": True}, state=state)
+        assert_true(code == 2 and not calls, f"{label}: selector conflict should reject before daemon: {argv}, calls={calls}")
+
+    code, _out, err, calls = _run_clear_peer_cli(["--to", "bob,carol", "--force"], {"ok": True}, state=state)
+    assert_true(code == 2 and "multi_force_disallowed" in err and not calls, f"{label}: multi force reject: code={code}, err={err!r}, calls={calls}")
+    code, _out, err, calls = _run_clear_peer_cli(["--to", "alice,bob"], {"ok": True}, state=state)
+    assert_true(code == 2 and "multi_self_disallowed" in err and not calls, f"{label}: multi self reject: code={code}, err={err!r}, calls={calls}")
+
+    code, out, err, _calls = _run_clear_peer_cli(["alice"], {"ok": True, "deferred": True, "target": "alice"}, state=state)
+    assert_true(code == 0 and out == "agent_clear_peer: self-clear for alice is scheduled after the current turn ends (deferred).\n", f"{label}: self text changed: out={out!r}")
+    assert_true(err == "Hint: further sends from this alias are blocked once the clear is reserved.\n", f"{label}: self hint changed: {err!r}")
+    code, out, _err, _calls = _run_clear_peer_cli(["alice", "--json"], {"ok": True, "deferred": True, "target": "alice"}, state=state)
+    assert_true(json.loads(out) == {"target": "alice", "cleared": False, "deferred": True, "force": False, "new_session_id": None}, f"{label}: self json changed: {out}")
+
+    code, out, _err, calls = _run_clear_peer_cli(["bob"], {"ok": True, "target": "bob", "cleared": True, "new_session_id": "bob-new", "forced_leave": True}, state=state)
+    assert_true(code == 0 and out == "agent_clear_peer: cleared bob.\n", f"{label}: single non-self text changed: {out!r}")
+    code, out, _err, _calls = _run_clear_peer_cli(["bob", "--json"], {"ok": True, "target": "bob", "cleared": True, "new_session_id": "bob-new", "forced_leave": True}, state=state)
+    assert_true("forced_leave" not in json.loads(out), f"{label}: single json must filter daemon additive fields: {out}")
+    assert_true(calls and calls[0]["payload"].get("target") == "bob" and "targets" not in calls[0]["payload"], f"{label}: single payload must stay single-target: {calls}")
+
+    code, _out, _err, calls = _run_clear_peer_cli(["--from", "bridge", "--allow-spoof", "--all"], {"ok": True, "results": [{"target": "alice", "status": "cleared", "ok": True, "cleared": True}, {"target": "bob", "status": "cleared", "ok": True, "cleared": True}, {"target": "carol", "status": "cleared", "ok": True, "cleared": True}]}, state=state)
+    assert_true(code == 0 and calls[0]["payload"].get("targets") == ["alice", "bob", "carol"], f"{label}: bridge --all should include all active aliases: {calls}")
+    two_peer = _participants_state(["alice", "bob"])
+    code, out, _err, calls = _run_clear_peer_cli(["--all"], {"ok": True, "target": "bob", "cleared": True}, state=two_peer)
+    assert_true(code == 0 and out == "agent_clear_peer: cleared bob.\n" and calls[0]["payload"].get("target") == "bob", f"{label}: attached --all two-peer should clear peer: out={out!r}, calls={calls}")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_multi_timeout_and_formatter(label: str, tmpdir: Path) -> None:
+    soft = bridge_clear_guard.ClearViolation("target_cancellable_messages", "bob has cancellable pending/pre-active inbound work", hard=False, target="bob")
+    text = bridge_clear_guard.format_clear_guard_result(
+        bridge_clear_guard.ClearGuardResult(ok=False, soft_blockers=[soft], force_attempted=False),
+        suppress_force_hint=True,
+        include_targets=True,
+    )
+    assert_true("bob soft:target_cancellable_messages" in text and "Retry with --force" not in text, f"{label}: multi formatter wrong: {text}")
+
+    participants = _clear_batch_participants()
+    with patched_environ(AGENT_BRIDGE_CLEAR_POST_CLEAR_DELAY_SEC="3"):
+        d = make_daemon(tmpdir, participants)
+        d.begin_command_context("clear_peer", {"op": "clear_peer", "targets": ["bob", "carol"]})
+        try:
+            expected_client = (bridge_daemon.CLEAR_CLIENT_TIMEOUT_SECONDS + 2.0) * 2 + bridge_daemon.CLEAR_MULTI_TIMEOUT_MARGIN_SECONDS
+            assert_true(d.command_context.info.get("client_timeout") == expected_client, f"{label}: daemon client timeout formula: {d.command_context.info}")
+            budget, margin = d.command_budget("clear_peer")
+            expected_budget = d.clear_peer_post_lock_worst_case_seconds() * 2 + bridge_daemon.CLEAR_MULTI_TIMEOUT_MARGIN_SECONDS
+            assert_true(budget == expected_budget and margin == 20.0, f"{label}: daemon budget formula: budget={budget}, margin={margin}")
+        finally:
+            d.command_context.info = {}
+
+        code, _out, _err, calls = _run_clear_peer_cli(
+            ["--to", "bob,carol"],
+            {
+                "ok": True,
+                "results": [
+                    {"target": "bob", "status": "cleared", "ok": True, "cleared": True},
+                    {"target": "carol", "status": "cleared", "ok": True, "cleared": True},
+                ],
+                "summary": {"all_cleared": True, "cleared": ["bob", "carol"], "forced_leave": [], "failed": [], "counts": {"cleared": 2, "forced_leave": 0, "failed": 0}},
+            },
+            state=_participants_state(["alice", "bob", "carol"]),
+        )
+        expected_cli = (bridge_clear_peer.CLEAR_SOCKET_TIMEOUT_SECONDS + 2.0) * 2 + bridge_clear_peer.CLEAR_MULTI_TIMEOUT_MARGIN_SECONDS
+        assert_true(code == 0 and calls[0]["timeout_seconds"] == expected_cli, f"{label}: cli timeout formula: calls={calls}")
+    print(f"  PASS  {label}")
+
+
 def scenario_self_clear_force_guidance_and_preserved_force(label: str, tmpdir: Path) -> None:
     participants = {
         "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91", "hook_session_id": "session-alice"},
@@ -18143,6 +18711,20 @@ def main() -> int:
             ("clear_reservation_blocks_delivery", scenario_clear_reservation_blocks_delivery),
             ("clear_guard_formatter_force_guidance", scenario_clear_guard_formatter_force_guidance),
             ("clear_guard_force_truth_matches_policy", scenario_clear_guard_force_truth_matches_policy),
+            ("clear_multi_guard_pass_reserves_all", scenario_clear_multi_guard_pass_reserves_all),
+            ("clear_multi_guard_hard_blocker_rejects_all", scenario_clear_multi_guard_hard_blocker_rejects_all),
+            ("clear_multi_guard_soft_blocker_rejects_all", scenario_clear_multi_guard_soft_blocker_rejects_all),
+            ("clear_multi_partial_outcomes_and_cleanup", scenario_clear_multi_partial_outcomes_and_cleanup),
+            ("clear_multi_pre_pane_failure_continues", scenario_clear_multi_pre_pane_failure_continues),
+            ("clear_multi_forced_leave_notice_waits_behind_reservation", scenario_clear_multi_forced_leave_notice_waits_behind_reservation),
+            ("clear_multi_lock_wait_failed_and_rerun", scenario_clear_multi_lock_wait_failed_and_rerun),
+            ("clear_multi_real_post_touch_exception_forces_leave", scenario_clear_multi_real_post_touch_exception_forces_leave),
+            ("clear_multi_real_success_holds_until_batch_end", scenario_clear_multi_real_success_holds_until_batch_end),
+            ("clear_multi_real_pre_pane_failure_holds_until_batch_end", scenario_clear_multi_real_pre_pane_failure_holds_until_batch_end),
+            ("clear_guard_blocks_pending_self_clear", scenario_clear_guard_blocks_pending_self_clear),
+            ("clear_multi_daemon_validation", scenario_clear_multi_daemon_validation),
+            ("clear_peer_cli_multi_and_compatibility", scenario_clear_peer_cli_multi_and_compatibility),
+            ("clear_multi_timeout_and_formatter", scenario_clear_multi_timeout_and_formatter),
             ("self_clear_force_guidance_and_preserved_force", scenario_self_clear_force_guidance_and_preserved_force),
             ("requester_cleared_prompt_guard_and_notice", scenario_requester_cleared_prompt_guard_and_notice),
             ("clear_marker_routes_fast_stop", scenario_clear_marker_routes_fast_stop),

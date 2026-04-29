@@ -58,6 +58,16 @@ values are also in-memory correlation ids only. Evidence:
 `bridge_daemon.py::build_wait_status`,
 `bridge_daemon.py::build_aggregate_status`.
 
+### Multi-Clear Atomic Guard, Best-Effort Execution
+
+Multi-target `agent_clear_peer` is atomic only through guard and reservation:
+the daemon snapshots queue and aggregate state, evaluates every target, and
+reserves every target before any pane is touched. Execution is sequential and
+best-effort after that point. A later pane/probe/identity failure can produce
+mixed `cleared`, `forced_leave`, and `failed` results, and inbound delivery to
+all batch targets is held for the duration of the batch. Evidence:
+`bridge_daemon.py::handle_clear_peers`, `bridge_daemon.py::run_clear_peer`.
+
 ### Model-Facing Payload Limits And Stable Body Errors
 
 Inline model-facing message bodies are capped at 11000 chars; larger payloads

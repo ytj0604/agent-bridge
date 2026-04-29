@@ -9,6 +9,9 @@ bridge's routing identity.
 ```bash
 agent_clear_peer <alias> [--force] [--json]
 agent_clear_peer --to <alias> [--force] [--json]
+agent_clear_peer <alias>,<alias>[,...] [--json]
+agent_clear_peer --to <alias>,<alias>[,...] [--json]
+agent_clear_peer --all [--json]
 ```
 
 `bridge_manage` also exposes the same operation as **Clear agent context**.
@@ -26,6 +29,43 @@ identity with the new session id across `session.json`,
 Self-clear is supported. `agent_clear_peer <your-alias>` schedules the clear
 after the current turn ends; once the clear is reserved, later sends from that
 alias are rejected until the clear finishes.
+
+## Multi-Target Clear
+
+`agent_clear_peer` accepts comma-separated aliases and `--all` for batch
+clears. Attached agents get the same `--all` target semantics as
+`agent_send_peer --all`: every active peer except the caller. A bridge/admin
+caller (`--from bridge --allow-spoof`) expands `--all` to every active alias.
+
+Multi-target clear is intentionally narrower than single-target clear:
+
+- `--force` is rejected when more than one target remains after deduplication
+  (`multi_force_disallowed`).
+- Self-clear must be the only target (`multi_self_disallowed`). Use
+  `agent_clear_peer <your-alias>` for the existing deferred self-clear path, or
+  omit yourself from the batch.
+- The daemon evaluates all targets from one queue snapshot and one aggregate
+  snapshot, then installs every reservation before touching any pane. If any
+  target has a hard or soft blocker, the whole batch is rejected and no target
+  is reserved. Multi-target refusals name the target for each blocker and never
+  suggest `--force`.
+- A pending self-clear for a target is treated as `clear_already_pending` for
+  both single-target and multi-target clears.
+
+Execution after reservation is sequential and best-effort. A target that fails
+after pane input may have been touched is force-left; a pre-pane failure is
+reported as `failed`; later targets still run. Text output groups mixed
+outcomes, for example:
+
+```text
+agent_clear_peer: cleared alice, carol; forced-leave bob (probe_timeout).
+```
+
+Human-facing text uses `forced-leave`; JSON status keys use `forced_leave`.
+Multi-target JSON keeps requested order in `results` and includes a `summary`
+with per-status counts and target lists. Single-target JSON is unchanged. The
+multi-target CLI exits 0 only when every target is `cleared`; mixed or all-failed
+execution summaries exit 1 after printing the per-target result.
 
 ## `--force`
 
@@ -71,7 +111,10 @@ than returning it to a stale-active state.
 
 - Do not type `/clear` manually in an attached bridge pane.
 - `agent_clear_peer` waits synchronously for non-self clears, with a 180 second
-  socket timeout.
+  socket timeout for one target. Multi-target clears use a batch timeout:
+  180 seconds per target, plus any configured settle delay above the 1 second
+  default per target, plus a 10 second batch margin
+  (`CLEAR_MULTI_TIMEOUT_MARGIN_SECONDS`).
 - `AGENT_BRIDGE_CLEAR_POST_CLEAR_DELAY_SEC` controls the post-clear settle
   delay. The default is 1 second; `0` disables the delay while keeping the
   post-clear pane readiness check. Invalid or non-finite values use the default,
