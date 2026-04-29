@@ -62,6 +62,7 @@ import bridge_identity  # noqa: E402
 import bridge_instructions  # noqa: E402
 import bridge_interrupt_peer  # noqa: E402
 import bridge_clear_peer  # noqa: E402
+import bridge_clear_guard  # noqa: E402
 import bridge_clear_marker  # noqa: E402
 import bridge_cancel_message  # noqa: E402
 import bridge_wait_status  # noqa: E402
@@ -15153,6 +15154,174 @@ def scenario_clear_reservation_blocks_delivery(label: str, tmpdir: Path) -> None
     print(f"  PASS  {label}")
 
 
+def scenario_clear_guard_formatter_force_guidance(label: str, tmpdir: Path) -> None:
+    soft = bridge_clear_guard.ClearViolation(
+        "target_originated_requests",
+        "bob has outstanding request rows",
+        hard=False,
+        refs=["msg-request"],
+    )
+    hard = bridge_clear_guard.ClearViolation(
+        "target_active_messages",
+        "bob has active/post-pane-touch inbound work",
+        refs=["msg-active"],
+    )
+
+    soft_only = bridge_clear_guard.format_clear_guard_result(
+        bridge_clear_guard.ClearGuardResult(ok=False, soft_blockers=[soft], force_attempted=False)
+    )
+    assert_true(
+        soft_only.startswith("soft:target_originated_requests:")
+        and "Retry with --force to disable auto-return for target-originated requests." in soft_only,
+        f"{label}: soft-only formatter must classify and guide: {soft_only}",
+    )
+
+    hard_only = bridge_clear_guard.format_clear_guard_result(
+        bridge_clear_guard.ClearGuardResult(ok=False, hard_blockers=[hard], force_attempted=False)
+    )
+    assert_true(
+        hard_only.startswith("hard:target_active_messages:")
+        and "Retry with --force" not in hard_only,
+        f"{label}: hard-only formatter must not recommend force: {hard_only}",
+    )
+
+    mixed = bridge_clear_guard.format_clear_guard_result(
+        bridge_clear_guard.ClearGuardResult(ok=False, hard_blockers=[hard], soft_blockers=[soft], force_attempted=False)
+    )
+    assert_true(
+        "hard:target_active_messages:" in mixed
+        and "soft:target_originated_requests:" in mixed
+        and "Retry with --force to disable auto-return for target-originated requests." in mixed,
+        f"{label}: mixed non-force formatter must include one trailing force hint: {mixed}",
+    )
+
+    mixed_forced = bridge_clear_guard.format_clear_guard_result(
+        bridge_clear_guard.ClearGuardResult(ok=False, hard_blockers=[hard], soft_blockers=[soft], force_attempted=True)
+    )
+    assert_true(
+        "hard:target_active_messages:" in mixed_forced
+        and "soft:target_originated_requests:" in mixed_forced
+        and "Retry with --force" not in mixed_forced,
+        f"{label}: mixed force-attempted formatter must not repeat force guidance: {mixed_forced}",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_guard_force_truth_matches_policy(label: str, tmpdir: Path) -> None:
+    participants = {"alice": {"alias": "alice", "agent_type": "codex", "pane": "%91"}, "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"}}
+
+    request_daemon = make_daemon(tmpdir / "request", participants)
+    request_daemon.queue.update(lambda queue: queue.append(test_message("msg-originated", frm="bob", to="alice", status="pending")))
+    nonforce = request_daemon.clear_guard("bob", force=False)
+    text = bridge_clear_guard.format_clear_guard_result(nonforce)
+    assert_true(not nonforce.ok, f"{label}: non-force originated request should block")
+    assert_true(not nonforce.hard_blockers, f"{label}: originated request must not be hard: {nonforce}")
+    assert_true(
+        [v.code for v in nonforce.soft_blockers] == ["target_originated_requests"],
+        f"{label}: originated request should be a soft blocker: {nonforce}",
+    )
+    assert_true(
+        "soft:target_originated_requests:" in text
+        and "Retry with --force to disable auto-return for target-originated requests." in text,
+        f"{label}: originated request text must advertise accurate force recovery: {text}",
+    )
+    forced = request_daemon.clear_guard("bob", force=True)
+    assert_true(forced.ok and not forced.hard_blockers, f"{label}: force should allow originated request absent hard blockers: {forced}")
+
+    aggregate_daemon = make_daemon(tmpdir / "aggregate", participants)
+    with locked_json(Path(aggregate_daemon.aggregate_file), {"version": 1, "aggregates": {}}) as data:
+        data.setdefault("aggregates", {})["agg-clear-guard"] = {
+            "id": "agg-clear-guard",
+            "requester": "bob",
+            "expected": ["alice"],
+            "message_ids": {"alice": "msg-agg-alice"},
+            "status": "collecting",
+            "delivered": False,
+        }
+    aggregate_guard = aggregate_daemon.clear_guard("bob", force=False)
+    aggregate_text = bridge_clear_guard.format_clear_guard_result(aggregate_guard)
+    assert_true(
+        not aggregate_guard.ok
+        and not aggregate_guard.hard_blockers
+        and [v.code for v in aggregate_guard.soft_blockers] == ["target_aggregate_requester"],
+        f"{label}: incomplete aggregate requester should be soft: {aggregate_guard}",
+    )
+    assert_true(
+        "soft:target_aggregate_requester:" in aggregate_text
+        and "Retry with --force to cancel incomplete aggregate waits." in aggregate_text,
+        f"{label}: aggregate requester text must advertise accurate force recovery: {aggregate_text}",
+    )
+
+    active_daemon = make_daemon(tmpdir / "active", participants)
+    active_daemon.queue.update(lambda queue: queue.append(test_message("msg-active", frm="alice", to="bob", status="submitted")))
+    active_nonforce = active_daemon.clear_guard("bob", force=False)
+    active_forced = active_daemon.clear_guard("bob", force=True)
+    assert_true(
+        not active_nonforce.ok
+        and [v.code for v in active_nonforce.hard_blockers] == ["target_active_messages"]
+        and not active_nonforce.soft_blockers,
+        f"{label}: active inbound must be hard for non-force: {active_nonforce}",
+    )
+    assert_true(
+        not active_forced.ok
+        and [v.code for v in active_forced.hard_blockers] == ["target_active_messages"],
+        f"{label}: active inbound must remain hard with force: {active_forced}",
+    )
+
+    mixed_daemon = make_daemon(tmpdir / "mixed", participants)
+    mixed_daemon.queue.update(lambda queue: queue.extend([
+        test_message("msg-mixed-active", frm="alice", to="bob", status="submitted"),
+        test_message("msg-mixed-originated", frm="bob", to="alice", status="pending"),
+    ]))
+    mixed_forced_guard = mixed_daemon.clear_guard("bob", force=True)
+    mixed_forced_text = bridge_clear_guard.format_clear_guard_result(mixed_forced_guard)
+    assert_true(
+        not mixed_forced_guard.ok
+        and [v.code for v in mixed_forced_guard.hard_blockers] == ["target_active_messages"]
+        and [v.code for v in mixed_forced_guard.soft_blockers] == ["target_originated_requests"],
+        f"{label}: mixed force guard should expose hard plus soft context: {mixed_forced_guard}",
+    )
+    assert_true(
+        "Retry with --force" not in mixed_forced_text,
+        f"{label}: force-attempted hard failure must not recommend force again: {mixed_forced_text}",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_self_clear_force_guidance_and_preserved_force(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91", "hook_session_id": "session-alice"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "hook_session_id": "session-bob"},
+    }
+
+    d = make_daemon(tmpdir / "cancel", participants)
+    d.pending_self_clears["alice"] = {"clear_id": "clear-self", "caller": "alice", "target": "alice", "force": False}
+    d.queue.update(lambda queue: queue.append(test_message("msg-inbound", frm="bob", to="alice", status="pending")))
+    with d.state_lock:
+        d.promote_pending_self_clear_locked("alice")
+    notice = d.queue.read()[0]
+    body = str(notice.get("body") or "")
+    assert_true(
+        notice.get("source") == "self_clear_cancelled"
+        and "soft:target_cancellable_messages:" in body
+        and "Retry with --force to cancel cancellable inbound work." in body,
+        f"{label}: self-clear cancellation should tell the target when force can recover: {notice}",
+    )
+
+    d2 = make_daemon(tmpdir / "force", participants)
+    d2._self_clear_worker = lambda _target, _reservation: None  # type: ignore[method-assign]
+    d2.pending_self_clears["alice"] = {"clear_id": "clear-self-force", "caller": "alice", "target": "alice", "force": True}
+    d2.queue.update(lambda queue: queue.append(test_message("msg-inbound-force", frm="bob", to="alice", status="pending")))
+    with d2.state_lock:
+        d2.promote_pending_self_clear_locked("alice")
+    reservation = d2.clear_reservations.get("alice") or {}
+    assert_true(
+        reservation.get("force") is True and "alice" not in d2.pending_self_clears,
+        f"{label}: deferred self-clear must preserve original force value when promoted: {reservation}",
+    )
+    print(f"  PASS  {label}")
+
+
 def scenario_requester_cleared_prompt_guard_and_notice(label: str, tmpdir: Path) -> None:
     participants = {
         "requester": {"alias": "requester", "agent_type": "codex", "pane": "%91"},
@@ -17691,6 +17860,9 @@ def main() -> int:
             ("response_send_guard_fallback_no_auto_return_allowed", scenario_response_send_guard_fallback_no_auto_return_allowed),
             ("response_send_guard_fallback_false_positive_resistance", scenario_response_send_guard_fallback_false_positive_resistance),
             ("clear_reservation_blocks_delivery", scenario_clear_reservation_blocks_delivery),
+            ("clear_guard_formatter_force_guidance", scenario_clear_guard_formatter_force_guidance),
+            ("clear_guard_force_truth_matches_policy", scenario_clear_guard_force_truth_matches_policy),
+            ("self_clear_force_guidance_and_preserved_force", scenario_self_clear_force_guidance_and_preserved_force),
             ("requester_cleared_prompt_guard_and_notice", scenario_requester_cleared_prompt_guard_and_notice),
             ("clear_marker_routes_fast_stop", scenario_clear_marker_routes_fast_stop),
             ("clear_marker_probe_id_fallback_contracts", scenario_clear_marker_probe_id_fallback_contracts),

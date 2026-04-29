@@ -38,8 +38,27 @@ disabled. When those preserved requests eventually finish, the responder gets a
 bridge notice explaining that the requester was cleared and the response was
 not delivered.
 
-Active/post-pane-touch work remains a hard blocker. Interrupt or let that work
-finish before clearing.
+Incomplete aggregate waits owned by the target also block without `--force`.
+With `--force`, those aggregate waits are cancelled as requester-cleared.
+
+Refusal text partitions blockers by whether `--force` can recover them:
+
+- `hard:<code>` means force-impossible. Examples include a clear already
+  pending for the target, a busy target/current prompt, and active or
+  post-pane-touch inbound work. Interrupt or let that work finish before
+  clearing.
+- `soft:<code>` means force-recoverable. Examples include cancellable inbound
+  rows, target-owned alarms, target-originated requests whose return route can
+  be disabled, and incomplete aggregate waits owned by the target.
+
+When a non-force refusal includes soft blockers, the message ends with a
+`Retry with --force to ...` clause that describes only the soft blocker actions
+present in that refusal. A refusal after `--force` was already attempted does
+not repeat that retry guidance.
+
+JSON responses use the same partitioning: `hard_blockers` contains only
+force-impossible blockers, and `soft_blockers` contains only force-recoverable
+blockers.
 
 ## Failure Policy
 

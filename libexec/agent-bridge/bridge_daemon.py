@@ -1367,13 +1367,19 @@ class BridgeDaemon:
         queue_snapshot = list(self.queue.read())
         hard: list[ClearViolation] = []
         soft: list[ClearViolation] = []
+        def add_violation(violation: ClearViolation) -> None:
+            if violation.hard:
+                hard.append(violation)
+            else:
+                soft.append(violation)
+
         if target in self.clear_reservations:
-            hard.append(ClearViolation("clear_already_pending", f"clear already active for {target}"))
+            add_violation(ClearViolation("clear_already_pending", f"clear already active for {target}"))
         if self.busy.get(target) or (self.current_prompt_by_agent.get(target) or {}).get("id"):
-            hard.append(ClearViolation("target_busy", f"{target} is currently processing a prompt"))
+            add_violation(ClearViolation("target_busy", f"{target} is currently processing a prompt"))
         inbound_active = active_queue_rows(queue_snapshot, target=target, last_enter_ts=self.last_enter_ts)
         if inbound_active:
-            hard.append(
+            add_violation(
                 ClearViolation(
                     "target_active_messages",
                     f"{target} has active/post-pane-touch inbound work",
@@ -1382,7 +1388,7 @@ class BridgeDaemon:
             )
         inbound_cancellable = cancellable_queue_rows(queue_snapshot, target=target, last_enter_ts=self.last_enter_ts)
         if inbound_cancellable:
-            soft.append(
+            add_violation(
                 ClearViolation(
                     "target_cancellable_messages",
                     f"{target} has cancellable pending/pre-active inbound work",
@@ -1393,23 +1399,21 @@ class BridgeDaemon:
         originated_requests = target_originated_requests(queue_snapshot, target=target)
         if originated_requests:
             refs = [str(item.get("id") or "") for item in originated_requests if item.get("id")]
-            violation = ClearViolation(
-                "target_originated_requests",
-                f"{target} has outstanding request rows",
-                hard=not force,
-                refs=refs,
+            add_violation(
+                ClearViolation(
+                    "target_originated_requests",
+                    f"{target} has outstanding request rows",
+                    hard=False,
+                    refs=refs,
+                )
             )
-            if force:
-                soft.append(violation)
-            else:
-                hard.append(violation)
         target_alarms = [
             wake_id
             for wake_id, wd in self.watchdogs.items()
             if wd and wd.get("is_alarm") and str(wd.get("sender") or "") == target
         ]
         if target_alarms:
-            soft.append(
+            add_violation(
                 ClearViolation(
                     "target_owned_alarms",
                     f"{target} owns active alarms",
@@ -1426,19 +1430,17 @@ class BridgeDaemon:
             and str(agg.get("status") or "collecting") not in {"complete", "cancelled_requester_cleared"}
         ]
         if requester_aggs:
-            violation = ClearViolation(
-                "target_aggregate_requester",
-                f"{target} owns incomplete aggregate waits",
-                hard=not force,
-                refs=requester_aggs,
+            add_violation(
+                ClearViolation(
+                    "target_aggregate_requester",
+                    f"{target} owns incomplete aggregate waits",
+                    hard=False,
+                    refs=requester_aggs,
+                )
             )
-            if force:
-                soft.append(violation)
-            else:
-                hard.append(violation)
         if hard or (soft and not force):
-            return ClearGuardResult(ok=False, hard_blockers=hard, soft_blockers=soft)
-        return ClearGuardResult(ok=True, hard_blockers=hard, soft_blockers=soft)
+            return ClearGuardResult(ok=False, hard_blockers=hard, soft_blockers=soft, force_attempted=force)
+        return ClearGuardResult(ok=True, hard_blockers=hard, soft_blockers=soft, force_attempted=force)
 
     def apply_force_clear_invalidation(self, target: str, caller: str) -> dict:
         now_iso = utc_now()

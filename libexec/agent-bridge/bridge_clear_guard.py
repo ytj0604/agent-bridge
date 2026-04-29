@@ -20,6 +20,7 @@ class ClearGuardResult:
     ok: bool
     hard_blockers: list[ClearViolation] = field(default_factory=list)
     soft_blockers: list[ClearViolation] = field(default_factory=list)
+    force_attempted: bool = False
 
     @property
     def has_soft(self) -> bool:
@@ -68,13 +69,38 @@ def target_originated_requests(queue: Iterable[dict], *, target: str) -> list[di
     return out
 
 
-def format_clear_guard_result(result: ClearGuardResult) -> str:
+_SOFT_FORCE_ACTIONS = {
+    "target_cancellable_messages": "cancel cancellable inbound work",
+    "target_owned_alarms": "cancel target-owned alarms",
+    "target_originated_requests": "disable auto-return for target-originated requests",
+    "target_aggregate_requester": "cancel incomplete aggregate waits",
+}
+
+
+def _force_actions_for(violations: Iterable[ClearViolation]) -> list[str]:
+    actions: list[str] = []
+    seen: set[str] = set()
+    for violation in violations:
+        action = _SOFT_FORCE_ACTIONS.get(violation.code)
+        if not action or action in seen:
+            continue
+        seen.add(action)
+        actions.append(action)
+    return actions
+
+
+def format_clear_guard_result(result: ClearGuardResult, *, force_attempted: bool | None = None) -> str:
+    force_was_attempted = result.force_attempted if force_attempted is None else force_attempted
     parts: list[str] = []
     for violation in result.hard_blockers:
         refs = f" refs={','.join(violation.refs)}" if violation.refs else ""
-        parts.append(f"hard:{violation.code}: {violation.message}{refs}")
+        prefix = "hard" if violation.hard else "soft"
+        parts.append(f"{prefix}:{violation.code}: {violation.message}{refs}")
     for violation in result.soft_blockers:
         refs = f" refs={','.join(violation.refs)}" if violation.refs else ""
-        parts.append(f"soft:{violation.code}: {violation.message}{refs}")
+        prefix = "hard" if violation.hard else "soft"
+        parts.append(f"{prefix}:{violation.code}: {violation.message}{refs}")
+    actions = _force_actions_for(result.soft_blockers)
+    if actions and not force_was_attempted:
+        parts.append(f"Retry with --force to {'; '.join(actions)}.")
     return "; ".join(parts) if parts else "clear allowed"
-
