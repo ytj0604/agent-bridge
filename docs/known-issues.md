@@ -69,6 +69,17 @@ diagnostics currently expose five stable codes: `missing_body`, `empty_stdin`,
 `bridge_send_peer.py::body_input_error`, and
 `bridge_send_peer.py::BodyInputError`.
 
+Auto-routed returned results use the daemon's 12000-char body guard. When a
+returned result would exceed that guard, the daemon writes the normalized full
+result to a private daemon-managed directory under `/tmp/agent-bridge-share/`
+and delivers a small `[bridge:body_redirected]` wrapper with a `File:` line and
+short JSON-escaped preview. The wrapper's preview is intentionally incomplete;
+recipients should read the file. If redirect fails, the
+receiver-visible reason is one of `permission_denied`, `no_space`, `collision`,
+`symlink_unsafe`, `unsafe_path`, `write_failed`, or `wrapper_too_large`.
+Redirected result files are not currently cleaned up automatically. Evidence:
+`bridge_daemon.py::redirect_oversized_result_body`.
+
 ### Cancel / Interrupt Boundary
 
 `agent_cancel_message` retracts pending, inflight pre-pane-touch/pre-paste, or
