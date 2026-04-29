@@ -27,3 +27,6 @@ Thumbs.db
 .venv/
 venv/
 env/
+
+# etc
+.codex

@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 
-from bridge_clear_marker import find_for_clear_window
+from bridge_clear_marker import find_for_clear_window, find_for_old_session_end
 from bridge_participants import active_participants, load_session, participants_from_state, save_session_state
 from bridge_pane_probe import probe_agent_process, tmux_display_pane, transcript_owners_for_session, transcript_session_id_for_pid
 from bridge_paths import state_root
@@ -1243,8 +1243,11 @@ def update_live_session(
         return None
     now = utc_now()
     target = target or tmux_target_for_pane(pane)
-    controlled_clear_marker = find_for_clear_window(pane=pane, agent=agent_type, session_id=session_id)
+    controlled_clear_marker = (
+        None if event == "session_ended" else find_for_clear_window(pane=pane, agent=agent_type, session_id=session_id)
+    )
     if event == "session_ended":
+        controlled_clear_end_marker = find_for_old_session_end(pane=pane, agent=agent_type, old_session_id=session_id)
         with locked_json(live_sessions_file(), {"version": 1, "panes": {}, "sessions": {}}) as data:
             panes = data.setdefault("panes", {})
             sessions = data.setdefault("sessions", {})
@@ -1254,6 +1257,25 @@ def update_live_session(
             key = identity_key(agent_type, session_id)
             if key in sessions and sessions[key].get("pane") == pane:
                 del sessions[key]
+        if controlled_clear_end_marker:
+            # Controlled clear owns the participant/lock lifecycle here: success
+            # replaces the old identity after the probe; failure force-leaves it.
+            events_file = str(controlled_clear_end_marker.get("events_file") or "")
+            if events_file:
+                append_jsonl(
+                    Path(events_file),
+                    {
+                        "event": "controlled_clear_session_end_suppressed",
+                        "bridge_session": controlled_clear_end_marker.get("bridge_session"),
+                        "bridge_agent": controlled_clear_end_marker.get("alias"),
+                        "agent": agent_type,
+                        "pane": pane,
+                        "old_session_id": session_id,
+                        "marker_id": controlled_clear_end_marker.get("id"),
+                        "created_ts": now,
+                    },
+                )
+            return None
         replacement = find_verified_live_record_for_identity(agent_type, session_id, exclude_pane=pane)
         if replacement:
             with locked_json(live_sessions_file(), {"version": 1, "panes": {}, "sessions": {}}) as data:

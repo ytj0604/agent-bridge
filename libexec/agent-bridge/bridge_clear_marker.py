@@ -10,6 +10,25 @@ from bridge_util import locked_json, locked_json_read, utc_now
 
 
 CONTROLLED_CLEAR_MARKER_TTL_SECONDS = 180.0
+CONTROLLED_CLEAR_MARKER_EXPIRY_MARGIN_SECONDS = 5.0
+
+
+def ttl_for_clear_lifetime(*, settle_delay_seconds: float, probe_timeout_seconds: float) -> float:
+    """Return a marker TTL that covers the configured clear lifetime."""
+    try:
+        settle = float(settle_delay_seconds)
+    except (TypeError, ValueError):
+        settle = 0.0
+    try:
+        probe_timeout = float(probe_timeout_seconds)
+    except (TypeError, ValueError):
+        probe_timeout = 0.0
+    if settle < 0.0 or not (settle < float("inf")):
+        settle = 0.0
+    if probe_timeout < 0.0 or not (probe_timeout < float("inf")):
+        probe_timeout = 0.0
+    clear_lifetime = settle + probe_timeout + CONTROLLED_CLEAR_MARKER_EXPIRY_MARGIN_SECONDS
+    return max(CONTROLLED_CLEAR_MARKER_TTL_SECONDS, clear_lifetime)
 
 
 def _default() -> dict:
@@ -107,9 +126,16 @@ def make_marker(
     public_events_file: str = "",
     caller: str = "",
     clear_id: str = "",
+    ttl_seconds: float | None = None,
 ) -> dict:
     now_ts = time.time()
     mid = marker_id(bridge_session, alias, probe_id)
+    try:
+        ttl = float(ttl_seconds) if ttl_seconds is not None else CONTROLLED_CLEAR_MARKER_TTL_SECONDS
+    except (TypeError, ValueError):
+        ttl = CONTROLLED_CLEAR_MARKER_TTL_SECONDS
+    if ttl <= 0.0 or not (ttl < float("inf")):
+        ttl = CONTROLLED_CLEAR_MARKER_TTL_SECONDS
     return {
         "id": mid,
         "bridge_session": bridge_session,
@@ -126,51 +152,108 @@ def make_marker(
         "phase": "pending_prompt",
         "created_at": utc_now(),
         "created_ts": now_ts,
-        "deadline_ts": now_ts + CONTROLLED_CLEAR_MARKER_TTL_SECONDS,
-        "expires_ts": now_ts + CONTROLLED_CLEAR_MARKER_TTL_SECONDS,
+        "deadline_ts": now_ts + ttl,
+        "expires_ts": now_ts + ttl,
     }
 
 
 def find_for_prompt(*, pane: str, agent: str, attach_probe: str) -> dict | None:
-    if not (pane and agent and attach_probe):
+    if not (agent and attach_probe):
         return None
+    candidates: list[dict] = []
     data = read_markers()
     for marker in (data.get("markers") or {}).values():
         if not isinstance(marker, dict) or _expired(marker):
-            continue
-        if str(marker.get("pane") or "") != pane:
             continue
         if str(marker.get("agent") or "") != agent:
             continue
         if str(marker.get("probe_id") or "") != attach_probe:
             continue
-        return dict(marker)
+        candidates.append(dict(marker))
+        if pane and str(marker.get("pane") or "") == pane:
+            return dict(marker)
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def mark_session_seen(marker: dict, *, new_session_id: str) -> dict | None:
+    mid = str(marker.get("id") or "")
+    if not mid:
+        return None
+
+    def mutate(current: dict) -> dict:
+        if new_session_id:
+            current["new_session_id"] = new_session_id
+        current["session_seen_at"] = utc_now()
+        return current
+
+    return update_marker(mid, mutate)
+
+
+def _matches_marker_session(marker: dict, session_id: str) -> bool:
+    if not session_id:
+        return False
+    return session_id in {
+        str(marker.get("old_session_id") or ""),
+        str(marker.get("new_session_id") or ""),
+    }
+
+
+def _unique_marker(candidates: list[dict]) -> dict | None:
+    if len(candidates) == 1:
+        return candidates[0]
     return None
 
 
 def find_for_stop(*, pane: str, agent: str, session_id: str = "", turn_id: str = "") -> dict | None:
-    if not (pane and agent):
+    if not agent:
         return None
+    candidates: list[dict] = []
     data = read_markers()
     for marker in (data.get("markers") or {}).values():
         if not isinstance(marker, dict) or _expired(marker):
-            continue
-        if str(marker.get("pane") or "") != pane:
             continue
         if str(marker.get("agent") or "") != agent:
             continue
         if str(marker.get("phase") or "") not in {"prompt_seen", "finalizing"}:
             continue
+        if pane:
+            if str(marker.get("pane") or "") != pane:
+                continue
+            if session_id and str(marker.get("new_session_id") or "") == session_id:
+                return dict(marker)
+            if turn_id and str(marker.get("probe_turn_id") or "") == turn_id:
+                return dict(marker)
+            continue
         if session_id and str(marker.get("new_session_id") or "") == session_id:
-            return dict(marker)
-        if turn_id and str(marker.get("probe_turn_id") or "") == turn_id:
-            return dict(marker)
-    return None
+            candidates.append(dict(marker))
+    return _unique_marker(candidates)
 
 
 def find_for_clear_window(*, pane: str, agent: str, session_id: str = "") -> dict | None:
-    if not (pane and agent):
+    if not agent:
         return None
+    candidates: list[dict] = []
+    data = read_markers()
+    for marker in (data.get("markers") or {}).values():
+        if not isinstance(marker, dict) or _expired(marker):
+            continue
+        if str(marker.get("agent") or "") != agent:
+            continue
+        if pane:
+            if str(marker.get("pane") or "") == pane:
+                return dict(marker)
+            continue
+        if _matches_marker_session(marker, session_id):
+            candidates.append(dict(marker))
+    return _unique_marker(candidates)
+
+
+def find_for_old_session_end(*, pane: str, agent: str, old_session_id: str) -> dict | None:
+    if not (pane and agent and old_session_id):
+        return None
+    candidates: list[dict] = []
     data = read_markers()
     for marker in (data.get("markers") or {}).values():
         if not isinstance(marker, dict) or _expired(marker):
@@ -179,8 +262,10 @@ def find_for_clear_window(*, pane: str, agent: str, session_id: str = "") -> dic
             continue
         if str(marker.get("agent") or "") != agent:
             continue
-        return dict(marker)
-    return None
+        if str(marker.get("old_session_id") or "") != old_session_id:
+            continue
+        candidates.append(dict(marker))
+    return _unique_marker(candidates)
 
 
 def mark_prompt_seen(marker: dict, *, new_session_id: str, probe_turn_id: str) -> dict | None:

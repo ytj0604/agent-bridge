@@ -25,6 +25,7 @@ from bridge_clear_marker import (
     make_marker,
     read_markers,
     remove_marker,
+    ttl_for_clear_lifetime,
     update_marker,
     write_marker,
 )
@@ -83,7 +84,7 @@ PANE_MODE_PROBE_TIMEOUT_SECONDS = 0.3
 PANE_MODE_FORCE_CANCEL_MODES = {"copy-mode", "copy-mode-vi", "view-mode"}
 TMUX_SEND_TIMEOUT_SECONDS = 5.0
 TMUX_DELIVERY_WORST_CASE_SECONDS = 20.0
-CLEAR_PROBE_TIMEOUT_SECONDS = 40.0
+CLEAR_PROBE_TIMEOUT_SECONDS = 180.0
 CLEAR_POST_CLEAR_DELAY_DEFAULT_SECONDS = 1.0
 CLEAR_POST_LOCK_WORST_CASE_SECONDS = 75.0
 CLEAR_CLIENT_TIMEOUT_SECONDS = 180.0
@@ -1733,6 +1734,10 @@ class BridgeDaemon:
         }
 
     def _write_clear_marker_locked(self, reservation: dict, participant: dict, pane: str) -> str:
+        marker_ttl_seconds = ttl_for_clear_lifetime(
+            settle_delay_seconds=self.clear_post_clear_delay_seconds,
+            probe_timeout_seconds=CLEAR_PROBE_TIMEOUT_SECONDS,
+        )
         marker = make_marker(
             bridge_session=self.bridge_session,
             alias=str(reservation.get("target") or ""),
@@ -1745,6 +1750,7 @@ class BridgeDaemon:
             public_events_file=str(self.public_state_file or ""),
             caller=str(reservation.get("caller") or ""),
             clear_id=str(reservation.get("clear_id") or ""),
+            ttl_seconds=marker_ttl_seconds,
         )
         marker_id_value = write_marker(marker)
         reservation["identity_marker_id"] = marker_id_value
@@ -2044,8 +2050,11 @@ class BridgeDaemon:
             marker_turn_id = str(marker.get("probe_turn_id") or "")
             record_turn_id = str(record.get("turn_id") or "")
             phase_ok = str(marker.get("phase") or "") == "prompt_seen"
-            turn_ok = bool(marker_turn_id) and (not record_turn_id or marker_turn_id == record_turn_id)
-            if not (phase_ok and marker_new_session and turn_ok):
+            if marker_turn_id:
+                turn_ids_compatible = not record_turn_id or marker_turn_id == record_turn_id
+            else:
+                turn_ids_compatible = not record_turn_id
+            if not (phase_ok and marker_new_session and turn_ids_compatible):
                 reservation["phase"] = "failed"
                 reservation["failure_reason"] = "clear_marker_phase2_missing"
                 condition = reservation.get("condition")

@@ -14676,6 +14676,168 @@ def scenario_clear_marker_routes_fast_stop(label: str, tmpdir: Path) -> None:
     print(f"  PASS  {label}")
 
 
+def scenario_clear_marker_probe_id_fallback_contracts(label: str, tmpdir: Path) -> None:
+    marker_file = tmpdir / "controlled-clears.json"
+    events = tmpdir / "events.raw.jsonl"
+    public_events = tmpdir / "events.jsonl"
+    fallback_events = tmpdir / "fallback.raw.jsonl"
+    fallback_public = tmpdir / "fallback.jsonl"
+    live_file = tmpdir / "live-sessions.json"
+    pane_locks_file = tmpdir / "pane-locks.json"
+    with patched_environ(
+        AGENT_BRIDGE_CONTROLLED_CLEARS=str(marker_file),
+        AGENT_BRIDGE_LIVE_SESSIONS=str(live_file),
+        AGENT_BRIDGE_PANE_LOCKS=str(pane_locks_file),
+        AGENT_BRIDGE_SESSION=None,
+        AGENT_BRIDGE_AGENT=None,
+        AGENT_BRIDGE_BUS=None,
+        AGENT_BRIDGE_EVENTS=None,
+        AGENT_BRIDGE_PUBLIC_EVENTS=None,
+        TMUX_PANE=None,
+    ):
+        marker = bridge_clear_marker.make_marker(
+            bridge_session="test-session",
+            alias="bob",
+            agent="claude",
+            old_session_id="old-session",
+            probe_id="probe-pane-missing",
+            pane="%92",
+            target="tmux:1.0",
+            events_file=str(events),
+            public_events_file=str(public_events),
+            caller="alice",
+            clear_id="clear-pane-missing",
+        )
+        bridge_clear_marker.write_marker(marker)
+        code = _run_hook_logger_record(
+            "claude",
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "new-session",
+                "turn_id": "turn-probe",
+                "prompt": "[bridge-probe:probe-pane-missing] hi",
+            },
+            state_file=fallback_events,
+            public_state_file=fallback_public,
+        )
+        assert_true(code == 0, f"{label}: prompt hook logger failed")
+        raw_events = read_events(events)
+        prompt_record = next((event for event in raw_events if event.get("event") == "prompt_submitted" and event.get("attach_probe") == "probe-pane-missing"), None)
+        assert_true(prompt_record and prompt_record.get("pane") == "%92", f"{label}: prompt must route via unique probe marker and normalize pane: {raw_events}")
+        assert_true(not any(event.get("attach_probe") == "probe-pane-missing" for event in read_events(fallback_events)), f"{label}: prompt must not route to fallback bus")
+        updated = bridge_clear_marker.read_markers()["markers"][marker["id"]]
+        assert_true(updated.get("phase") == "prompt_seen" and updated.get("new_session_id") == "new-session", f"{label}: prompt must write phase-2 keys: {updated}")
+
+        marker_mismatch = bridge_clear_marker.make_marker(
+            bridge_session="test-session",
+            alias="carol",
+            agent="claude",
+            old_session_id="old-mismatch",
+            probe_id="probe-pane-mismatch",
+            pane="%93",
+            target="tmux:1.1",
+            events_file=str(events),
+            public_events_file=str(public_events),
+        )
+        bridge_clear_marker.write_marker(marker_mismatch)
+        with patched_environ(TMUX_PANE="%not-the-marker-pane"):
+            code = _run_hook_logger_record(
+                "claude",
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "new-mismatch",
+                    "turn_id": "turn-mismatch",
+                    "prompt": "[bridge-probe:probe-pane-mismatch] hi",
+                },
+                state_file=fallback_events,
+                public_state_file=fallback_public,
+            )
+        assert_true(code == 0, f"{label}: mismatched-pane prompt hook logger failed")
+        mismatch_record = next((event for event in read_events(events) if event.get("attach_probe") == "probe-pane-mismatch"), None)
+        assert_true(mismatch_record and mismatch_record.get("pane") == "%93", f"{label}: mismatched pane prompt must route by unique probe marker: {read_events(events)}")
+        live = read_json(live_file, {"panes": {}, "sessions": {}})
+        locks = read_json(pane_locks_file, {"panes": {}})
+        assert_true("%not-the-marker-pane" not in (live.get("panes") or {}), f"{label}: raw mismatched pane must not receive live record: {live}")
+        assert_true("%not-the-marker-pane" not in (locks.get("panes") or {}), f"{label}: raw mismatched pane must not receive pane lock: {locks}")
+        assert_true(((live.get("panes") or {}).get("%93") or {}).get("session_id") == "new-mismatch", f"{label}: marker pane should receive live record: {live}")
+
+        bridge_clear_marker.write_marker({
+            **bridge_clear_marker.make_marker(
+                bridge_session="test-session",
+                alias="bob",
+                agent="claude",
+                old_session_id="old-a",
+                probe_id="probe-ambiguous",
+                pane="%93",
+                target="tmux:1.1",
+                events_file=str(events),
+            ),
+            "id": "ambiguous-a",
+        })
+        bridge_clear_marker.write_marker({
+            **bridge_clear_marker.make_marker(
+                bridge_session="test-session",
+                alias="carol",
+                agent="claude",
+                old_session_id="old-b",
+                probe_id="probe-ambiguous",
+                pane="%94",
+                target="tmux:1.2",
+                events_file=str(events),
+            ),
+            "id": "ambiguous-b",
+        })
+        ambiguous = bridge_clear_marker.find_for_prompt(pane="", agent="claude", attach_probe="probe-ambiguous")
+        assert_true(ambiguous is None, f"{label}: ambiguous pane-less probe lookup must not choose first marker: {ambiguous}")
+
+        marker_no_probe = bridge_clear_marker.make_marker(
+            bridge_session="test-session",
+            alias="dave",
+            agent="claude",
+            old_session_id="old-no-probe",
+            probe_id="probe-no-auto",
+            pane="%95",
+            target="tmux:1.3",
+            events_file=str(events),
+        )
+        bridge_clear_marker.write_marker(marker_no_probe)
+        with patched_environ(TMUX_PANE="%95"):
+            code = _run_hook_logger_record(
+                "claude",
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "new-no-probe",
+                    "turn_id": "turn-no-probe",
+                    "prompt": "manual prompt without bridge probe marker",
+                },
+                state_file=fallback_events,
+                public_state_file=fallback_public,
+            )
+        assert_true(code == 0, f"{label}: no-probe prompt hook logger failed")
+        no_probe = bridge_clear_marker.read_markers()["markers"][marker_no_probe["id"]]
+        assert_true(no_probe.get("phase") == "pending_prompt" and not no_probe.get("probe_turn_id"), f"{label}: no-attach-probe prompt must not mark prompt_seen: {no_probe}")
+
+        marker_stop = bridge_clear_marker.make_marker(
+            bridge_session="test-session",
+            alias="erin",
+            agent="claude",
+            old_session_id="old-stop",
+            probe_id="probe-stop",
+            pane="%96",
+            target="tmux:1.4",
+            events_file=str(events),
+        )
+        marker_stop["phase"] = "prompt_seen"
+        marker_stop["new_session_id"] = "new-stop"
+        marker_stop["probe_turn_id"] = "turn-stop"
+        bridge_clear_marker.write_marker(marker_stop)
+        turn_only = bridge_clear_marker.find_for_stop(pane="", agent="claude", session_id="", turn_id="turn-stop")
+        by_session = bridge_clear_marker.find_for_stop(pane="", agent="claude", session_id="new-stop", turn_id="")
+        assert_true(turn_only is None, f"{label}: pane-less Stop must not recover by turn_id alone: {turn_only}")
+        assert_true(by_session and by_session.get("alias") == "erin", f"{label}: pane-less Stop may recover by new_session_id: {by_session}")
+    print(f"  PASS  {label}")
+
+
 def scenario_clear_post_clear_first_request_routes_reply(label: str, tmpdir: Path) -> None:
     state_root_dir = tmpdir / "state"
     session_dir = state_root_dir / "test-session"
@@ -15032,6 +15194,47 @@ def scenario_clear_post_clear_delay_config_and_settle(label: str, tmpdir: Path) 
         thread.join(1.0)
         assert_true(saw_settle and saw_probe, f"{label}: expected post_clear_settle then waiting_probe phases, result={result}, sends={sends}")
         assert_true(not thread.is_alive(), f"{label}: runner should stop after injected failure")
+
+    long_delay = 240.0
+    with patched_environ(
+        AGENT_BRIDGE_CONTROLLED_CLEARS=str(tmpdir / "controlled-clears-long.json"),
+        AGENT_BRIDGE_CLEAR_POST_CLEAR_DELAY_SEC=str(long_delay),
+    ):
+        d = make_daemon(tmpdir / "long-settle", participants)
+        d.dry_run = False
+        d.resolve_endpoint_detail = lambda _target, purpose="write": {"ok": True, "pane": "%92", "reason": "ok"}  # type: ignore[method-assign]
+        d.pane_mode_status = lambda _pane: {"in_mode": False, "mode": "", "error": ""}  # type: ignore[method-assign]
+        d._clear_tmux_send = lambda _pane, _text, *, target, message_id: {"ok": True, "pane_touched": True, "error": ""}  # type: ignore[method-assign]
+        result = {}
+
+        def runner_long() -> None:
+            result["value"] = d.run_clear_peer("alice", "bob", force=False)
+
+        thread = threading.Thread(target=runner_long, daemon=True)
+        thread.start()
+        saw_long_settle = False
+        for _ in range(200):
+            with d.state_lock:
+                reservation = d.clear_reservations.get("bob") or {}
+                if reservation.get("phase") == "post_clear_settle":
+                    saw_long_settle = True
+                    marker = (bridge_clear_marker.read_markers().get("markers") or {}).get(str(reservation.get("identity_marker_id") or "")) or {}
+                    ttl = float(marker.get("expires_ts") or 0.0) - float(marker.get("created_ts") or 0.0)
+                    required_ttl = bridge_clear_marker.ttl_for_clear_lifetime(
+                        settle_delay_seconds=long_delay,
+                        probe_timeout_seconds=bridge_daemon.CLEAR_PROBE_TIMEOUT_SECONDS,
+                    )
+                    assert_true(ttl >= required_ttl - 0.001, f"{label}: marker TTL must cover configured clear lifetime: ttl={ttl}, required={required_ttl}, marker={marker}")
+                    assert_true(ttl > bridge_clear_marker.CONTROLLED_CLEAR_MARKER_TTL_SECONDS, f"{label}: long settle must extend default marker TTL: ttl={ttl}")
+                    reservation["failure_reason"] = "test_stop"
+                    condition = reservation.get("condition")
+                    if isinstance(condition, threading.Condition):
+                        condition.notify_all()
+                    break
+            time.sleep(0.005)
+        thread.join(1.0)
+        assert_true(saw_long_settle, f"{label}: long settle marker should be inspectable, result={result}")
+        assert_true(not thread.is_alive(), f"{label}: long-settle runner should stop after injected failure")
     print(f"  PASS  {label}")
 
 
@@ -15307,6 +15510,8 @@ def scenario_clear_claude_post_clear_probe_pasted_and_completes(label: str, tmpd
     registry_file = tmpdir / "attached-sessions.json"
     pane_locks_file = tmpdir / "pane-locks.json"
     live_file = tmpdir / "live-sessions.json"
+    fallback_events = tmpdir / "fallback.raw.jsonl"
+    fallback_public = tmpdir / "fallback.jsonl"
     participants = {
         "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91", "hook_session_id": "alice-session", "target": "test:1.1"},
         "bob": {"alias": "bob", "agent_type": "claude", "pane": "%93", "hook_session_id": "old-claude-session", "target": "test:1.3"},
@@ -15317,7 +15522,7 @@ def scenario_clear_claude_post_clear_probe_pasted_and_completes(label: str, tmpd
         AGENT_BRIDGE_PANE_LOCKS=str(pane_locks_file),
         AGENT_BRIDGE_LIVE_SESSIONS=str(live_file),
         AGENT_BRIDGE_CONTROLLED_CLEARS=str(tmpdir / "controlled-clears.json"),
-        AGENT_BRIDGE_CLEAR_POST_CLEAR_DELAY_SEC="0",
+        AGENT_BRIDGE_CLEAR_POST_CLEAR_DELAY_SEC="0.05",
         AGENT_BRIDGE_SESSION=None,
         AGENT_BRIDGE_AGENT=None,
         AGENT_BRIDGE_BUS=None,
@@ -15340,6 +15545,44 @@ def scenario_clear_claude_post_clear_probe_pasted_and_completes(label: str, tmpd
 
         d.force_leave_after_clear_failure = record_force_leave  # type: ignore[method-assign]
         identity = verified_identity("claude", "%93", pid=9400, start_time="940")
+        old_live = identity_live_record(
+            agent="claude",
+            alias="bob",
+            session_id="old-claude-session",
+            pane="%93",
+            process_identity=identity,
+        )
+        old_mapping = {
+            "agent": "claude",
+            "alias": "bob",
+            "session_id": "old-claude-session",
+            "bridge_session": "test-session",
+            "pane": "%93",
+            "target": "test:1.3",
+            "events_file": str(d.state_file),
+            "public_events_file": str(d.public_state_file),
+            "queue_file": str(d.queue.path),
+            "attached_at": utc_now(),
+            "last_seen_at": utc_now(),
+        }
+        registry_file.write_text(json.dumps({"version": 1, "sessions": {"claude:old-claude-session": old_mapping}}), encoding="utf-8")
+        pane_locks_file.write_text(json.dumps({
+            "version": 1,
+            "panes": {
+                "%93": {
+                    "bridge_session": "test-session",
+                    "agent": "claude",
+                    "alias": "bob",
+                    "target": "test:1.3",
+                    "hook_session_id": "old-claude-session",
+                },
+            },
+        }), encoding="utf-8")
+        live_file.write_text(json.dumps({
+            "version": 1,
+            "panes": {"%93": old_live},
+            "sessions": {"claude:old-claude-session": old_live},
+        }), encoding="utf-8")
         old_target = bridge_identity.tmux_target_for_pane
         old_identity_probe = bridge_identity.probe_agent_process
         old_daemon_probe = bridge_daemon.probe_agent_process
@@ -15357,44 +15600,112 @@ def scenario_clear_claude_post_clear_probe_pasted_and_completes(label: str, tmpd
             for _ in range(200):
                 with d.state_lock:
                     reservation = d.clear_reservations.get("bob")
+                    if reservation and reservation.get("phase") == "post_clear_settle":
+                        break
+                time.sleep(0.01)
+            assert_true(reservation and reservation.get("phase") == "post_clear_settle", f"{label}: claude clear must enter settle before probe: {reservation}")
+            assert_true(sends == ["/clear"], f"{label}: SessionStart should occur before probe paste in this regression: {sends}")
+            code = _run_hook_logger_record(
+                "claude",
+                {
+                    "hook_event_name": "SessionEnd",
+                    "session_id": "old-claude-session",
+                    "cwd": "/tmp",
+                    "model": "claude-test",
+                },
+                state_file=fallback_events,
+                public_state_file=fallback_public,
+            )
+            assert_true(code == 0, f"{label}: claude old SessionEnd hook logger failed")
+            state_after_end = read_json(session_dir / "session.json", {})
+            bob_after_end = (state_after_end.get("participants") or {}).get("bob") or {}
+            assert_true(bob_after_end.get("status", "active") == "active", f"{label}: old-session SessionEnd during controlled clear must not detach participant: {bob_after_end}")
+            locks_after_end = read_json(pane_locks_file, {"panes": {}})
+            lock_after_end = (locks_after_end.get("panes") or {}).get("%93") or {}
+            assert_true(lock_after_end.get("hook_session_id") == "old-claude-session", f"{label}: old-session SessionEnd must not remove pane lock: {locks_after_end}")
+            registry_after_end = read_json(registry_file, {"sessions": {}})
+            assert_true("claude:old-claude-session" in (registry_after_end.get("sessions") or {}), f"{label}: old-session SessionEnd must not remove attached registry: {registry_after_end}")
+            live_after_end = read_json(live_file, {"panes": {}, "sessions": {}})
+            assert_true("%93" not in (live_after_end.get("panes") or {}), f"{label}: old live pane may be cleaned after SessionEnd: {live_after_end}")
+            assert_true("claude:old-claude-session" not in (live_after_end.get("sessions") or {}), f"{label}: old live session may be cleaned after SessionEnd: {live_after_end}")
+            assert_true(
+                any(event.get("event") == "controlled_clear_session_end_suppressed" for event in read_events(Path(d.state_file))),
+                f"{label}: suppression diagnostic should be logged: {read_events(Path(d.state_file))}",
+            )
+            code = _run_hook_logger_record(
+                "claude",
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": "new-claude-session",
+                    "source": "clear",
+                    "cwd": "/tmp",
+                    "model": "claude-test",
+                },
+                state_file=fallback_events,
+                public_state_file=fallback_public,
+            )
+            assert_true(code == 0, f"{label}: claude SessionStart hook logger failed")
+            session_record = next((event for event in reversed(read_events(Path(d.state_file))) if event.get("event") == "session_start" and event.get("session_id") == "new-claude-session"), None)
+            assert_true(session_record and session_record.get("pane") == "%93", f"{label}: SessionStart must route to room bus via clear marker: {read_events(Path(d.state_file))}")
+            assert_true(not any(event.get("session_id") == "new-claude-session" for event in read_events(fallback_events)), f"{label}: SessionStart must not route to fallback bus")
+            marker_id = str(reservation.get("identity_marker_id") or "")
+            marker_after_session = (bridge_clear_marker.read_markers().get("markers") or {}).get(marker_id) or {}
+            assert_true(marker_after_session.get("new_session_id") == "new-claude-session" and marker_after_session.get("phase") == "pending_prompt", f"{label}: SessionStart may record session but not mark prompt_seen: {marker_after_session}")
+
+            for _ in range(200):
+                with d.state_lock:
+                    reservation = d.clear_reservations.get("bob")
                     if reservation and reservation.get("phase") == "waiting_probe":
                         break
                 time.sleep(0.01)
-            assert_true(reservation and reservation.get("phase") == "waiting_probe", f"{label}: claude clear must reach probe wait without SessionStart: {reservation}")
-            assert_true(len(sends) == 2 and sends[0] == "/clear" and "[bridge-probe:" in sends[1], f"{label}: probe should paste after clear without SessionStart: {sends}")
+            assert_true(reservation and reservation.get("phase") == "waiting_probe", f"{label}: claude clear must reach probe wait after settle: {reservation}")
+            assert_true(len(sends) == 2 and sends[0] == "/clear" and "[bridge-probe:" in sends[1], f"{label}: probe should paste after settle: {sends}")
             probe_id = str(reservation.get("probe_id") or "")
-            code = _run_hook_logger_record(
-                "claude",
-                {
-                    "hook_event_name": "UserPromptSubmit",
-                    "session_id": "new-claude-session",
-                    "turn_id": "turn-claude-probe",
-                    "prompt": f"[bridge-probe:{probe_id}] bridge clear probe",
-                    "cwd": "/tmp",
-                    "model": "claude-test",
-                },
-                state_file=Path(d.state_file),
-                public_state_file=Path(d.public_state_file),
-            )
+            with patched_environ(TMUX_PANE=None):
+                code = _run_hook_logger_record(
+                    "claude",
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": "new-claude-session",
+                        "prompt": f"[bridge-probe:{probe_id}] bridge clear probe",
+                        "cwd": "/tmp",
+                        "model": "claude-test",
+                    },
+                    state_file=fallback_events,
+                    public_state_file=fallback_public,
+                )
             assert_true(code == 0, f"{label}: claude prompt hook logger failed")
             prompt_record = next(event for event in reversed(read_events(Path(d.state_file))) if event.get("event") == "prompt_submitted" and event.get("attach_probe") == probe_id)
+            assert_true(prompt_record.get("pane") == "%93", f"{label}: prompt_submitted must normalize marker pane: {prompt_record}")
+            assert_true(prompt_record.get("session_id") == "new-claude-session" and "turn_id" not in prompt_record, f"{label}: production Claude prompt hook shape should have no turn_id: {prompt_record}")
+            assert_true(not any(event.get("attach_probe") == probe_id for event in read_events(fallback_events)), f"{label}: prompt_submitted must not route to fallback bus")
             d.handle_prompt_submitted(prompt_record)
-            code = _run_hook_logger_record(
-                "claude",
-                {
-                    "hook_event_name": "Stop",
-                    "session_id": "new-claude-session",
-                    "turn_id": "turn-claude-probe",
-                    "last_assistant_message": "bridge clear probe complete",
-                    "cwd": "/tmp",
-                    "model": "claude-test",
-                },
-                state_file=Path(d.state_file),
-                public_state_file=Path(d.public_state_file),
+            assert_true(
+                any(event.get("event") == "clear_probe_prompt_seen" and event.get("target") == "bob" for event in read_events(Path(d.state_file))),
+                f"{label}: daemon should accept no-turn prompt phase2: {read_events(Path(d.state_file))}",
             )
+            with patched_environ(TMUX_PANE=None):
+                code = _run_hook_logger_record(
+                    "claude",
+                    {
+                        "hook_event_name": "Stop",
+                        "session_id": "new-claude-session",
+                        "last_assistant_message": "bridge clear probe complete",
+                        "cwd": "/tmp",
+                        "model": "claude-test",
+                    },
+                    state_file=fallback_events,
+                    public_state_file=fallback_public,
+                )
             assert_true(code == 0, f"{label}: claude stop hook logger failed")
-            stop_record = next(event for event in reversed(read_events(Path(d.state_file))) if event.get("event") == "response_finished" and event.get("turn_id") == "turn-claude-probe")
+            stop_record = next(event for event in reversed(read_events(Path(d.state_file))) if event.get("event") == "response_finished" and event.get("session_id") == "new-claude-session")
+            assert_true(stop_record.get("pane") == "%93", f"{label}: Stop must normalize marker pane: {stop_record}")
+            assert_true("turn_id" not in stop_record, f"{label}: production Claude Stop hook shape should have no turn_id: {stop_record}")
             d.handle_response_finished(stop_record)
+            assert_true(
+                any(event.get("event") == "clear_probe_response_finished" and event.get("target") == "bob" for event in read_events(Path(d.state_file))),
+                f"{label}: daemon should accept no-turn response by new session id: {read_events(Path(d.state_file))}",
+            )
             thread.join(2.0)
         finally:
             bridge_identity.tmux_target_for_pane = old_target  # type: ignore[assignment]
@@ -15406,6 +15717,68 @@ def scenario_clear_claude_post_clear_probe_pasted_and_completes(label: str, tmpd
         state = read_json(session_dir / "session.json", {})
         bob = (state.get("participants") or {}).get("bob") or {}
         assert_true(bob.get("status") == "active" and bob.get("hook_session_id") == "new-claude-session", f"{label}: alias should remain active after clear: {bob}")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_session_end_suppression_is_exact(label: str, tmpdir: Path) -> None:
+    def run_session_end(*, pane: str, session_id: str, events: Path, public_events: Path) -> None:
+        with patched_environ(
+            AGENT_BRIDGE_SESSION=None,
+            AGENT_BRIDGE_AGENT=None,
+            AGENT_BRIDGE_BUS=None,
+            AGENT_BRIDGE_EVENTS=None,
+            AGENT_BRIDGE_PUBLIC_EVENTS=None,
+            TMUX_PANE=pane,
+        ):
+            code = _run_hook_logger_record(
+                "claude",
+                {
+                    "hook_event_name": "SessionEnd",
+                    "session_id": session_id,
+                    "cwd": "/tmp",
+                    "model": "claude-test",
+                },
+                state_file=events,
+                public_state_file=public_events,
+            )
+        assert_true(code == 0, f"{label}: SessionEnd hook logger failed")
+
+    normal_dir = tmpdir / "normal"
+    with isolated_identity_env(normal_dir) as state_root_path:
+        write_identity_fixture(state_root_path, alias="bob", agent="claude", session_id="old-session", pane="%98")
+        events = state_root_path / "test-session" / "events.raw.jsonl"
+        public_events = state_root_path / "test-session" / "events.jsonl"
+        run_session_end(pane="%98", session_id="old-session", events=events, public_events=public_events)
+        state = read_json(state_root_path / "test-session" / "session.json", {})
+        bob = (state.get("participants") or {}).get("bob") or {}
+        locks = read_json(Path(os.environ["AGENT_BRIDGE_PANE_LOCKS"]), {"panes": {}})
+        assert_true(bob.get("status") == "detached", f"{label}: normal SessionEnd must detach participant: {bob}")
+        assert_true("%98" not in (locks.get("panes") or {}), f"{label}: normal SessionEnd must remove matching pane lock: {locks}")
+
+    near_dir = tmpdir / "near-miss"
+    with isolated_identity_env(near_dir) as state_root_path:
+        marker_file = near_dir / "controlled-clears.json"
+        with patched_environ(AGENT_BRIDGE_CONTROLLED_CLEARS=str(marker_file)):
+            write_identity_fixture(state_root_path, alias="bob", agent="claude", session_id="old-session", pane="%98")
+            marker = bridge_clear_marker.make_marker(
+                bridge_session="test-session",
+                alias="bob",
+                agent="claude",
+                old_session_id="different-old-session",
+                probe_id="probe-near-miss",
+                pane="%98",
+                target="tmux:1.0",
+                events_file=str(state_root_path / "test-session" / "events.raw.jsonl"),
+            )
+            bridge_clear_marker.write_marker(marker)
+            events = state_root_path / "test-session" / "events.raw.jsonl"
+            public_events = state_root_path / "test-session" / "events.jsonl"
+            run_session_end(pane="%98", session_id="old-session", events=events, public_events=public_events)
+            state = read_json(state_root_path / "test-session" / "session.json", {})
+            bob = (state.get("participants") or {}).get("bob") or {}
+            locks = read_json(Path(os.environ["AGENT_BRIDGE_PANE_LOCKS"]), {"panes": {}})
+            assert_true(bob.get("status") == "detached", f"{label}: near-miss marker must not suppress SessionEnd: {bob}")
+            assert_true("%98" not in (locks.get("panes") or {}), f"{label}: near-miss marker must not keep pane lock: {locks}")
     print(f"  PASS  {label}")
 
 
@@ -15661,6 +16034,63 @@ def scenario_clear_marker_phase2_missing_forces_leave(label: str, tmpdir: Path) 
     assert_true(called and called[0].get("reason") == "clear_marker_phase2_missing", f"{label}: missing marker phase2 must force leave: {called}")
     events = read_events(Path(d.state_file))
     assert_true(any(e.get("event") == "clear_marker_phase2_missing" for e in events), f"{label}: explicit marker diagnostic required")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_marker_phase2_rejects_record_turn_without_marker_turn(label: str, tmpdir: Path) -> None:
+    marker_file = tmpdir / "controlled-clears.json"
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91", "hook_session_id": "session-alice"},
+        "bob": {"alias": "bob", "agent_type": "claude", "pane": "%92", "hook_session_id": "old-session", "target": "test:1.2"},
+    }
+    with patched_environ(AGENT_BRIDGE_CONTROLLED_CLEARS=str(marker_file)):
+        d = make_daemon(tmpdir, participants)
+        marker = bridge_clear_marker.make_marker(
+            bridge_session="test-session",
+            alias="bob",
+            agent="claude",
+            old_session_id="old-session",
+            probe_id="probe-no-marker-turn",
+            pane="%92",
+            target="test:1.2",
+            events_file=str(d.state_file),
+            public_events_file=str(d.public_state_file),
+        )
+        marker["phase"] = "prompt_seen"
+        marker["new_session_id"] = "new-session"
+        bridge_clear_marker.write_marker(marker)
+        d.clear_reservations["bob"] = {
+            "target": "bob",
+            "caller": "alice",
+            "probe_id": "probe-no-marker-turn",
+            "identity_marker_id": marker["id"],
+            "pane_touched": False,
+            "condition": threading.Condition(d.state_lock),
+        }
+        with d.state_lock:
+            handled = d.handle_clear_prompt_submitted_locked(
+                "bob",
+                {
+                    "event": "prompt_submitted",
+                    "attach_probe": "probe-no-marker-turn",
+                    "session_id": "new-session",
+                    "turn_id": "turn-from-record-only",
+                },
+            )
+        assert_true(handled is True, f"{label}: clear prompt should be handled")
+        reservation = d.clear_reservations["bob"]
+        assert_true(reservation.get("failure_reason") == "clear_marker_phase2_missing", f"{label}: record-only turn id must fail closed: {reservation}")
+        assert_true(not reservation.get("new_session_id") and not reservation.get("probe_turn_id"), f"{label}: daemon must not reconstruct phase2 keys from bus record: {reservation}")
+        events = read_events(Path(d.state_file))
+        diagnostic = next((event for event in reversed(events) if event.get("event") == "clear_marker_phase2_missing"), None)
+        assert_true(
+            diagnostic
+            and diagnostic.get("marker_phase") == "prompt_seen"
+            and diagnostic.get("marker_new_session_present") is True
+            and diagnostic.get("marker_probe_turn_id") == ""
+            and diagnostic.get("record_turn_id") == "turn-from-record-only",
+            f"{label}: diagnostic should expose record-only turn mismatch: {events}",
+        )
     print(f"  PASS  {label}")
 
 
@@ -16670,6 +17100,7 @@ def main() -> int:
             ("clear_reservation_blocks_delivery", scenario_clear_reservation_blocks_delivery),
             ("requester_cleared_prompt_guard_and_notice", scenario_requester_cleared_prompt_guard_and_notice),
             ("clear_marker_routes_fast_stop", scenario_clear_marker_routes_fast_stop),
+            ("clear_marker_probe_id_fallback_contracts", scenario_clear_marker_probe_id_fallback_contracts),
             ("clear_post_clear_first_request_routes_reply", scenario_clear_post_clear_first_request_routes_reply),
             ("clear_with_existing_inbound_queue_routes_replies", scenario_clear_with_existing_inbound_queue_routes_replies),
             ("clear_file_fallback_blocked_sender_aged_ingress", scenario_clear_file_fallback_blocked_sender_aged_ingress),
@@ -16679,11 +17110,13 @@ def main() -> int:
             ("clear_requires_verified_process_identity", scenario_clear_requires_verified_process_identity),
             ("clear_codex_post_clear_endpoint_verify_immediately", scenario_clear_codex_post_clear_endpoint_verify_immediately),
             ("clear_claude_post_clear_probe_pasted_and_completes", scenario_clear_claude_post_clear_probe_pasted_and_completes),
+            ("clear_session_end_suppression_is_exact", scenario_clear_session_end_suppression_is_exact),
             ("command_state_lock_timeout_before_mutation", scenario_command_state_lock_timeout_before_mutation),
             ("clear_success_delivery_defers_near_deadline", scenario_clear_success_delivery_defers_near_deadline),
             ("clear_success_delivery_lock_wait_does_not_fail_after_commit", scenario_clear_success_delivery_lock_wait_does_not_fail_after_commit),
             ("clear_probe_subprocess_timeouts", scenario_clear_probe_subprocess_timeouts),
             ("clear_marker_phase2_missing_forces_leave", scenario_clear_marker_phase2_missing_forces_leave),
+            ("clear_marker_phase2_rejects_record_turn_without_marker_turn", scenario_clear_marker_phase2_rejects_record_turn_without_marker_turn),
             ("run_clear_peer_phase2_failure_returns_immediately", scenario_run_clear_peer_phase2_failure_returns_immediately),
             ("clear_force_leave_cleans_identity_stores", scenario_clear_force_leave_cleans_identity_stores),
             ("clear_force_leave_unowned_lock_serializes_cleanup", scenario_clear_force_leave_unowned_lock_serializes_cleanup),

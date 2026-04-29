@@ -34,6 +34,13 @@ and aggregate JSON persist, but restart can lose live routing context. Evidence:
 `bridge_daemon.py::BridgeDaemon.__init__`,
 `bridge_daemon.py::_recover_orphan_delivered_messages`, `bridge_daemon_ctl.py`.
 
+Pre-existing `status="inflight"` queue rows are preserved after daemon restart
+as delivery blockers because they may already have been pasted into the target
+pane. The new daemon waits for a matching `prompt_submitted` hook to bind the
+row by nonce; if that hook never arrives, operator recovery is explicit via
+`agent_interrupt_peer <alias>` or `agent_cancel_message <msg_id>` when the row is
+still safely cancellable.
+
 ### Bounded Tombstone Window
 
 Recent terminal/idempotency tombstones are best-effort memory: 600 seconds and

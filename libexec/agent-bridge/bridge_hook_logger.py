@@ -6,7 +6,7 @@ import re
 import sys
 from pathlib import Path
 
-from bridge_clear_marker import find_for_clear_window, find_for_prompt, find_for_stop, mark_prompt_seen
+from bridge_clear_marker import find_for_clear_window, find_for_prompt, find_for_stop, mark_prompt_seen, mark_session_seen
 from bridge_paths import state_root
 from bridge_identity import update_live_session
 from bridge_util import append_jsonl, locked_json_read, public_record as redact_public_record, utc_now
@@ -158,10 +158,13 @@ def controlled_clear_mapping(agent: str, record: dict) -> dict | None:
     session_id = str(record.get("session_id") or "")
     turn_id = str(record.get("turn_id") or "")
     attach_probe = str(record.get("attach_probe") or "")
+    event = str(record.get("event") or "")
     marker = None
-    if attach_probe:
+    if event == "prompt_submitted":
+        if not attach_probe:
+            return None
         marker = find_for_prompt(pane=pane, agent=agent, attach_probe=attach_probe)
-        if marker and record.get("event") == "prompt_submitted":
+        if marker:
             updated = mark_prompt_seen(
                 marker,
                 new_session_id=session_id,
@@ -169,10 +172,19 @@ def controlled_clear_mapping(agent: str, record: dict) -> dict | None:
             )
             if updated:
                 marker = updated
-    elif record.get("event") == "response_finished":
+            record["attach_probe"] = str(marker.get("probe_id") or attach_probe)
+            record["pane"] = str(marker.get("pane") or record.get("pane") or "")
+    elif event == "response_finished":
         marker = find_for_stop(pane=pane, agent=agent, session_id=session_id, turn_id=turn_id)
-    else:
+        if marker:
+            record["pane"] = str(marker.get("pane") or record.get("pane") or "")
+    elif event == "session_start":
         marker = find_for_clear_window(pane=pane, agent=agent, session_id=session_id)
+        if marker:
+            updated = mark_session_seen(marker, new_session_id=session_id)
+            if updated:
+                marker = updated
+            record["pane"] = str(marker.get("pane") or record.get("pane") or "")
     return marker_mapping(marker) if marker else None
 
 
@@ -225,7 +237,7 @@ def main() -> int:
     live_mapping = update_live_session(
         agent_type=args.agent,
         session_id=str(payload.get("session_id") or ""),
-        pane=str(os.environ.get("TMUX_PANE") or ""),
+        pane=str(record.get("pane") or os.environ.get("TMUX_PANE") or ""),
         bridge_session=str(record.get("bridge_session") or ""),
         alias=str(record.get("bridge_agent") or ""),
         event=str(record.get("event") or ""),
