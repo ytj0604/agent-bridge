@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import json
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -428,3 +429,239 @@ def _patch_enqueue_for_unit(be, state: dict, *, socket_error: str = "") -> None:
 def _write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+
+
+def _enqueue_alarm(d, owner: str, note: str = "") -> str:
+    return d.register_alarm(owner, 600.0, note) or ""
+
+def _set_response_context(
+    d,
+    responder: str,
+    requester: str,
+    *,
+    auto_return: bool = True,
+    message_id: str = "msg-active-response",
+    aggregate_id: str | None = None,
+) -> None:
+    d.current_prompt_by_agent[responder] = {
+        "id": message_id,
+        "nonce": "n-active-response",
+        "causal_id": "c",
+        "hop_count": 1,
+        "from": requester,
+        "kind": "request",
+        "intent": "test",
+        "auto_return": auto_return,
+        "aggregate_id": aggregate_id,
+        "aggregate_expected": [responder] if aggregate_id else None,
+        "aggregate_message_ids": {responder: message_id} if aggregate_id else None,
+        "turn_id": "t-active-response",
+    }
+
+def _watchdogs_for_message(d, message_id: str, phase: str | None = None) -> list[tuple[str, dict]]:
+    return [
+        (wake_id, wd)
+        for wake_id, wd in d.watchdogs.items()
+        if wd.get("ref_message_id") == message_id
+        and not wd.get("is_alarm")
+        and (phase is None or wd.get("watchdog_phase") == phase)
+    ]
+
+def _make_inflight(
+    d,
+    message_id: str,
+    frm: str,
+    to: str,
+    nonce: str,
+    *,
+    auto_return: bool = True,
+    kind: str = "request",
+    aggregate_id: str | None = None,
+    aggregate_expected: list[str] | None = None,
+    aggregate_message_ids: dict[str, str] | None = None,
+) -> None:
+    """Plant a queue item already in inflight state (as if try_deliver ran)."""
+    msg = {
+        "id": message_id,
+        "created_ts": utc_now(),
+        "updated_ts": utc_now(),
+        "from": frm, "to": to,
+        "kind": kind, "intent": "test",
+        "body": "hello",
+        "causal_id": f"causal-{uuid.uuid4().hex[:12]}",
+        "hop_count": 1, "auto_return": auto_return,
+        "reply_to": None, "source": "test", "bridge_session": "test-session",
+        "status": "inflight", "nonce": nonce, "delivery_attempts": 1,
+    }
+    if aggregate_id:
+        msg["aggregate_id"] = aggregate_id
+        msg["aggregate_expected"] = aggregate_expected or [to]
+        msg["aggregate_message_ids"] = aggregate_message_ids or {to: message_id}
+    def add(queue):
+        queue.append(msg)
+        return None
+    d.queue.update(add)
+    d.reserved[to] = message_id
+
+def _make_delivered_context(
+    d,
+    message_id: str,
+    frm: str,
+    to: str,
+    nonce: str,
+    *,
+    auto_return: bool = True,
+    kind: str = "request",
+    source: str = "test",
+    turn_id: str | None = None,
+    aggregate_id: str | None = None,
+    aggregate_expected: list[str] | None = None,
+    aggregate_message_ids: dict[str, str] | None = None,
+    watchdog: bool = False,
+) -> dict:
+    msg = {
+        "id": message_id,
+        "created_ts": utc_now(),
+        "updated_ts": utc_now(),
+        "delivered_ts": utc_now(),
+        "from": frm, "to": to,
+        "kind": kind, "intent": "test",
+        "body": "hello",
+        "causal_id": f"causal-{uuid.uuid4().hex[:12]}",
+        "hop_count": 1, "auto_return": auto_return,
+        "reply_to": None, "source": source, "bridge_session": "test-session",
+        "status": "delivered", "nonce": nonce, "delivery_attempts": 1,
+    }
+    if aggregate_id:
+        msg["aggregate_id"] = aggregate_id
+        msg["aggregate_expected"] = aggregate_expected or [to]
+        msg["aggregate_message_ids"] = aggregate_message_ids or {to: message_id}
+    def add(queue):
+        queue.append(msg)
+        return None
+    d.queue.update(add)
+    d.current_prompt_by_agent[to] = {
+        "id": message_id,
+        "nonce": nonce,
+        "causal_id": msg["causal_id"],
+        "hop_count": 1,
+        "from": frm,
+        "kind": kind,
+        "intent": "test",
+        "auto_return": auto_return,
+        "aggregate_id": aggregate_id,
+        "aggregate_expected": msg.get("aggregate_expected"),
+        "aggregate_message_ids": msg.get("aggregate_message_ids"),
+        "turn_id": turn_id,
+    }
+    if watchdog:
+        d.watchdogs[f"wake-{message_id}"] = {
+            "sender": frm,
+            "deadline": time.time() + 600.0,
+            "ref_message_id": message_id,
+            "ref_aggregate_id": None,
+            "ref_to": to,
+            "is_alarm": False,
+        }
+    return msg
+
+def _queue_item(d, message_id: str) -> dict | None:
+    return next((item for item in d.queue.read() if item.get("id") == message_id), None)
+
+def _active_turn(
+    d,
+    *,
+    message_id: str,
+    frm: str = "codex",
+    to: str = "claude",
+    nonce: str = "n-active-turn",
+    turn_id: str = "active-turn",
+    auto_return: bool = True,
+    kind: str = "request",
+    aggregate_id: str | None = None,
+    aggregate_expected: list[str] | None = None,
+    aggregate_message_ids: dict[str, str] | None = None,
+) -> dict:
+    msg = _make_delivered_context(
+        d,
+        message_id,
+        frm=frm,
+        to=to,
+        nonce=nonce,
+        turn_id=turn_id,
+        auto_return=auto_return,
+        kind=kind,
+        aggregate_id=aggregate_id,
+        aggregate_expected=aggregate_expected,
+        aggregate_message_ids=aggregate_message_ids,
+    )
+    d.busy[to] = True
+    d.reserved[to] = None
+    d.last_enter_ts[message_id] = time.time()
+    d.remember_nonce(nonce, msg)
+    return msg
+
+def _plant_watchdog(
+    d,
+    wake_id: str,
+    *,
+    sender: str = "codex",
+    message_id: str | None = None,
+    aggregate_id: str | None = None,
+    to: str = "claude",
+    deadline: float | None = None,
+) -> str:
+    d.watchdogs[wake_id] = {
+        "sender": sender,
+        "deadline": time.time() if deadline is None else deadline,
+        "ref_message_id": message_id,
+        "ref_aggregate_id": aggregate_id,
+        "ref_to": to,
+        "ref_kind": "request",
+        "ref_intent": "test",
+        "ref_causal_id": "causal-watchdog",
+        "ref_aggregate_expected": ["w1", "w2"] if aggregate_id else [],
+        "is_alarm": False,
+    }
+    return wake_id
+
+def _auto_return_results(d, sender: str, target: str) -> list[dict]:
+    return [
+        item for item in d.queue.read()
+        if item.get("from") == sender
+        and item.get("to") == target
+        and item.get("kind") == "result"
+        and item.get("source") == "auto_return"
+    ]
+
+def _assert_auto_return_result_shape(
+    label: str,
+    result: dict,
+    *,
+    sender: str,
+    target: str,
+    reply_to: str,
+    causal_id: str,
+    hop_count: int,
+    body: str,
+) -> None:
+    assert_true(result.get("from") == sender, f"{label}: result sender mismatch: {result}")
+    assert_true(result.get("to") == target, f"{label}: result target mismatch: {result}")
+    assert_true(result.get("kind") == "result", f"{label}: result kind mismatch: {result}")
+    assert_true(result.get("source") == "auto_return", f"{label}: result source mismatch: {result}")
+    assert_true(result.get("auto_return") is False, f"{label}: result must not auto-return: {result}")
+    assert_true(result.get("reply_to") == reply_to, f"{label}: reply_to mismatch: {result}")
+    assert_true(result.get("causal_id") == causal_id, f"{label}: causal_id mismatch: {result}")
+    assert_true(int(result.get("hop_count") or 0) == hop_count, f"{label}: hop_count mismatch: {result}")
+    assert_true(result.get("body") == body, f"{label}: body mismatch: {result.get('body')!r}")
+
+def _import_daemon_ctl():
+    libexec = LIBEXEC
+    if str(libexec) not in sys.path:
+        sys.path.insert(0, str(libexec))
+    import importlib
+    return importlib.import_module("bridge_daemon_ctl")
+
+def _daemon_command_result(d: bridge_daemon.BridgeDaemon, payload: dict) -> dict:
+    raw = json.dumps(payload, ensure_ascii=True).encode("utf-8") + b"\n"
+    return d.handle_command_connection(FakeCommandConn(raw))  # type: ignore[arg-type]
