@@ -68,6 +68,7 @@ yes="0"
 dry_run="0"
 install_hooks="1"
 ignore_hook_failure="0"
+skip_claude_editor_mode="0"
 update_shell_rc="auto"
 path_block_begin="# >>> Agent Bridge >>>"
 path_block_end="# <<< Agent Bridge <<<"
@@ -75,10 +76,12 @@ path_block_end="# <<< Agent Bridge <<<"
 usage() {
   local code="${1:-2}"
   cat >&2 <<'EOF'
-usage: install.sh [--yes] [--dry-run] [--bin-dir DIR] [--skip-hooks] [--ignore-hook-failure] [--no-shell-rc]
+usage: install.sh [--yes] [--dry-run] [--bin-dir DIR] [--skip-hooks] [--ignore-hook-failure] [--skip-claude-editor-mode] [--no-shell-rc]
 
   --skip-hooks            do not run hook config installation
   --ignore-hook-failure   explicit shim-only/diagnostic escape hatch; only applies when hook installation runs
+  --skip-claude-editor-mode
+                          do not force Claude Code editorMode=normal during install
   --no-shell-rc           do not add the Agent Bridge PATH block to your shell rc
 EOF
   exit "$code"
@@ -211,6 +214,23 @@ backup_rc_if_needed() {
   fi
 }
 
+configure_claude_editor_mode() {
+  if [[ "$skip_claude_editor_mode" == "1" ]]; then
+    echo "skip: --skip-claude-editor-mode; Claude Code editorMode unchanged"
+    return
+  fi
+  local path
+  local args
+  for path in "$HOME/.claude.json" "$HOME/.claude/settings.json"; do
+    args=("$libexec_dir/bridge_set_editor_mode.py" --path "$path")
+    if [[ "$dry_run" == "1" ]]; then
+      args+=(--dry-run)
+    fi
+    # Warning/skipped configs return success; real filesystem errors still abort under set -e.
+    "$python_bin" "${args[@]}"
+  done
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --yes|-y)
@@ -231,6 +251,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --ignore-hook-failure)
       ignore_hook_failure="1"
+      shift
+      ;;
+    --skip-claude-editor-mode)
+      skip_claude_editor_mode="1"
       shift
       ;;
     --no-shell-rc)
@@ -342,6 +366,10 @@ if [[ "$install_hooks" == "1" ]]; then
     fi
   fi
 fi
+
+# Keep Claude Code in normal editor mode so bridge prompt paste is reliable.
+# This runs after hook setup, so hook hard failures abort before this config edit.
+configure_claude_editor_mode
 
 if ! command -v tmux >/dev/null 2>&1; then
   echo "warning: tmux not found on PATH. Agent Bridge attaches to tmux panes, so bridge_run will fail until tmux is installed." >&2

@@ -6905,6 +6905,9 @@ def scenario_uninstall_sh_hook_helper_failure_aborts(label: str, tmpdir: Path) -
 
 def _write_fake_install_tree(root: Path, *, omit: Path | None = None) -> None:
     shutil.copy2(ROOT / "install.sh", root / "install.sh")
+    helper = root / "libexec" / "agent-bridge" / "bridge_set_editor_mode.py"
+    helper.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "libexec" / "agent-bridge" / "bridge_set_editor_mode.py", helper)
     for _, relative in INSTALL_SHIM_TARGETS:
         if omit is not None and relative == omit:
             continue
@@ -7118,6 +7121,27 @@ def _run_bridge_uninstall_hooks(
         capture_output=True,
         text=True,
         env=_fake_install_env(tmpdir),
+        timeout=10,
+    )
+
+
+def _run_bridge_set_editor_mode(path: Path, *, dry_run: bool = False, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    cmd = [
+        sys.executable,
+        str(ROOT / "libexec" / "agent-bridge" / "bridge_set_editor_mode.py"),
+        "--path",
+        str(path),
+    ]
+    if dry_run:
+        cmd.append("--dry-run")
+    env = _fake_install_env(path.parent)
+    if env_extra:
+        env.update(env_extra)
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=env,
         timeout=10,
     )
 
@@ -7408,6 +7432,412 @@ def scenario_install_sh_shell_rc_replaces_existing_marker_block(label: str, tmpd
     assert_true(text.count("# >>> Agent Bridge >>>") == 1 and text.count("# <<< Agent Bridge <<<") == 1, f"{label}: marker block should be replaced, not appended: {text!r}")
     assert_true(str(bin_a) not in text, f"{label}: old bin_dir should be removed from managed block: {text!r}")
     assert_true(f"export PATH={shlex.quote(str(bin_b))}:\"$PATH\"" in text, f"{label}: new bin_dir should be present and quoted: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def _claude_backups(path: Path) -> list[Path]:
+    return sorted(path.parent.glob(f"{path.name}.agent-bridge.bak.*"))
+
+
+def _claude_temps(path: Path) -> list[Path]:
+    return sorted(path.parent.glob(f".{path.name}.agent-bridge.tmp.*"))
+
+
+def _assert_ordered_substrings(label: str, text: str, *needles: str) -> None:
+    cursor = -1
+    for needle in needles:
+        index = text.find(needle, cursor + 1)
+        assert_true(index >= 0, f"{label}: missing ordered stdout substring {needle!r}: {text!r}")
+        assert_true(index > cursor, f"{label}: stdout substring {needle!r} is out of order: {text!r}")
+        cursor = index
+
+
+def scenario_install_sh_claude_editor_mode_missing_skips(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "claude-mode-missing"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir)
+    home = Path(env["HOME"])
+
+    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-missing", env=env)
+    assert_true(proc.returncode == 0, f"{label}: missing Claude config should not fail install: {proc.stderr!r}")
+    assert_true(not (home / ".claude.json").exists(), f"{label}: missing Claude config must not be created")
+    assert_true(not (home / ".claude" / "settings.json").exists(), f"{label}: missing Claude settings must not be created")
+    _assert_ordered_substrings(
+        label,
+        proc.stdout,
+        f"skip: Claude Code config absent at {home / '.claude.json'}",
+        f"skip: Claude Code config absent at {home / '.claude' / 'settings.json'}",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_updates_with_backup(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "claude-mode-update"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir)
+    home = Path(env["HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / ".claude.json"
+    original = b'{\n  "theme": "light",\n  "editorMode": "vim",\n  "nested": {\n    "keep": true\n  }\n}'
+    config.write_bytes(original)
+
+    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-update", env=env)
+    assert_true(proc.returncode == 0, f"{label}: install should update vim editorMode: stdout={proc.stdout!r} stderr={proc.stderr!r}")
+    data = json.loads(config.read_text(encoding="utf-8"))
+    assert_true(data.get("editorMode") == "normal", f"{label}: editorMode should be normal: {data}")
+    assert_true(list(data) == ["theme", "editorMode", "nested"], f"{label}: root key order should be preserved: {list(data)}")
+    assert_true(data.get("nested") == {"keep": True}, f"{label}: nested fields should be preserved: {data}")
+    assert_true(not config.read_bytes().endswith(b"\n"), f"{label}: original missing trailing newline should stay missing")
+    backups = _claude_backups(config)
+    assert_true(len(backups) == 1, f"{label}: exactly one Claude config backup expected, got {backups}")
+    assert_true(re.match(r"^\.claude\.json\.agent-bridge\.bak\.\d{14}\.\d+$", backups[0].name), f"{label}: backup name should match convention: {backups[0].name}")
+    assert_true(backups[0].read_bytes() == original, f"{label}: backup must preserve original bytes")
+    assert_true(not _claude_temps(config), f"{label}: no temp files should remain after update")
+    assert_true("set Claude Code editorMode=normal for reliable bridge prompt paste" in proc.stdout, f"{label}: update reason should be announced: {proc.stdout!r}")
+    assert_true('(was "vim")' in proc.stdout, f"{label}: update should show previous value: {proc.stdout!r}")
+    assert_true("JSON whitespace/escape style normalized" in proc.stdout, f"{label}: normalization should be disclosed: {proc.stdout!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_updates_global_and_settings(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "claude-mode-two-files"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir)
+    home = Path(env["HOME"])
+    claude_dir = home / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    global_config = home / ".claude.json"
+    settings_config = claude_dir / "settings.json"
+    global_original = b'{\n  "editorMode": "vim",\n  "global": true\n}\n'
+    settings_original = b'{\n  "editorMode": "vim",\n  "settings": true\n}\n'
+    global_config.write_bytes(global_original)
+    settings_config.write_bytes(settings_original)
+
+    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-two-files", env=env)
+    assert_true(proc.returncode == 0, f"{label}: install should update both Claude config files: stdout={proc.stdout!r} stderr={proc.stderr!r}")
+    global_data = json.loads(global_config.read_text(encoding="utf-8"))
+    settings_data = json.loads(settings_config.read_text(encoding="utf-8"))
+    assert_true(global_data.get("editorMode") == "normal", f"{label}: ~/.claude.json should be normal: {global_data}")
+    assert_true(settings_data.get("editorMode") == "normal", f"{label}: ~/.claude/settings.json should be normal: {settings_data}")
+    global_backups = _claude_backups(global_config)
+    settings_backups = _claude_backups(settings_config)
+    assert_true(len(global_backups) == 1 and global_backups[0].read_bytes() == global_original, f"{label}: global backup should preserve original: {global_backups}")
+    assert_true(len(settings_backups) == 1 and settings_backups[0].read_bytes() == settings_original, f"{label}: settings backup should preserve original: {settings_backups}")
+    assert_true(not _claude_temps(global_config), f"{label}: no global temp files should remain")
+    assert_true(not _claude_temps(settings_config), f"{label}: no settings temp files should remain")
+    _assert_ordered_substrings(label, proc.stdout, str(global_config), str(settings_config))
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_missing_global_updates_settings(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "claude-mode-mixed-absent"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir)
+    home = Path(env["HOME"])
+    claude_dir = home / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    global_config = home / ".claude.json"
+    settings_config = claude_dir / "settings.json"
+    settings_original = b'{\n  "editorMode": "vim",\n  "settings": true\n}\n'
+    settings_config.write_bytes(settings_original)
+
+    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-mixed-absent", env=env)
+    assert_true(proc.returncode == 0, f"{label}: missing global should not prevent settings update: stdout={proc.stdout!r} stderr={proc.stderr!r}")
+    assert_true(not global_config.exists(), f"{label}: missing global config must not be created")
+    settings_data = json.loads(settings_config.read_text(encoding="utf-8"))
+    assert_true(settings_data.get("editorMode") == "normal", f"{label}: settings should be normal: {settings_data}")
+    settings_backups = _claude_backups(settings_config)
+    assert_true(len(settings_backups) == 1 and settings_backups[0].read_bytes() == settings_original, f"{label}: settings backup should preserve original: {settings_backups}")
+    _assert_ordered_substrings(
+        label,
+        proc.stdout,
+        f"skip: Claude Code config absent at {global_config}",
+        f"set Claude Code editorMode=normal for reliable bridge prompt paste in {settings_config}",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_invalid_global_still_updates_settings(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "claude-mode-cross-file"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir)
+    home = Path(env["HOME"])
+    claude_dir = home / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    global_config = home / ".claude.json"
+    settings_config = claude_dir / "settings.json"
+    global_original = b'{"editorMode": '
+    settings_original = b'{\n  "editorMode": "vim",\n  "settings": true\n}\n'
+    global_config.write_bytes(global_original)
+    settings_config.write_bytes(settings_original)
+
+    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-cross-file", env=env)
+    assert_true(proc.returncode == 0, f"{label}: invalid global should warn-skip and continue: stdout={proc.stdout!r} stderr={proc.stderr!r}")
+    assert_true(global_config.read_bytes() == global_original, f"{label}: invalid global bytes must be unchanged")
+    assert_true(not _claude_backups(global_config), f"{label}: invalid global should not create backup")
+    settings_data = json.loads(settings_config.read_text(encoding="utf-8"))
+    assert_true(settings_data.get("editorMode") == "normal", f"{label}: settings should be normal: {settings_data}")
+    settings_backups = _claude_backups(settings_config)
+    assert_true(len(settings_backups) == 1 and settings_backups[0].read_bytes() == settings_original, f"{label}: settings backup should preserve original: {settings_backups}")
+    assert_true("WARNING:" in proc.stderr and str(global_config) in proc.stderr and "cannot parse Claude Code config JSON" in proc.stderr, f"{label}: global parse warning expected: {proc.stderr!r}")
+    _assert_ordered_substrings(
+        label,
+        proc.stdout,
+        f"skip: Claude Code config parse failed at {global_config}",
+        f"set Claude Code editorMode=normal for reliable bridge prompt paste in {settings_config}",
+    )
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_normal_noop(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "claude-mode-normal"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir)
+    home = Path(env["HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / ".claude.json"
+    original = b'{\n  "theme": "light",\n  "editorMode": "normal"\n}\n'
+    config.write_bytes(original)
+
+    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-normal", env=env)
+    assert_true(proc.returncode == 0, f"{label}: normal editorMode should not fail install: {proc.stderr!r}")
+    assert_true(config.read_bytes() == original, f"{label}: already-normal config must be byte-unchanged")
+    assert_true(not _claude_backups(config), f"{label}: no backup expected for no-op")
+    assert_true("skip: Claude Code editorMode already normal" in proc.stdout, f"{label}: no-op should print skip message: {proc.stdout!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_absent_adds_root(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "claude-mode-add"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir)
+    home = Path(env["HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / ".claude.json"
+    original = b'{\n  "theme": "light",\n  "nested": {\n    "keep": true\n  }\n}\n'
+    config.write_bytes(original)
+
+    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-add", env=env)
+    assert_true(proc.returncode == 0, f"{label}: missing editorMode key should be added: {proc.stderr!r}")
+    text = config.read_text(encoding="utf-8")
+    data = json.loads(text)
+    assert_true(data.get("editorMode") == "normal", f"{label}: editorMode should be added at root: {data}")
+    assert_true(list(data) == ["theme", "nested", "editorMode"], f"{label}: added root key should append without reordering existing keys: {list(data)}")
+    assert_true(text.endswith("\n"), f"{label}: original trailing newline should be preserved")
+    backups = _claude_backups(config)
+    assert_true(len(backups) == 1 and backups[0].read_bytes() == original, f"{label}: add should create exact backup: {backups}")
+    assert_true("add Claude Code editorMode=normal" in proc.stdout, f"{label}: add should be announced: {proc.stdout!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_invalid_json_skips(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "claude-mode-invalid"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir)
+    home = Path(env["HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / ".claude.json"
+    original = b'{"editorMode": '
+    config.write_bytes(original)
+
+    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-invalid", env=env)
+    assert_true(proc.returncode == 0, f"{label}: invalid Claude JSON should warn and continue: {proc.stderr!r}")
+    assert_true(config.read_bytes() == original, f"{label}: invalid JSON must not be overwritten")
+    assert_true(not _claude_backups(config), f"{label}: invalid JSON should not create backup")
+    assert_true("WARNING:" in proc.stderr and "cannot parse Claude Code config JSON" in proc.stderr, f"{label}: parse warning expected: {proc.stderr!r}")
+    assert_true("skip: Claude Code config parse failed" in proc.stdout, f"{label}: parse skip stdout expected: {proc.stdout!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_invalid_utf8_skips(label: str, tmpdir: Path) -> None:
+    config = tmpdir / ".claude.json"
+    original = b"\xff\xfe{\x00"
+    config.write_bytes(original)
+
+    proc = _run_bridge_set_editor_mode(config)
+    assert_true(proc.returncode == 0, f"{label}: invalid UTF-8 should warn and continue: {proc.stderr!r}")
+    assert_true(config.read_bytes() == original, f"{label}: invalid UTF-8 bytes must not be overwritten")
+    assert_true(not _claude_backups(config), f"{label}: invalid UTF-8 should not create backup")
+    assert_true("WARNING:" in proc.stderr and "cannot read Claude Code config as UTF-8" in proc.stderr, f"{label}: UTF-8 warning expected: {proc.stderr!r}")
+    assert_true("skip: Claude Code config unreadable" in proc.stdout, f"{label}: UTF-8 skip stdout expected: {proc.stdout!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_bom_skips(label: str, tmpdir: Path) -> None:
+    config = tmpdir / ".claude.json"
+    original = b'\xef\xbb\xbf{\n  "editorMode": "vim"\n}\n'
+    config.write_bytes(original)
+
+    proc = _run_bridge_set_editor_mode(config)
+    assert_true(proc.returncode == 0, f"{label}: BOM JSON should warn and continue: {proc.stderr!r}")
+    assert_true(config.read_bytes() == original, f"{label}: BOM JSON must not be rewritten")
+    assert_true(not _claude_backups(config), f"{label}: BOM JSON should not create backup")
+    assert_true("WARNING:" in proc.stderr and "cannot parse Claude Code config JSON" in proc.stderr, f"{label}: BOM should stay strict JSON parse warning: {proc.stderr!r}")
+    assert_true("skip: Claude Code config parse failed" in proc.stdout, f"{label}: BOM parse skip stdout expected: {proc.stdout!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_non_object_skips(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "claude-mode-non-object"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir)
+    home = Path(env["HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / ".claude.json"
+    original = b'["editorMode", "vim"]\n'
+    config.write_bytes(original)
+
+    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-non-object", env=env)
+    assert_true(proc.returncode == 0, f"{label}: non-object Claude JSON should warn and continue: {proc.stderr!r}")
+    assert_true(config.read_bytes() == original, f"{label}: non-object JSON must not be overwritten")
+    assert_true(not _claude_backups(config), f"{label}: non-object JSON should not create backup")
+    assert_true("WARNING:" in proc.stderr and "root is not an object" in proc.stderr, f"{label}: non-object warning expected: {proc.stderr!r}")
+    assert_true("skip: Claude Code config root is not an object" in proc.stdout, f"{label}: non-object skip stdout expected: {proc.stdout!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_dry_run_no_write(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "claude-mode-dry-run"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir)
+    home = Path(env["HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / ".claude.json"
+    original = b'{\n  "editorMode": "vim"\n}\n'
+    config.write_bytes(original)
+
+    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-dry-run", env=env, extra_args=["--dry-run"])
+    assert_true(proc.returncode == 0, f"{label}: dry-run Claude editorMode update should succeed: {proc.stderr!r}")
+    assert_true(config.read_bytes() == original, f"{label}: dry-run must not update Claude config")
+    assert_true(not _claude_backups(config), f"{label}: dry-run must not create backup")
+    assert_true(not _claude_temps(config), f"{label}: dry-run must not leave temp files")
+    assert_true("dry-run: would set Claude Code editorMode=normal" in proc.stdout, f"{label}: dry-run should preview update: {proc.stdout!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_preserves_mode(label: str, tmpdir: Path) -> None:
+    config = tmpdir / ".claude.json"
+    config.write_text('{\n  "editorMode": "vim"\n}\n', encoding="utf-8")
+    os.chmod(config, 0o600)
+
+    proc = _run_bridge_set_editor_mode(config)
+    assert_true(proc.returncode == 0, f"{label}: helper should update config: {proc.stderr!r}")
+    mode = config.stat().st_mode & 0o777
+    assert_true(mode == 0o600, f"{label}: helper should preserve file mode 0600, got {oct(mode)}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_symlink_preserved(label: str, tmpdir: Path) -> None:
+    target_dir = tmpdir / "dotfiles"
+    target_dir.mkdir()
+    target = target_dir / "claude.json"
+    target.write_text('{\n  "editorMode": "vim",\n  "name": "keep"\n}\n', encoding="utf-8")
+    link = tmpdir / ".claude.json"
+    link.symlink_to(target)
+    original = target.read_bytes()
+
+    proc = _run_bridge_set_editor_mode(link)
+    assert_true(proc.returncode == 0, f"{label}: helper should update symlink target: {proc.stderr!r}")
+    assert_true(link.is_symlink(), f"{label}: ~/.claude.json symlink object must be preserved")
+    data = json.loads(target.read_text(encoding="utf-8"))
+    assert_true(data.get("editorMode") == "normal" and data.get("name") == "keep", f"{label}: symlink target should be updated semantically: {data}")
+    backups = _claude_backups(target)
+    assert_true(len(backups) == 1 and backups[0].read_bytes() == original, f"{label}: backup should be taken beside resolved target: {backups}")
+    assert_true(not _claude_backups(link), f"{label}: link directory should not receive backup for resolved target")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_nested_root_absent_warns_skips(label: str, tmpdir: Path) -> None:
+    config = tmpdir / ".claude.json"
+    original = b'{\n  "settings": {\n    "editorMode": "vim"\n  }\n}\n'
+    config.write_bytes(original)
+
+    proc = _run_bridge_set_editor_mode(config)
+    assert_true(proc.returncode == 0, f"{label}: nested-only editorMode should be warning-skip: {proc.stderr!r}")
+    assert_true(config.read_bytes() == original, f"{label}: nested-only editorMode must not be overwritten")
+    assert_true(not _claude_backups(config), f"{label}: nested-only skip should not create backup")
+    assert_true("WARNING:" in proc.stderr and "$.settings.editorMode" in proc.stderr, f"{label}: nested warning should name path: {proc.stderr!r}")
+    assert_true("skip: root editorMode absent and nested editorMode found" in proc.stdout, f"{label}: nested-only skip stdout expected: {proc.stdout!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_nested_with_root_warns_updates_root_only(label: str, tmpdir: Path) -> None:
+    config = tmpdir / ".claude.json"
+    config.write_text('{\n  "editorMode": "vim",\n  "settings": {\n    "editorMode": "emacs"\n  }\n}\n', encoding="utf-8")
+
+    proc = _run_bridge_set_editor_mode(config)
+    assert_true(proc.returncode == 0, f"{label}: helper should update root despite nested warning: {proc.stderr!r}")
+    data = json.loads(config.read_text(encoding="utf-8"))
+    assert_true(data.get("editorMode") == "normal", f"{label}: root editorMode should update: {data}")
+    assert_true(data.get("settings", {}).get("editorMode") == "emacs", f"{label}: nested editorMode must not be mutated: {data}")
+    assert_true("WARNING:" in proc.stderr and "$.settings.editorMode" in proc.stderr, f"{label}: nested warning should name path: {proc.stderr!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_skip_flag_no_write(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "claude-mode-skip-flag"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir)
+    home = Path(env["HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    claude_dir = home / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    config = home / ".claude.json"
+    settings_config = claude_dir / "settings.json"
+    original = b'{\n  "editorMode": "vim"\n}\n'
+    config.write_bytes(original)
+    settings_config.write_bytes(original)
+
+    proc = _run_fake_install(root, tmpdir / "shims-claude-mode-skip-flag", env=env, extra_args=["--skip-claude-editor-mode"])
+    assert_true(proc.returncode == 0, f"{label}: skip flag should not fail install: {proc.stderr!r}")
+    assert_true(config.read_bytes() == original, f"{label}: skip flag must leave config byte-identical")
+    assert_true(settings_config.read_bytes() == original, f"{label}: skip flag must leave settings config byte-identical")
+    assert_true(not _claude_backups(config), f"{label}: skip flag must not create backup")
+    assert_true(not _claude_backups(settings_config), f"{label}: skip flag must not create settings backup")
+    assert_true(proc.stdout.count("skip: --skip-claude-editor-mode; Claude Code editorMode unchanged") == 1, f"{label}: skip flag should print exactly one global skip line: {proc.stdout!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_broken_symlink_warns(label: str, tmpdir: Path) -> None:
+    link = tmpdir / ".claude.json"
+    missing_target = tmpdir / "missing" / "claude.json"
+    link.symlink_to(missing_target)
+
+    proc = _run_bridge_set_editor_mode(link)
+    assert_true(proc.returncode == 0, f"{label}: broken symlink should warn and continue: {proc.stderr!r}")
+    assert_true(link.is_symlink(), f"{label}: broken symlink should remain a symlink")
+    assert_true(not missing_target.exists(), f"{label}: missing target must not be created")
+    assert_true("WARNING:" in proc.stderr and "symlink target is missing" in proc.stderr and str(missing_target) in proc.stderr, f"{label}: broken symlink warning expected: {proc.stderr!r}")
+    assert_true("skip: Claude Code config absent" in proc.stdout, f"{label}: broken symlink skip stdout expected: {proc.stdout!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_claude_editor_mode_concurrent_change_aborts(label: str, tmpdir: Path) -> None:
+    config = tmpdir / ".claude.json"
+    original = b'{\n  "editorMode": "vim",\n  "counter": 1\n}\n'
+    racer = b'{\n  "editorMode": "vim",\n  "counter": 2\n}\n'
+    race_file = tmpdir / "race-bytes.json"
+    config.write_bytes(original)
+    race_file.write_bytes(racer)
+
+    proc = _run_bridge_set_editor_mode(config, env_extra={"BRIDGE_EDITOR_MODE_TEST_RACE_FILE": str(race_file)})
+    assert_true(proc.returncode == 0, f"{label}: concurrent change should warn-skip, not fail: {proc.stderr!r}")
+    assert_true(config.read_bytes() == racer, f"{label}: concurrent writer bytes must win unchanged")
+    assert_true(not _claude_backups(config), f"{label}: concurrent-change guard must not create backup")
+    assert_true(not _claude_temps(config), f"{label}: concurrent-change guard must clean temp file")
+    assert_true("WARNING:" in proc.stderr and "concurrent change detected" in proc.stderr and "Re-run install.sh after closing Claude Code" in proc.stderr, f"{label}: concurrent warning expected: {proc.stderr!r}")
+    assert_true("skip: concurrent change detected" in proc.stdout, f"{label}: concurrent skip stdout expected: {proc.stdout!r}")
     print(f"  PASS  {label}")
 
 
@@ -16863,6 +17293,25 @@ def main() -> int:
             ("install_sh_shell_rc_backup_and_path_short_circuit", scenario_install_sh_shell_rc_backup_and_path_short_circuit),
             ("install_sh_shell_quotes_bin_dir_metacharacters", scenario_install_sh_shell_quotes_bin_dir_metacharacters),
             ("install_sh_shell_rc_replaces_existing_marker_block", scenario_install_sh_shell_rc_replaces_existing_marker_block),
+            ("install_sh_claude_editor_mode_missing_skips", scenario_install_sh_claude_editor_mode_missing_skips),
+            ("install_sh_claude_editor_mode_updates_with_backup", scenario_install_sh_claude_editor_mode_updates_with_backup),
+            ("install_sh_claude_editor_mode_updates_global_and_settings", scenario_install_sh_claude_editor_mode_updates_global_and_settings),
+            ("install_sh_claude_editor_mode_missing_global_updates_settings", scenario_install_sh_claude_editor_mode_missing_global_updates_settings),
+            ("install_sh_claude_editor_mode_invalid_global_still_updates_settings", scenario_install_sh_claude_editor_mode_invalid_global_still_updates_settings),
+            ("install_sh_claude_editor_mode_normal_noop", scenario_install_sh_claude_editor_mode_normal_noop),
+            ("install_sh_claude_editor_mode_absent_adds_root", scenario_install_sh_claude_editor_mode_absent_adds_root),
+            ("install_sh_claude_editor_mode_invalid_json_skips", scenario_install_sh_claude_editor_mode_invalid_json_skips),
+            ("install_sh_claude_editor_mode_invalid_utf8_skips", scenario_install_sh_claude_editor_mode_invalid_utf8_skips),
+            ("install_sh_claude_editor_mode_bom_skips", scenario_install_sh_claude_editor_mode_bom_skips),
+            ("install_sh_claude_editor_mode_non_object_skips", scenario_install_sh_claude_editor_mode_non_object_skips),
+            ("install_sh_claude_editor_mode_dry_run_no_write", scenario_install_sh_claude_editor_mode_dry_run_no_write),
+            ("install_sh_claude_editor_mode_preserves_mode", scenario_install_sh_claude_editor_mode_preserves_mode),
+            ("install_sh_claude_editor_mode_symlink_preserved", scenario_install_sh_claude_editor_mode_symlink_preserved),
+            ("install_sh_claude_editor_mode_nested_root_absent_warns_skips", scenario_install_sh_claude_editor_mode_nested_root_absent_warns_skips),
+            ("install_sh_claude_editor_mode_nested_with_root_warns_updates_root_only", scenario_install_sh_claude_editor_mode_nested_with_root_warns_updates_root_only),
+            ("install_sh_claude_editor_mode_skip_flag_no_write", scenario_install_sh_claude_editor_mode_skip_flag_no_write),
+            ("install_sh_claude_editor_mode_broken_symlink_warns", scenario_install_sh_claude_editor_mode_broken_symlink_warns),
+            ("install_sh_claude_editor_mode_concurrent_change_aborts", scenario_install_sh_claude_editor_mode_concurrent_change_aborts),
             ("install_sh_hook_failure_hard_fails", scenario_install_sh_hook_failure_hard_fails),
             ("install_sh_hook_failure_ignore_flag_allows_success", scenario_install_sh_hook_failure_ignore_flag_allows_success),
             ("install_sh_hook_dry_run_failure_hard_fails", scenario_install_sh_hook_dry_run_failure_hard_fails),

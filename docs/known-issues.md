@@ -92,6 +92,30 @@ The attach-time probe is a compact quickstart, not the full reference.
 semantics are unclear. Evidence: `bridge_instructions.py::probe_prompt`,
 `bridge_instructions.py::model_cheat_sheet`.
 
+### User-Side Esc Cancellation Is Undetectable
+
+When a user presses Esc directly in a peer pane to cancel an in-progress
+generation, neither Claude Code nor Codex CLI fires a Stop/`response_finished`
+hook. The daemon therefore cannot observe the cancellation and the peer stays
+`busy=True` with `current_prompt_id` still bound; further inbound messages
+queue behind that stuck context. Recovery requires either (a) the user
+submitting any follow-up prompt in that pane so a normal
+`prompt_submitted`/`response_finished` cycle resolves the matching, or (b)
+another agent calling `agent_interrupt_peer <alias>` to force daemon-side
+cleanup. Operationally users should avoid Esc-only cancellation while bridge
+routing is active.
+
+### User-Side `/clear` Drops The Alias
+
+When a user types `/clear` directly in a peer pane, the daemon treats the
+peer as detached: identity rotation, fingerprint, and routing state cannot be
+recovered without a controlled-clear marker. The alias remains visible in
+session state but stops receiving new bridge traffic. Recovery is to clear
+that peer through `bridge_manage`, through another agent's
+`agent_clear_peer <alias>`, or by asking the peer itself to `agent_clear_peer`
+its own alias. Operationally users should not invoke `/clear` directly while
+bridge routing is active.
+
 ---
 
 ## Current Issues
