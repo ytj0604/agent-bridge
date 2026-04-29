@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 from collections import OrderedDict
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -18,8 +19,34 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from bridge_identity import backfill_session_process_identities, resolve_participant_endpoint_detail
-from bridge_participants import active_participants, participant_record
+from bridge_clear_marker import (
+    cleanup_expired_or_orphaned,
+    find_for_clear_window,
+    make_marker,
+    read_markers,
+    remove_marker,
+    update_marker,
+    write_marker,
+)
+from bridge_clear_guard import (
+    ClearGuardResult,
+    ClearViolation,
+    active_queue_rows,
+    cancellable_queue_rows,
+    format_clear_guard_result,
+    target_originated_requests,
+)
+from bridge_identity import (
+    backfill_session_process_identities,
+    live_record_matches,
+    read_live_by_pane,
+    replace_attached_session_identity_for_clear,
+    resolve_participant_endpoint_detail,
+    verified_process_identity,
+)
+from bridge_instructions import probe_prompt
+from bridge_participants import active_participants, format_peer_summary, participant_record
+from bridge_pane_probe import probe_agent_process
 from bridge_paths import model_bin_dir, state_root
 from bridge_response_guard import (
     context_from_current_prompt,
@@ -28,6 +55,7 @@ from bridge_response_guard import (
 )
 from bridge_util import (
     MAX_PEER_BODY_CHARS,
+    RESTART_PRESERVED_INFLIGHT_KEY,
     append_jsonl,
     classify_prior_for_hint,
     locked_json,
@@ -53,6 +81,19 @@ TURN_ID_MISMATCH_GRACE_DEFAULT_SECONDS = 300.0
 TURN_ID_MISMATCH_POST_WATCHDOG_GRACE_DEFAULT_SECONDS = 1.0
 PANE_MODE_PROBE_TIMEOUT_SECONDS = 0.3
 PANE_MODE_FORCE_CANCEL_MODES = {"copy-mode", "copy-mode-vi", "view-mode"}
+TMUX_SEND_TIMEOUT_SECONDS = 5.0
+TMUX_DELIVERY_WORST_CASE_SECONDS = 20.0
+CLEAR_PROBE_TIMEOUT_SECONDS = 40.0
+CLEAR_POST_CLEAR_DELAY_DEFAULT_SECONDS = 1.0
+CLEAR_POST_LOCK_WORST_CASE_SECONDS = 75.0
+CLEAR_CLIENT_TIMEOUT_SECONDS = 180.0
+CLEAR_LOCK_WAIT_BUDGET_SECONDS = 85.0
+COMMAND_DEFAULT_CLIENT_TIMEOUT_SECONDS = 5.0
+COMMAND_SHORT_CLIENT_TIMEOUT_SECONDS = 2.0
+COMMAND_DEFAULT_POST_LOCK_WORST_CASE_SECONDS = 0.5
+COMMAND_SHORT_POST_LOCK_WORST_CASE_SECONDS = 0.25
+COMMAND_SAFETY_MARGIN_SECONDS = 0.5
+COMMAND_SHORT_SAFETY_MARGIN_SECONDS = 0.25
 INTERRUPT_KEY_DELAY_DEFAULT_SECONDS = 0.15
 INTERRUPT_KEY_DELAY_MIN_SECONDS = 0.05
 INTERRUPT_KEY_DELAY_MAX_SECONDS = 1.0
@@ -73,6 +114,10 @@ PANE_MODE_ENTER_DEFER_KEYS = (
     "pane_mode_enter_deferred_since",
     "pane_mode_enter_deferred_since_ts",
     "pane_mode_enter_deferred_mode",
+)
+RESTART_INFLIGHT_METADATA_KEYS = (
+    RESTART_PRESERVED_INFLIGHT_KEY,
+    "restart_preserved_inflight_at",
 )
 INTERRUPTED_TOMBSTONE_LIMIT_PER_AGENT = 16
 INTERRUPTED_TOMBSTONE_TTL_SECONDS = 600.0
@@ -153,6 +198,12 @@ class BoundedSet:
         return True
 
 
+class CommandLockWaitExceeded(RuntimeError):
+    def __init__(self, command_class: str = "") -> None:
+        self.command_class = command_class
+        super().__init__(command_class or "lock_wait_exceeded")
+
+
 def one_line(text: str) -> str:
     return " ".join(str(text).split())
 
@@ -219,10 +270,12 @@ def run_tmux_send_literal(
             ["tmux", "load-buffer", "-b", buffer_name, "-"],
             input=prompt.encode("utf-8"),
             check=True,
+            timeout=TMUX_SEND_TIMEOUT_SECONDS,
         )
         subprocess.run(
             ["tmux", "paste-buffer", "-p", "-r", "-d", "-b", buffer_name, "-t", target],
             check=True,
+            timeout=TMUX_SEND_TIMEOUT_SECONDS,
         )
     finally:
         try:
@@ -231,13 +284,73 @@ def run_tmux_send_literal(
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                timeout=TMUX_SEND_TIMEOUT_SECONDS,
             )
         except Exception:
             pass
 
 
 def run_tmux_enter(target: str) -> None:
-    subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True)
+    subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True, timeout=TMUX_SEND_TIMEOUT_SECONDS)
+
+
+def run_tmux_send_literal_touch_result(
+    target: str,
+    prompt: str,
+    *,
+    bridge_session: str = "",
+    target_alias: str = "",
+    message_id: str = "",
+    nonce: str = "",
+) -> dict:
+    """Send literal text and Enter, reporting whether pane input may be mutated."""
+    buffer_name = tmux_prompt_buffer_name(bridge_session, target_alias or target, message_id, nonce)
+    pane_touched = False
+    try:
+        try:
+            subprocess.run(
+                ["tmux", "load-buffer", "-b", buffer_name, "-"],
+                input=prompt.encode("utf-8"),
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=TMUX_SEND_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            return {"ok": False, "pane_touched": False, "error": f"load-buffer: {exc}"}
+        try:
+            subprocess.run(
+                ["tmux", "paste-buffer", "-p", "-r", "-d", "-b", buffer_name, "-t", target],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=TMUX_SEND_TIMEOUT_SECONDS,
+            )
+            pane_touched = True
+        except Exception as exc:
+            return {"ok": False, "pane_touched": True, "error": f"paste-buffer: {exc}"}
+        try:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", target, "Enter"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=TMUX_SEND_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            return {"ok": False, "pane_touched": True, "error": f"enter: {exc}"}
+        return {"ok": True, "pane_touched": pane_touched, "error": ""}
+    finally:
+        try:
+            subprocess.run(
+                ["tmux", "delete-buffer", "-b", buffer_name],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=TMUX_SEND_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            pass
 
 
 def probe_tmux_pane_mode(target: str) -> dict:
@@ -296,6 +409,28 @@ def resolve_non_negative_env_seconds(env_name: str, default: float) -> tuple[flo
         return default, f"invalid {env_name}={raw!r}; using {default:g}"
     if value < 0:
         return default, f"{env_name}={raw!r} is negative; using {default:g}"
+    return value, None
+
+
+def resolve_clear_post_clear_delay_seconds() -> tuple[float, str | None]:
+    env_name = "AGENT_BRIDGE_CLEAR_POST_CLEAR_DELAY_SEC"
+    raw = os.environ.get(env_name)
+    if raw is None or str(raw).strip() == "":
+        return CLEAR_POST_CLEAR_DELAY_DEFAULT_SECONDS, None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return (
+            CLEAR_POST_CLEAR_DELAY_DEFAULT_SECONDS,
+            f"invalid {env_name}={raw!r}; using {CLEAR_POST_CLEAR_DELAY_DEFAULT_SECONDS:g}",
+        )
+    if not math.isfinite(value):
+        return (
+            CLEAR_POST_CLEAR_DELAY_DEFAULT_SECONDS,
+            f"{env_name}={raw!r} is non-finite; using {CLEAR_POST_CLEAR_DELAY_DEFAULT_SECONDS:g}",
+        )
+    if value < 0:
+        return 0.0, f"{env_name}={raw!r} is negative; using 0"
     return value, None
 
 
@@ -386,7 +521,14 @@ def build_peer_prompt(message: dict, nonce: str) -> str:
         details.append(f"aggregate_id={message.get('aggregate_id')}")
     if kind == "request":
         label = "Request"
-        hint = "Reply normally; do not call agent_send_peer; bridge auto-returns your reply."
+        if message.get("requester_cleared"):
+            cleared = str(message.get("requester_cleared_alias") or sender)
+            hint = (
+                f"Reply normally for local completion; requester {cleared} was cleared, "
+                "so bridge will not deliver this reply back."
+            )
+        else:
+            hint = "Reply normally; do not call agent_send_peer; bridge auto-returns your reply."
     elif kind == "result":
         label = "Result"
         hint = "Use locally; do not reply to peer."
@@ -460,6 +602,7 @@ class BridgeDaemon:
         self.session_mtime_ns: int | None = None
         self.submit_delay = args.submit_delay
         self.submit_timeout = args.submit_timeout
+        self.clear_post_clear_delay_seconds, clear_delay_warning = resolve_clear_post_clear_delay_seconds()
         self.pane_mode_grace_seconds, self.pane_mode_grace_warning = resolve_pane_mode_grace_seconds()
         self.turn_id_mismatch_grace_seconds, turn_id_mismatch_grace_warning = resolve_non_negative_env_seconds(
             "AGENT_BRIDGE_TURN_ID_MISMATCH_GRACE_SEC",
@@ -485,6 +628,11 @@ class BridgeDaemon:
         self.interrupt_config_warnings = [
             warning
             for warning in (interrupt_key_delay_warning, claude_interrupt_keys_warning)
+            if warning
+        ]
+        self.clear_config_warnings = [
+            warning
+            for warning in (clear_delay_warning,)
             if warning
         ]
         self.from_start = args.from_start
@@ -519,6 +667,8 @@ class BridgeDaemon:
         # delivery to that target until another interrupt completes the full
         # configured key sequence, or an operator manually clears it.
         self.interrupt_partial_failure_blocks: dict[str, dict] = {}
+        self.clear_reservations: dict[str, dict] = {}
+        self.pending_self_clears: dict[str, dict] = {}
         # interrupted_turns[alias] stores short-lived message tombstones. Some
         # suppress identifiable late prompt_submitted / response_finished events
         # from cancelled turns; all help model-facing commands distinguish
@@ -538,9 +688,17 @@ class BridgeDaemon:
         # holding this lock, including Claude's short ESC -> C-c delay, so
         # hook events and replacement delivery cannot interleave between keys.
         self.state_lock = threading.RLock()
+        self.command_context = threading.local()
         self.last_delivery_tick = 0.0
         self.startup_backfill_summary: dict[str, dict] = {}
+        try:
+            removed_markers = cleanup_expired_or_orphaned(active_marker_ids={"__daemon_startup_no_active_clears__"})
+            for marker in removed_markers:
+                self.safe_log("controlled_clear_marker_removed_on_startup", marker_id=marker.get("id"))
+        except Exception:
+            pass
         self.reload_participants()
+        self._preserve_startup_inflight_messages()
         if self.bridge_session and not self.dry_run:
             try:
                 self.startup_backfill_summary = backfill_session_process_identities(self.bridge_session, self.session_state)
@@ -606,12 +764,26 @@ class BridgeDaemon:
                 continue
             except OSError:
                 break
-            with conn:
+            worker = threading.Thread(
+                target=self.handle_command_worker,
+                args=(conn,),
+                name="bridge-command-worker",
+                daemon=True,
+            )
+            worker.start()
+
+    def handle_command_worker(self, conn: socket.socket) -> None:
+        with conn:
+            try:
                 response = self.handle_command_connection(conn)
-                try:
-                    conn.sendall((json.dumps(response, ensure_ascii=True) + "\n").encode("utf-8"))
-                except OSError:
-                    pass
+            except CommandLockWaitExceeded as exc:
+                response = self.lock_wait_exceeded_response(exc.command_class)
+            finally:
+                self.command_context.info = {}
+            try:
+                conn.sendall((json.dumps(response, ensure_ascii=True) + "\n").encode("utf-8"))
+            except OSError:
+                pass
 
     def _finite_watchdog_delay(self, message: dict) -> float | None:
         if "watchdog_delay_sec" not in message:
@@ -700,48 +872,68 @@ class BridgeDaemon:
             return {"ok": False, "error": "messages must be a list"}
         ids = []
         hints = []
-        self.reload_participants()
-        with self.state_lock:
-            validated: list[dict] = []
-            for message in messages:
-                if not isinstance(message, dict):
-                    return {"ok": False, "error": "message entry must be an object"}
-                if self.bridge_session and message.get("bridge_session") not in {None, "", self.bridge_session}:
-                    return {"ok": False, "error": "bridge_session mismatch"}
-                sender = str(message.get("from") or "")
-                target = str(message.get("to") or "")
-                if sender != "bridge" and sender not in self.participants:
-                    return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
-                if target not in self.participants:
-                    return {"ok": False, "error": f"target {target!r} is not an active participant"}
-                if not message.get("id"):
-                    message["id"] = short_id("msg")
-                message["bridge_session"] = self.bridge_session
-                context = self.current_prompt_by_agent.get(sender) or {}
-                violation = response_send_violation(
-                    sender=sender,
-                    targets=[target],
-                    outgoing_kind=normalize_kind(message.get("kind"), "request"),
-                    force=bool(force_response_send),
-                    contexts=[context_from_current_prompt(sender, context)] if context else [],
-                    source="current_prompt",
-                )
-                if violation:
-                    return {
-                        "ok": False,
-                        "error": format_response_send_violation(violation),
-                        "error_kind": "response_send_guard",
-                    }
-                watchdog_error = self.validate_enqueue_watchdog_metadata(message)
-                if watchdog_error:
-                    return watchdog_error
-                validated.append(message)
-            for message in validated:
-                hint = self.prior_message_hint_for_enqueue(message, list(self.queue.read()))
-                if self.enqueue_ipc_message(message):
-                    ids.append(message["id"])
-                    if hint:
-                        hints.append(hint)
+        try:
+            self.reload_participants()
+            lock_ctx = self.command_state_lock(
+                post_lock_worst_case=COMMAND_SHORT_POST_LOCK_WORST_CASE_SECONDS,
+                margin=COMMAND_SHORT_SAFETY_MARGIN_SECONDS,
+                command_class="enqueue",
+            )
+            with lock_ctx:
+                if not self.command_deadline_ok(
+                    post_lock_worst_case=COMMAND_SHORT_POST_LOCK_WORST_CASE_SECONDS,
+                    margin=COMMAND_SHORT_SAFETY_MARGIN_SECONDS,
+                    command_class="enqueue",
+                ):
+                    return self.lock_wait_exceeded_response("enqueue")
+                validated: list[dict] = []
+                for message in messages:
+                    if not isinstance(message, dict):
+                        return {"ok": False, "error": "message entry must be an object"}
+                    if self.bridge_session and message.get("bridge_session") not in {None, "", self.bridge_session}:
+                        return {"ok": False, "error": "bridge_session mismatch"}
+                    sender = str(message.get("from") or "")
+                    target = str(message.get("to") or "")
+                    if sender != "bridge" and sender not in self.participants:
+                        return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
+                    if self.sender_blocked_by_clear(sender):
+                        return {
+                            "ok": False,
+                            "error": f"sender {sender!r} is blocked by a pending clear",
+                            "error_kind": "self_clear_pending" if sender in self.pending_self_clears else "clear_in_progress",
+                        }
+                    if target not in self.participants:
+                        return {"ok": False, "error": f"target {target!r} is not an active participant"}
+                    if not message.get("id"):
+                        message["id"] = short_id("msg")
+                    message["bridge_session"] = self.bridge_session
+                    context = self.current_prompt_by_agent.get(sender) or {}
+                    violation = response_send_violation(
+                        sender=sender,
+                        targets=[target],
+                        outgoing_kind=normalize_kind(message.get("kind"), "request"),
+                        force=bool(force_response_send),
+                        contexts=[context_from_current_prompt(sender, context)] if context else [],
+                        source="current_prompt",
+                    )
+                    if violation:
+                        return {
+                            "ok": False,
+                            "error": format_response_send_violation(violation),
+                            "error_kind": "response_send_guard",
+                        }
+                    watchdog_error = self.validate_enqueue_watchdog_metadata(message)
+                    if watchdog_error:
+                        return watchdog_error
+                    validated.append(message)
+                for message in validated:
+                    hint = self.prior_message_hint_for_enqueue(message, list(self.queue.read()))
+                    if self.enqueue_ipc_message(message):
+                        ids.append(message["id"])
+                        if hint:
+                            hints.append(hint)
+        except CommandLockWaitExceeded:
+            return self.lock_wait_exceeded_response("enqueue")
         response = {"ok": True, "ids": ids}
         if hints:
             response["hints"] = hints
@@ -765,6 +957,7 @@ class BridgeDaemon:
         if not isinstance(request, dict):
             return {"ok": False, "error": "unsupported command"}
         op = request.get("op")
+        self.begin_command_context(str(op or ""))
         if op == "enqueue":
             return self.handle_enqueue_command(
                 request.get("messages"),
@@ -801,7 +994,19 @@ class BridgeDaemon:
             if target not in self.participants:
                 return {"ok": False, "error": f"target {target!r} is not an active participant"}
             result = self.handle_interrupt(sender, target)
+            if result.get("error_kind") == "lock_wait_exceeded":
+                return {"ok": False, "error": "lock_wait_exceeded", "error_kind": "lock_wait_exceeded"}
             return {"ok": True, **result}
+        if op == "clear_peer":
+            self.reload_participants()
+            sender = str(request.get("from") or "")
+            target = str(request.get("target") or "")
+            force = bool(request.get("force"))
+            if sender and sender != "bridge" and sender not in self.participants:
+                return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
+            if target not in self.participants:
+                return {"ok": False, "error": f"target {target!r} is not an active participant"}
+            return self.handle_clear_peer(sender or "bridge", target, force=force)
         if op == "clear_hold":
             self.reload_participants()
             sender = str(request.get("from") or "")
@@ -811,6 +1016,8 @@ class BridgeDaemon:
             if target not in self.participants:
                 return {"ok": False, "error": f"target {target!r} is not an active participant"}
             info = self.release_hold(target, reason=f"manual_clear_by_{sender or 'bridge'}", by_sender=sender)
+            if isinstance(info, dict) and info.get("_lock_wait_exceeded"):
+                return self.lock_wait_exceeded_response("clear_hold")
             return {
                 "ok": True,
                 "had_hold": info is not None,
@@ -860,7 +1067,7 @@ class BridgeDaemon:
                 return result
             target = str(result.get("target") or "")
             if result.get("cancelled") and target:
-                self.try_deliver(target)
+                self.try_deliver_command_aware(target, message_id=message_id)
             return result
         if op == "wait_status":
             self.reload_participants()
@@ -885,7 +1092,7 @@ class BridgeDaemon:
             self.reload_participants()
             target = str(request.get("target") or "")
             peers = []
-            with self.state_lock:
+            with self.command_state_lock(command_class="status"):
                 queue_snapshot = list(self.queue.read())
                 aliases = [target] if target else sorted(self.participants)
                 for alias in aliases:
@@ -926,6 +1133,14 @@ class BridgeDaemon:
                         "current_prompt_turn_id": cur.get("turn_id"),
                         "held": held is not None,
                         "held_info": held or {},
+                        "clear_active": alias in self.clear_reservations,
+                        "clear_info": {
+                            key: value
+                            for key, value in (self.clear_reservations.get(alias) or {}).items()
+                            if key not in {"condition"}
+                        },
+                        "self_clear_pending": alias in self.pending_self_clears,
+                        "self_clear_info": dict(self.pending_self_clears.get(alias) or {}),
                         "interrupt_partial_failure_blocked": partial_interrupt is not None,
                         "interrupt_partial_failure_info": partial_interrupt or {},
                         "_pane": pane,
@@ -961,6 +1176,1011 @@ class BridgeDaemon:
         except OSError:
             return None
 
+    def begin_command_context(self, op: str) -> None:
+        client_timeout = COMMAND_DEFAULT_CLIENT_TIMEOUT_SECONDS
+        if op in {"enqueue", "alarm"}:
+            client_timeout = COMMAND_SHORT_CLIENT_TIMEOUT_SECONDS
+        if op == "clear_peer":
+            client_timeout = CLEAR_CLIENT_TIMEOUT_SECONDS
+        self.command_context.info = {
+            "op": op,
+            "started_ts": time.monotonic(),
+            "client_timeout": client_timeout,
+        }
+
+    def command_context_info(self) -> dict:
+        info = getattr(self.command_context, "info", None)
+        return info if isinstance(info, dict) else {}
+
+    def command_remaining_budget(self) -> float | None:
+        info = self.command_context_info()
+        if not info:
+            return None
+        try:
+            started = float(info.get("started_ts") or 0.0)
+            timeout = float(info.get("client_timeout") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        return max(0.0, started + timeout - time.monotonic())
+
+    def command_deadline_ok(self, *, post_lock_worst_case: float, margin: float, command_class: str = "") -> bool:
+        remaining = self.command_remaining_budget()
+        if remaining is None:
+            return True
+        ok = remaining >= max(0.0, float(post_lock_worst_case) + float(margin))
+        if not ok:
+            self.log(
+                "command_lock_wait_exceeded",
+                command_class=command_class or self.command_context_info().get("op"),
+                remaining_budget_ms=int(remaining * 1000),
+                required_budget_ms=int(max(0.0, float(post_lock_worst_case) + float(margin)) * 1000),
+            )
+        return ok
+
+    def command_budget(self, command_class: str = "") -> tuple[float, float]:
+        command = str(command_class or self.command_context_info().get("op") or "")
+        if command == "clear_peer":
+            return self.clear_peer_post_lock_worst_case_seconds(), 20.0
+        if command in {"enqueue", "alarm"}:
+            return COMMAND_SHORT_POST_LOCK_WORST_CASE_SECONDS, COMMAND_SHORT_SAFETY_MARGIN_SECONDS
+        return COMMAND_DEFAULT_POST_LOCK_WORST_CASE_SECONDS, COMMAND_SAFETY_MARGIN_SECONDS
+
+    def clear_peer_post_lock_worst_case_seconds(self) -> float:
+        return CLEAR_POST_LOCK_WORST_CASE_SECONDS + max(0.0, float(self.clear_post_clear_delay_seconds or 0.0))
+
+    def _state_lock_owned_by_current_thread(self) -> bool:
+        is_owned = getattr(self.state_lock, "_is_owned", None)
+        if not callable(is_owned):
+            return False
+        try:
+            return bool(is_owned())
+        except Exception:
+            return False
+
+    @contextmanager
+    def command_state_lock(
+        self,
+        *,
+        post_lock_worst_case: float | None = None,
+        margin: float | None = None,
+        command_class: str = "",
+    ):
+        command = str(command_class or self.command_context_info().get("op") or "")
+        if post_lock_worst_case is None or margin is None:
+            default_post_lock, default_margin = self.command_budget(command)
+            if post_lock_worst_case is None:
+                post_lock_worst_case = default_post_lock
+            if margin is None:
+                margin = default_margin
+        required = max(0.0, float(post_lock_worst_case) + float(margin))
+        if not self.command_context_info():
+            with self.state_lock:
+                yield
+            return
+        if self._state_lock_owned_by_current_thread():
+            self.state_lock.acquire()
+            try:
+                if not self.command_deadline_ok(
+                    post_lock_worst_case=float(post_lock_worst_case),
+                    margin=float(margin),
+                    command_class=command,
+                ):
+                    raise CommandLockWaitExceeded(command)
+                yield
+            finally:
+                self.state_lock.release()
+            return
+        remaining = self.command_remaining_budget()
+        if remaining is not None and remaining < required:
+            self.log(
+                "command_lock_wait_exceeded",
+                command_class=command or self.command_context_info().get("op") or "",
+                remaining_budget_ms=int(remaining * 1000),
+                required_budget_ms=int(required * 1000),
+            )
+            raise CommandLockWaitExceeded(command)
+        if remaining is None:
+            self.state_lock.acquire()
+            acquired = True
+        else:
+            wait_budget = max(0.0, remaining - required)
+            if command == "clear_peer":
+                wait_budget = min(wait_budget, CLEAR_LOCK_WAIT_BUDGET_SECONDS)
+            acquired = self.state_lock.acquire(timeout=wait_budget)
+        if not acquired:
+            latest = self.command_remaining_budget()
+            self.log(
+                "command_lock_wait_exceeded",
+                command_class=command or self.command_context_info().get("op") or "",
+                remaining_budget_ms=int((latest or 0.0) * 1000),
+                required_budget_ms=int(required * 1000),
+            )
+            raise CommandLockWaitExceeded(command)
+        try:
+            if not self.command_deadline_ok(
+                post_lock_worst_case=float(post_lock_worst_case),
+                margin=float(margin),
+                command_class=command,
+            ):
+                raise CommandLockWaitExceeded(command)
+            yield
+        finally:
+            self.state_lock.release()
+
+    def lock_wait_exceeded_response(self, command_class: str = "") -> dict:
+        return {
+            "ok": False,
+            "error": "lock_wait_exceeded",
+            "error_kind": "lock_wait_exceeded",
+            "command_class": command_class or self.command_context_info().get("op") or "",
+        }
+
+    def command_delivery_allowed(self, target: str, message_id: str = "") -> bool:
+        remaining = self.command_remaining_budget()
+        if remaining is None:
+            return True
+        required = TMUX_DELIVERY_WORST_CASE_SECONDS + COMMAND_SAFETY_MARGIN_SECONDS
+        if remaining >= required:
+            return True
+        self.log(
+            "command_delivery_deferred_deadline",
+            command_class=self.command_context_info().get("op") or "",
+            message_id=message_id,
+            target=target,
+            remaining_budget_ms=int(remaining * 1000),
+        )
+        return False
+
+    def try_deliver_command_aware(self, target: str | None = None, *, message_id: str = "") -> None:
+        if target and not self.command_delivery_allowed(str(target), message_id):
+            return
+        if target is None and self.command_remaining_budget() is not None:
+            remaining = self.command_remaining_budget() or 0.0
+            if remaining < TMUX_DELIVERY_WORST_CASE_SECONDS + COMMAND_SAFETY_MARGIN_SECONDS:
+                self.log(
+                    "command_delivery_deferred_deadline",
+                    command_class=self.command_context_info().get("op") or "",
+                    message_id=message_id,
+                    target="",
+                    remaining_budget_ms=int(remaining * 1000),
+                )
+                return
+        try:
+            self.try_deliver(target)
+        except CommandLockWaitExceeded as exc:
+            remaining = self.command_remaining_budget()
+            self.log(
+                "command_delivery_deferred_lock_wait",
+                command_class=exc.command_class or self.command_context_info().get("op") or "",
+                message_id=message_id,
+                target=str(target or ""),
+                remaining_budget_ms=int((remaining or 0.0) * 1000),
+            )
+
+    def sender_blocked_by_clear(self, sender: str) -> bool:
+        if not sender or sender == "bridge":
+            return False
+        return sender in self.clear_reservations or sender in self.pending_self_clears
+
+    def clear_guard(self, target: str, *, force: bool) -> ClearGuardResult:
+        queue_snapshot = list(self.queue.read())
+        hard: list[ClearViolation] = []
+        soft: list[ClearViolation] = []
+        if target in self.clear_reservations:
+            hard.append(ClearViolation("clear_already_pending", f"clear already active for {target}"))
+        if self.busy.get(target) or (self.current_prompt_by_agent.get(target) or {}).get("id"):
+            hard.append(ClearViolation("target_busy", f"{target} is currently processing a prompt"))
+        inbound_active = active_queue_rows(queue_snapshot, target=target, last_enter_ts=self.last_enter_ts)
+        if inbound_active:
+            hard.append(
+                ClearViolation(
+                    "target_active_messages",
+                    f"{target} has active/post-pane-touch inbound work",
+                    refs=[str(item.get("id") or "") for item in inbound_active if item.get("id")],
+                )
+            )
+        inbound_cancellable = cancellable_queue_rows(queue_snapshot, target=target, last_enter_ts=self.last_enter_ts)
+        if inbound_cancellable:
+            soft.append(
+                ClearViolation(
+                    "target_cancellable_messages",
+                    f"{target} has cancellable pending/pre-active inbound work",
+                    hard=False,
+                    refs=[str(item.get("id") or "") for item in inbound_cancellable if item.get("id")],
+                )
+            )
+        originated_requests = target_originated_requests(queue_snapshot, target=target)
+        if originated_requests:
+            refs = [str(item.get("id") or "") for item in originated_requests if item.get("id")]
+            violation = ClearViolation(
+                "target_originated_requests",
+                f"{target} has outstanding request rows",
+                hard=not force,
+                refs=refs,
+            )
+            if force:
+                soft.append(violation)
+            else:
+                hard.append(violation)
+        target_alarms = [
+            wake_id
+            for wake_id, wd in self.watchdogs.items()
+            if wd and wd.get("is_alarm") and str(wd.get("sender") or "") == target
+        ]
+        if target_alarms:
+            soft.append(
+                ClearViolation(
+                    "target_owned_alarms",
+                    f"{target} owns active alarms",
+                    hard=False,
+                    refs=target_alarms,
+                )
+            )
+        aggregates = read_json(self.aggregate_file, {"version": 1, "aggregates": {}}).get("aggregates") or {}
+        requester_aggs = [
+            str(agg_id)
+            for agg_id, agg in aggregates.items()
+            if isinstance(agg, dict)
+            and str(agg.get("requester") or "") == target
+            and str(agg.get("status") or "collecting") not in {"complete", "cancelled_requester_cleared"}
+        ]
+        if requester_aggs:
+            violation = ClearViolation(
+                "target_aggregate_requester",
+                f"{target} owns incomplete aggregate waits",
+                hard=not force,
+                refs=requester_aggs,
+            )
+            if force:
+                soft.append(violation)
+            else:
+                hard.append(violation)
+        if hard or (soft and not force):
+            return ClearGuardResult(ok=False, hard_blockers=hard, soft_blockers=soft)
+        return ClearGuardResult(ok=True, hard_blockers=hard, soft_blockers=soft)
+
+    def apply_force_clear_invalidation(self, target: str, caller: str) -> dict:
+        now_iso = utc_now()
+        cancelled_alarms: list[str] = []
+        removed_rows: list[dict] = []
+        requester_cleared_ids: list[str] = []
+        cancelled_aggregates: list[str] = []
+        for wake_id, wd in list(self.watchdogs.items()):
+            if wd and wd.get("is_alarm") and str(wd.get("sender") or "") == target:
+                removed = self.watchdogs.pop(wake_id, None)
+                if removed:
+                    self._record_alarm_wake_tombstone(wake_id, removed, "cancelled_by_clear")
+                    cancelled_alarms.append(wake_id)
+
+        def queue_mutator(queue: list[dict]) -> None:
+            kept: list[dict] = []
+            for item in queue:
+                if str(item.get("to") or "") == target and classify_prior_for_hint(item, self.last_enter_ts) == "cancel":
+                    removed_rows.append(dict(item))
+                    continue
+                if str(item.get("from") or "") == target and normalize_kind(item.get("kind"), "request") == "request":
+                    item["auto_return"] = False
+                    item["requester_cleared"] = True
+                    item["requester_cleared_alias"] = target
+                    item["requester_cleared_at"] = now_iso
+                    item["requester_cleared_by"] = caller
+                    item["updated_ts"] = now_iso
+                    requester_cleared_ids.append(str(item.get("id") or ""))
+                kept.append(item)
+            queue[:] = kept
+
+        self.queue.update(queue_mutator)
+        for row in removed_rows:
+            msg_id = str(row.get("id") or "")
+            nonce = str(row.get("nonce") or "")
+            if nonce:
+                self.discard_nonce(nonce)
+            if msg_id:
+                self.last_enter_ts.pop(msg_id, None)
+                self.cancel_watchdogs_for_message(msg_id, reason="cancelled_by_clear")
+                self.suppress_pending_watchdog_wakes(ref_message_id=msg_id, reason="cancelled_by_clear")
+            self._record_message_tombstone(
+                target,
+                row,
+                by_sender=caller,
+                reason="cancelled_by_clear",
+                suppress_late_hooks=bool(nonce),
+                prompt_submitted_seen=False,
+            )
+            if row.get("aggregate_id"):
+                self._record_aggregate_interrupted_reply(row, by_sender=caller, reason="cancelled_by_clear")
+        for msg_id in requester_cleared_ids:
+            self.cancel_watchdogs_for_message(msg_id, reason="requester_cleared")
+            self.suppress_pending_watchdog_wakes(ref_message_id=msg_id, reason="requester_cleared")
+        for responder, context in list(self.current_prompt_by_agent.items()):
+            if str(context.get("from") or "") != target:
+                continue
+            context["auto_return"] = False
+            context["requester_cleared"] = True
+            context["requester_cleared_alias"] = target
+            context["requester_cleared_at"] = now_iso
+            context["requester_cleared_by"] = caller
+            msg_id = str(context.get("id") or "")
+            if msg_id:
+                self.cancel_watchdogs_for_message(msg_id, reason="requester_cleared")
+                self.suppress_pending_watchdog_wakes(ref_message_id=msg_id, reason="requester_cleared")
+            self.log(
+                "active_requester_cleared",
+                responder=responder,
+                requester=target,
+                message_id=msg_id,
+                by_sender=caller,
+            )
+
+        def aggregate_mutator(data: dict) -> None:
+            aggregates = data.setdefault("aggregates", {})
+            for agg_id, aggregate in list(aggregates.items()):
+                if not isinstance(aggregate, dict):
+                    continue
+                if str(aggregate.get("requester") or "") != target:
+                    continue
+                if str(aggregate.get("status") or "") == "complete":
+                    continue
+                aggregate["status"] = "cancelled_requester_cleared"
+                aggregate["cancelled_at"] = now_iso
+                aggregate["cancelled_by"] = caller
+                aggregate["delivered"] = False
+                aggregate["updated_ts"] = now_iso
+                cancelled_aggregates.append(str(agg_id))
+
+        with locked_json(self.aggregate_file, {"version": 1, "aggregates": {}}) as data:
+            aggregate_mutator(data)
+        for agg_id in cancelled_aggregates:
+            self.cancel_watchdogs_for_aggregate(agg_id, reason="requester_cleared")
+            self.suppress_pending_watchdog_wakes(ref_aggregate_id=agg_id, reason="requester_cleared")
+        self.log(
+            "clear_force_invalidated",
+            target=target,
+            by_sender=caller,
+            cancelled_alarm_ids=cancelled_alarms,
+            removed_message_ids=[row.get("id") for row in removed_rows],
+            requester_cleared_message_ids=requester_cleared_ids,
+            cancelled_aggregate_ids=cancelled_aggregates,
+        )
+        return {
+            "cancelled_alarms": cancelled_alarms,
+            "removed_message_ids": [row.get("id") for row in removed_rows],
+            "requester_cleared_message_ids": requester_cleared_ids,
+            "cancelled_aggregate_ids": cancelled_aggregates,
+        }
+
+    def force_leave_after_clear_failure(self, target: str, *, caller: str, reason: str, reservation: dict | None = None) -> None:
+        # Forced-leave cleanup is a daemon-internal recovery path, not a
+        # client-visible command mutation. It must run serialized even if the
+        # originating command budget is exhausted, so take the raw state lock
+        # here rather than re-entering command_state_lock.
+        if not self._state_lock_owned_by_current_thread():
+            with self.state_lock:
+                self.force_leave_after_clear_failure(target, caller=caller, reason=reason, reservation=reservation)
+            return
+        reservation = reservation or self.clear_reservations.get(target) or {}
+        old_session_id = str(reservation.get("old_session_id") or "")
+        new_session_id = str(reservation.get("new_session_id") or "")
+        participant = self.participants.get(target) or {}
+        agent_type = str(participant.get("agent_type") or reservation.get("agent") or "")
+        now_iso = utc_now()
+        removed_rows: list[dict] = []
+
+        def queue_mutator(queue: list[dict]) -> None:
+            kept: list[dict] = []
+            for item in queue:
+                if str(item.get("to") or "") == target:
+                    removed_rows.append(dict(item))
+                    continue
+                if str(item.get("from") or "") == target and normalize_kind(item.get("kind"), "request") == "request":
+                    item["auto_return"] = False
+                    item["requester_cleared"] = True
+                    item["requester_cleared_alias"] = target
+                    item["requester_cleared_at"] = now_iso
+                    item["requester_cleared_by"] = caller
+                    item["updated_ts"] = now_iso
+                kept.append(item)
+            queue[:] = kept
+
+        self.queue.update(queue_mutator)
+        for row in removed_rows:
+            msg_id = str(row.get("id") or "")
+            if msg_id:
+                self.cancel_watchdogs_for_message(msg_id, reason="clear_forced_leave")
+                self.suppress_pending_watchdog_wakes(ref_message_id=msg_id, reason="clear_forced_leave")
+            if row.get("aggregate_id"):
+                self._record_aggregate_interrupted_reply(row, by_sender=caller, reason="endpoint_lost", deliver=False)
+        for wake_id, wd in list(self.watchdogs.items()):
+            if wd and str(wd.get("sender") or "") == target:
+                removed = self.watchdogs.pop(wake_id, None)
+                if removed and removed.get("is_alarm"):
+                    self._record_alarm_wake_tombstone(wake_id, removed, "clear_forced_leave")
+                self.log("watchdog_cancelled", wake_id=wake_id, reason="clear_forced_leave")
+        self.busy[target] = False
+        self.reserved[target] = None
+        self.current_prompt_by_agent.pop(target, None)
+        self.interrupt_partial_failure_blocks.pop(target, None)
+        self.pending_self_clears.pop(target, None)
+        marker_id_value = str(reservation.get("identity_marker_id") or "")
+        if marker_id_value:
+            remove_marker(marker_id_value)
+        self.clear_reservations.pop(target, None)
+        try:
+            self._mark_participant_detached_for_clear(target, agent_type=agent_type, old_session_id=old_session_id, new_session_id=new_session_id, reason=reason)
+        except Exception as exc:
+            self.safe_log("clear_forced_leave_cleanup_failed", target=target, error=str(exc), reason=reason)
+        self.session_mtime_ns = None
+        self._reload_participants_unlocked()
+        for alias in sorted(self.participants):
+            if alias == target:
+                continue
+            notice = make_message(
+                sender="bridge",
+                target=alias,
+                intent="clear_forced_leave_notice",
+                body=f"[bridge:peer_cleared] {target} was removed from the bridge after clear failed ({reason}).",
+                causal_id=short_id("causal"),
+                hop_count=0,
+                auto_return=False,
+                kind="notice",
+                source="clear_forced_leave",
+            )
+            self.queue_message(notice, deliver=False)
+        self.log(
+            "clear_forced_leave",
+            target=target,
+            by_sender=caller,
+            reason=reason,
+            removed_message_ids=[row.get("id") for row in removed_rows],
+        )
+
+    def _mark_participant_detached_for_clear(
+        self,
+        target: str,
+        *,
+        agent_type: str,
+        old_session_id: str,
+        new_session_id: str,
+        reason: str,
+    ) -> None:
+        session_path = self.session_file
+        attached_path = state_root() / "attached-sessions.json"
+        pane_locks_path = state_root() / "pane-locks.json"
+        live_path = state_root() / "live-sessions.json"
+        # Honor test/installation overrides used by bridge_identity.
+        attached_path = Path(os.environ.get("AGENT_BRIDGE_ATTACH_REGISTRY", str(attached_path)))
+        pane_locks_path = Path(os.environ.get("AGENT_BRIDGE_PANE_LOCKS", str(pane_locks_path)))
+        live_path = Path(os.environ.get("AGENT_BRIDGE_LIVE_SESSIONS", str(live_path)))
+        with locked_json(session_path, {"session": self.bridge_session, "participants": {}}) as state:
+            with locked_json(attached_path, {"version": 1, "sessions": {}}) as registry:
+                with locked_json(pane_locks_path, {"version": 1, "panes": {}}) as locks:
+                    with locked_json(live_path, {"version": 1, "panes": {}, "sessions": {}}) as live:
+                        participant = (state.setdefault("participants", {}) or {}).get(target)
+                        pane = ""
+                        if isinstance(participant, dict):
+                            pane = str(participant.get("pane") or "")
+                            participant["status"] = "detached"
+                            participant["detached_at"] = utc_now()
+                            participant["detach_reason"] = reason
+                            participant["endpoint_status"] = "cleared"
+                        for key in (old_session_id, new_session_id):
+                            if key and agent_type:
+                                registry.setdefault("sessions", {}).pop(f"{agent_type}:{key}", None)
+                                live.setdefault("sessions", {}).pop(f"{agent_type}:{key}", None)
+                        panes = locks.setdefault("panes", {})
+                        for lock_pane, record in list(panes.items()):
+                            if not isinstance(record, dict):
+                                continue
+                            if record.get("alias") == target or record.get("hook_session_id") in {old_session_id, new_session_id}:
+                                del panes[lock_pane]
+                        live_panes = live.setdefault("panes", {})
+                        for live_pane, record in list(live_panes.items()):
+                            if not isinstance(record, dict):
+                                continue
+                            if live_pane == pane or record.get("alias") == target or record.get("session_id") in {old_session_id, new_session_id}:
+                                del live_panes[live_pane]
+    def handle_clear_peer(self, sender: str, target: str, *, force: bool) -> dict:
+        if not target:
+            return {"ok": False, "error": "target required"}
+        if target in self.clear_reservations:
+            return {"ok": False, "error": "clear_already_pending", "error_kind": "clear_already_pending"}
+        if sender == target and sender != "bridge":
+            try:
+                with self.command_state_lock(command_class="clear_peer"):
+                    if not self.command_deadline_ok(
+                        post_lock_worst_case=COMMAND_DEFAULT_POST_LOCK_WORST_CASE_SECONDS,
+                        margin=COMMAND_SAFETY_MARGIN_SECONDS,
+                        command_class="clear_peer",
+                    ):
+                        return self.lock_wait_exceeded_response("clear_peer")
+                    if target in self.clear_reservations or target in self.pending_self_clears:
+                        return {"ok": False, "error": "clear_already_pending", "error_kind": "clear_already_pending"}
+                    self.pending_self_clears[target] = {
+                        "clear_id": short_id("clear"),
+                        "caller": sender,
+                        "target": target,
+                        "force": bool(force),
+                        "created_at": utc_now(),
+                        "created_ts": time.time(),
+                    }
+            except CommandLockWaitExceeded:
+                return self.lock_wait_exceeded_response("clear_peer")
+            self.log("self_clear_deferred", target=target, by_sender=sender, force=bool(force))
+            return {"ok": True, "deferred": True, "target": target}
+        return self.run_clear_peer(sender, target, force=force)
+
+    def _new_clear_reservation(self, caller: str, target: str, *, force: bool, participant: dict, pane: str = "") -> dict:
+        clear_id = short_id("clear")
+        probe_id = f"{self.bridge_session}:{target}:{uuid.uuid4().hex[:10]}"
+        return {
+            "clear_id": clear_id,
+            "caller": caller,
+            "target": target,
+            "force": bool(force),
+            "probe_id": probe_id,
+            "old_session_id": str(participant.get("hook_session_id") or ""),
+            "old_turn_id_hint": "",
+            "deadline_ts": time.time() + CLEAR_PROBE_TIMEOUT_SECONDS,
+            "phase": "reserved",
+            "pane_touched": False,
+            "probe_prompt_submitted": False,
+            "probe_turn_id": "",
+            "new_session_id": "",
+            "identity_marker_id": "",
+            "pane": pane,
+            "agent": str(participant.get("agent_type") or ""),
+            "condition": threading.Condition(self.state_lock),
+        }
+
+    def _write_clear_marker_locked(self, reservation: dict, participant: dict, pane: str) -> str:
+        marker = make_marker(
+            bridge_session=self.bridge_session,
+            alias=str(reservation.get("target") or ""),
+            agent=str(participant.get("agent_type") or ""),
+            old_session_id=str(reservation.get("old_session_id") or ""),
+            probe_id=str(reservation.get("probe_id") or ""),
+            pane=pane,
+            target=str(participant.get("target") or pane),
+            events_file=str(self.state_file),
+            public_events_file=str(self.public_state_file or ""),
+            caller=str(reservation.get("caller") or ""),
+            clear_id=str(reservation.get("clear_id") or ""),
+        )
+        marker_id_value = write_marker(marker)
+        reservation["identity_marker_id"] = marker_id_value
+        reservation["phase"] = "pending_prompt"
+        return marker_id_value
+
+    def _clear_tmux_send(self, pane: str, text: str, *, target: str, message_id: str) -> dict:
+        if self.dry_run:
+            return {"ok": True, "pane_touched": True, "error": ""}
+        return run_tmux_send_literal_touch_result(
+            pane,
+            text,
+            bridge_session=self.bridge_session,
+            target_alias=target,
+            message_id=message_id,
+            nonce=message_id,
+        )
+
+    def _clear_probe_text(self, target: str, probe_id: str) -> str:
+        return probe_prompt("clear", probe_id, target, format_peer_summary(self.session_state))
+
+    def _wait_for_clear_settle_locked(self, reservation: dict) -> None:
+        delay = max(0.0, float(self.clear_post_clear_delay_seconds or 0.0))
+        reservation["phase"] = "post_clear_settle"
+        reservation["post_clear_settle_delay_sec"] = delay
+        self.log(
+            "clear_post_clear_settle",
+            target=reservation.get("target"),
+            by_sender=reservation.get("caller"),
+            delay_sec=delay,
+        )
+        if delay <= 0:
+            return
+        condition = reservation.get("condition")
+        if not isinstance(condition, threading.Condition):
+            return
+        deadline = time.time() + delay
+        while not reservation.get("failure_reason"):
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            condition.wait(min(remaining, 0.25))
+
+    def clear_process_identity_for_replacement(self, *, agent_type: str, session_id: str, pane: str) -> dict:
+        if not (agent_type and session_id and pane):
+            return {}
+        live = read_live_by_pane(pane)
+        if live_record_matches(live, agent_type, session_id):
+            identity = verified_process_identity(live)
+            if identity:
+                return identity
+        try:
+            probed = probe_agent_process(pane, agent_type)
+        except Exception as exc:
+            self.safe_log(
+                "clear_process_identity_probe_failed",
+                agent_type=agent_type,
+                session_id=session_id,
+                pane=pane,
+                error=str(exc),
+            )
+            return {}
+        if str(probed.get("status") or "") == "verified":
+            return dict(probed)
+        self.log(
+            "clear_process_identity_unverified",
+            agent_type=agent_type,
+            session_id=session_id,
+            pane=pane,
+            probe_status=probed.get("status"),
+            reason=probed.get("reason"),
+        )
+        return {}
+
+    def run_clear_peer(self, caller: str, target: str, *, force: bool, existing_reservation: dict | None = None) -> dict:
+        reservation: dict | None = existing_reservation
+        participant: dict = {}
+        endpoint_detail: dict = {}
+        try:
+            state_lock_ctx = self.command_state_lock(
+                post_lock_worst_case=self.clear_peer_post_lock_worst_case_seconds(),
+                margin=20.0,
+                command_class="clear_peer",
+            )
+            state_lock_ctx.__enter__()
+        except CommandLockWaitExceeded:
+            return self.lock_wait_exceeded_response("clear_peer")
+        try:
+            if not self.command_deadline_ok(
+                post_lock_worst_case=self.clear_peer_post_lock_worst_case_seconds(),
+                margin=20.0,
+                command_class="clear_peer",
+            ):
+                return self.lock_wait_exceeded_response("clear_peer")
+            self._reload_participants_unlocked()
+            if target not in self.participants:
+                return {"ok": False, "error": f"target {target!r} is not an active participant"}
+            participant = dict(self.participants.get(target) or {})
+            if reservation is None:
+                guard = self.clear_guard(target, force=force)
+                if not guard.ok:
+                    return {
+                        "ok": False,
+                        "error": format_clear_guard_result(guard),
+                        "error_kind": "clear_blocked",
+                        "hard_blockers": [v.__dict__ for v in guard.hard_blockers],
+                        "soft_blockers": [v.__dict__ for v in guard.soft_blockers],
+                    }
+                reservation = self._new_clear_reservation(caller, target, force=force, participant=participant)
+                self.clear_reservations[target] = reservation
+            else:
+                self.clear_reservations[target] = reservation
+                reservation.setdefault("condition", threading.Condition(self.state_lock))
+                reservation.setdefault("deadline_ts", time.time() + CLEAR_PROBE_TIMEOUT_SECONDS)
+                reservation.setdefault("phase", "reserved")
+                reservation.setdefault("force", bool(force))
+
+            endpoint_detail = self.resolve_endpoint_detail(target, purpose="write")
+            pane = str(endpoint_detail.get("pane") or "") if endpoint_detail.get("ok") else ""
+            if not pane:
+                self.clear_reservations.pop(target, None)
+                marker_id_existing = str(reservation.get("identity_marker_id") or "")
+                if marker_id_existing:
+                    remove_marker(marker_id_existing)
+                return {"ok": False, "error": str(endpoint_detail.get("reason") or "endpoint_lost"), "error_kind": "endpoint_lost", "target": target}
+            reservation["pane"] = pane
+            mode_status = self.pane_mode_status(pane)
+            if mode_status.get("error") or mode_status.get("in_mode"):
+                self.clear_reservations.pop(target, None)
+                marker_id_existing = str(reservation.get("identity_marker_id") or "")
+                if marker_id_existing:
+                    remove_marker(marker_id_existing)
+                return {"ok": False, "error": str(mode_status.get("error") or "pane_in_mode"), "error_kind": "pane_not_ready", "target": target}
+
+            marker_id_value = self._write_clear_marker_locked(reservation, participant, pane)
+            clear_status = self._clear_tmux_send(pane, "/clear", target=target, message_id=str(reservation.get("clear_id") or "clear"))
+            reservation["pane_touched"] = bool(clear_status.get("pane_touched"))
+            if not clear_status.get("ok"):
+                if reservation.get("pane_touched"):
+                    self.force_leave_after_clear_failure(target, caller=caller, reason=f"clear_write_failed:{clear_status.get('error')}", reservation=reservation)
+                else:
+                    self.clear_reservations.pop(target, None)
+                    remove_marker(marker_id_value)
+                return {
+                    "ok": False,
+                    "error": str(clear_status.get("error") or "clear_write_failed"),
+                    "error_kind": "clear_write_failed",
+                    "pane_touched": bool(clear_status.get("pane_touched")),
+                    "target": target,
+                }
+
+            self._wait_for_clear_settle_locked(reservation)
+            if reservation.get("failure_reason"):
+                return {
+                    "ok": False,
+                    "error": str(reservation.get("failure_reason") or "clear_failed"),
+                    "error_kind": str(reservation.get("failure_reason") or "clear_failed"),
+                    "target": target,
+                }
+            settle_mode_status = self.pane_mode_status(pane)
+            if settle_mode_status.get("error") or settle_mode_status.get("in_mode"):
+                reason_detail = str(settle_mode_status.get("error") or settle_mode_status.get("mode") or "pane_in_mode")
+                reason = f"clear_settle_pane_not_ready:{reason_detail}"
+                self.force_leave_after_clear_failure(target, caller=caller, reason=reason, reservation=reservation)
+                return {"ok": False, "error": reason, "error_kind": "clear_settle_pane_not_ready", "target": target}
+
+            if force:
+                try:
+                    reservation["force_invalidation"] = self.apply_force_clear_invalidation(target, caller)
+                except Exception as exc:
+                    self.safe_log("clear_force_invalidation_failed", target=target, by_sender=caller, error=str(exc))
+                    self.force_leave_after_clear_failure(target, caller=caller, reason=f"force_invalidation_failed:{exc}", reservation=reservation)
+                    return {"ok": False, "error": str(exc), "error_kind": "force_invalidation_failed", "target": target}
+
+            probe_text = self._clear_probe_text(target, str(reservation.get("probe_id") or ""))
+            probe_status = self._clear_tmux_send(pane, probe_text, target=target, message_id=str(reservation.get("probe_id") or "probe"))
+            if not probe_status.get("ok"):
+                self.force_leave_after_clear_failure(target, caller=caller, reason=f"probe_write_failed:{probe_status.get('error')}", reservation=reservation)
+                return {"ok": False, "error": str(probe_status.get("error") or "probe_write_failed"), "error_kind": "probe_write_failed", "target": target}
+            reservation["phase"] = "waiting_probe"
+            reservation["deadline_ts"] = time.time() + CLEAR_PROBE_TIMEOUT_SECONDS
+            self.log("clear_probe_sent", target=target, by_sender=caller, probe_id=reservation.get("probe_id"))
+
+            if self.dry_run:
+                reservation["phase"] = "probe_finished"
+                reservation["probe_prompt_submitted"] = True
+                reservation["probe_response_finished"] = True
+                reservation["new_session_id"] = reservation.get("old_session_id") or "dry-run-session"
+
+            condition = reservation["condition"]
+            while not reservation.get("probe_response_finished") and not reservation.get("failure_reason"):
+                remaining = float(reservation.get("deadline_ts") or time.time()) - time.time()
+                if remaining <= 0:
+                    break
+                condition.wait(min(remaining, 1.0))
+            failure_reason = str(reservation.get("failure_reason") or "")
+            if failure_reason:
+                return {"ok": False, "error": failure_reason, "error_kind": failure_reason, "target": target}
+            if not reservation.get("probe_response_finished"):
+                self.force_leave_after_clear_failure(target, caller=caller, reason="probe_timeout", reservation=reservation)
+                return {"ok": False, "error": "probe_timeout", "error_kind": "probe_timeout", "target": target}
+            reservation["phase"] = "finalizing"
+            marker_id_value = str(reservation.get("identity_marker_id") or "")
+            if marker_id_value:
+                update_marker(marker_id_value, lambda current: {**current, "phase": "finalizing"})
+        finally:
+            state_lock_ctx.__exit__(None, None, None)
+
+        agent_type = str(participant.get("agent_type") or reservation.get("agent") or "")
+        new_session_id = str(reservation.get("new_session_id") or "")
+        pane = str(reservation.get("pane") or "")
+        identity_required = not (self.dry_run and not str(reservation.get("old_session_id") or ""))
+        process_identity = (
+            self.clear_process_identity_for_replacement(
+                agent_type=agent_type,
+                session_id=new_session_id,
+                pane=pane,
+            )
+            if identity_required
+            else {}
+        )
+
+        if not identity_required:
+            helper_result = {"ok": True, "dry_run": True}
+        else:
+            helper_result = replace_attached_session_identity_for_clear(
+                bridge_session=self.bridge_session,
+                alias=target,
+                agent_type=agent_type,
+                old_session_id=str(reservation.get("old_session_id") or ""),
+                new_session_id=new_session_id,
+                pane=pane,
+                target=str(participant.get("target") or endpoint_detail.get("target") or ""),
+                cwd=str(participant.get("cwd") or ""),
+                model=str(participant.get("model") or ""),
+                process_identity=process_identity,
+            )
+
+        try:
+            final_lock_ctx = self.command_state_lock(
+                post_lock_worst_case=COMMAND_DEFAULT_POST_LOCK_WORST_CASE_SECONDS,
+                margin=COMMAND_SAFETY_MARGIN_SECONDS,
+                command_class="clear_peer",
+            )
+            final_lock_ctx.__enter__()
+        except CommandLockWaitExceeded:
+            self.force_leave_after_clear_failure(target, caller=caller, reason="lock_wait_exceeded_after_identity", reservation=reservation)
+            return self.lock_wait_exceeded_response("clear_peer")
+        try:
+            if not helper_result.get("ok"):
+                self.force_leave_after_clear_failure(target, caller=caller, reason=f"identity_replace_failed:{helper_result.get('error')}", reservation=reservation)
+                return {
+                    "ok": False,
+                    "error": str(helper_result.get("error") or "identity_replace_failed"),
+                    "error_kind": "identity_replace_failed",
+                    "target": target,
+                }
+            if identity_required and not verified_process_identity(helper_result.get("live_record") or {}):
+                self.force_leave_after_clear_failure(target, caller=caller, reason="clear_process_identity_unverified", reservation=reservation)
+                return {
+                    "ok": False,
+                    "error": "clear_process_identity_unverified",
+                    "error_kind": "clear_process_identity_unverified",
+                    "target": target,
+                }
+            remove_marker(str(reservation.get("identity_marker_id") or ""))
+            self.clear_reservations.pop(target, None)
+            self.pending_self_clears.pop(target, None)
+            self.busy[target] = False
+            self.reserved[target] = None
+            self.current_prompt_by_agent.pop(target, None)
+            self.session_mtime_ns = None
+            self._reload_participants_unlocked()
+            self.log(
+                "clear_peer_completed",
+                target=target,
+                by_sender=caller,
+                force=bool(force),
+                probe_id=reservation.get("probe_id"),
+                new_session_id=reservation.get("new_session_id"),
+            )
+        finally:
+            final_lock_ctx.__exit__(None, None, None)
+        self.try_deliver_command_aware(target)
+        return {"ok": True, "target": target, "cleared": True, "force": bool(force), "new_session_id": reservation.get("new_session_id")}
+
+    def handle_clear_prompt_submitted_locked(self, agent: str, record: dict) -> bool:
+        reservation = self.clear_reservations.get(agent)
+        if not reservation:
+            return False
+        attach_probe = str(record.get("attach_probe") or "")
+        if attach_probe and attach_probe == str(reservation.get("probe_id") or ""):
+            marker_id_value = str(reservation.get("identity_marker_id") or "")
+            marker = (read_markers().get("markers") or {}).get(marker_id_value) if marker_id_value else None
+            marker = marker if isinstance(marker, dict) else {}
+            marker_new_session = str(marker.get("new_session_id") or "")
+            marker_turn_id = str(marker.get("probe_turn_id") or "")
+            record_turn_id = str(record.get("turn_id") or "")
+            phase_ok = str(marker.get("phase") or "") == "prompt_seen"
+            turn_ok = bool(marker_turn_id) and (not record_turn_id or marker_turn_id == record_turn_id)
+            if not (phase_ok and marker_new_session and turn_ok):
+                reservation["phase"] = "failed"
+                reservation["failure_reason"] = "clear_marker_phase2_missing"
+                condition = reservation.get("condition")
+                if isinstance(condition, threading.Condition):
+                    condition.notify_all()
+                self.log(
+                    "clear_marker_phase2_missing",
+                    target=agent,
+                    probe_id=reservation.get("probe_id"),
+                    marker_id=marker_id_value,
+                    marker_phase=marker.get("phase"),
+                    marker_new_session_present=bool(marker_new_session),
+                    marker_probe_turn_id=marker_turn_id,
+                    record_turn_id=record_turn_id,
+                )
+                self.busy[agent] = False
+                self.reserved[agent] = None
+                if reservation.get("pane_touched"):
+                    self.force_leave_after_clear_failure(
+                        agent,
+                        caller=str(reservation.get("caller") or "bridge"),
+                        reason="clear_marker_phase2_missing",
+                        reservation=reservation,
+                    )
+                return True
+            reservation["new_session_id"] = marker_new_session
+            reservation["probe_turn_id"] = marker_turn_id
+            reservation["probe_prompt_submitted"] = True
+            reservation["phase"] = "prompt_seen"
+            self.log(
+                "clear_probe_prompt_seen",
+                target=agent,
+                probe_id=reservation.get("probe_id"),
+                new_session_id=reservation.get("new_session_id"),
+                probe_turn_id=reservation.get("probe_turn_id"),
+            )
+        else:
+            self.log("clear_window_prompt_suppressed", target=agent, attach_probe=attach_probe, turn_id=record.get("turn_id"))
+        self.busy[agent] = False
+        self.reserved[agent] = None
+        return True
+
+    def handle_clear_response_finished_locked(self, agent: str, record: dict) -> bool:
+        reservation = self.clear_reservations.get(agent)
+        if not reservation:
+            return False
+        response_turn_id = str(record.get("turn_id") or "")
+        response_session_id = str(record.get("session_id") or "")
+        probe_turn_id = str(reservation.get("probe_turn_id") or "")
+        new_session_id = str(reservation.get("new_session_id") or "")
+        matches_probe = bool(
+            (probe_turn_id and response_turn_id == probe_turn_id)
+            or (new_session_id and response_session_id == new_session_id)
+        )
+        if matches_probe or (self.dry_run and reservation.get("probe_prompt_submitted")):
+            reservation["probe_response_finished"] = True
+            reservation["phase"] = "probe_finished"
+            if response_session_id:
+                reservation["new_session_id"] = response_session_id
+            if response_turn_id:
+                reservation["probe_turn_id"] = response_turn_id
+            condition = reservation.get("condition")
+            if isinstance(condition, threading.Condition):
+                condition.notify_all()
+            self.log(
+                "clear_probe_response_finished",
+                target=agent,
+                probe_id=reservation.get("probe_id"),
+                new_session_id=reservation.get("new_session_id"),
+                probe_turn_id=reservation.get("probe_turn_id"),
+            )
+        else:
+            self.log(
+                "clear_window_response_ignored",
+                target=agent,
+                response_turn_id=response_turn_id,
+                response_session_id=response_session_id,
+                probe_turn_id=probe_turn_id,
+                new_session_id=new_session_id,
+            )
+        self.busy[agent] = False
+        self.reserved[agent] = None
+        return True
+
+    def promote_pending_self_clear_locked(self, sender: str) -> None:
+        pending = self.pending_self_clears.pop(sender, None)
+        if not pending:
+            return
+        force = bool(pending.get("force"))
+        self.reload_participants()
+        if sender not in self.participants:
+            return
+        guard = self.clear_guard(sender, force=force)
+        if not guard.ok:
+            notice = make_message(
+                sender="bridge",
+                target=sender,
+                intent="self_clear_cancelled",
+                body=f"[bridge:self_clear_cancelled] Deferred self-clear did not run: {format_clear_guard_result(guard)}.",
+                causal_id=short_id("causal"),
+                hop_count=0,
+                auto_return=False,
+                kind="notice",
+                source="self_clear_cancelled",
+            )
+
+            def prepend(queue: list[dict]) -> None:
+                queue.insert(0, notice)
+
+            self.queue.update(prepend)
+            self.log("self_clear_cancelled", target=sender, reason=format_clear_guard_result(guard))
+            return
+        participant = dict(self.participants.get(sender) or {})
+        reservation = self._new_clear_reservation(str(pending.get("caller") or sender), sender, force=force, participant=participant)
+        reservation["clear_id"] = str(pending.get("clear_id") or reservation.get("clear_id"))
+        self.clear_reservations[sender] = reservation
+        self.log("self_clear_promoted", target=sender, force=force, clear_id=reservation.get("clear_id"))
+        threading.Thread(
+            target=self._self_clear_worker,
+            args=(sender, reservation),
+            name=f"bridge-self-clear-{sender}",
+            daemon=True,
+        ).start()
+
+    def _self_clear_worker(self, target: str, reservation: dict) -> None:
+        try:
+            self.run_clear_peer(
+                str(reservation.get("caller") or target),
+                target,
+                force=bool(reservation.get("force")),
+                existing_reservation=reservation,
+            )
+        except Exception as exc:
+            self.safe_log("self_clear_worker_failed", target=target, error=str(exc))
+
     def enqueue_ipc_message(self, message: dict) -> bool:
         # Daemon-socket ingress for an externally-originated message
         # (op=enqueue from bridge_enqueue.py). Append the message to the
@@ -972,6 +2192,15 @@ class BridgeDaemon:
         # arm later in two phases: delivery at pending->inflight reservation,
         # then response at inflight->delivered prompt submission.
         with self.state_lock:
+            sender = str(message.get("from") or "")
+            if self.sender_blocked_by_clear(sender):
+                self.log(
+                    "message_enqueue_rejected_sender_clear_blocked",
+                    message_id=message.get("id"),
+                    from_agent=sender,
+                    to=message.get("to"),
+                )
+                return False
             if any(it.get("id") == message["id"] for it in self.queue.read()):
                 self.log("message_enqueue_skipped_duplicate", message_id=message["id"], from_agent=message.get("from"), to=message.get("to"))
                 return False
@@ -1110,6 +2339,17 @@ class BridgeDaemon:
         }
 
     def reload_participants(self) -> None:
+        command = str(self.command_context_info().get("op") or "reload_participants")
+        with self.command_state_lock(command_class=command):
+            if self.command_context_info() and not self.command_deadline_ok(
+                post_lock_worst_case=self.command_budget(command)[0],
+                margin=self.command_budget(command)[1],
+                command_class=command,
+            ):
+                raise CommandLockWaitExceeded(command)
+            self._reload_participants_unlocked()
+
+    def _reload_participants_unlocked(self) -> None:
         state = {}
         if self.bridge_session:
             path = self.session_file
@@ -1299,6 +2539,7 @@ class BridgeDaemon:
             self.busy.get(target)
             or self.reserved.get(target)
             or self.interrupt_partial_failure_blocks.get(target)
+            or self.clear_reservations.get(target)
         ):
             return None
 
@@ -1627,7 +2868,7 @@ class BridgeDaemon:
 
         self.queue.update(mutator)
 
-    def queue_message(self, message: dict, log_event: bool = True) -> None:
+    def queue_message(self, message: dict, log_event: bool = True, deliver: bool = True) -> None:
         def mutator(queue: list[dict]) -> None:
             if not any(item.get("id") == message["id"] for item in queue):
                 queue.append(message)
@@ -1649,7 +2890,8 @@ class BridgeDaemon:
                 aggregate_expected=message.get("aggregate_expected"),
                 source=message.get("source"),
             )
-        self.try_deliver(str(message["to"]))
+        if deliver:
+            self.try_deliver_command_aware(str(message["to"]), message_id=str(message.get("id") or ""))
 
     def suppress_pending_watchdog_wakes(
         self,
@@ -1854,9 +3096,12 @@ class BridgeDaemon:
         return rows
 
     def build_wait_status(self, caller: str) -> dict:
-        with self.state_lock:
-            queue_snapshot = list(self.queue.read())
-            watchdog_snapshot = {wake_id: dict(wd) for wake_id, wd in self.watchdogs.items()}
+        try:
+            with self.command_state_lock(command_class="wait_status"):
+                queue_snapshot = list(self.queue.read())
+                watchdog_snapshot = {wake_id: dict(wd) for wake_id, wd in self.watchdogs.items()}
+        except CommandLockWaitExceeded:
+            return self.lock_wait_exceeded_response("wait_status")
         try:
             aggregate_data = read_json(self.aggregate_file, {"aggregates": {}})
             aggregates = aggregate_data.get("aggregates") or {}
@@ -2063,13 +3308,16 @@ class BridgeDaemon:
     def build_aggregate_status(self, caller: str, aggregate_id: str) -> dict:
         # Best-effort debug snapshot: queue/watchdogs/tombstones are atomic
         # together; aggregate JSON is read afterwards to preserve lock order.
-        with self.state_lock:
-            queue_snapshot = list(self.queue.read())
-            watchdog_snapshot = {wake_id: dict(wd) for wake_id, wd in self.watchdogs.items()}
-            tombstone_snapshot = {
-                alias: [dict(entry) for entry in entries]
-                for alias, entries in self.interrupted_turns.items()
-            }
+        try:
+            with self.command_state_lock(command_class="aggregate_status"):
+                queue_snapshot = list(self.queue.read())
+                watchdog_snapshot = {wake_id: dict(wd) for wake_id, wd in self.watchdogs.items()}
+                tombstone_snapshot = {
+                    alias: [dict(entry) for entry in entries]
+                    for alias, entries in self.interrupted_turns.items()
+                }
+        except CommandLockWaitExceeded:
+            return self.lock_wait_exceeded_response("aggregate_status")
         try:
             aggregate_data = read_json(self.aggregate_file, {"aggregates": {}})
             aggregate = (aggregate_data.get("aggregates") or {}).get(aggregate_id) or {}
@@ -2201,6 +3449,7 @@ class BridgeDaemon:
                 self.busy.get(target)
                 or self.reserved.get(target)
                 or self.interrupt_partial_failure_blocks.get(target)
+                or self.clear_reservations.get(target)
             ):
                 return None
 
@@ -2421,6 +3670,8 @@ class BridgeDaemon:
                     item.pop("last_error", None)
                     for key in PANE_MODE_METADATA_KEYS + PANE_MODE_ENTER_DEFER_KEYS:
                         item.pop(key, None)
+                    for key in RESTART_INFLIGHT_METADATA_KEYS:
+                        item.pop(key, None)
                     return dict(item)
                 return None
 
@@ -2483,7 +3734,22 @@ class BridgeDaemon:
         # checks and the registration cannot interleave with delivery,
         # cancellation, or termination of the same message.
         # Returns (ok, error_code, new_deadline_iso).
-        with self.state_lock:
+        try:
+            lock_ctx = self.command_state_lock(
+                post_lock_worst_case=COMMAND_DEFAULT_POST_LOCK_WORST_CASE_SECONDS,
+                margin=COMMAND_SAFETY_MARGIN_SECONDS,
+                command_class="extend_watchdog",
+            )
+            lock_ctx.__enter__()
+        except CommandLockWaitExceeded:
+            return False, "lock_wait_exceeded", None
+        try:
+            if not self.command_deadline_ok(
+                post_lock_worst_case=COMMAND_DEFAULT_POST_LOCK_WORST_CASE_SECONDS,
+                margin=COMMAND_SAFETY_MARGIN_SECONDS,
+                command_class="extend_watchdog",
+            ):
+                return False, "lock_wait_exceeded", None
             queue = list(self.queue.read())
             item = next((it for it in queue if it.get("id") == message_id), None)
             if not item:
@@ -2528,6 +3794,8 @@ class BridgeDaemon:
                 watchdog_phase=phase,
             )
             return True, None, new_deadline_iso
+        finally:
+            lock_ctx.__exit__(None, None, None)
 
     def _message_is_active_inflight_for_cancel(self, item: dict) -> bool:
         if str(item.get("status") or "") != "inflight":
@@ -2558,7 +3826,22 @@ class BridgeDaemon:
         """
         if not sender or sender == "bridge":
             return {"ok": False, "error": "invalid_sender"}
-        with self.state_lock:
+        try:
+            lock_ctx = self.command_state_lock(
+                post_lock_worst_case=COMMAND_DEFAULT_POST_LOCK_WORST_CASE_SECONDS,
+                margin=COMMAND_SAFETY_MARGIN_SECONDS,
+                command_class="cancel_message",
+            )
+            lock_ctx.__enter__()
+        except CommandLockWaitExceeded:
+            return self.lock_wait_exceeded_response("cancel_message")
+        try:
+            if not self.command_deadline_ok(
+                post_lock_worst_case=COMMAND_DEFAULT_POST_LOCK_WORST_CASE_SECONDS,
+                margin=COMMAND_SAFETY_MARGIN_SECONDS,
+                command_class="cancel_message",
+            ):
+                return self.lock_wait_exceeded_response("cancel_message")
             self._prune_interrupted_turns_for_all()
             item = next((dict(it) for it in self.queue.read() if it.get("id") == message_id), None)
             if not item:
@@ -2660,6 +3943,8 @@ class BridgeDaemon:
                 "input_clear_ok": None,
                 "input_clear_error": "",
             }
+        finally:
+            lock_ctx.__exit__(None, None, None)
 
     def remove_delivered_message(self, target: str, message_id: str) -> dict | None:
         def mutator(queue: list[dict]) -> dict | None:
@@ -2774,6 +4059,8 @@ class BridgeDaemon:
                 if last is not None and now - last < 1.0:
                     continue
                 target = str(item.get("to") or "")
+                if target in self.clear_reservations:
+                    continue
                 endpoint_detail = self.resolve_endpoint_detail(target, purpose="write")
                 if not endpoint_detail.get("ok"):
                     self.finalize_undeliverable_message(item, endpoint_detail, phase="enter_retry")
@@ -2996,7 +4283,22 @@ class BridgeDaemon:
         if not ALARM_CLIENT_WAKE_ID_RE.fullmatch(requested_wake_id):
             return {"ok": False, "error": "wake_id must match wake-[a-f0-9]{12}"}
         deadline = time.time() + delay
-        with self.state_lock:
+        try:
+            lock_ctx = self.command_state_lock(
+                post_lock_worst_case=COMMAND_SHORT_POST_LOCK_WORST_CASE_SECONDS,
+                margin=COMMAND_SHORT_SAFETY_MARGIN_SECONDS,
+                command_class="alarm",
+            )
+            lock_ctx.__enter__()
+        except CommandLockWaitExceeded:
+            return self.lock_wait_exceeded_response("alarm")
+        try:
+            if not self.command_deadline_ok(
+                post_lock_worst_case=COMMAND_SHORT_POST_LOCK_WORST_CASE_SECONDS,
+                margin=COMMAND_SHORT_SAFETY_MARGIN_SECONDS,
+                command_class="alarm",
+            ):
+                return self.lock_wait_exceeded_response("alarm")
             self._prune_alarm_wake_tombstones()
             if not client_supplied_wake_id:
                 while requested_wake_id in self.watchdogs or requested_wake_id in self.alarm_wake_tombstones:
@@ -3057,6 +4359,8 @@ class BridgeDaemon:
                 sender=sender,
                 delay_seconds=delay,
             )
+        finally:
+            lock_ctx.__exit__(None, None, None)
         return {"ok": True, "wake_id": requested_wake_id, "alarm_status": "registered", "duplicate": False}
 
     def register_alarm(self, sender: str, delay_seconds: float, body: str | None = None, wake_id: str | None = None) -> str | None:
@@ -3696,8 +5000,43 @@ class BridgeDaemon:
         # a fresh replacement prompt. The bounded key delay is the v1
         # correctness/perf trade-off and is documented in the lock ordering
         # comment in __init__.
-        self.reload_participants()
-        with self.state_lock:
+        try:
+            self.reload_participants()
+            lock_ctx = self.command_state_lock(
+                post_lock_worst_case=INTERRUPT_SEND_KEY_TIMEOUT_SECONDS,
+                margin=COMMAND_SAFETY_MARGIN_SECONDS,
+                command_class="interrupt",
+            )
+            lock_ctx.__enter__()
+        except CommandLockWaitExceeded:
+            return {
+                "esc_sent": False,
+                "esc_error": "lock_wait_exceeded",
+                "interrupt_ok": False,
+                "interrupt_keys": [],
+                "cc_sent": None,
+                "cc_error": None,
+                "held": False,
+                "cancelled_message_ids": [],
+                "error_kind": "lock_wait_exceeded",
+            }
+        try:
+            if not self.command_deadline_ok(
+                post_lock_worst_case=COMMAND_DEFAULT_POST_LOCK_WORST_CASE_SECONDS,
+                margin=COMMAND_SAFETY_MARGIN_SECONDS,
+                command_class="interrupt",
+            ):
+                return {
+                    "esc_sent": False,
+                    "esc_error": "lock_wait_exceeded",
+                    "interrupt_ok": False,
+                    "interrupt_keys": [],
+                    "cc_sent": None,
+                    "cc_error": None,
+                    "held": False,
+                    "cancelled_message_ids": [],
+                    "error_kind": "lock_wait_exceeded",
+                }
             endpoint_detail = self.resolve_endpoint_detail(target, purpose="write")
             pane = str(endpoint_detail.get("pane") or "") if endpoint_detail.get("ok") else ""
             if not pane:
@@ -3738,6 +5077,22 @@ class BridgeDaemon:
             had_active = self.target_has_active_interrupt_work(target, active_context_before)
 
             interrupt_keys: list[str] = ["Escape"]
+            if not self.command_deadline_ok(
+                post_lock_worst_case=INTERRUPT_SEND_KEY_TIMEOUT_SECONDS,
+                margin=COMMAND_SAFETY_MARGIN_SECONDS,
+                command_class="interrupt",
+            ):
+                return {
+                    "esc_sent": False,
+                    "esc_error": "lock_wait_exceeded",
+                    "interrupt_ok": False,
+                    "interrupt_keys": [],
+                    "cc_sent": None,
+                    "cc_error": None,
+                    "held": False,
+                    "cancelled_message_ids": [],
+                    "error_kind": "lock_wait_exceeded",
+                }
             esc_ok, esc_error = self.send_interrupt_key(pane, "Escape")
             if not esc_ok:
                 self.log("esc_failed", target=target, by_sender=sender, error=esc_error)
@@ -3775,11 +5130,20 @@ class BridgeDaemon:
                 if not self.dry_run and self.interrupt_key_delay_seconds > 0:
                     time.sleep(self.interrupt_key_delay_seconds)
                 interrupt_keys.append("C-c")
-                cc_ok, cc_error_text = self.send_interrupt_key(pane, "C-c")
-                cc_sent = cc_ok
-                if not cc_ok:
-                    cc_error = cc_error_text
+                if not self.command_deadline_ok(
+                    post_lock_worst_case=INTERRUPT_SEND_KEY_TIMEOUT_SECONDS,
+                    margin=COMMAND_SAFETY_MARGIN_SECONDS,
+                    command_class="interrupt",
+                ):
+                    cc_sent = False
+                    cc_error = "lock_wait_exceeded"
                     self.log("cc_send_failed", target=target, by_sender=sender, error=cc_error)
+                else:
+                    cc_ok, cc_error_text = self.send_interrupt_key(pane, "C-c")
+                    cc_sent = cc_ok
+                    if not cc_ok:
+                        cc_error = cc_error_text
+                        self.log("cc_send_failed", target=target, by_sender=sender, error=cc_error)
             interrupt_ok = cc_sent is not False
             self.busy[target] = False
             self.reserved[target] = None
@@ -3833,13 +5197,15 @@ class BridgeDaemon:
                 interrupt_ok=interrupt_ok,
                 cc_sent=cc_sent,
             )
+        finally:
+            lock_ctx.__exit__(None, None, None)
 
         # Kick delivery to the interrupted target so queued corrections run
         # promptly. If the configured key sequence only partially completed,
         # leave queued work pending rather than appending to a possibly dirty
         # prompt buffer.
         if interrupt_ok:
-            self.try_deliver(target)
+            self.try_deliver_command_aware(target)
         else:
             self.log(
                 "interrupt_delivery_skipped",
@@ -3904,7 +5270,7 @@ class BridgeDaemon:
             "delivery_attempts": 0,
         }
 
-    def _record_aggregate_interrupted_reply(self, cancelled_msg: dict, by_sender: str, *, reason: str) -> None:
+    def _record_aggregate_interrupted_reply(self, cancelled_msg: dict, by_sender: str, *, reason: str, deliver: bool = True) -> None:
         # Inject a synthetic "[interrupted]" reply for this peer into the
         # aggregate's reply set so the aggregate can still progress (and
         # eventually complete or hit its watchdog) without depending on a
@@ -3944,7 +5310,7 @@ class BridgeDaemon:
                 f"[interrupted by {by_sender or 'bridge'}: peer did not respond before being asked to stop]"
             )
         try:
-            self.collect_aggregate_response(synthetic_sender, synthetic_text, synthetic_context)
+            self.collect_aggregate_response(synthetic_sender, synthetic_text, synthetic_context, deliver=deliver)
         except Exception as exc:
             self.safe_log(
                 "aggregate_interrupt_inject_failed",
@@ -3954,9 +5320,12 @@ class BridgeDaemon:
             )
 
     def release_hold(self, target: str, reason: str, by_sender: str | None = None) -> dict | None:
-        with self.state_lock:
-            info = self.held_interrupt.pop(target, None)
-            partial_block = self.interrupt_partial_failure_blocks.pop(target, None)
+        try:
+            with self.command_state_lock(command_class="clear_hold"):
+                info = self.held_interrupt.pop(target, None)
+                partial_block = self.interrupt_partial_failure_blocks.pop(target, None)
+        except CommandLockWaitExceeded:
+            return {"error": "lock_wait_exceeded", "error_kind": "lock_wait_exceeded", "_lock_wait_exceeded": True}
         had_held = info is not None
         if not info and not partial_block:
             return None
@@ -3988,8 +5357,8 @@ class BridgeDaemon:
             partial_cc_error=(partial_block or {}).get("cc_error"),
             hold_duration_ms=hold_duration_ms,
         )
-        self.try_deliver(target)
-        self.try_deliver()
+        self.try_deliver_command_aware(target)
+        self.try_deliver_command_aware()
         return info
 
     def cancel_watchdogs_for_message(
@@ -4168,10 +5537,14 @@ class BridgeDaemon:
             for item in queue:
                 if item.get("status") != "inflight":
                     continue
+                if str(item.get("to") or "") in self.clear_reservations:
+                    continue
                 if item.get("pane_mode_enter_deferred_since_ts"):
                     item["updated_ts"] = utc_now()
                     if item.get("last_error") not in {"pane_mode_probe_failed_waiting_enter"}:
                         item["last_error"] = "pane_in_mode_waiting_enter"
+                    continue
+                if item.get(RESTART_PRESERVED_INFLIGHT_KEY):
                     continue
                 updated = item.get("updated_ts") or item.get("created_ts")
                 try:
@@ -4217,6 +5590,8 @@ class BridgeDaemon:
         suppressed_interrupted_prompt = False
         message: dict = {}
         with self.state_lock:
+            if self.handle_clear_prompt_submitted_locked(agent, record):
+                return
             observed_nonce = record.get("nonce")
             record_turn_id = record.get("turn_id")
             interrupted_prompt = self._match_interrupted_prompt(agent, observed_nonce, record_turn_id)
@@ -4386,6 +5761,10 @@ class BridgeDaemon:
                     "aggregate_message_ids": message.get("aggregate_message_ids"),
                     "aggregate_mode": message.get("aggregate_mode"),
                     "aggregate_started_ts": message.get("aggregate_started_ts"),
+                    "requester_cleared": bool(message.get("requester_cleared")),
+                    "requester_cleared_alias": message.get("requester_cleared_alias"),
+                    "requester_cleared_at": message.get("requester_cleared_at"),
+                    "requester_cleared_by": message.get("requester_cleared_by"),
                     "turn_id": record.get("turn_id"),
                 }
 
@@ -4484,7 +5863,7 @@ class BridgeDaemon:
                 prompt_submitted_seen=True,
             )
 
-    def collect_aggregate_response(self, sender: str, text: str, context: dict) -> None:
+    def collect_aggregate_response(self, sender: str, text: str, context: dict, deliver: bool = True) -> None:
         aggregate_id = str(context.get("aggregate_id") or "")
         if not aggregate_id:
             return
@@ -4507,6 +5886,9 @@ class BridgeDaemon:
         def mutator(data: dict) -> dict | None:
             data.setdefault("version", 1)
             aggregates = data.setdefault("aggregates", {})
+            existing = aggregates.get(aggregate_id)
+            if isinstance(existing, dict) and existing.get("status") == "cancelled_requester_cleared":
+                return {"_cancelled_requester_cleared": True, **dict(existing)}
             aggregate = aggregates.setdefault(
                 aggregate_id,
                 {
@@ -4557,6 +5939,16 @@ class BridgeDaemon:
         with locked_json(self.aggregate_file, {"version": 1, "aggregates": {}}) as data:
             completed = mutator(data)
 
+        if completed and completed.get("_cancelled_requester_cleared"):
+            self.log(
+                "aggregate_reply_ignored_requester_cleared",
+                aggregate_id=aggregate_id,
+                from_agent=sender,
+                requester=requester,
+                reply_to=reply_to,
+            )
+            return
+
         expected_count = len(expected)
         received_count = 0
         if completed:
@@ -4599,7 +5991,7 @@ class BridgeDaemon:
             self._record_aggregate_completion_tombstones(completed)
             self.cancel_watchdogs_for_aggregate(aggregate_id, reason="aggregate_complete")
             self.suppress_pending_watchdog_wakes(ref_aggregate_id=aggregate_id, reason="aggregate_complete")
-            self.queue_message(message)
+            self.queue_message(message, deliver=deliver)
             self.log(
                 "aggregate_result_queued",
                 message_id=message["id"],
@@ -4614,6 +6006,42 @@ class BridgeDaemon:
     def maybe_return_response(self, sender: str, text: str, context: dict) -> None:
         requester = context.get("from")
         self.reload_participants()
+        if context.get("requester_cleared"):
+            message_id = str(context.get("id") or "")
+            aggregate_id = str(context.get("aggregate_id") or "")
+            cleared = str(context.get("requester_cleared_alias") or requester or "")
+            if message_id:
+                self.suppress_pending_watchdog_wakes(ref_message_id=message_id, reason="requester_cleared")
+                self.cancel_watchdogs_for_message(message_id, reason="requester_cleared")
+            if aggregate_id:
+                self.cancel_watchdogs_for_aggregate(aggregate_id, reason="requester_cleared")
+                self.suppress_pending_watchdog_wakes(ref_aggregate_id=aggregate_id, reason="requester_cleared")
+            body = (
+                f"[bridge:requester_cleared] Requester {cleared or '(unknown)'} was cleared before "
+                "your response could be returned. The bridge did not deliver this response back."
+            )
+            notice = make_message(
+                sender="bridge",
+                target=sender,
+                intent="requester_cleared_response_notice",
+                body=body,
+                causal_id=str(context.get("causal_id") or short_id("causal")),
+                hop_count=int(context.get("hop_count") or 0),
+                auto_return=False,
+                kind="notice",
+                reply_to=message_id,
+                source="requester_cleared",
+            )
+            self.queue_message(notice)
+            self.log(
+                "requester_cleared_response_suppressed",
+                responder=sender,
+                requester=requester,
+                requester_cleared_alias=cleared,
+                message_id=message_id,
+                aggregate_id=aggregate_id,
+            )
+            return
         if requester not in self.participants or requester == sender:
             return
         if not context.get("auto_return"):
@@ -4711,6 +6139,8 @@ class BridgeDaemon:
         run_delivery_after_lock = False
         with self.state_lock:
             text = record.get("last_assistant_message") or ""
+            if self.handle_clear_response_finished_locked(sender, record):
+                return
             context = self.current_prompt_by_agent.get(sender) or {}
             response_turn_id = record.get("turn_id")
             context_turn_id = context.get("turn_id") if context else None
@@ -4797,6 +6227,7 @@ class BridgeDaemon:
                         context,
                         watchdog_reason="interrupted_tombstone_terminal",
                     )
+                    self.promote_pending_self_clear_locked(sender)
                     run_delivery_after_lock = True
                 else:
                     return
@@ -4910,6 +6341,7 @@ class BridgeDaemon:
                 if first_time:
                     self.maybe_return_response(sender, text, context)
                 self._cleanup_terminal_context_locked(sender, context, watchdog_reason="terminal_response")
+                self.promote_pending_self_clear_locked(sender)
         self.try_deliver(sender)
         self.try_deliver()
 
@@ -4935,6 +6367,48 @@ class BridgeDaemon:
                 self._apply_alarm_cancel_to_queued_message(msg_id)
             if target in self.participants:
                 self.try_deliver(str(target))
+
+    def _drop_ingress_row_from_blocked_sender(self, message_id: str, *, phase: str) -> bool:
+        if not message_id:
+            return False
+        removed: dict | None = None
+
+        def mutator(queue: list[dict]) -> bool:
+            nonlocal removed
+            kept: list[dict] = []
+            dropped = False
+            for item in queue:
+                if item.get("id") == message_id and item.get("status") == "ingressing":
+                    sender = str(item.get("from") or "")
+                    if self.sender_blocked_by_clear(sender):
+                        removed = dict(item)
+                        dropped = True
+                        continue
+                kept.append(item)
+            if dropped:
+                queue[:] = kept
+            return dropped
+
+        dropped = bool(self.queue.update(mutator))
+        if dropped and removed:
+            sender = str(removed.get("from") or "")
+            self._record_message_tombstone(
+                str(removed.get("to") or ""),
+                removed,
+                by_sender="bridge",
+                reason="sender_clear_blocked",
+                suppress_late_hooks=False,
+                prompt_submitted_seen=False,
+            )
+            self.log(
+                "ingress_dropped_sender_clear_blocked",
+                message_id=message_id,
+                from_agent=sender,
+                to=removed.get("to"),
+                phase=phase,
+                error_kind="self_clear_pending" if sender in self.pending_self_clears else "clear_in_progress",
+            )
+        return dropped
 
     def _apply_alarm_cancel_to_queued_message(self, message_id: str) -> None:
         # Single source of truth for finalizing ingestion of a message
@@ -4968,6 +6442,8 @@ class BridgeDaemon:
             return
         if item.get("status") != "ingressing":
             return
+        if self._drop_ingress_row_from_blocked_sender(message_id, phase="event"):
+            return
         original_body = item.get("body")
         self._maybe_cancel_alarms_for_incoming(item)
         body_changed = item.get("body") != original_body
@@ -4994,6 +6470,44 @@ class BridgeDaemon:
         for fields in stripped_logs:
             self.log("watchdog_stripped_no_auto_return", **fields)
 
+    def _preserve_startup_inflight_messages(self) -> None:
+        # Startup recovery: a status=inflight row may already have been pasted
+        # into the peer pane by the previous daemon. Since current_prompt and
+        # last_enter_ts are in-memory only, automatically requeueing that row
+        # after submit_timeout can paste the same prompt again. Preserve normal
+        # inflight rows as delivery blockers and let a later prompt_submitted
+        # bind them via find_inflight_candidate's queue scan.
+        #
+        # Pane-mode enter-deferred rows are different: the text was pasted but
+        # Enter was intentionally delayed. Their durable pane-mode metadata is
+        # the existing recovery signal, so do not freeze them here.
+        preserved: list[dict] = []
+        now_iso = utc_now()
+
+        def mutator(queue: list[dict]) -> list[dict]:
+            for item in queue:
+                if item.get("status") != "inflight":
+                    continue
+                if item.get("pane_mode_enter_deferred_since_ts"):
+                    continue
+                if item.get(RESTART_PRESERVED_INFLIGHT_KEY):
+                    continue
+                item[RESTART_PRESERVED_INFLIGHT_KEY] = True
+                item["restart_preserved_inflight_at"] = now_iso
+                item["updated_ts"] = now_iso
+                preserved.append(dict(item))
+            return preserved
+
+        self.queue.update(mutator)
+        for item in preserved:
+            self.log(
+                "inflight_preserved_after_daemon_restart",
+                message_id=item.get("id"),
+                to=item.get("to"),
+                from_agent=item.get("from"),
+                nonce=item.get("nonce"),
+            )
+
     def _recover_ingressing_messages(self) -> None:
         # Startup recovery: any queue items left in transient "ingressing"
         # state were written by bridge_enqueue.py's file-fallback path
@@ -5003,11 +6517,16 @@ class BridgeDaemon:
         # so just promote these to "pending" and unblock delivery; log
         # the recovery for operator visibility.
         recovered: list[str] = []
+        dropped: list[dict] = []
         stripped_logs: list[dict] = []
 
         def mutator(queue: list[dict]) -> None:
+            kept: list[dict] = []
             for item in queue:
                 if item.get("status") == "ingressing":
+                    if self.sender_blocked_by_clear(str(item.get("from") or "")):
+                        dropped.append(dict(item))
+                        continue
                     stripped_log = self._strip_no_auto_return_watchdog_metadata(
                         item,
                         phase="recovery",
@@ -5019,8 +6538,26 @@ class BridgeDaemon:
                     item["updated_ts"] = utc_now()
                     item["last_error"] = "ingressing_recovered_after_daemon_restart"
                     recovered.append(str(item.get("id") or ""))
+                kept.append(item)
+            if dropped:
+                queue[:] = kept
 
         self.queue.update(mutator)
+        for item in dropped:
+            self._record_message_tombstone(
+                str(item.get("to") or ""),
+                item,
+                by_sender="bridge",
+                reason="sender_clear_blocked",
+                suppress_late_hooks=False,
+                prompt_submitted_seen=False,
+            )
+            self.log(
+                "ingressing_recovery_dropped_sender_clear_blocked",
+                message_id=item.get("id"),
+                from_agent=item.get("from"),
+                to=item.get("to"),
+            )
         for fields in stripped_logs:
             self.log("watchdog_stripped_no_auto_return", **fields)
         for msg_id in recovered:
@@ -5111,11 +6648,14 @@ class BridgeDaemon:
             self.last_ingressing_check = now
             threshold = now - self.INGRESSING_AGE_PROMOTE_SEC
             promoted: list[tuple[str, float, bool]] = []
+            dropped: list[dict] = []
             stripped_logs: list[dict] = []
 
             def mutator(queue: list[dict]) -> None:
+                kept: list[dict] = []
                 for item in queue:
                     if item.get("status") != "ingressing":
+                        kept.append(item)
                         continue
                     created = item.get("created_ts") or item.get("updated_ts")
                     age_unknown = False
@@ -5125,6 +6665,10 @@ class BridgeDaemon:
                         ts = 0.0
                         age_unknown = True
                     if not age_unknown and ts >= threshold:
+                        kept.append(item)
+                        continue
+                    if self.sender_blocked_by_clear(str(item.get("from") or "")):
+                        dropped.append(dict(item))
                         continue
                     age_sec = max(0.0, now - ts) if not age_unknown else 0.0
                     stripped_log = self._strip_no_auto_return_watchdog_metadata(
@@ -5138,8 +6682,26 @@ class BridgeDaemon:
                     item["updated_ts"] = utc_now()
                     item["last_error"] = "ingressing_promoted_aged"
                     promoted.append((str(item.get("id") or ""), age_sec, age_unknown))
+                    kept.append(item)
+                if dropped:
+                    queue[:] = kept
 
             self.queue.update(mutator)
+            for item in dropped:
+                self._record_message_tombstone(
+                    str(item.get("to") or ""),
+                    item,
+                    by_sender="bridge",
+                    reason="sender_clear_blocked",
+                    suppress_late_hooks=False,
+                    prompt_submitted_seen=False,
+                )
+                self.log(
+                    "ingressing_promotion_dropped_sender_clear_blocked",
+                    message_id=item.get("id"),
+                    from_agent=item.get("from"),
+                    to=item.get("to"),
+                )
             for fields in stripped_logs:
                 self.log("watchdog_stripped_no_auto_return", **fields)
             for msg_id, age_sec, age_unknown in promoted:
@@ -5337,6 +6899,8 @@ class BridgeDaemon:
                     self.log("turn_id_mismatch_grace_config_warning", warning=warning)
                 for warning in self.interrupt_config_warnings:
                     self.log("interrupt_config_warning", warning=warning)
+                for warning in self.clear_config_warnings:
+                    self.log("clear_config_warning", warning=warning)
                 if self.startup_backfill_summary:
                     unknown = [
                         alias for alias, item in self.startup_backfill_summary.items()

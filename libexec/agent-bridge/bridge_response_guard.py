@@ -13,6 +13,7 @@ class ResponseContext(TypedDict, total=False):
     to: str
     kind: str
     auto_return: bool
+    requester_cleared: bool
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ def context_from_current_prompt(sender: str, context: dict) -> ResponseContext:
         "to": str(sender or ""),
         "kind": normalize_kind(context.get("kind"), "request"),
         "auto_return": bool(context.get("auto_return")),
+        "requester_cleared": bool(context.get("requester_cleared")),
     }
 
 
@@ -44,7 +46,8 @@ def contexts_from_queue(sender: str, queue: Iterable[dict]) -> list[ResponseCont
             continue
         if normalize_kind(item.get("kind"), "notice") != "request":
             continue
-        if not bool(item.get("auto_return")):
+        requester_cleared = bool(item.get("requester_cleared"))
+        if not bool(item.get("auto_return")) and not requester_cleared:
             continue
         requester = str(item.get("from") or "")
         if not requester:
@@ -55,7 +58,8 @@ def contexts_from_queue(sender: str, queue: Iterable[dict]) -> list[ResponseCont
                 "from_agent": requester,
                 "to": sender,
                 "kind": "request",
-                "auto_return": True,
+                "auto_return": bool(item.get("auto_return")),
+                "requester_cleared": requester_cleared,
             }
         )
     return contexts
@@ -83,7 +87,7 @@ def response_send_violation(
     for context in contexts:
         if normalize_kind(context.get("kind"), "notice") != "request":
             continue
-        if not bool(context.get("auto_return")):
+        if not bool(context.get("auto_return")) and not bool(context.get("requester_cleared")):
             continue
         if str(context.get("to") or "") != sender:
             continue

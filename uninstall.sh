@@ -92,6 +92,7 @@ if [[ "$remove_shims" == "1" ]]; then
     agent_view_peer \
     agent_alarm \
     agent_interrupt_peer \
+    agent_clear_peer \
     agent_extend_wait \
     agent_cancel_message \
     agent_wait_status \

@@ -8,6 +8,7 @@ import subprocess
 
 
 VALID_AGENTS = {"claude", "codex"}
+PROCESS_PROBE_TIMEOUT_SECONDS = 5.0
 UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 CODEX_ROLLOUT_PATH_RE = re.compile(
     rf"(^|/)\.codex/sessions/\d{{4}}/\d{{2}}/\d{{2}}/"
@@ -16,7 +17,14 @@ CODEX_ROLLOUT_PATH_RE = re.compile(
 
 
 def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
+    return subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=check,
+        timeout=PROCESS_PROBE_TIMEOUT_SECONDS,
+    )
 
 
 def tmux_display_pane(pane: str) -> dict:
@@ -27,6 +35,8 @@ def tmux_display_pane(pane: str) -> dict:
         proc = run(["tmux", "display-message", "-p", "-t", pane, fmt], check=False)
     except FileNotFoundError:
         return {"error": "tmux_unavailable"}
+    except subprocess.TimeoutExpired:
+        return {"error": "tmux_timeout"}
     except OSError as exc:
         return {"error": f"tmux_error:{exc}"}
     if proc.returncode != 0:
@@ -107,6 +117,8 @@ def transcript_owners_for_session(agent_type: str, session_id: str) -> list[dict
 def load_process_table() -> dict:
     try:
         proc = run(["ps", "-axo", "pid=,ppid=,args="], check=False)
+    except subprocess.TimeoutExpired:
+        return {"processes": {}, "children": {}, "error": "ps_timeout"}
     except OSError as exc:
         return {"processes": {}, "children": {}, "error": f"ps_unavailable:{exc}"}
     if proc.returncode != 0:

@@ -208,6 +208,13 @@ def run_root() -> Path:
     return _user_state_base() / "run"
 
 
+def controlled_clears_file() -> Path:
+    override = os.environ.get("AGENT_BRIDGE_CONTROLLED_CLEARS")
+    if override:
+        return _expand(override)
+    return run_root() / "controlled-clears.json"
+
+
 def log_root() -> Path:
     return _runtime_dir("AGENT_BRIDGE_LOG_DIR", "log", "log", pin_key="log_root")
 

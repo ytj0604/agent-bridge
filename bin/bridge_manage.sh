@@ -108,6 +108,34 @@ leave_agent() {
   "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_leave.py" -s "$session" --alias "${aliases[$choice]}"
 }
 
+clear_agent() {
+  aliases=()
+  while IFS= read -r alias; do
+    aliases+=("$alias")
+  done < <(list_aliases)
+  if [[ "${#aliases[@]}" -eq 0 ]]; then
+    echo "no agents in room"
+    return 0
+  fi
+  if ! choice="$(bridge_select_menu "Select agent to clear" "${aliases[@]}")"; then
+    return 130
+  fi
+  local alias="${aliases[$choice]}"
+  set +e
+  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_clear_peer.py" --session "$session" --from bridge --allow-spoof --to "$alias"
+  local code=$?
+  set -e
+  if [[ "$code" -eq 0 ]]; then
+    return 0
+  fi
+  if ! retry="$(bridge_select_menu "Clear $alias failed. Retry with --force?" "Retry with --force" "Cancel")"; then
+    return 130
+  fi
+  if [[ "$retry" == "0" ]]; then
+    "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_clear_peer.py" --session "$session" --from bridge --allow-spoof --to "$alias" --force
+  fi
+}
+
 stop_room() {
   "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_daemon_ctl.py" stop -s "$session"
   if "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_daemon_ctl.py" status -s "$session" --json |
@@ -166,6 +194,7 @@ while true; do
   if ! action="$(bridge_select_menu "$menu_title" \
     "Join agent pane" \
     "Leave agent" \
+    "Clear agent context" \
     "Show daemon status" \
     "Tail daemon log" \
     "Clear peer view cache" \
@@ -178,13 +207,14 @@ while true; do
   case "$action" in
     0) join_agent ;;
     1) leave_agent ;;
-    2) show_status ;;
-    3) tail_daemon_log ;;
-    4) clear_peer_view_cache ;;
-    5) reload_daemon ;;
-    6) stop_room ;;
-    7) session=""; choose_room ;;
-    8) exit 0 ;;
+    2) clear_agent ;;
+    3) show_status ;;
+    4) tail_daemon_log ;;
+    5) clear_peer_view_cache ;;
+    6) reload_daemon ;;
+    7) stop_room ;;
+    8) session=""; choose_room ;;
+    9) exit 0 ;;
     *) echo "invalid action" >&2 ;;
   esac
 done

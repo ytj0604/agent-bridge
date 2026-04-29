@@ -6,10 +6,14 @@ import os
 from pathlib import Path
 import subprocess
 
+from bridge_clear_marker import find_for_clear_window
 from bridge_participants import active_participants, load_session, participants_from_state, save_session_state
 from bridge_pane_probe import probe_agent_process, tmux_display_pane, transcript_owners_for_session, transcript_session_id_for_pid
 from bridge_paths import state_root
 from bridge_util import append_jsonl, locked_json, locked_json_read, utc_now
+
+
+IDENTITY_TMUX_TIMEOUT_SECONDS = 5.0
 
 
 def attached_sessions_file() -> Path:
@@ -26,6 +30,149 @@ def live_sessions_file() -> Path:
 
 def identity_key(agent_type: str, session_id: str) -> str:
     return f"{agent_type}:{session_id}"
+
+
+def replace_attached_session_identity_for_clear(
+    *,
+    bridge_session: str,
+    alias: str,
+    agent_type: str,
+    old_session_id: str,
+    new_session_id: str,
+    pane: str,
+    target: str = "",
+    cwd: str = "",
+    model: str = "",
+    process_identity: dict | None = None,
+) -> dict:
+    """Replace an attached alias identity after a controlled /clear probe.
+
+    Lock order is session.json -> attached registry -> pane locks -> live
+    sessions. Do not call update_attached_endpoint() here; it acquires
+    overlapping locks internally.
+    """
+    if not (bridge_session and alias and agent_type and old_session_id and new_session_id and pane):
+        return {"ok": False, "error": "missing_identity"}
+    target = target or tmux_target_for_pane(pane)
+    now = utc_now()
+    session_path = state_root() / bridge_session / "session.json"
+    with locked_json(session_path, {"session": bridge_session, "participants": {}}) as state:
+        state_dir = Path(state.get("state_dir") or session_path.parent)
+        bus_file = str(Path(state.get("bus_file") or state_dir / "events.raw.jsonl"))
+        public_events_file = str(Path(state.get("events_file") or state_dir / "events.jsonl"))
+        queue_file = str(Path(state.get("queue_file") or state_dir / "pending.json"))
+        live_record = {
+            "agent": agent_type,
+            "session_id": new_session_id,
+            "pane": pane,
+            "target": target,
+            "bridge_session": bridge_session,
+            "alias": alias,
+            "event": "controlled_clear",
+            "last_seen_at": now,
+            "cwd": cwd,
+            "model": model,
+            "process_identity": process_identity or {},
+            "events_file": bus_file,
+            "public_events_file": public_events_file,
+            "queue_file": queue_file,
+        }
+        mapping = {
+            "agent": agent_type,
+            "alias": alias,
+            "session_id": new_session_id,
+            "bridge_session": bridge_session,
+            "pane": pane,
+            "target": target,
+            "events_file": bus_file,
+            "public_events_file": public_events_file,
+            "queue_file": queue_file,
+            "attached_at": now,
+            "last_seen_at": now,
+            "cwd": cwd,
+            "model": model,
+        }
+        with locked_json(attached_sessions_file(), {"version": 1, "sessions": {}}) as registry:
+            with locked_json(pane_locks_file(), {"version": 1, "panes": {}}) as locks:
+                with locked_json(live_sessions_file(), {"version": 1, "panes": {}, "sessions": {}}) as live:
+                    participants = state.setdefault("participants", {})
+                    participant = participants.get(alias)
+                    if not isinstance(participant, dict):
+                        return {"ok": False, "error": "alias_missing"}
+                    participant["agent_type"] = agent_type
+                    participant["pane"] = pane
+                    participant["target"] = target
+                    participant["hook_session_id"] = new_session_id
+                    participant["status"] = "active"
+                    participant["last_seen_at"] = now
+                    if cwd:
+                        participant["cwd"] = cwd
+                    if model:
+                        participant["model"] = model
+                    for key in (
+                        "detached_at",
+                        "detach_reason",
+                        "endpoint_status",
+                        "endpoint_lost_at",
+                        "endpoint_lost_reason",
+                        "last_pane",
+                    ):
+                        participant.pop(key, None)
+                    state.setdefault("panes", {})[alias] = pane
+                    state.setdefault("targets", {})[alias] = target
+                    state.setdefault("hook_session_ids", {})[alias] = new_session_id
+
+                    sessions = registry.setdefault("sessions", {})
+                    sessions.pop(identity_key(agent_type, old_session_id), None)
+                    sessions[identity_key(agent_type, new_session_id)] = mapping
+
+                    panes = locks.setdefault("panes", {})
+                    for lock_pane, record in list(panes.items()):
+                        if not isinstance(record, dict):
+                            continue
+                        if (
+                            record.get("bridge_session") == bridge_session
+                            and (
+                                record.get("alias") == alias
+                                or record.get("hook_session_id") in {old_session_id, new_session_id}
+                            )
+                            and lock_pane != pane
+                        ):
+                            del panes[lock_pane]
+                    panes[pane] = {
+                        "bridge_session": bridge_session,
+                        "agent": agent_type,
+                        "alias": alias,
+                        "target": target,
+                        "hook_session_id": new_session_id,
+                        "locked_at": now,
+                        "last_seen_at": now,
+                    }
+
+                    live_panes = live.setdefault("panes", {})
+                    live_sessions = live.setdefault("sessions", {})
+                    old_key = identity_key(agent_type, old_session_id)
+                    new_key = identity_key(agent_type, new_session_id)
+                    if not verified_process_identity(live_record):
+                        for candidate in (live_panes.get(pane), live_sessions.get(new_key)):
+                            if not isinstance(candidate, dict):
+                                continue
+                            if not live_record_matches(candidate, agent_type, new_session_id):
+                                continue
+                            preserved_identity = verified_process_identity(candidate)
+                            if preserved_identity:
+                                live_record["process_identity"] = preserved_identity
+                                break
+                    if old_key in live_sessions and str((live_sessions.get(old_key) or {}).get("pane") or "") == pane:
+                        del live_sessions[old_key]
+                    existing = live_panes.get(pane)
+                    if isinstance(existing, dict):
+                        existing_key = identity_key(str(existing.get("agent") or ""), str(existing.get("session_id") or ""))
+                        if existing_key and existing_key in live_sessions and str((live_sessions.get(existing_key) or {}).get("pane") or "") == pane:
+                            del live_sessions[existing_key]
+                    live_panes[pane] = live_record
+                    live_sessions[new_key] = live_record
+    return {"ok": True, "mapping": mapping, "live_record": live_record}
 
 
 def read_attached_mapping(agent_type: str, session_id: str) -> dict | None:
@@ -214,12 +361,16 @@ def read_live_by_identity(agent_type: str, session_id: str) -> dict:
 def tmux_target_for_pane(pane: str) -> str:
     if not pane:
         return ""
-    proc = subprocess.run(
-        ["tmux", "display-message", "-p", "-t", pane, "#{session_name}:#{window_index}.#{pane_index}"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{session_name}:#{window_index}.#{pane_index}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=IDENTITY_TMUX_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return pane
     if proc.returncode == 0 and proc.stdout.strip():
         return proc.stdout.strip()
     return pane
@@ -228,12 +379,16 @@ def tmux_target_for_pane(pane: str) -> str:
 def tmux_pane_for_target(target: str) -> str:
     if not target:
         return ""
-    proc = subprocess.run(
-        ["tmux", "display-message", "-p", "-t", target, "#{pane_id}"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", target, "#{pane_id}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=IDENTITY_TMUX_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
     pane = proc.stdout.strip() if proc.returncode == 0 else ""
     return pane if pane.startswith("%") else ""
 
@@ -1088,6 +1243,7 @@ def update_live_session(
         return None
     now = utc_now()
     target = target or tmux_target_for_pane(pane)
+    controlled_clear_marker = find_for_clear_window(pane=pane, agent=agent_type, session_id=session_id)
     if event == "session_ended":
         with locked_json(live_sessions_file(), {"version": 1, "panes": {}, "sessions": {}}) as data:
             panes = data.setdefault("panes", {})
@@ -1153,7 +1309,12 @@ def update_live_session(
         process_identity = prior_identity
 
     canonicalized = {}
-    if (not bridge_session or not alias) and prior_live and not live_record_matches(prior_live, agent_type, session_id):
+    if (
+        not controlled_clear_marker
+        and (not bridge_session or not alias)
+        and prior_live
+        and not live_record_matches(prior_live, agent_type, session_id)
+    ):
         canonicalized = canonicalize_unscoped_hook_record(
             agent_type=agent_type,
             payload_session_id=session_id,
@@ -1282,6 +1443,9 @@ def update_live_session(
         return None
 
     lock = read_pane_lock(pane)
+    if controlled_clear_marker:
+        return None
+
     if lock and (
         str(lock.get("hook_session_id") or "") != session_id
         or str(lock.get("agent") or "") != agent_type

@@ -572,8 +572,10 @@ def _build_restart_warnings(counts: dict[str, int]) -> list[str]:
         )
     if inflight_count:
         out.append(
-            f"{inflight_count} inflight message(s) at restart; the new daemon will requeue "
-            "them after submit_timeout."
+            f"{inflight_count} inflight message(s) at restart; the new daemon will preserve "
+            "them as delivery blockers and wait for the matching prompt_submitted hook. "
+            "If a peer is stuck, recover explicitly with agent_interrupt_peer <alias> "
+            "or agent_cancel_message <msg_id> when the row is still cancellable."
         )
     out.append(
         "in-memory state (held_interrupt, watchdogs, alarms, current_prompt) is reset; "

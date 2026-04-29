@@ -31,6 +31,7 @@ SHORT_ID_LEN = 12
 PRIOR_MESSAGE_HINT_PREFIX = "PRIOR_MESSAGE_HINT: "
 PRIOR_HINT_CANCEL = "cancel"
 PRIOR_HINT_INTERRUPT = "interrupt"
+RESTART_PRESERVED_INFLIGHT_KEY = "restart_preserved_inflight"
 
 
 class TmuxCaptureError(RuntimeError):
@@ -83,6 +84,8 @@ def classify_prior_for_hint(
     if status == "inflight":
         if item.get("pane_mode_enter_deferred_since_ts"):
             return PRIOR_HINT_CANCEL
+        if item.get(RESTART_PRESERVED_INFLIGHT_KEY):
+            return PRIOR_HINT_INTERRUPT
         message_id = str(item.get("id") or "")
         if message_id and last_enter_ts is not None and message_id in last_enter_ts:
             return PRIOR_HINT_INTERRUPT

@@ -6,6 +6,7 @@ import re
 import sys
 from pathlib import Path
 
+from bridge_clear_marker import find_for_clear_window, find_for_prompt, find_for_stop, mark_prompt_seen
 from bridge_paths import state_root
 from bridge_identity import update_live_session
 from bridge_util import append_jsonl, locked_json_read, public_record as redact_public_record, utc_now
@@ -138,6 +139,43 @@ def attached_mapping(agent: str, session_id: object) -> dict | None:
     return mapping if isinstance(mapping, dict) else None
 
 
+def marker_mapping(marker: dict) -> dict:
+    return {
+        "bridge_session": str(marker.get("bridge_session") or ""),
+        "alias": str(marker.get("alias") or ""),
+        "agent": str(marker.get("agent") or ""),
+        "session_id": str(marker.get("new_session_id") or marker.get("old_session_id") or ""),
+        "pane": str(marker.get("pane") or ""),
+        "target": str(marker.get("target") or ""),
+        "events_file": str(marker.get("events_file") or ""),
+        "public_events_file": str(marker.get("public_events_file") or ""),
+        "_controlled_clear_marker": dict(marker),
+    }
+
+
+def controlled_clear_mapping(agent: str, record: dict) -> dict | None:
+    pane = str(record.get("pane") or "")
+    session_id = str(record.get("session_id") or "")
+    turn_id = str(record.get("turn_id") or "")
+    attach_probe = str(record.get("attach_probe") or "")
+    marker = None
+    if attach_probe:
+        marker = find_for_prompt(pane=pane, agent=agent, attach_probe=attach_probe)
+        if marker and record.get("event") == "prompt_submitted":
+            updated = mark_prompt_seen(
+                marker,
+                new_session_id=session_id,
+                probe_turn_id=turn_id,
+            )
+            if updated:
+                marker = updated
+    elif record.get("event") == "response_finished":
+        marker = find_for_stop(pane=pane, agent=agent, session_id=session_id, turn_id=turn_id)
+    else:
+        marker = find_for_clear_window(pane=pane, agent=agent, session_id=session_id)
+    return marker_mapping(marker) if marker else None
+
+
 def attach_discovery_path() -> Path:
     return Path(os.environ.get("AGENT_BRIDGE_ATTACH_DISCOVERY", str(ATTACH_DISCOVERY)))
 
@@ -167,6 +205,16 @@ def main() -> int:
 
     bridge_session = os.environ.get("AGENT_BRIDGE_SESSION")
     mapping = None
+    controlled_mapping = controlled_clear_mapping(args.agent, record)
+    if controlled_mapping:
+        mapping = controlled_mapping
+        bridge_session = bridge_session or str(controlled_mapping.get("bridge_session") or "")
+        if bridge_session:
+            record["bridge_session"] = bridge_session
+        if controlled_mapping.get("alias"):
+            record["bridge_agent"] = controlled_mapping.get("alias") or args.agent
+        if controlled_mapping.get("pane"):
+            record["pane"] = controlled_mapping.get("pane") or record.get("pane")
     if not bridge_session:
         mapping = attached_mapping(args.agent, payload.get("session_id"))
         if mapping:
