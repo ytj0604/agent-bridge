@@ -3,12 +3,14 @@ import argparse
 from collections import OrderedDict
 from contextlib import contextmanager
 import hashlib
+import errno
 import json
 import math
 import os
 import re
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -57,6 +59,8 @@ from bridge_response_guard import (
 from bridge_util import (
     MAX_PEER_BODY_CHARS,
     RESTART_PRESERVED_INFLIGHT_KEY,
+    SHORT_ID_LEN,
+    SHARED_PAYLOAD_ROOT,
     append_jsonl,
     classify_prior_for_hint,
     locked_json,
@@ -131,6 +135,10 @@ ALARM_WAKE_TOMBSTONE_TTL_SECONDS = 60 * 60
 ALARM_WAKE_TOMBSTONE_LIMIT = 4096
 WAIT_STATUS_SECTION_LIMIT = 50
 AGGREGATE_STATUS_LEG_LIMIT = 100
+PEER_RESULT_REDIRECT_PREVIEW_CHARS = 100
+PEER_RESULT_REDIRECT_WRAPPER_MAX_CHARS = 600
+PEER_RESULT_REDIRECT_DIRNAME = "replies"
+PEER_RESULT_FILE_ID_RE = re.compile(rf"^msg-[a-f0-9]{{{SHORT_ID_LEN}}}$")
 RESPONSE_LIKE_TOMBSTONE_REASONS = {
     # Tombstone reasons emitted today include terminal_response,
     # reply_received, interrupted_tombstone_terminal, aggregate_complete,
@@ -203,6 +211,13 @@ class CommandLockWaitExceeded(RuntimeError):
     def __init__(self, command_class: str = "") -> None:
         self.command_class = command_class
         super().__init__(command_class or "lock_wait_exceeded")
+
+
+class PeerResultRedirectError(RuntimeError):
+    def __init__(self, reason: str, detail: str = "") -> None:
+        self.reason = reason
+        self.detail = detail
+        super().__init__(detail or reason)
 
 
 def one_line(text: str) -> str:
@@ -2878,6 +2893,210 @@ class BridgeDaemon:
                 item["updated_ts"] = utc_now()
 
         self.queue.update(mutator)
+
+    def _peer_result_redirect_os_reason(self, exc: OSError) -> str:
+        if exc.errno in {errno.EACCES, errno.EPERM}:
+            return "permission_denied"
+        if exc.errno == errno.ENOSPC:
+            return "no_space"
+        if exc.errno == errno.EEXIST:
+            return "collision"
+        if exc.errno == errno.ELOOP:
+            return "symlink_unsafe"
+        if exc.errno in {errno.ENOTDIR, errno.EISDIR}:
+            return "unsafe_path"
+        return "write_failed"
+
+    def _peer_result_redirect_dir(self) -> tuple[Path, int]:
+        root = Path(SHARED_PAYLOAD_ROOT)
+        redirect_dir = root / PEER_RESULT_REDIRECT_DIRNAME
+        uid = os.getuid()
+        try:
+            os.mkdir(root, 0o1777)
+            os.chmod(root, 0o1777)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise PeerResultRedirectError(self._peer_result_redirect_os_reason(exc), f"mkdir {root}: {exc}") from exc
+
+        try:
+            root_stat = os.lstat(root)
+        except OSError as exc:
+            raise PeerResultRedirectError(self._peer_result_redirect_os_reason(exc), f"stat {root}: {exc}") from exc
+        root_mode = stat.S_IMODE(root_stat.st_mode)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise PeerResultRedirectError("unsafe_path", f"{root} is not a directory")
+        if root_stat.st_uid not in {uid, 0}:
+            raise PeerResultRedirectError("permission_denied", f"{root} owner uid is {root_stat.st_uid}")
+        if root_mode & 0o022 and not root_mode & stat.S_ISVTX:
+            raise PeerResultRedirectError("permission_denied", f"{root} is writable by other users without sticky bit")
+
+        try:
+            os.mkdir(redirect_dir, 0o700)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise PeerResultRedirectError(self._peer_result_redirect_os_reason(exc), f"mkdir {redirect_dir}: {exc}") from exc
+
+        try:
+            dir_stat = os.lstat(redirect_dir)
+        except OSError as exc:
+            raise PeerResultRedirectError(self._peer_result_redirect_os_reason(exc), f"stat {redirect_dir}: {exc}") from exc
+        if not stat.S_ISDIR(dir_stat.st_mode):
+            raise PeerResultRedirectError("symlink_unsafe" if stat.S_ISLNK(dir_stat.st_mode) else "unsafe_path", f"{redirect_dir} is not a safe directory")
+        if dir_stat.st_uid != uid:
+            raise PeerResultRedirectError("permission_denied", f"{redirect_dir} owner uid is {dir_stat.st_uid}")
+        if stat.S_IMODE(dir_stat.st_mode) & 0o077:
+            try:
+                os.chmod(redirect_dir, 0o700)
+                dir_stat = os.lstat(redirect_dir)
+            except OSError as exc:
+                raise PeerResultRedirectError(self._peer_result_redirect_os_reason(exc), f"chmod {redirect_dir}: {exc}") from exc
+            if stat.S_IMODE(dir_stat.st_mode) & 0o077:
+                raise PeerResultRedirectError("permission_denied", f"{redirect_dir} is not private")
+
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            dir_fd = os.open(redirect_dir, flags)
+        except OSError as exc:
+            raise PeerResultRedirectError(self._peer_result_redirect_os_reason(exc), f"open {redirect_dir}: {exc}") from exc
+        fd_stat = os.fstat(dir_fd)
+        if not stat.S_ISDIR(fd_stat.st_mode) or fd_stat.st_uid != uid or stat.S_IMODE(fd_stat.st_mode) & 0o077:
+            os.close(dir_fd)
+            raise PeerResultRedirectError("permission_denied", f"{redirect_dir} failed private directory verification")
+        return redirect_dir, dir_fd
+
+    def _peer_result_redirect_filename(self, message_id: str) -> tuple[str, bool]:
+        if PEER_RESULT_FILE_ID_RE.fullmatch(message_id):
+            return f"reply-{message_id}.txt", False
+        return f"{short_id('reply')}.txt", True
+
+    def _build_peer_result_redirect_wrapper(self, *, total_chars: int, path: Path, normalized_body: str) -> tuple[str, int]:
+        preview_chars = min(PEER_RESULT_REDIRECT_PREVIEW_CHARS, len(normalized_body))
+        while True:
+            preview = json.dumps(normalized_body[:preview_chars], ensure_ascii=True)
+            wrapper = (
+                f"[bridge:body_redirected] Full reply ({total_chars} chars) saved to file. "
+                "Read this file; the preview is intentionally truncated.\n"
+                f"File: {path}\n"
+                f"Preview: {preview}"
+            )
+            if len(wrapper) <= PEER_RESULT_REDIRECT_WRAPPER_MAX_CHARS:
+                return wrapper, preview_chars
+            if preview_chars <= 0:
+                raise PeerResultRedirectError("wrapper_too_large", f"wrapper would exceed {PEER_RESULT_REDIRECT_WRAPPER_MAX_CHARS} chars")
+            preview_chars = max(0, preview_chars - 10)
+
+    def _write_peer_result_redirect_file(self, *, dir_fd: int, filename: str, normalized_body: str) -> None:
+        tmp_name = f".{filename}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = -1
+        try:
+            fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
+            data = normalized_body.encode("utf-8")
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            os.link(tmp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+            os.fsync(dir_fd)
+        except FileExistsError as exc:
+            raise PeerResultRedirectError("collision", f"{filename} already exists") from exc
+        except OSError as exc:
+            raise PeerResultRedirectError(self._peer_result_redirect_os_reason(exc), f"write {filename}: {exc}") from exc
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+                try:
+                    os.fsync(dir_fd)
+                except OSError:
+                    pass
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+    def _build_peer_result_redirect_failure_body(self, normalized_body: str, reason: str) -> str:
+        return (
+            f"[bridge:body_redirect_failed] Oversized reply ({len(normalized_body)} chars) could not be saved to file; "
+            f"reason={reason}. Delivering truncated inline fallback.\n"
+            f"{normalized_body}"
+        )
+
+    def redirect_oversized_result_body(self, message: dict) -> None:
+        if normalize_kind(message.get("kind"), "") != "result":
+            return
+        normalized_body = normalize_prompt_body_text(str(message.get("body") or ""))
+        if len(normalized_body) <= MAX_PEER_BODY_CHARS:
+            return
+
+        message_id = str(message.get("id") or "")
+        filename, sanitized = self._peer_result_redirect_filename(message_id)
+        dir_fd: int | None = None
+        redirect_path: Path | None = None
+        try:
+            redirect_dir, dir_fd = self._peer_result_redirect_dir()
+            redirect_path = redirect_dir / filename
+            wrapper, preview_chars = self._build_peer_result_redirect_wrapper(
+                total_chars=len(normalized_body),
+                path=redirect_path,
+                normalized_body=normalized_body,
+            )
+            self._write_peer_result_redirect_file(
+                dir_fd=dir_fd,
+                filename=filename,
+                normalized_body=normalized_body,
+            )
+            message["body"] = wrapper
+            if sanitized:
+                self.log(
+                    "body_redirect_message_id_sanitized",
+                    message_id=message_id,
+                    redirect_file=str(redirect_path),
+                )
+            self.log(
+                "body_redirected",
+                message_id=message_id,
+                from_agent=message.get("from"),
+                to=message.get("to"),
+                kind=message.get("kind"),
+                intent=message.get("intent"),
+                source=message.get("source"),
+                normalized_chars=len(normalized_body),
+                limit_chars=MAX_PEER_BODY_CHARS,
+                redirect_file=str(redirect_path),
+                preview_chars=preview_chars,
+            )
+        except PeerResultRedirectError as exc:
+            message["body"] = self._build_peer_result_redirect_failure_body(normalized_body, exc.reason)
+            self.safe_log(
+                "body_redirect_failed",
+                message_id=message_id,
+                from_agent=message.get("from"),
+                to=message.get("to"),
+                kind=message.get("kind"),
+                intent=message.get("intent"),
+                source=message.get("source"),
+                normalized_chars=len(normalized_body),
+                limit_chars=MAX_PEER_BODY_CHARS,
+                reason=exc.reason,
+                detail=exc.detail,
+                redirect_file=str(redirect_path or ""),
+            )
+        finally:
+            if dir_fd is not None:
+                try:
+                    os.close(dir_fd)
+                except OSError:
+                    pass
 
     def queue_message(self, message: dict, log_event: bool = True, deliver: bool = True) -> None:
         def mutator(queue: list[dict]) -> None:
@@ -5998,6 +6217,7 @@ class BridgeDaemon:
         )
         message["aggregate_id"] = aggregate_id
         message["aggregate_expected"] = completed.get("expected") or expected
+        self.redirect_oversized_result_body(message)
         with self.state_lock:
             self._record_aggregate_completion_tombstones(completed)
             self.cancel_watchdogs_for_aggregate(aggregate_id, reason="aggregate_complete")
@@ -6087,6 +6307,7 @@ class BridgeDaemon:
             reply_to=context.get("id"),
             source="auto_return",
         )
+        self.redirect_oversized_result_body(message)
         self.queue_message(message)
         self.log(
             "response_return_queued",

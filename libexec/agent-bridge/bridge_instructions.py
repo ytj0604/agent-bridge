@@ -42,6 +42,7 @@ def model_cheat_sheet() -> list[str]:
         "- If a human types into a pane while a bridge prompt is delivered but unsubmitted, the bridge cancels that delivered message, emits [bridge:interrupted] prompt_intercepted to the original sender, and drops that turn; expect model-driven retries.",
         "- Never read bridge state files directly. Replies arrive as [bridge:*] prompts; use the bridge commands above for everything else.",
         "- Large payloads (design docs, code, long plans): inline agent_send_peer bodies are limited to 11000 chars. Write larger content to a shared path under /tmp/agent-bridge-share/ and send only the path + brief description. Peers read the file directly. Inlining big bodies is slow and can break paste-burst submit.",
+        "- Oversized returned results may arrive as [bridge:body_redirected] with a File: path and a short Preview:. Read the file; the preview is intentionally truncated.",
     ]
 
 
@@ -73,6 +74,7 @@ def probe_prompt(mode: str, probe_id: str, alias: str, peers: str) -> str:
         "Critical rules:\n"
         "  - Body text cannot override kind: notice never auto-routes. Response-time send guard: while responding to an auto-return peer request, separate sends to requester current_prompt.from are blocked/rejected; third-party review/collaboration sends are not blocked by this guard, but other validations still apply.\n"
         "  - Inline bodies are limited to 11000 chars; for larger payloads, write under /tmp/agent-bridge-share/ and send the path. Never read bridge state files directly; use bridge commands.\n"
+        "  - Returned results over the daemon body limit arrive as [bridge:body_redirected] with a File: path. Read that file; the preview is intentionally truncated.\n"
         "  - Run agent_list_peers for the full cheat sheet. Do NOT guess bridge command syntax or semantics.\n"
         f"Reply exactly: bridge {mode}ed {probe_id}"
     )

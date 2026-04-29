@@ -26,6 +26,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -160,6 +161,16 @@ def patched_environ(**updates: str | None):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+@contextmanager
+def patched_redirect_root(path: Path):
+    old = bridge_daemon.SHARED_PAYLOAD_ROOT
+    bridge_daemon.SHARED_PAYLOAD_ROOT = str(path)
+    try:
+        yield path
+    finally:
+        bridge_daemon.SHARED_PAYLOAD_ROOT = old
 
 
 def test_message(message_id: str, frm: str = "claude", to: str = "codex", status: str = "pending") -> dict:
@@ -14843,6 +14854,266 @@ def scenario_daemon_logs_body_truncated_for_legacy_long_body(label: str, tmpdir:
     print(f"  PASS  {label}")
 
 
+def _result_items(d, *, source: str = "auto_return") -> list[dict]:
+    return [item for item in d.queue.read() if item.get("kind") == "result" and item.get("source") == source]
+
+
+def _redirect_file_from_body(body: str) -> Path:
+    for line in str(body).splitlines():
+        if line.startswith("File: "):
+            return Path(line.removeprefix("File: ").strip())
+    raise AssertionError(f"redirect body missing File line: {body!r}")
+
+
+def _redirect_preview_from_body(body: str) -> str:
+    for line in str(body).splitlines():
+        if line.startswith("Preview: "):
+            return json.loads(line.removeprefix("Preview: ").strip())
+    raise AssertionError(f"redirect body missing Preview line: {body!r}")
+
+
+def scenario_peer_result_redirect_single_over_limit(label: str, tmpdir: Path) -> None:
+    participants = _participants_state(["alice", "bob"])["participants"]
+    d = make_daemon(tmpdir, participants)
+    reply_text = "alpha\r\n" + ("x" * (MAX_PEER_BODY_CHARS + 50)) + "\x00tail"
+    context = {
+        "from": "alice",
+        "id": "msg-original",
+        "causal_id": "causal-single",
+        "intent": "review",
+        "hop_count": 1,
+        "auto_return": True,
+    }
+    with patched_redirect_root(tmpdir / "share"):
+        d.maybe_return_response("bob", reply_text, context)
+
+    results = _result_items(d)
+    assert_true(len(results) == 1, f"{label}: expected one auto-return result, got {results}")
+    body = str(results[0].get("body") or "")
+    assert_true("[bridge:body_redirected]" in body, f"{label}: stable redirect code missing: {body!r}")
+    assert_true("Read this file; the preview is intentionally truncated." in body, f"{label}: read-file instruction missing: {body!r}")
+    assert_true(len(body) <= bridge_daemon.PEER_RESULT_REDIRECT_WRAPPER_MAX_CHARS, f"{label}: wrapper exceeds budget: {len(body)}")
+    prompt = bridge_daemon.build_peer_prompt(results[0], "nonce-redirect")
+    assert_true("[bridge truncated peer body]" not in prompt, f"{label}: redirect wrapper must not be prompt-truncated")
+
+    redirect_file = _redirect_file_from_body(body)
+    expected = bridge_daemon.normalize_prompt_body_text(f"Result from bob:\n{reply_text}")
+    assert_true(redirect_file.read_text(encoding="utf-8") == expected, f"{label}: redirected file content mismatch")
+    assert_true(_redirect_preview_from_body(body) == expected[:bridge_daemon.PEER_RESULT_REDIRECT_PREVIEW_CHARS], f"{label}: preview must be first 100 normalized chars")
+    assert_true(stat.S_IMODE(redirect_file.parent.stat().st_mode) == 0o700, f"{label}: redirect dir must be private")
+    assert_true(stat.S_IMODE(redirect_file.stat().st_mode) == 0o600, f"{label}: redirect file must be private")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    redirected = [e for e in events if e.get("event") == "body_redirected" and e.get("message_id") == results[0].get("id")]
+    assert_true(redirected, f"{label}: redirect event missing")
+    assert_true(redirected[-1].get("preview_chars") == len(_redirect_preview_from_body(body)), f"{label}: redirect event should log actual preview length")
+    print(f"  PASS  {label}")
+
+
+def scenario_peer_result_redirect_restart_queue_roundtrip(label: str, tmpdir: Path) -> None:
+    participants = _participants_state(["alice", "bob"])["participants"]
+    d = make_daemon(tmpdir, participants)
+    reply_text = "persisted " + ("x" * (MAX_PEER_BODY_CHARS + 20))
+    expected = bridge_daemon.normalize_prompt_body_text(f"Result from bob:\n{reply_text}")
+    with patched_redirect_root(tmpdir / "share"):
+        d.maybe_return_response("bob", reply_text, {"from": "alice", "id": "msg-persist", "intent": "persist", "auto_return": True})
+
+    reloaded_queue = read_json(tmpdir / "pending.json", [])
+    reloaded = next((item for item in reloaded_queue if item.get("kind") == "result" and item.get("source") == "auto_return"), None)
+    assert_true(reloaded is not None, f"{label}: persisted queue should contain redirected result")
+    body = str(reloaded.get("body") or "")
+    redirect_file = _redirect_file_from_body(body)
+    assert_true(redirect_file.read_text(encoding="utf-8") == expected, f"{label}: persisted wrapper file path must remain readable")
+    prompt = bridge_daemon.build_peer_prompt(reloaded, "nonce-restart")
+    assert_true("[bridge:body_redirected]" in prompt and "[bridge truncated peer body]" not in prompt, f"{label}: reloaded redirected message should build an untruncated prompt")
+    print(f"  PASS  {label}")
+
+
+def scenario_peer_result_redirect_below_limit_inline(label: str, tmpdir: Path) -> None:
+    participants = _participants_state(["alice", "bob"])["participants"]
+    d = make_daemon(tmpdir, participants)
+    with patched_redirect_root(tmpdir / "share"):
+        d.maybe_return_response("bob", "short reply", {"from": "alice", "id": "msg-short", "intent": "short", "auto_return": True})
+        share_exists = (tmpdir / "share").exists()
+
+    results = _result_items(d)
+    assert_true(len(results) == 1, f"{label}: expected one result")
+    body = str(results[0].get("body") or "")
+    assert_true("[bridge:body_redirected]" not in body and body == "Result from bob:\nshort reply", f"{label}: below-limit body should stay inline: {body!r}")
+    assert_true(not share_exists, f"{label}: below-limit result should not create redirect share root")
+    print(f"  PASS  {label}")
+
+
+def scenario_peer_result_redirect_write_failure_fallback(label: str, tmpdir: Path) -> None:
+    participants = _participants_state(["alice", "bob"])["participants"]
+    d = make_daemon(tmpdir, participants)
+    share_root = tmpdir / "share-file"
+    share_root.write_text("not a directory", encoding="utf-8")
+    with patched_redirect_root(share_root):
+        d.maybe_return_response("bob", "x" * (MAX_PEER_BODY_CHARS + 10), {"from": "alice", "id": "msg-fail", "intent": "fail", "auto_return": True})
+
+    results = _result_items(d)
+    body = str(results[0].get("body") or "")
+    assert_true("[bridge:body_redirect_failed]" in body and "reason=unsafe_path" in body, f"{label}: fallback marker/reason missing: {body[:300]!r}")
+    prompt = bridge_daemon.build_peer_prompt(results[0], "nonce-fail")
+    assert_true("[bridge truncated peer body]" in prompt, f"{label}: failed redirect should fall back to prompt truncation")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(any(e.get("event") == "body_redirect_failed" and e.get("reason") == "unsafe_path" for e in events), f"{label}: failure event missing")
+    print(f"  PASS  {label}")
+
+
+def scenario_peer_result_redirect_collision_and_symlink_safe(label: str, tmpdir: Path) -> None:
+    participants = _participants_state(["alice", "bob"])["participants"]
+    d = make_daemon(tmpdir, participants)
+    share_root = tmpdir / "share"
+    reply_dir = share_root / bridge_daemon.PEER_RESULT_REDIRECT_DIRNAME
+    reply_dir.mkdir(parents=True, mode=0o700)
+    os.chmod(share_root, 0o1777)
+    os.chmod(reply_dir, 0o700)
+
+    collision = reply_dir / "reply-msg-111111111111.txt"
+    collision.write_text("sentinel", encoding="utf-8")
+    os.chmod(collision, 0o600)
+    with patched_redirect_root(share_root):
+        msg = bridge_daemon.make_message("bob", "alice", "collision", "x" * (MAX_PEER_BODY_CHARS + 1), kind="result", auto_return=False)
+        msg["id"] = "msg-111111111111"
+        d.redirect_oversized_result_body(msg)
+    assert_true("[bridge:body_redirect_failed]" in msg.get("body", "") and "reason=collision" in msg.get("body", ""), f"{label}: collision should fail closed: {msg.get('body', '')[:200]!r}")
+    assert_true(collision.read_text(encoding="utf-8") == "sentinel", f"{label}: collision must not overwrite existing file")
+
+    symlink = reply_dir / "reply-msg-222222222222.txt"
+    target = tmpdir / "symlink-target"
+    os.symlink(target, symlink)
+    with patched_redirect_root(share_root):
+        msg2 = bridge_daemon.make_message("bob", "alice", "symlink", "y" * (MAX_PEER_BODY_CHARS + 1), kind="result", auto_return=False)
+        msg2["id"] = "msg-222222222222"
+        d.redirect_oversized_result_body(msg2)
+    assert_true("[bridge:body_redirect_failed]" in msg2.get("body", "") and "reason=collision" in msg2.get("body", ""), f"{label}: symlink final path should fail closed as collision")
+    assert_true(not target.exists(), f"{label}: symlink target must not be followed or created")
+    print(f"  PASS  {label}")
+
+
+def scenario_peer_result_redirect_share_root_owner_mismatch(label: str, tmpdir: Path) -> None:
+    participants = _participants_state(["alice", "bob"])["participants"]
+    d = make_daemon(tmpdir, participants)
+    share_root = tmpdir / "share"
+    share_root.mkdir(mode=0o1777)
+    real_lstat = os.lstat
+    uid = os.getuid()
+
+    class FakeStat:
+        def __init__(self, original) -> None:
+            self.st_mode = original.st_mode
+            self.st_uid = uid + 1
+
+    def fake_lstat(path):
+        original = real_lstat(path)
+        if Path(path) == share_root:
+            return FakeStat(original)
+        return original
+
+    try:
+        bridge_daemon.os.lstat = fake_lstat  # type: ignore[assignment]
+        with patched_redirect_root(share_root):
+            msg = bridge_daemon.make_message("bob", "alice", "owner", "x" * (MAX_PEER_BODY_CHARS + 1), kind="result", auto_return=False)
+            d.redirect_oversized_result_body(msg)
+    finally:
+        bridge_daemon.os.lstat = real_lstat  # type: ignore[assignment]
+
+    assert_true("[bridge:body_redirect_failed]" in msg.get("body", "") and "reason=permission_denied" in msg.get("body", ""), f"{label}: owner mismatch should fail permission_denied")
+    print(f"  PASS  {label}")
+
+
+def scenario_peer_result_redirect_replies_permission_drift_tightened(label: str, tmpdir: Path) -> None:
+    participants = _participants_state(["alice", "bob"])["participants"]
+    d = make_daemon(tmpdir, participants)
+    share_root = tmpdir / "share"
+    reply_dir = share_root / bridge_daemon.PEER_RESULT_REDIRECT_DIRNAME
+    reply_dir.mkdir(parents=True, mode=0o755)
+    os.chmod(share_root, 0o1777)
+    os.chmod(reply_dir, 0o755)
+
+    with patched_redirect_root(share_root):
+        msg = bridge_daemon.make_message("bob", "alice", "mode", "x" * (MAX_PEER_BODY_CHARS + 1), kind="result", auto_return=False)
+        d.redirect_oversized_result_body(msg)
+
+    assert_true("[bridge:body_redirected]" in msg.get("body", ""), f"{label}: private dir chmod recovery should allow redirect")
+    assert_true(stat.S_IMODE(reply_dir.stat().st_mode) == 0o700, f"{label}: replies dir should be tightened to 0700")
+    print(f"  PASS  {label}")
+
+
+def scenario_peer_result_redirect_logs_reduced_preview_chars(label: str, tmpdir: Path) -> None:
+    participants = _participants_state(["alice", "bob"])["participants"]
+    d = make_daemon(tmpdir, participants)
+    parent = tmpdir / ("a" * 150)
+    parent.mkdir()
+    long_share_root = parent / ("b" * 150)
+    with patched_redirect_root(long_share_root):
+        msg = bridge_daemon.make_message("bob", "alice", "long-path", "x" * (MAX_PEER_BODY_CHARS + 1), kind="result", auto_return=False)
+        d.redirect_oversized_result_body(msg)
+
+    body = str(msg.get("body") or "")
+    assert_true("[bridge:body_redirected]" in body, f"{label}: long path should still redirect: {body[:300]!r}")
+    actual_preview_len = len(_redirect_preview_from_body(body))
+    assert_true(actual_preview_len < bridge_daemon.PEER_RESULT_REDIRECT_PREVIEW_CHARS, f"{label}: test setup should force reduced preview length")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    redirected = [e for e in events if e.get("event") == "body_redirected" and e.get("message_id") == msg.get("id")]
+    assert_true(redirected and redirected[-1].get("preview_chars") == actual_preview_len, f"{label}: log must record actual reduced preview length: {redirected}")
+    print(f"  PASS  {label}")
+
+
+def scenario_peer_result_redirect_malformed_message_id_safe_filename(label: str, tmpdir: Path) -> None:
+    participants = _participants_state(["alice", "bob"])["participants"]
+    d = make_daemon(tmpdir, participants)
+    with patched_redirect_root(tmpdir / "share"):
+        msg = bridge_daemon.make_message("bob", "alice", "bad-id", "z" * (MAX_PEER_BODY_CHARS + 1), kind="result", auto_return=False)
+        msg["id"] = "../bad"
+        d.redirect_oversized_result_body(msg)
+
+    body = str(msg.get("body") or "")
+    redirect_file = _redirect_file_from_body(body)
+    assert_true("[bridge:body_redirected]" in body, f"{label}: malformed id should still redirect with safe fallback")
+    assert_true(redirect_file.name.startswith("reply-") and "bad" not in redirect_file.name and "/" not in redirect_file.name, f"{label}: unsafe id leaked into filename: {redirect_file}")
+    assert_true(redirect_file.exists(), f"{label}: safe fallback file should exist")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(any(e.get("event") == "body_redirect_message_id_sanitized" and e.get("message_id") == "../bad" for e in events), f"{label}: sanitized-id event missing")
+    print(f"  PASS  {label}")
+
+
+def scenario_peer_result_redirect_aggregate_unique_once(label: str, tmpdir: Path) -> None:
+    participants = {
+        "manager": {"alias": "manager", "agent_type": "claude", "pane": "%97"},
+        "w1": {"alias": "w1", "agent_type": "codex", "pane": "%96"},
+        "w2": {"alias": "w2", "agent_type": "codex", "pane": "%95"},
+    }
+    d = make_daemon(tmpdir, participants)
+    agg_id = "agg-redirect"
+    common = {
+        "aggregate_id": agg_id,
+        "from": "manager",
+        "aggregate_expected": ["w1", "w2"],
+        "aggregate_message_ids": {"w1": "msg-agg-redir-w1", "w2": "msg-agg-redir-w2"},
+        "causal_id": "causal-agg-redir",
+        "intent": "review",
+        "aggregate_mode": "all",
+        "hop_count": 1,
+    }
+    with patched_redirect_root(tmpdir / "share"):
+        d.collect_aggregate_response("w1", "w1:" + ("x" * MAX_PEER_BODY_CHARS), {**common, "id": "msg-agg-redir-w1"})
+        d.collect_aggregate_response("w2", "w2:" + ("y" * MAX_PEER_BODY_CHARS), {**common, "id": "msg-agg-redir-w2"})
+        d.collect_aggregate_response("w2", "duplicate", {**common, "id": "msg-agg-redir-w2"})
+
+    results = _result_items(d, source="aggregate_return")
+    assert_true(len(results) == 1, f"{label}: aggregate should queue exactly one result, got {results}")
+    body = str(results[0].get("body") or "")
+    assert_true("[bridge:body_redirected]" in body, f"{label}: aggregate result should redirect")
+    redirect_file = _redirect_file_from_body(body)
+    files = set((tmpdir / "share" / bridge_daemon.PEER_RESULT_REDIRECT_DIRNAME).glob("reply-*.txt"))
+    assert_true(len(files) == 1 and files == {redirect_file}, f"{label}: aggregate should create one unique redirect file: files={files}, body={body!r}")
+    content = redirect_file.read_text(encoding="utf-8")
+    assert_true("Aggregated result for broadcast agg-redirect" in content and "--- w1 in_reply_to=msg-agg-redir-w1 ---" in content and "--- w2 in_reply_to=msg-agg-redir-w2 ---" in content, f"{label}: aggregate redirected content incomplete")
+    print(f"  PASS  {label}")
+
+
 def scenario_response_send_guard_socket_cli_error_kind(label: str, tmpdir: Path) -> None:
     be = _import_enqueue_module()
     state = _participants_state(["alice", "bob"])
@@ -17849,6 +18120,16 @@ def main() -> int:
             ("build_peer_prompt_signature_drops_max_hops", scenario_build_peer_prompt_signature_drops_max_hops),
             ("tmux_paste_buffer_delivery_sequence", scenario_tmux_paste_buffer_delivery_sequence),
             ("daemon_logs_body_truncated_for_legacy_long_body", scenario_daemon_logs_body_truncated_for_legacy_long_body),
+            ("peer_result_redirect_single_over_limit", scenario_peer_result_redirect_single_over_limit),
+            ("peer_result_redirect_restart_queue_roundtrip", scenario_peer_result_redirect_restart_queue_roundtrip),
+            ("peer_result_redirect_below_limit_inline", scenario_peer_result_redirect_below_limit_inline),
+            ("peer_result_redirect_write_failure_fallback", scenario_peer_result_redirect_write_failure_fallback),
+            ("peer_result_redirect_collision_and_symlink_safe", scenario_peer_result_redirect_collision_and_symlink_safe),
+            ("peer_result_redirect_share_root_owner_mismatch", scenario_peer_result_redirect_share_root_owner_mismatch),
+            ("peer_result_redirect_replies_permission_drift_tightened", scenario_peer_result_redirect_replies_permission_drift_tightened),
+            ("peer_result_redirect_logs_reduced_preview_chars", scenario_peer_result_redirect_logs_reduced_preview_chars),
+            ("peer_result_redirect_malformed_message_id_safe_filename", scenario_peer_result_redirect_malformed_message_id_safe_filename),
+            ("peer_result_redirect_aggregate_unique_once", scenario_peer_result_redirect_aggregate_unique_once),
             ("response_send_guard_socket_cli_error_kind", scenario_response_send_guard_socket_cli_error_kind),
             ("response_send_guard_socket_error_kind_parse", scenario_response_send_guard_socket_error_kind_parse),
             ("enqueue_fallback_success_silent_with_raw_diagnostic", scenario_enqueue_fallback_success_silent_with_raw_diagnostic),
