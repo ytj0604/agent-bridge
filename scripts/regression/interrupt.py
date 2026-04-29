@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stderr, redirect_stdout
-import inspect
 import io
 import json
-import os
 import subprocess
 import sys
-import threading
 import time
 import uuid
 from pathlib import Path
@@ -16,37 +12,20 @@ from pathlib import Path
 from .harness import (
     _active_turn,
     _auto_return_results,
-    _daemon_command_result,
     _make_delivered_context,
     _make_inflight,
-    _participants_state,
     _plant_watchdog,
     _queue_item,
     assert_true,
-    identity_live_record,
-    isolated_identity_env,
     make_daemon,
     patched_environ,
     read_events,
-    read_raw_events,
-    set_identity_target,
     test_message,
-    verified_identity,
-    write_identity_fixture,
-    write_live_identity_records,
 )
 
 import bridge_daemon  # noqa: E402
-import bridge_hook_logger  # noqa: E402
-import bridge_identity  # noqa: E402
 import bridge_interrupt_peer  # noqa: E402
-import bridge_clear_peer  # noqa: E402
-import bridge_clear_guard  # noqa: E402
-import bridge_clear_marker  # noqa: E402
-import bridge_leave  # noqa: E402
-import bridge_pane_probe  # noqa: E402
-import bridge_response_guard  # noqa: E402
-from bridge_util import locked_json, read_json, utc_now, write_json_atomic  # noqa: E402
+from bridge_util import read_json, utc_now  # noqa: E402
 
 
 def scenario_held_interrupt_does_not_block_delivery(label: str, tmpdir: Path) -> None:
