@@ -12949,6 +12949,147 @@ def scenario_alarm_request_retry_exhaustion_is_bounded(label: str, tmpdir: Path)
     print(f"  PASS  {label}")
 
 
+def scenario_alarm_request_retries_lock_wait_with_stable_wake_id(label: str, tmpdir: Path) -> None:
+    ba = _import_alarm_module()
+    run_dir = tmpdir / "run"
+    run_dir.mkdir()
+    socket_path = run_dir / "test-session.sock"
+    received: list[dict] = []
+    ready = threading.Event()
+
+    def read_payload(conn: socket.socket) -> dict:
+        raw = b""
+        while b"\n" not in raw:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            raw += chunk
+        payload = json.loads(raw.decode("utf-8"))
+        received.append(payload)
+        return payload
+
+    def server() -> None:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+            srv.bind(str(socket_path))
+            srv.listen(4)
+            ready.set()
+            conn, _ = srv.accept()
+            with conn:
+                read_payload(conn)
+                conn.sendall((json.dumps({"ok": False, "error": "lock_wait_exceeded", "error_kind": "lock_wait_exceeded"}) + "\n").encode("utf-8"))
+            conn, _ = srv.accept()
+            with conn:
+                second = read_payload(conn)
+                conn.sendall((json.dumps({"ok": True, "wake_id": second["wake_id"]}) + "\n").encode("utf-8"))
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+    assert_true(ready.wait(1.0), f"{label}: socket server did not start")
+    ba.run_root = lambda: run_dir  # type: ignore[assignment]
+    ba.short_id = lambda prefix: "wake-555555555555"  # type: ignore[assignment]
+    ba.ALARM_SOCKET_TIMEOUT_SECONDS = 0.15
+    ba.ALARM_SOCKET_MAX_ATTEMPTS = 3
+    stderr = io.StringIO()
+    with redirect_stderr(stderr):
+        ok, wake_id, error = ba.request_alarm("test-session", "alice", 600.0, "lock retry")
+    thread.join(1.0)
+    assert_true(ok and wake_id == "wake-555555555555" and error == "", f"{label}: lock wait retry should succeed: {(ok, wake_id, error)}")
+    assert_true(not thread.is_alive(), f"{label}: socket server thread should finish")
+    assert_true(len(received) == 2, f"{label}: expected lock wait plus one retry, got {received}")
+    assert_true(received[0].get("wake_id") == received[1].get("wake_id") == "wake-555555555555", f"{label}: retry must reuse wake id: {received}")
+    assert_true("lock_wait_exceeded" in stderr.getvalue() and "retrying (2/3)" in stderr.getvalue(), f"{label}: retry breadcrumb should explain lock wait: {stderr.getvalue()!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_alarm_request_lock_wait_retry_exhaustion_is_bounded(label: str, tmpdir: Path) -> None:
+    ba = _import_alarm_module()
+    run_dir = tmpdir / "run"
+    run_dir.mkdir()
+    socket_path = run_dir / "test-session.sock"
+    received: list[dict] = []
+    ready = threading.Event()
+
+    def server() -> None:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+            srv.bind(str(socket_path))
+            srv.listen(4)
+            ready.set()
+            for _ in range(2):
+                conn, _ = srv.accept()
+                with conn:
+                    raw = b""
+                    while b"\n" not in raw:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        raw += chunk
+                    received.append(json.loads(raw.decode("utf-8")))
+                    conn.sendall((json.dumps({"ok": False, "error": "lock_wait_exceeded", "error_kind": "lock_wait_exceeded"}) + "\n").encode("utf-8"))
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+    assert_true(ready.wait(1.0), f"{label}: socket server did not start")
+    ba.run_root = lambda: run_dir  # type: ignore[assignment]
+    ba.short_id = lambda prefix: "wake-666666666666"  # type: ignore[assignment]
+    ba.ALARM_SOCKET_TIMEOUT_SECONDS = 0.15
+    ba.ALARM_SOCKET_MAX_ATTEMPTS = 2
+    start = time.monotonic()
+    stderr = io.StringIO()
+    with redirect_stderr(stderr):
+        ok, wake_id, error = ba.request_alarm("test-session", "alice", 600.0, "lock exhausted")
+    elapsed = time.monotonic() - start
+    thread.join(1.0)
+    assert_true(not ok and wake_id == "", f"{label}: exhausted lock retry should fail without stdout wake id: {(ok, wake_id, error)}")
+    assert_true(elapsed < 1.0, f"{label}: lock retry exhaustion should be bounded, elapsed={elapsed:.3f}s")
+    assert_true("after 2 attempts" in error and "wake-666666666666" in error and "lock_wait_exceeded" in error, f"{label}: error must include attempts, wake id, lock wait: {error!r}")
+    assert_true(len(received) == 2, f"{label}: server should receive bounded attempts only: {received}")
+    assert_true({item.get("wake_id") for item in received} == {"wake-666666666666"}, f"{label}: all attempts should use stable wake id: {received}")
+    assert_true("retrying (2/2)" in stderr.getvalue(), f"{label}: retry breadcrumb should include final attempt count: {stderr.getvalue()!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_alarm_request_non_retryable_daemon_error_is_immediate(label: str, tmpdir: Path) -> None:
+    ba = _import_alarm_module()
+    run_dir = tmpdir / "run"
+    run_dir.mkdir()
+    socket_path = run_dir / "test-session.sock"
+    received: list[dict] = []
+    ready = threading.Event()
+
+    def server() -> None:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+            srv.bind(str(socket_path))
+            srv.listen(1)
+            ready.set()
+            conn, _ = srv.accept()
+            with conn:
+                raw = b""
+                while b"\n" not in raw:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    raw += chunk
+                received.append(json.loads(raw.decode("utf-8")))
+                conn.sendall((json.dumps({"ok": False, "error": "wake_id conflict"}) + "\n").encode("utf-8"))
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+    assert_true(ready.wait(1.0), f"{label}: socket server did not start")
+    ba.run_root = lambda: run_dir  # type: ignore[assignment]
+    ba.short_id = lambda prefix: "wake-777777777777"  # type: ignore[assignment]
+    ba.ALARM_SOCKET_TIMEOUT_SECONDS = 0.15
+    ba.ALARM_SOCKET_MAX_ATTEMPTS = 3
+    stderr = io.StringIO()
+    with redirect_stderr(stderr):
+        ok, wake_id, error = ba.request_alarm("test-session", "alice", 600.0, "conflict")
+    thread.join(1.0)
+    assert_true(not ok and wake_id == "" and error == "wake_id conflict", f"{label}: non-retryable error should return as-is: {(ok, wake_id, error)}")
+    assert_true(not thread.is_alive(), f"{label}: socket server thread should finish")
+    assert_true(len(received) == 1, f"{label}: non-retryable error must not retry: {received}")
+    assert_true("retrying" not in stderr.getvalue(), f"{label}: non-retryable error must not print retry breadcrumb: {stderr.getvalue()!r}")
+    print(f"  PASS  {label}")
+
+
 def scenario_alarm_request_rejects_mismatched_daemon_wake_id(label: str, tmpdir: Path) -> None:
     ba = _import_alarm_module()
     run_dir = tmpdir / "run"
@@ -17130,6 +17271,9 @@ def main() -> int:
             ("alarm_request_failure_prints_no_success_hint", scenario_alarm_request_failure_prints_no_success_hint),
             ("alarm_request_retries_timeout_with_stable_wake_id", scenario_alarm_request_retries_timeout_with_stable_wake_id),
             ("alarm_request_retry_exhaustion_is_bounded", scenario_alarm_request_retry_exhaustion_is_bounded),
+            ("alarm_request_retries_lock_wait_with_stable_wake_id", scenario_alarm_request_retries_lock_wait_with_stable_wake_id),
+            ("alarm_request_lock_wait_retry_exhaustion_is_bounded", scenario_alarm_request_lock_wait_retry_exhaustion_is_bounded),
+            ("alarm_request_non_retryable_daemon_error_is_immediate", scenario_alarm_request_non_retryable_daemon_error_is_immediate),
             ("alarm_request_rejects_mismatched_daemon_wake_id", scenario_alarm_request_rejects_mismatched_daemon_wake_id),
             ("resolve_default_watchdog_seconds_env_table", scenario_resolve_default_watchdog_seconds_env_table),
             ("daemon_socket_alarm_op_rejects_non_finite", scenario_daemon_socket_alarm_op_rejects_non_finite),

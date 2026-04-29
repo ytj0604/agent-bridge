@@ -29,6 +29,10 @@ ALARM_SOCKET_TIMEOUT_SECONDS = 2.0
 ALARM_SOCKET_MAX_ATTEMPTS = 3
 
 
+def is_retryable_alarm_response(response: dict) -> bool:
+    return str(response.get("error_kind") or "") == "lock_wait_exceeded"
+
+
 def request_alarm(bridge_session: str, sender: str, delay_seconds: float, body: str | None) -> tuple[bool, str, str]:
     socket_path = run_root() / f"{bridge_session}.sock"
     if not socket_path.exists():
@@ -72,6 +76,20 @@ def request_alarm(bridge_session: str, sender: str, delay_seconds: float, body: 
         except Exception as exc:
             return False, "", f"invalid daemon response for wake_id {wake_id}: {exc}"
         if not response.get("ok"):
+            if is_retryable_alarm_response(response):
+                if attempt < ALARM_SOCKET_MAX_ATTEMPTS:
+                    print(
+                        f"agent_alarm: daemon lock_wait_exceeded for wake_id {wake_id}; retrying "
+                        f"({attempt + 1}/{ALARM_SOCKET_MAX_ATTEMPTS})",
+                        file=sys.stderr,
+                    )
+                    continue
+                return (
+                    False,
+                    "",
+                    f"daemon retryable error after {ALARM_SOCKET_MAX_ATTEMPTS} attempts "
+                    f"for wake_id {wake_id}: lock_wait_exceeded",
+                )
             return False, "", str(response.get("error") or "daemon rejected alarm")
         response_wake_id = str(response.get("wake_id") or "")
         if response_wake_id != wake_id:
