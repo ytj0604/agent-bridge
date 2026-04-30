@@ -5,6 +5,7 @@ import io
 import json
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -369,6 +370,61 @@ def scenario_interrupt_no_try_deliver_between_keys(label: str, tmpdir: Path) -> 
     d.handle_interrupt(sender="alice", target="bob")
 
     assert_true(calls == ["key:Escape", "key:C-c", "try_deliver:bob"], f"{label}: try_deliver must not interleave between keys: {calls}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_waits_for_same_target_delivery_touch(label: str, tmpdir: Path) -> None:
+    d = _make_interrupt_key_daemon(tmpdir, "claude")
+    msg = test_message("msg-delivery-touch", frm="alice", to="bob", status="pending")
+    d.queue.update(lambda queue: queue.append(msg) or None)
+    events: list[str] = []
+    paste_started = threading.Event()
+    release_paste = threading.Event()
+
+    def pane_mode(_pane: str) -> dict:
+        events.append(f"pane_mode_lock:{d.state_lock._is_owned()}")
+        return {"in_mode": False, "mode": "", "error": ""}
+
+    def paste(_pane: str, _prompt: str, **_kwargs) -> dict:
+        events.append(f"paste_start_lock:{d.state_lock._is_owned()}")
+        paste_started.set()
+        assert_true(release_paste.wait(5.0), f"{label}: timed out waiting to release paste")
+        events.append(f"paste_end_lock:{d.state_lock._is_owned()}")
+        return {"ok": True, "pane_touched": True, "error": ""}
+
+    def enter(_pane: str) -> None:
+        events.append(f"enter_lock:{d.state_lock._is_owned()}")
+
+    def interrupt_key(_pane: str, key: str) -> tuple[bool, str]:
+        events.append(f"key:{key}:lock:{d.state_lock._is_owned()}")
+        return True, ""
+
+    d.pane_mode_status = pane_mode  # type: ignore[method-assign]
+    d.run_tmux_paste_literal_touch_result = paste  # type: ignore[method-assign]
+    d.run_tmux_enter = enter  # type: ignore[method-assign]
+    d.send_interrupt_key = interrupt_key  # type: ignore[method-assign]
+
+    delivery_thread = threading.Thread(target=lambda: d.try_deliver("bob"))
+    delivery_thread.start()
+    assert_true(paste_started.wait(5.0), f"{label}: paste did not start")
+
+    interrupt_result: list[dict] = []
+    interrupt_thread = threading.Thread(target=lambda: interrupt_result.append(d.handle_interrupt(sender="alice", target="bob")))
+    interrupt_thread.start()
+    time.sleep(0.05)
+    assert_true(interrupt_thread.is_alive(), f"{label}: interrupt should wait for same-target delivery target lock")
+    assert_true(not any(event.startswith("key:") for event in events), f"{label}: interrupt keys must not interleave with paste: {events}")
+
+    release_paste.set()
+    delivery_thread.join(5.0)
+    interrupt_thread.join(5.0)
+    assert_true(not delivery_thread.is_alive() and not interrupt_thread.is_alive(), f"{label}: threads should finish")
+    assert_true(interrupt_result and interrupt_result[0].get("interrupt_ok") is True, f"{label}: interrupt should succeed: {interrupt_result}")
+    key_index = next((idx for idx, event in enumerate(events) if event.startswith("key:Escape")), -1)
+    paste_end_index = next((idx for idx, event in enumerate(events) if event.startswith("paste_end")), -1)
+    assert_true(paste_end_index >= 0 and key_index > paste_end_index, f"{label}: interrupt keys must come after paste end: {events}")
+    assert_true(any(event == "key:C-c:lock:True" for event in events), f"{label}: claude C-c should still be state-lock protected: {events}")
+    assert_true(_queue_item(d, "msg-delivery-touch") is None, f"{label}: interrupt should cancel the pane-touched row")
     print(f"  PASS  {label}")
 
 
@@ -1111,6 +1167,7 @@ SCENARIOS = [
     ('interrupt_claude_cc_failure_does_not_revert_state', scenario_interrupt_claude_cc_failure_does_not_revert_state),
     ('interrupt_holds_state_lock_through_sequence', scenario_interrupt_holds_state_lock_through_sequence),
     ('interrupt_no_try_deliver_between_keys', scenario_interrupt_no_try_deliver_between_keys),
+    ('interrupt_waits_for_same_target_delivery_touch', scenario_interrupt_waits_for_same_target_delivery_touch),
     ('interrupt_env_override_disables_cc', scenario_interrupt_env_override_disables_cc),
     ('interrupt_key_delay_env_nonfinite_uses_default', scenario_interrupt_key_delay_env_nonfinite_uses_default),
     ('interrupt_key_delay_env_clamps_out_of_range', scenario_interrupt_key_delay_env_clamps_out_of_range),

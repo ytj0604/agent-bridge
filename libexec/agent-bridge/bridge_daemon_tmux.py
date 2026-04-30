@@ -75,6 +75,53 @@ def run_tmux_send_literal(
             pass
 
 
+def run_tmux_paste_literal_touch_result(
+    target: str,
+    prompt: str,
+    *,
+    bridge_session: str = "",
+    target_alias: str = "",
+    message_id: str = "",
+    nonce: str = "",
+) -> dict:
+    """Paste literal text, reporting whether pane input may be mutated."""
+    buffer_name = tmux_prompt_buffer_name(bridge_session, target_alias or target, message_id, nonce)
+    try:
+        try:
+            subprocess.run(
+                ["tmux", "load-buffer", "-b", buffer_name, "-"],
+                input=prompt.encode("utf-8"),
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=TMUX_SEND_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            return {"ok": False, "pane_touched": False, "error": f"load-buffer: {exc}"}
+        try:
+            subprocess.run(
+                ["tmux", "paste-buffer", "-p", "-r", "-d", "-b", buffer_name, "-t", target],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=TMUX_SEND_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            return {"ok": False, "pane_touched": True, "error": f"paste-buffer: {exc}"}
+        return {"ok": True, "pane_touched": True, "error": ""}
+    finally:
+        try:
+            subprocess.run(
+                ["tmux", "delete-buffer", "-b", buffer_name],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=TMUX_SEND_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            pass
+
+
 def run_tmux_enter(target: str) -> None:
     subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True, timeout=TMUX_SEND_TIMEOUT_SECONDS)
 

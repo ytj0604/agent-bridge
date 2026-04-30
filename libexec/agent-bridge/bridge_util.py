@@ -82,6 +82,8 @@ def classify_prior_for_hint(
     if status in {"submitted", "delivered"}:
         return PRIOR_HINT_INTERRUPT
     if status == "inflight":
+        if item.get("pane_touched"):
+            return PRIOR_HINT_INTERRUPT
         if item.get("pane_mode_enter_deferred_since_ts"):
             return PRIOR_HINT_CANCEL
         if item.get(RESTART_PRESERVED_INFLIGHT_KEY):

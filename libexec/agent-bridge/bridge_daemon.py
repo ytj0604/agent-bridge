@@ -100,6 +100,7 @@ from bridge_daemon_tmux import (
     _tmux_buffer_component,
     cancel_tmux_pane_mode,
     probe_tmux_pane_mode,
+    run_tmux_paste_literal_touch_result,
     run_tmux_enter,
     run_tmux_send_literal,
     run_tmux_send_literal_touch_result,
@@ -729,6 +730,9 @@ class BridgeDaemon:
 
     def run_tmux_send_literal(self, *args, **kwargs):
         return run_tmux_send_literal(*args, **kwargs)
+
+    def run_tmux_paste_literal_touch_result(self, *args, **kwargs):
+        return run_tmux_paste_literal_touch_result(*args, **kwargs)
 
     def run_tmux_enter(self, *args, **kwargs):
         return run_tmux_enter(*args, **kwargs)
@@ -1603,6 +1607,9 @@ class BridgeDaemon:
     def mark_message_pending(self, message_id: str, error: str | None = None) -> None:
         return daemon_delivery.mark_message_pending(self, message_id, error)
 
+    def mark_message_pane_touched(self, message_id: str, target: str) -> dict | None:
+        return daemon_delivery.mark_message_pane_touched(self, message_id, target)
+
     def mark_message_submitted(self, message_id: str) -> None:
         return daemon_delivery.mark_message_submitted(self, message_id)
 
@@ -1643,13 +1650,14 @@ class BridgeDaemon:
     def cancel_message(self, sender: str, message_id: str) -> dict:
         """Cancel one sender-owned message before it becomes an active turn.
 
-        State-lock serialization is the safety boundary: delivery and cancel
-        both hold state_lock through reservation, tmux paste, and enter, so a
-        mid-delivery cancel waits until the delivery attempt reaches a stable
-        queue sub-state before deciding whether to remove or reject.
+        Delivery holds the per-target lock through pane touch, while durable
+        queue markers distinguish pre-touch inflight rows from active work.
+        Cancel uses the same target lock before removing sender-owned rows so
+        it observes a stable pre-touch or post-touch state.
         """
         if not sender or sender == "bridge":
             return {"ok": False, "error": "invalid_sender"}
+        preliminary_target = ""
         try:
             lock_ctx = self.command_state_lock(
                 post_lock_worst_case=COMMAND_DEFAULT_POST_LOCK_WORST_CASE_SECONDS,
@@ -1688,7 +1696,6 @@ class BridgeDaemon:
                         "target": tombstone.get("target") or "",
                     }
                 return {"ok": False, "error": "message_not_found", "message_id": message_id}
-
             owner = str(item.get("from") or "")
             if owner != sender:
                 return {
@@ -1697,78 +1704,133 @@ class BridgeDaemon:
                     "message_id": message_id,
                     "owner": owner,
                 }
-
-            status = str(item.get("status") or "")
-            target = str(item.get("to") or "")
-            prior_kind = self._classify_prior_for_hint(item)
-            if prior_kind == "interrupt":
-                return {
-                    "ok": False,
-                    "error": "message_active_use_interrupt",
-                    "message_id": message_id,
-                    "target": target,
-                    "status": status,
-                }
-            if prior_kind != "cancel":
-                return {
-                    "ok": False,
-                    "error": "message_not_cancellable_state",
-                    "message_id": message_id,
-                    "status": status,
-                }
-
-            removed = self._remove_queue_message_by_id(message_id) or item
-            nonce = str(removed.get("nonce") or "")
-            if nonce:
-                self.discard_nonce(nonce)
-            if self.reserved.get(target) == message_id:
-                self.reserved[target] = None
-            self.last_enter_ts.pop(message_id, None)
-            active_context = self.current_prompt_by_agent.get(target) or {}
-            if str(active_context.get("id") or "") == message_id:
-                self.current_prompt_by_agent.pop(target, None)
-                self.busy[target] = False
-            if removed.get("aggregate_id"):
-                self.cancel_watchdogs_for_message(message_id, reason="cancelled_by_sender", phase=WATCHDOG_PHASE_DELIVERY)
-            else:
-                self.cancel_watchdogs_for_message(message_id, reason="cancelled_by_sender")
-            self.suppress_pending_watchdog_wakes(ref_message_id=message_id, reason="cancelled_by_sender")
-
-            suppress_late_hooks = bool(status == "inflight" and nonce)
-            self._record_message_tombstone(
-                target,
-                removed,
-                by_sender=sender,
-                reason="cancelled_by_sender",
-                suppress_late_hooks=suppress_late_hooks,
-                prompt_submitted_seen=False,
-            )
-            if removed.get("aggregate_id"):
-                self._record_aggregate_interrupted_reply(removed, by_sender=sender, reason="cancelled_by_sender")
-            self.log(
-                "message_cancelled",
-                message_id=message_id,
-                from_agent=owner,
-                to=target,
-                status=status,
-                aggregate_id=removed.get("aggregate_id"),
-                by_sender=sender,
-            )
-            return {
-                "ok": True,
-                "message_id": message_id,
-                "cancelled": True,
-                "already_terminal": False,
-                "status_before": status,
-                "target": target,
-                "aggregate_id": removed.get("aggregate_id"),
-                "input_clear_required": False,
-                "input_clear_attempted": False,
-                "input_clear_ok": None,
-                "input_clear_error": "",
-            }
+            preliminary_target = str(item.get("to") or "")
         finally:
             lock_ctx.__exit__(None, None, None)
+
+        if not preliminary_target:
+            return {"ok": False, "error": "message_not_found", "message_id": message_id}
+
+        with self.target_locks_for([preliminary_target]):
+            try:
+                lock_ctx = self.command_state_lock(
+                    post_lock_worst_case=COMMAND_DEFAULT_POST_LOCK_WORST_CASE_SECONDS,
+                    margin=COMMAND_SAFETY_MARGIN_SECONDS,
+                    command_class="cancel_message",
+                )
+                lock_ctx.__enter__()
+            except CommandLockWaitExceeded:
+                return self.lock_wait_exceeded_response("cancel_message")
+            try:
+                if not self.command_deadline_ok(
+                    post_lock_worst_case=COMMAND_DEFAULT_POST_LOCK_WORST_CASE_SECONDS,
+                    margin=COMMAND_SAFETY_MARGIN_SECONDS,
+                    command_class="cancel_message",
+                ):
+                    return self.lock_wait_exceeded_response("cancel_message")
+                self._prune_interrupted_turns_for_all()
+                item = next((dict(it) for it in self.queue.read() if it.get("id") == message_id), None)
+                if not item:
+                    tombstone = self._find_message_tombstone(message_id)
+                    if tombstone:
+                        owner = str(tombstone.get("prior_sender") or "")
+                        if owner and owner != sender:
+                            return {
+                                "ok": False,
+                                "error": "not_owner",
+                                "message_id": message_id,
+                                "owner": owner,
+                            }
+                        return {
+                            "ok": True,
+                            "message_id": message_id,
+                            "cancelled": False,
+                            "already_terminal": True,
+                            "terminal_reason": tombstone.get("reason") or "terminal",
+                            "target": tombstone.get("target") or "",
+                        }
+                    return {"ok": False, "error": "message_not_found", "message_id": message_id}
+
+                owner = str(item.get("from") or "")
+                if owner != sender:
+                    return {
+                        "ok": False,
+                        "error": "not_owner",
+                        "message_id": message_id,
+                        "owner": owner,
+                    }
+
+                status = str(item.get("status") or "")
+                target = str(item.get("to") or "")
+                prior_kind = self._classify_prior_for_hint(item)
+                if prior_kind == "interrupt":
+                    return {
+                        "ok": False,
+                        "error": "message_active_use_interrupt",
+                        "message_id": message_id,
+                        "target": target,
+                        "status": status,
+                    }
+                if prior_kind != "cancel":
+                    return {
+                        "ok": False,
+                        "error": "message_not_cancellable_state",
+                        "message_id": message_id,
+                        "status": status,
+                    }
+
+                removed = self._remove_queue_message_by_id(message_id) or item
+                nonce = str(removed.get("nonce") or "")
+                if nonce:
+                    self.discard_nonce(nonce)
+                if self.reserved.get(target) == message_id:
+                    self.reserved[target] = None
+                self.last_enter_ts.pop(message_id, None)
+                active_context = self.current_prompt_by_agent.get(target) or {}
+                if str(active_context.get("id") or "") == message_id:
+                    self.current_prompt_by_agent.pop(target, None)
+                    self.busy[target] = False
+                if removed.get("aggregate_id"):
+                    self.cancel_watchdogs_for_message(message_id, reason="cancelled_by_sender", phase=WATCHDOG_PHASE_DELIVERY)
+                else:
+                    self.cancel_watchdogs_for_message(message_id, reason="cancelled_by_sender")
+                self.suppress_pending_watchdog_wakes(ref_message_id=message_id, reason="cancelled_by_sender")
+
+                suppress_late_hooks = bool(status == "inflight" and nonce)
+                self._record_message_tombstone(
+                    target,
+                    removed,
+                    by_sender=sender,
+                    reason="cancelled_by_sender",
+                    suppress_late_hooks=suppress_late_hooks,
+                    prompt_submitted_seen=False,
+                )
+                if removed.get("aggregate_id"):
+                    self._record_aggregate_interrupted_reply(removed, by_sender=sender, reason="cancelled_by_sender")
+                self.log(
+                    "message_cancelled",
+                    message_id=message_id,
+                    from_agent=owner,
+                    to=target,
+                    status=status,
+                    aggregate_id=removed.get("aggregate_id"),
+                    by_sender=sender,
+                )
+                return {
+                    "ok": True,
+                    "message_id": message_id,
+                    "cancelled": True,
+                    "already_terminal": False,
+                    "status_before": status,
+                    "target": target,
+                    "aggregate_id": removed.get("aggregate_id"),
+                    "input_clear_required": False,
+                    "input_clear_attempted": False,
+                    "input_clear_ok": None,
+                    "input_clear_error": "",
+                }
+            finally:
+                lock_ctx.__exit__(None, None, None)
 
     def remove_delivered_message(self, target: str, message_id: str) -> dict | None:
         return daemon_delivery.remove_delivered_message(self, target, message_id)
@@ -2194,6 +2256,8 @@ class BridgeDaemon:
                     item["updated_ts"] = utc_now()
                     if item.get("last_error") not in {"pane_mode_probe_failed_waiting_enter"}:
                         item["last_error"] = "pane_in_mode_waiting_enter"
+                    continue
+                if item.get("pane_touched"):
                     continue
                 if item.get(RESTART_PRESERVED_INFLIGHT_KEY):
                     continue

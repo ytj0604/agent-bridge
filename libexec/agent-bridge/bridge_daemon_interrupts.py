@@ -287,6 +287,11 @@ def _lock_wait_response(command_class: str, *, interrupt_shape: bool = False) ->
 
 
 def handle_interrupt(d, sender: str, target: str) -> dict:
+    with d.target_locks_for([target]):
+        return _handle_interrupt_under_target_lock(d, sender, target)
+
+
+def _handle_interrupt_under_target_lock(d, sender: str, target: str) -> dict:
     # Interrupt semantics:
     #   1. ESC fail-closed: if tmux send-keys fails, no state mutation.
     #   2. Cancel (not requeue) the active in-flight message and any
@@ -300,13 +305,11 @@ def handle_interrupt(d, sender: str, target: str) -> dict:
     #      "[interrupted]" reply recorded into the aggregate, so the
     #      aggregate can still complete from the remaining peers'
     #      replies (and so the aggregate watchdog isn't dropped).
-    # IMPORTANT: pane resolve, key dispatch, and state mutation all run
-    # inside state_lock. Otherwise a prompt_submitted/response_finished
-    # event or queued replacement delivery could interleave between ESC
-    # and Claude's follow-up C-c, causing stale ctx mutation or clearing
-    # a fresh replacement prompt. The bounded key delay is the v1
-    # correctness/perf trade-off and is documented in the lock ordering
-    # comment in __init__.
+    # IMPORTANT: the caller holds the target lock for this target, then
+    # pane resolve, key dispatch, and state mutation all run inside
+    # state_lock. Otherwise a prompt_submitted/response_finished event or
+    # queued replacement delivery could interleave with the interrupt key
+    # sequence or same-target pane touch.
     default_post_lock, default_margin = d.command_budget("interrupt")
     try:
         d.reload_participants()

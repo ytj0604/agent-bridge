@@ -798,6 +798,12 @@ def run_clear_peer(
     reservation: dict | None = existing_reservation
     participant: dict = {}
     endpoint_detail: dict = {}
+    # Clear still performs its existing state-lock protected tmux sends until
+    # Stage 15b. The target lock only spans the pane-touching section so hook
+    # events can reacquire the target during the clear probe wait.
+    target_lock_ctx = d.target_locks_for([target])
+    target_lock_ctx.__enter__()
+    target_lock_held = True
     try:
         state_lock_ctx = d.command_state_lock(
             post_lock_worst_case=d.clear_peer_post_lock_worst_case_seconds(),
@@ -806,6 +812,9 @@ def run_clear_peer(
         )
         state_lock_ctx.__enter__()
     except Exception as exc:
+        if target_lock_held:
+            target_lock_ctx.__exit__(None, None, None)
+            target_lock_held = False
         if not _is_command_lock_wait_exceeded(exc):
             raise
         if hold_reservation_after_success:
@@ -923,6 +932,9 @@ def run_clear_peer(
         reservation["phase"] = "waiting_probe"
         reservation["deadline_ts"] = time.time() + CLEAR_PROBE_TIMEOUT_SECONDS
         d.log("clear_probe_sent", target=target, by_sender=caller, probe_id=reservation.get("probe_id"))
+        if target_lock_held:
+            target_lock_ctx.__exit__(None, None, None)
+            target_lock_held = False
 
         if d.dry_run:
             reservation["phase"] = "probe_finished"
@@ -948,6 +960,8 @@ def run_clear_peer(
             update_marker(marker_id_value, lambda current: {**current, "phase": "finalizing"})
     finally:
         state_lock_ctx.__exit__(None, None, None)
+        if target_lock_held:
+            target_lock_ctx.__exit__(None, None, None)
 
     agent_type = str(participant.get("agent_type") or reservation.get("agent") or "")
     new_session_id = str(reservation.get("new_session_id") or "")

@@ -2171,6 +2171,63 @@ def scenario_clear_success_delivery_lock_wait_does_not_fail_after_commit(label: 
     print(f"  PASS  {label}")
 
 
+def scenario_clear_waits_for_same_target_delivery_touch(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.dry_run = False
+    d.resolve_endpoint_detail = lambda target, purpose="write": {"ok": True, "pane": participants[target]["pane"], "reason": "ok"}  # type: ignore[method-assign]
+    d.pane_mode_status = lambda _pane: {"in_mode": False, "mode": "", "error": ""}  # type: ignore[method-assign]
+    d.queue.update(lambda queue: queue.append(test_message("msg-clear-race", frm="alice", to="bob", status="pending")) or None)
+
+    paste_started = threading.Event()
+    release_paste = threading.Event()
+    delivery_events: list[str] = []
+    clear_sends: list[str] = []
+    clear_result: list[dict] = []
+
+    def paste(_pane: str, _prompt: str, **_kwargs) -> dict:
+        delivery_events.append(f"delivery_paste_start_lock:{d.state_lock._is_owned()}")
+        paste_started.set()
+        assert_true(release_paste.wait(5.0), f"{label}: timed out waiting to release delivery paste")
+        delivery_events.append(f"delivery_paste_end_lock:{d.state_lock._is_owned()}")
+        return {"ok": True, "pane_touched": True, "error": ""}
+
+    def enter(_pane: str) -> None:
+        delivery_events.append(f"delivery_enter_lock:{d.state_lock._is_owned()}")
+
+    def clear_send(_pane: str, text: str, *, target: str, message_id: str) -> dict:
+        clear_sends.append(text)
+        return {"ok": True, "pane_touched": True, "error": ""}
+
+    d.run_tmux_paste_literal_touch_result = paste  # type: ignore[method-assign]
+    d.run_tmux_enter = enter  # type: ignore[method-assign]
+    d._clear_tmux_send = clear_send  # type: ignore[method-assign]
+
+    delivery_thread = threading.Thread(target=lambda: d.try_deliver("bob"), daemon=True)
+    delivery_thread.start()
+    assert_true(paste_started.wait(5.0), f"{label}: delivery paste did not start")
+
+    clear_thread = threading.Thread(target=lambda: clear_result.append(d.handle_clear_peer("alice", "bob", force=True)), daemon=True)
+    clear_thread.start()
+    time.sleep(0.05)
+    assert_true(clear_thread.is_alive(), f"{label}: clear should wait for same-target delivery target lock")
+    assert_true(clear_sends == [], f"{label}: clear must not pane-touch while delivery paste is blocked: {clear_sends}")
+
+    release_paste.set()
+    delivery_thread.join(5.0)
+    clear_thread.join(5.0)
+    assert_true(not delivery_thread.is_alive() and not clear_thread.is_alive(), f"{label}: threads should finish")
+    assert_true(clear_sends == [], f"{label}: clear should reject after pane-touched delivery without sending /clear: {clear_sends}")
+    assert_true(clear_result and clear_result[0].get("error_kind") == "clear_blocked", f"{label}: clear should be blocked after pane touch: {clear_result}")
+    row = _queue_item(d, "msg-clear-race") or {}
+    assert_true(row.get("status") == "inflight" and row.get("pane_touched") is True, f"{label}: delivery row should stay pane-touched inflight: {row}")
+    assert_true(any(event == "delivery_enter_lock:False" for event in delivery_events), f"{label}: delivery enter should remain outside state_lock: {delivery_events}")
+    print(f"  PASS  {label}")
+
+
 def scenario_clear_probe_subprocess_timeouts(label: str, tmpdir: Path) -> None:
     calls: list[dict] = []
     original_probe_run = bridge_pane_probe.subprocess.run
@@ -2728,6 +2785,7 @@ SCENARIOS = [
     ('command_state_lock_timeout_before_mutation', scenario_command_state_lock_timeout_before_mutation),
     ('clear_success_delivery_defers_near_deadline', scenario_clear_success_delivery_defers_near_deadline),
     ('clear_success_delivery_lock_wait_does_not_fail_after_commit', scenario_clear_success_delivery_lock_wait_does_not_fail_after_commit),
+    ('clear_waits_for_same_target_delivery_touch', scenario_clear_waits_for_same_target_delivery_touch),
     ('clear_probe_subprocess_timeouts', scenario_clear_probe_subprocess_timeouts),
     ('clear_marker_phase2_missing_forces_leave', scenario_clear_marker_phase2_missing_forces_leave),
     ('clear_marker_phase2_rejects_record_turn_without_marker_turn', scenario_clear_marker_phase2_rejects_record_turn_without_marker_turn),

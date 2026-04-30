@@ -2399,6 +2399,7 @@ def scenario_prior_hint_classifier_drift_invariant(label: str, tmpdir: Path) -> 
         ("msg-inflight-active", True, False, "interrupt", True),
         ("msg-inflight-deferred", True, True, "cancel", False),
         ("msg-inflight-deferred-no-enter", False, True, "cancel", False),
+        ("msg-inflight-pane-touched", False, False, "interrupt", True),
     ]
     for message_id, has_enter, deferred, expected_kind, expected_active in cases:
         item = test_message(message_id, frm="alice", to="bob", status="inflight")
@@ -2408,11 +2409,160 @@ def scenario_prior_hint_classifier_drift_invariant(label: str, tmpdir: Path) -> 
             d.last_enter_ts.pop(message_id, None)
         if deferred:
             item["pane_mode_enter_deferred_since_ts"] = time.time()
+        if message_id == "msg-inflight-pane-touched":
+            item["pane_touched"] = True
         prior_kind = d._classify_prior_for_hint(item)
         active = d._message_is_active_inflight_for_cancel(item)
         assert_true(prior_kind == expected_kind, f"{label}: classifier mismatch for {message_id}: {prior_kind!r}")
         assert_true(active is expected_active, f"{label}: active predicate mismatch for {message_id}: {active!r}")
         assert_true((prior_kind == "interrupt") == active, f"{label}: classifier drift for {message_id}: {prior_kind!r} vs active={active!r}")
+    print(f"  PASS  {label}")
+
+def _delivery_split_daemon(tmpdir: Path, queue_items: list[dict]) -> bridge_daemon.BridgeDaemon:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+        "carol": {"alias": "carol", "agent_type": "codex", "pane": "%93"},
+    }
+    d = make_daemon(tmpdir, participants, queue_items=queue_items)
+    d.dry_run = False
+    panes = {"alice": "%91", "bob": "%92", "carol": "%93"}
+    d.resolve_endpoint_detail = lambda target, purpose="write": {"ok": True, "pane": panes[str(target)], "reason": ""}  # type: ignore[method-assign]
+    return d
+
+def _delivery_watchdogs_for(d: bridge_daemon.BridgeDaemon, message_id: str, phase: str = "delivery") -> list[dict]:
+    return [
+        dict(wd)
+        for wd in d.watchdogs.values()
+        if wd.get("ref_message_id") == message_id and d.normalize_watchdog_phase(wd) == phase
+    ]
+
+def scenario_delivery_pre_touch_failure_requeues_and_cancel_removes(label: str, tmpdir: Path) -> None:
+    msg = test_message("msg-pre-touch-fail", frm="alice", to="bob", status="pending")
+    msg["watchdog_delay_sec"] = 30.0
+    d = _delivery_split_daemon(tmpdir, [msg])
+    d.pane_mode_status = lambda pane: {"in_mode": False, "mode": "", "error": ""}  # type: ignore[method-assign]
+    d.run_tmux_paste_literal_touch_result = lambda *args, **kwargs: {"ok": False, "pane_touched": False, "error": "load-buffer: failed"}  # type: ignore[method-assign]
+
+    d.try_deliver("bob")
+
+    row = _queue_item(d, "msg-pre-touch-fail") or {}
+    assert_true(row.get("status") == "pending" and not row.get("nonce"), f"{label}: pre-touch failure should requeue cleanly: {row}")
+    assert_true(not row.get("pane_touched"), f"{label}: pre-touch failure must not mark pane_touched: {row}")
+    assert_true(d.reserved.get("bob") is None, f"{label}: reservation should clear after pre-touch failure: {d.reserved}")
+    assert_true(not _delivery_watchdogs_for(d, "msg-pre-touch-fail"), f"{label}: delivery watchdog should be cancelled: {d.watchdogs}")
+    cancel = d.cancel_message("alice", "msg-pre-touch-fail")
+    assert_true(cancel.get("ok") is True and cancel.get("cancelled") is True, f"{label}: requeued pre-touch row should be cancellable: {cancel}")
+    assert_true(_queue_item(d, "msg-pre-touch-fail") is None, f"{label}: cancel should remove row")
+    print(f"  PASS  {label}")
+
+def scenario_delivery_post_touch_failure_requires_interrupt(label: str, tmpdir: Path) -> None:
+    msg = test_message("msg-post-touch-fail", frm="alice", to="bob", status="pending")
+    msg["watchdog_delay_sec"] = 30.0
+    d = _delivery_split_daemon(tmpdir, [msg])
+    d.pane_mode_status = lambda pane: {"in_mode": False, "mode": "", "error": ""}  # type: ignore[method-assign]
+    d.run_tmux_paste_literal_touch_result = lambda *args, **kwargs: {"ok": False, "pane_touched": True, "error": "paste-buffer: failed"}  # type: ignore[method-assign]
+
+    d.try_deliver("bob")
+
+    row = _queue_item(d, "msg-post-touch-fail") or {}
+    assert_true(row.get("status") == "inflight" and row.get("pane_touched") is True, f"{label}: post-touch failure should stay active: {row}")
+    assert_true(row.get("nonce") and d.reserved.get("bob") == "msg-post-touch-fail", f"{label}: nonce/reservation should remain: row={row} reserved={d.reserved}")
+    assert_true(_delivery_watchdogs_for(d, "msg-post-touch-fail"), f"{label}: delivery watchdog should remain: {d.watchdogs}")
+    cancel = d.cancel_message("alice", "msg-post-touch-fail")
+    assert_true(cancel.get("error") == "message_active_use_interrupt", f"{label}: post-touch row should reject cancel: {cancel}")
+    assert_true(_queue_item(d, "msg-post-touch-fail") is not None, f"{label}: cancel must not remove post-touch row")
+    print(f"  PASS  {label}")
+
+def scenario_delivery_post_touch_pre_enter_cancel_rejects(label: str, tmpdir: Path) -> None:
+    msg = test_message("msg-post-touch-cancel", frm="alice", to="bob", status="pending")
+    msg["watchdog_delay_sec"] = 30.0
+    d = _delivery_split_daemon(tmpdir, [msg])
+    paste_done = threading.Event()
+    pre_enter_probe = threading.Event()
+    release_probe = threading.Event()
+    probe_count = {"count": 0}
+
+    def pane_mode(_pane: str) -> dict:
+        assert_true(not d.state_lock._is_owned(), f"{label}: pane-mode probe should not hold state_lock")
+        probe_count["count"] += 1
+        if probe_count["count"] == 3:
+            pre_enter_probe.set()
+            assert_true(release_probe.wait(5.0), f"{label}: timed out waiting to release pre-enter probe")
+            return {"in_mode": True, "mode": "copy-mode", "error": ""}
+        return {"in_mode": False, "mode": "", "error": ""}
+
+    def paste(*args, **kwargs) -> dict:
+        assert_true(not d.state_lock._is_owned(), f"{label}: paste should not hold state_lock")
+        paste_done.set()
+        return {"ok": True, "pane_touched": True, "error": ""}
+
+    d.pane_mode_status = pane_mode  # type: ignore[method-assign]
+    d.run_tmux_paste_literal_touch_result = paste  # type: ignore[method-assign]
+
+    delivery_thread = threading.Thread(target=lambda: d.try_deliver("bob"))
+    delivery_thread.start()
+    assert_true(paste_done.wait(5.0), f"{label}: paste did not run")
+    assert_true(pre_enter_probe.wait(5.0), f"{label}: pre-enter probe did not block")
+
+    cancel_result: list[dict] = []
+    cancel_thread = threading.Thread(target=lambda: cancel_result.append(d.cancel_message("alice", "msg-post-touch-cancel")))
+    cancel_thread.start()
+    time.sleep(0.05)
+    assert_true(cancel_thread.is_alive(), f"{label}: cancel should wait for target lock during pane touch")
+    release_probe.set()
+    delivery_thread.join(5.0)
+    cancel_thread.join(5.0)
+    assert_true(not delivery_thread.is_alive() and not cancel_thread.is_alive(), f"{label}: threads should finish")
+
+    row = _queue_item(d, "msg-post-touch-cancel") or {}
+    assert_true(row.get("status") == "inflight" and row.get("pane_touched") is True, f"{label}: row should stay pane-touched inflight: {row}")
+    assert_true(_delivery_watchdogs_for(d, "msg-post-touch-cancel"), f"{label}: delivery watchdog should remain: {d.watchdogs}")
+    assert_true(cancel_result and cancel_result[0].get("error") == "message_active_use_interrupt", f"{label}: cancel should reject with interrupt guidance: {cancel_result}")
+    print(f"  PASS  {label}")
+
+def scenario_delivery_unrelated_target_progress_during_blocked_tmux(label: str, tmpdir: Path) -> None:
+    bob_first = test_message("msg-bob-blocked", frm="alice", to="bob", status="pending")
+    bob_second = test_message("msg-bob-second", frm="alice", to="bob", status="pending")
+    carol_msg = test_message("msg-carol-progress", frm="alice", to="carol", status="pending")
+    d = _delivery_split_daemon(tmpdir, [bob_first, bob_second, carol_msg])
+    bob_started = threading.Event()
+    release_bob = threading.Event()
+    lock_observations: list[tuple[str, bool]] = []
+
+    def pane_mode(pane: str) -> dict:
+        lock_observations.append((f"pane_mode:{pane}", d.state_lock._is_owned()))
+        return {"in_mode": False, "mode": "", "error": ""}
+
+    def paste(pane: str, *args, **kwargs) -> dict:
+        lock_observations.append((f"paste:{pane}", d.state_lock._is_owned()))
+        if pane == "%92":
+            bob_started.set()
+            assert_true(release_bob.wait(5.0), f"{label}: timed out waiting to release bob paste")
+        return {"ok": True, "pane_touched": True, "error": ""}
+
+    def enter(pane: str) -> None:
+        lock_observations.append((f"enter:{pane}", d.state_lock._is_owned()))
+
+    d.pane_mode_status = pane_mode  # type: ignore[method-assign]
+    d.run_tmux_paste_literal_touch_result = paste  # type: ignore[method-assign]
+    d.run_tmux_enter = enter  # type: ignore[method-assign]
+
+    global_thread = threading.Thread(target=lambda: d.try_deliver())
+    global_thread.start()
+    assert_true(bob_started.wait(5.0), f"{label}: bob paste did not block")
+
+    d.try_deliver("carol")
+    carol_row = _queue_item(d, "msg-carol-progress") or {}
+    bob_second_row = _queue_item(d, "msg-bob-second") or {}
+    assert_true(carol_row.get("status") == "inflight", f"{label}: unrelated carol should progress while bob paste is blocked: {carol_row}")
+    assert_true(bob_second_row.get("status") == "pending", f"{label}: same-target bob follow-up should stay queued: {bob_second_row}")
+
+    release_bob.set()
+    global_thread.join(5.0)
+    assert_true(not global_thread.is_alive(), f"{label}: global delivery thread should finish")
+    held = [name for name, owned in lock_observations if owned]
+    assert_true(not held, f"{label}: tmux phase must not hold state_lock: {lock_observations}")
     print(f"  PASS  {label}")
 
 def scenario_daemon_socket_ack_message_unsupported_does_not_delete_queue(label: str, tmpdir: Path) -> None:
@@ -3176,6 +3326,10 @@ SCENARIOS = [
     ('daemon_prior_hint_current_prompt_only', scenario_daemon_prior_hint_current_prompt_only),
     ('daemon_prior_hint_active_ctx_beats_pending_queue_row', scenario_daemon_prior_hint_active_ctx_beats_pending_queue_row),
     ('prior_hint_classifier_drift_invariant', scenario_prior_hint_classifier_drift_invariant),
+    ('delivery_pre_touch_failure_requeues_and_cancel_removes', scenario_delivery_pre_touch_failure_requeues_and_cancel_removes),
+    ('delivery_post_touch_failure_requires_interrupt', scenario_delivery_post_touch_failure_requires_interrupt),
+    ('delivery_post_touch_pre_enter_cancel_rejects', scenario_delivery_post_touch_pre_enter_cancel_rejects),
+    ('delivery_unrelated_target_progress_during_blocked_tmux', scenario_delivery_unrelated_target_progress_during_blocked_tmux),
     ('daemon_socket_ack_message_unsupported_does_not_delete_queue', scenario_daemon_socket_ack_message_unsupported_does_not_delete_queue),
     ('daemon_ack_message_helper_removed', scenario_daemon_ack_message_helper_removed),
     ('orphan_nonce_in_user_prompt', scenario_orphan_nonce_in_user_prompt),

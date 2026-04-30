@@ -26,6 +26,10 @@ PANE_MODE_ENTER_DEFER_KEYS = (
     "pane_mode_enter_deferred_since_ts",
     "pane_mode_enter_deferred_mode",
 )
+PANE_TOUCH_METADATA_KEYS = (
+    "pane_touched",
+    "pane_touched_ts",
+)
 RESTART_INFLIGHT_METADATA_KEYS = (
     RESTART_PRESERVED_INFLIGHT_KEY,
     "restart_preserved_inflight_at",
@@ -344,6 +348,125 @@ def maybe_defer_for_pane_mode(d, target: str, pane: str, message: dict) -> bool:
     return False
 
 
+def maybe_defer_for_pane_mode_outside_state_lock(d, target: str, pane: str, message: dict) -> bool:
+    status = d.pane_mode_status(pane)
+    if status.get("error"):
+        with d.state_lock:
+            if d.mark_pane_mode_probe_failed(str(message.get("id") or ""), str(status.get("error") or "")):
+                d.safe_log(
+                    "pane_mode_probe_failed",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    error=status.get("error"),
+                    phase="pre_reserve",
+                )
+        return True
+    if not status.get("in_mode"):
+        with d.state_lock:
+            cleared = d.clear_pane_mode_metadata(str(message.get("id") or ""))
+            if cleared:
+                d.log(
+                    "pane_mode_block_cleared",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    mode=cleared.get("pane_mode_blocked_mode"),
+                    blocked_duration_sec=d.blocked_duration(cleared),
+                )
+        return False
+
+    mode = str(status.get("mode") or "")
+    with d.state_lock:
+        blocked = d.annotate_pending_pane_mode_block(target, str(message.get("id") or ""), mode)
+        if not blocked:
+            return True
+        if blocked.get("_pane_mode_started"):
+            d.log(
+                "pane_mode_block_started",
+                target=target,
+                pane=pane,
+                message_id=message.get("id"),
+                mode=mode,
+            )
+        age = float(blocked.get("_pane_mode_blocked_age") or 0.0)
+    if d.pane_mode_grace_seconds is None or age < d.pane_mode_grace_seconds:
+        return True
+    if mode not in PANE_MODE_FORCE_CANCEL_MODES:
+        with d.state_lock:
+            if d.mark_pane_mode_unforceable(str(message.get("id") or "")):
+                d.log(
+                    "pane_mode_block_unforceable",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    mode=mode,
+                    blocked_duration_sec=age,
+                )
+        return True
+
+    ok, error = d.force_cancel_pane_mode(pane, mode)
+    if not ok:
+        with d.state_lock:
+            if d.mark_pane_mode_cancel_failed(str(message.get("id") or ""), error):
+                d.log(
+                    "pane_mode_force_cancelled",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    mode=mode,
+                    blocked_duration_sec=age,
+                    success=False,
+                    error=error,
+                )
+        return True
+
+    after = d.pane_mode_status(pane)
+    if after.get("error"):
+        error = str(after.get("error"))
+        with d.state_lock:
+            if d.mark_pane_mode_cancel_failed(str(message.get("id") or ""), error):
+                d.log(
+                    "pane_mode_force_cancelled",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    mode=mode,
+                    blocked_duration_sec=age,
+                    success=False,
+                    error=error,
+                )
+        return True
+    if after.get("in_mode"):
+        error = f"pane still in mode {after.get('mode') or ''}".strip()
+        with d.state_lock:
+            if d.mark_pane_mode_cancel_failed(str(message.get("id") or ""), error):
+                d.log(
+                    "pane_mode_force_cancelled",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    mode=mode,
+                    blocked_duration_sec=age,
+                    success=False,
+                    error=error,
+                )
+        return True
+
+    with d.state_lock:
+        d.clear_pane_mode_metadata(str(message.get("id") or ""))
+        d.log(
+            "pane_mode_force_cancelled",
+            target=target,
+            pane=pane,
+            message_id=message.get("id"),
+            mode=mode,
+            blocked_duration_sec=age,
+            success=True,
+        )
+    return False
+
+
 def defer_inflight_for_pane_mode(d, message: dict, mode: str) -> dict | None:
     message_id = str(message.get("id") or "")
     target = str(message.get("to") or "")
@@ -489,15 +612,35 @@ def reserve_next(d, target: str) -> dict | None:
         return message
 
 
+def mark_message_pane_touched(d, message_id: str, target: str) -> dict | None:
+    now_iso = utc_now()
+
+    def mutator(queue: list[dict]) -> dict | None:
+        for item in queue:
+            if item.get("id") != message_id or item.get("to") != target or item.get("status") != "inflight":
+                continue
+            item["pane_touched"] = True
+            item["pane_touched_ts"] = item.get("pane_touched_ts") or now_iso
+            item["updated_ts"] = now_iso
+            return dict(item)
+        return None
+
+    return d.queue.update(mutator)
+
+
+def _queue_inflight_matches(d, message_id: str, target: str, nonce: str) -> dict | None:
+    for item in d.queue.read():
+        if item.get("id") != message_id or item.get("to") != target:
+            continue
+        if item.get("status") != "inflight" or str(item.get("nonce") or "") != nonce:
+            return None
+        return dict(item)
+    return None
+
+
 def _try_deliver_targets_locked(d, targets: list[str]) -> None:
     for agent in targets:
         if agent not in d.participants:
-            continue
-        candidate = d.next_pending_candidate(agent)
-        if not candidate:
-            continue
-        pane = d.resolve_target_pane(agent)
-        if pane and d.maybe_defer_for_pane_mode(agent, pane, candidate):
             continue
         message = d.reserve_next(agent)
         if not message:
@@ -511,139 +654,228 @@ def try_deliver(d, target: str | None = None, *, use_target_locks: bool = True) 
     if use_target_locks:
         if d._state_lock_owned_by_current_thread():
             raise RuntimeError("target-locking delivery cannot run while state_lock is owned")
-        with d.target_locks_for(targets):
-            with d.state_lock:
-                _try_deliver_targets_locked(d, targets)
+        for agent in targets:
+            with d.target_locks_for([agent]):
+                with d.state_lock:
+                    candidate = d.next_pending_candidate(agent) if agent in d.participants else None
+                    pane = d.resolve_target_pane(agent) if candidate else ""
+                if candidate and pane and maybe_defer_for_pane_mode_outside_state_lock(d, agent, pane, candidate):
+                    continue
+                with d.state_lock:
+                    message = d.reserve_next(agent) if candidate else None
+                if message:
+                    d.deliver_reserved(message)
         return
     with d.state_lock:
         _try_deliver_targets_locked(d, targets)
 
 
-def deliver_reserved(d, message: dict) -> None:
+def _finalize_pre_touch_delivery_failure(d, message: dict, error: str) -> None:
     target = str(message["to"])
     nonce = str(message["nonce"])
-    endpoint_detail = d.resolve_endpoint_detail(target, purpose="write")
-    if not endpoint_detail.get("ok"):
-        d.finalize_undeliverable_message(message, endpoint_detail, phase="pre_send")
-        return
-    pane = str(endpoint_detail.get("pane") or "")
-    mode_status = d.pane_mode_status(pane)
-    if mode_status.get("error"):
-        deferred = d.defer_inflight_for_pane_mode_probe_failed(message, str(mode_status.get("error") or ""))
-        if deferred and deferred.get("_pane_mode_probe_failed_first"):
-            d.safe_log(
-                "pane_mode_probe_failed",
-                target=target,
-                pane=pane,
-                message_id=message.get("id"),
-                error=mode_status.get("error"),
-                phase="pre_send",
-            )
-        return
-    elif mode_status.get("in_mode"):
-        mode = str(mode_status.get("mode") or "")
-        blocked = d.defer_inflight_for_pane_mode(message, mode)
-        if blocked and blocked.get("_pane_mode_started"):
-            d.log(
-                "pane_mode_block_started",
-                target=target,
-                pane=pane,
-                message_id=message.get("id"),
-                mode=mode,
-                phase="pre_send",
-            )
-        d.last_enter_ts.pop(str(message.get("id") or ""), None)
-        return
-    else:
-        d.clear_pane_mode_metadata(str(message.get("id") or ""))
-
-    d.reserved[target] = str(message["id"])
-    d.remember_nonce(nonce, message)
-    body_text = str(message.get("body") or "")
-    normalized_body_text = normalize_prompt_body_text(body_text)
-    if len(normalized_body_text) > MAX_PEER_BODY_CHARS:
-        d.log(
-            "body_truncated",
-            message_id=message.get("id"),
-            from_agent=message.get("from"),
-            to=target,
-            kind=message.get("kind"),
-            intent=message.get("intent"),
-            original_chars=len(body_text),
-            normalized_chars=len(normalized_body_text),
-            limit_chars=MAX_PEER_BODY_CHARS,
-        )
-    prompt = build_peer_prompt(message, nonce)
-    enter_deferred = False
-
-    try:
-        if not d.dry_run:
-            d.run_tmux_send_literal(
-                pane,
-                prompt,
-                bridge_session=d.bridge_session,
-                target_alias=target,
-                message_id=str(message["id"]),
-                nonce=nonce,
-            )
-            time.sleep(d.submit_delay)
-            enter_status = d.pane_mode_status(pane)
-            if enter_status.get("error"):
-                enter_deferred = True
-                error = str(enter_status.get("error") or "")
-                defer_info = d.mark_enter_deferred_for_pane_mode(str(message["id"]), target, "probe_error", error=error)
-                if defer_info and defer_info.get("_pane_mode_enter_defer_started"):
-                    d.safe_log(
-                        "pane_mode_probe_failed",
-                        target=target,
-                        pane=pane,
-                        message_id=message.get("id"),
-                        error=error,
-                        phase="pre_enter",
-                    )
-            elif enter_status.get("in_mode"):
-                enter_deferred = True
-                mode = str(enter_status.get("mode") or "")
-                defer_info = d.mark_enter_deferred_for_pane_mode(str(message["id"]), target, mode)
-                if defer_info and defer_info.get("_pane_mode_enter_defer_started"):
-                    d.log(
-                        "enter_deferred_pane_mode",
-                        message_id=message["id"],
-                        to=target,
-                        mode=mode,
-                    )
-            else:
-                d.clear_enter_deferred_metadata(str(message["id"]))
-                d.run_tmux_enter(pane)
-    except Exception as exc:
-        d.mark_message_pending(str(message["id"]), str(exc))
-        d.reserved[target] = None
+    with d.state_lock:
+        d.mark_message_pending(str(message["id"]), error)
+        if d.reserved.get(target) == str(message["id"]):
+            d.reserved[target] = None
         d.discard_nonce(nonce)
         d.log(
             "message_delivery_failed",
             message_id=message["id"],
             to=target,
             nonce=nonce,
-            error=str(exc),
+            error=error,
+            pane_touched=False,
         )
+
+
+def _finalize_post_touch_delivery_failure(d, message: dict, error: str) -> None:
+    target = str(message["to"])
+    nonce = str(message["nonce"])
+    with d.state_lock:
+        d.mark_message_pane_touched(str(message["id"]), target)
+        d.last_enter_ts[str(message["id"])] = time.time()
+        d.log(
+            "message_delivery_failed",
+            message_id=message["id"],
+            to=target,
+            nonce=nonce,
+            error=error,
+            pane_touched=True,
+        )
+
+
+def _prepare_reserved_for_paste(d, message: dict) -> dict | None:
+    target = str(message["to"])
+    nonce = str(message["nonce"])
+    message_id = str(message["id"])
+    current = _queue_inflight_matches(d, message_id, target, nonce)
+    if not current:
+        return None
+    d.clear_pane_mode_metadata(message_id)
+    current = _queue_inflight_matches(d, message_id, target, nonce) or current
+    d.reserved[target] = message_id
+    d.remember_nonce(nonce, current)
+    body_text = str(current.get("body") or "")
+    normalized_body_text = normalize_prompt_body_text(body_text)
+    if len(normalized_body_text) > MAX_PEER_BODY_CHARS:
+        d.log(
+            "body_truncated",
+            message_id=current.get("id"),
+            from_agent=current.get("from"),
+            to=target,
+            kind=current.get("kind"),
+            intent=current.get("intent"),
+            original_chars=len(body_text),
+            normalized_chars=len(normalized_body_text),
+            limit_chars=MAX_PEER_BODY_CHARS,
+        )
+    return current
+
+
+def _finalize_delivery_attempt(d, message: dict, *, enter_deferred: bool) -> None:
+    with d.state_lock:
+        d.last_enter_ts[str(message["id"])] = time.time()
+        d.log(
+            "message_delivery_attempted",
+            message_id=message["id"],
+            from_agent=message["from"],
+            to=str(message["to"]),
+            kind=message.get("kind"),
+            intent=message["intent"],
+            nonce=message["nonce"],
+            causal_id=message["causal_id"],
+            hop_count=message["hop_count"],
+            auto_return=message["auto_return"],
+            aggregate_id=message.get("aggregate_id"),
+            dry_run=d.dry_run,
+            enter_deferred=enter_deferred,
+        )
+
+
+def _handle_pre_enter_mode_status(d, message: dict, pane: str, enter_status: dict) -> bool:
+    target = str(message["to"])
+    message_id = str(message["id"])
+    if enter_status.get("error"):
+        error = str(enter_status.get("error") or "")
+        with d.state_lock:
+            defer_info = d.mark_enter_deferred_for_pane_mode(message_id, target, "probe_error", error=error)
+            if defer_info and defer_info.get("_pane_mode_enter_defer_started"):
+                d.safe_log(
+                    "pane_mode_probe_failed",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    error=error,
+                    phase="pre_enter",
+                )
+        return True
+    if enter_status.get("in_mode"):
+        mode = str(enter_status.get("mode") or "")
+        with d.state_lock:
+            defer_info = d.mark_enter_deferred_for_pane_mode(message_id, target, mode)
+            if defer_info and defer_info.get("_pane_mode_enter_defer_started"):
+                d.log(
+                    "enter_deferred_pane_mode",
+                    message_id=message["id"],
+                    to=target,
+                    mode=mode,
+                )
+        return True
+    with d.state_lock:
+        d.clear_enter_deferred_metadata(message_id)
+    return False
+
+
+def deliver_reserved(d, message: dict) -> None:
+    target = str(message["to"])
+    nonce = str(message["nonce"])
+    with d.state_lock:
+        endpoint_detail = d.resolve_endpoint_detail(target, purpose="write")
+    if not endpoint_detail.get("ok"):
+        with d.state_lock:
+            d.finalize_undeliverable_message(message, endpoint_detail, phase="pre_send")
+        return
+    pane = str(endpoint_detail.get("pane") or "")
+    mode_status = d.pane_mode_status(pane)
+    if mode_status.get("error"):
+        with d.state_lock:
+            deferred = d.defer_inflight_for_pane_mode_probe_failed(message, str(mode_status.get("error") or ""))
+            if deferred and deferred.get("_pane_mode_probe_failed_first"):
+                d.safe_log(
+                    "pane_mode_probe_failed",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    error=mode_status.get("error"),
+                    phase="pre_send",
+                )
+        return
+    elif mode_status.get("in_mode"):
+        mode = str(mode_status.get("mode") or "")
+        with d.state_lock:
+            blocked = d.defer_inflight_for_pane_mode(message, mode)
+            if blocked and blocked.get("_pane_mode_started"):
+                d.log(
+                    "pane_mode_block_started",
+                    target=target,
+                    pane=pane,
+                    message_id=message.get("id"),
+                    mode=mode,
+                    phase="pre_send",
+                )
+            d.last_enter_ts.pop(str(message.get("id") or ""), None)
         return
 
-    d.last_enter_ts[str(message["id"])] = time.time()
-    d.log(
-        "message_delivery_attempted",
-        message_id=message["id"],
-        from_agent=message["from"],
-        to=target,
-        kind=message.get("kind"),
-        intent=message["intent"],
-        nonce=nonce,
-        causal_id=message["causal_id"],
-        hop_count=message["hop_count"],
-        auto_return=message["auto_return"],
-        aggregate_id=message.get("aggregate_id"),
-        dry_run=d.dry_run,
-        enter_deferred=enter_deferred,
-    )
+    with d.state_lock:
+        cleared = d.clear_pane_mode_metadata(str(message.get("id") or ""))
+        if cleared:
+            d.log(
+                "pane_mode_block_cleared",
+                target=target,
+                pane=pane,
+                message_id=message.get("id"),
+                mode=cleared.get("pane_mode_blocked_mode"),
+                blocked_duration_sec=d.blocked_duration(cleared),
+            )
+        prepared = _prepare_reserved_for_paste(d, message)
+    if not prepared:
+        return
+
+    prompt = build_peer_prompt(prepared, nonce)
+    if d.dry_run:
+        paste_status = {"ok": True, "pane_touched": False, "error": ""}
+    else:
+        paste_status = d.run_tmux_paste_literal_touch_result(
+            pane,
+            prompt,
+            bridge_session=d.bridge_session,
+            target_alias=target,
+            message_id=str(prepared["id"]),
+            nonce=nonce,
+        )
+    if not paste_status.get("ok"):
+        error = str(paste_status.get("error") or "tmux paste failed")
+        if paste_status.get("pane_touched"):
+            _finalize_post_touch_delivery_failure(d, prepared, error)
+        else:
+            _finalize_pre_touch_delivery_failure(d, prepared, error)
+        return
+    if paste_status.get("pane_touched"):
+        with d.state_lock:
+            d.mark_message_pane_touched(str(prepared["id"]), target)
+
+    if not d.dry_run:
+        time.sleep(d.submit_delay)
+    enter_status = d.pane_mode_status(pane)
+    enter_deferred = _handle_pre_enter_mode_status(d, prepared, pane, enter_status)
+    if not enter_deferred and not d.dry_run:
+        try:
+            d.run_tmux_enter(pane)
+        except Exception as exc:
+            _finalize_post_touch_delivery_failure(d, prepared, str(exc))
+            return
+
+    _finalize_delivery_attempt(d, prepared, enter_deferred=enter_deferred)
 
 
 def mark_message_pending(d, message_id: str, error: str | None = None) -> None:
@@ -658,6 +890,8 @@ def mark_message_pending(d, message_id: str, error: str | None = None) -> None:
                 item["last_error"] = error
                 if not str(error).startswith("pane_"):
                     for key in PANE_MODE_METADATA_KEYS + PANE_MODE_ENTER_DEFER_KEYS:
+                        item.pop(key, None)
+                    for key in PANE_TOUCH_METADATA_KEYS:
                         item.pop(key, None)
 
     d.queue.update(mutator)
@@ -695,6 +929,8 @@ def mark_message_delivered_by_id(d, agent: str, message_id: str) -> dict | None:
                 item["updated_ts"] = now_iso
                 item.pop("last_error", None)
                 for key in PANE_MODE_METADATA_KEYS + PANE_MODE_ENTER_DEFER_KEYS:
+                    item.pop(key, None)
+                for key in PANE_TOUCH_METADATA_KEYS:
                     item.pop(key, None)
                 for key in RESTART_INFLIGHT_METADATA_KEYS:
                     item.pop(key, None)

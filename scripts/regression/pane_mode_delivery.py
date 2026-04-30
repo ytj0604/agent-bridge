@@ -11,7 +11,6 @@ from .harness import (
 )
 
 import bridge_attach  # noqa: E402
-import bridge_daemon  # noqa: E402
 
 from bridge_util import (
     RESTART_PRESERVED_INFLIGHT_KEY,
@@ -241,18 +240,12 @@ def scenario_pre_enter_probe_failure_defers_enter(label: str, tmpdir: Path) -> N
     d.pane_mode_status = lambda pane: status_calls.pop(0) if status_calls else {"in_mode": False, "mode": "", "error": "probe boom"}  # type: ignore[method-assign]
     literal_calls: list[str] = []
     enter_calls: list[str] = []
-    old_literal = bridge_daemon.run_tmux_send_literal
-    old_enter = bridge_daemon.run_tmux_enter
-    bridge_daemon.run_tmux_send_literal = lambda pane, prompt, **kwargs: literal_calls.append(pane)  # type: ignore[assignment]
-    bridge_daemon.run_tmux_enter = lambda pane: enter_calls.append(pane)  # type: ignore[assignment]
-    try:
-        msg = test_message("msg-mode-pre-enter")
-        def add(queue): queue.append(msg); return None
-        d.queue.update(add)
-        d.try_deliver("codex")
-    finally:
-        bridge_daemon.run_tmux_send_literal = old_literal  # type: ignore[assignment]
-        bridge_daemon.run_tmux_enter = old_enter  # type: ignore[assignment]
+    d.run_tmux_paste_literal_touch_result = lambda pane, prompt, **kwargs: literal_calls.append(pane) or {"ok": True, "pane_touched": True, "error": ""}  # type: ignore[method-assign]
+    d.run_tmux_enter = lambda pane: enter_calls.append(pane)  # type: ignore[method-assign]
+    msg = test_message("msg-mode-pre-enter")
+    def add(queue): queue.append(msg); return None
+    d.queue.update(add)
+    d.try_deliver("codex")
     queued = next((it for it in d.queue.read() if it.get("id") == "msg-mode-pre-enter"), None)
     assert_true(literal_calls == ["%98"], f"{label}: literal paste should have happened once")
     assert_true(enter_calls == [], f"{label}: probe failure before Enter must not press Enter")
