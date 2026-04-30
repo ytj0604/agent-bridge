@@ -48,8 +48,17 @@ from bridge_daemon_messages import (
 )
 import bridge_daemon_aggregates as daemon_aggregates
 import bridge_daemon_commands as daemon_commands
+import bridge_daemon_delivery as daemon_delivery
 import bridge_daemon_status as daemon_status
 import bridge_daemon_watchdogs as daemon_watchdogs
+from bridge_daemon_delivery import (
+    PANE_MODE_ENTER_DEFER_KEYS,
+    PANE_MODE_FORCE_CANCEL_MODES,
+    PANE_MODE_METADATA_KEYS,
+    RESTART_INFLIGHT_METADATA_KEYS,
+    TMUX_DELIVERY_WORST_CASE_SECONDS,
+    pane_mode_block_since_ts,
+)
 from bridge_daemon_status import AGGREGATE_STATUS_LEG_LIMIT, WAIT_STATUS_SECTION_LIMIT
 from bridge_daemon_store import AggregateStore, QueueStore
 from bridge_daemon_state import (
@@ -130,8 +139,6 @@ CAPTURE_RESPONSE_TTL_SECONDS = 60 * 60
 PANE_MODE_GRACE_DEFAULT_SECONDS = 180.0
 TURN_ID_MISMATCH_GRACE_DEFAULT_SECONDS = 300.0
 TURN_ID_MISMATCH_POST_WATCHDOG_GRACE_DEFAULT_SECONDS = 1.0
-PANE_MODE_FORCE_CANCEL_MODES = {"copy-mode", "copy-mode-vi", "view-mode"}
-TMUX_DELIVERY_WORST_CASE_SECONDS = 20.0
 CLEAR_PROBE_TIMEOUT_SECONDS = 180.0
 CLEAR_POST_CLEAR_DELAY_DEFAULT_SECONDS = 1.0
 CLEAR_POST_LOCK_WORST_CASE_SECONDS = 75.0
@@ -150,26 +157,6 @@ INTERRUPT_KEY_DELAY_MIN_SECONDS = 0.05
 INTERRUPT_KEY_DELAY_MAX_SECONDS = 1.0
 INTERRUPT_SEND_KEY_TIMEOUT_SECONDS = 1.0
 CLAUDE_INTERRUPT_KEYS_DEFAULT = ("Escape", "C-c")
-PANE_MODE_METADATA_KEYS = (
-    "pane_mode_blocked_since",
-    "pane_mode_blocked_since_ts",
-    "pane_mode_blocked_mode",
-    "pane_mode_block_count",
-    "pane_mode_unforceable_logged",
-    "pane_mode_cancel_failed_logged",
-    "pane_mode_probe_failed_logged",
-    "last_pane_mode_cancel_error",
-    "last_pane_mode_probe_error",
-)
-PANE_MODE_ENTER_DEFER_KEYS = (
-    "pane_mode_enter_deferred_since",
-    "pane_mode_enter_deferred_since_ts",
-    "pane_mode_enter_deferred_mode",
-)
-RESTART_INFLIGHT_METADATA_KEYS = (
-    RESTART_PRESERVED_INFLIGHT_KEY,
-    "restart_preserved_inflight_at",
-)
 INTERRUPTED_TOMBSTONE_LIMIT_PER_AGENT = 16
 INTERRUPTED_TOMBSTONE_TTL_SECONDS = 600.0
 EMPTY_RESPONSE_BODY = "(empty response)"
@@ -311,21 +298,6 @@ def resolve_claude_interrupt_keys() -> tuple[tuple[str, ...], str | None]:
             f"AGENT_BRIDGE_CLAUDE_INTERRUPT_KEYS={raw!r} must include esc first; using esc,c-c",
         )
     return tuple(keys), None
-
-
-def pane_mode_block_since_ts(item: dict) -> float | None:
-    raw_ts = item.get("pane_mode_blocked_since_ts")
-    try:
-        return float(raw_ts)
-    except (TypeError, ValueError):
-        pass
-    raw_iso = item.get("pane_mode_blocked_since")
-    if not raw_iso:
-        return None
-    try:
-        return datetime.fromisoformat(str(raw_iso).replace("Z", "+00:00")).timestamp()
-    except (TypeError, ValueError):
-        return None
 
 
 class BridgeDaemon:
@@ -755,6 +727,12 @@ class BridgeDaemon:
             "command_class": command_class or self.command_context_info().get("op") or "",
         }
 
+    def run_tmux_send_literal(self, *args, **kwargs):
+        return run_tmux_send_literal(*args, **kwargs)
+
+    def run_tmux_enter(self, *args, **kwargs):
+        return run_tmux_enter(*args, **kwargs)
+
     def command_delivery_allowed(self, target: str, message_id: str = "") -> bool:
         remaining = self.command_remaining_budget()
         if remaining is None:
@@ -772,30 +750,7 @@ class BridgeDaemon:
         return False
 
     def try_deliver_command_aware(self, target: str | None = None, *, message_id: str = "") -> None:
-        if target and not self.command_delivery_allowed(str(target), message_id):
-            return
-        if target is None and self.command_remaining_budget() is not None:
-            remaining = self.command_remaining_budget() or 0.0
-            if remaining < TMUX_DELIVERY_WORST_CASE_SECONDS + COMMAND_SAFETY_MARGIN_SECONDS:
-                self.log(
-                    "command_delivery_deferred_deadline",
-                    command_class=self.command_context_info().get("op") or "",
-                    message_id=message_id,
-                    target="",
-                    remaining_budget_ms=int(remaining * 1000),
-                )
-                return
-        try:
-            self.try_deliver(target)
-        except CommandLockWaitExceeded as exc:
-            remaining = self.command_remaining_budget()
-            self.log(
-                "command_delivery_deferred_lock_wait",
-                command_class=exc.command_class or self.command_context_info().get("op") or "",
-                message_id=message_id,
-                target=str(target or ""),
-                remaining_budget_ms=int((remaining or 0.0) * 1000),
-            )
+        return daemon_delivery.try_deliver_command_aware(self, target, message_id=message_id)
 
     def sender_blocked_by_clear(self, sender: str) -> bool:
         if not sender or sender == "bridge":
@@ -2201,338 +2156,40 @@ class BridgeDaemon:
         return str(detail.get("pane") or "") if detail.get("ok") else ""
 
     def next_pending_candidate(self, target: str) -> dict | None:
-        if (
-            self.busy.get(target)
-            or self.reserved.get(target)
-            or self.interrupt_partial_failure_blocks.get(target)
-            or self.clear_reservations.get(target)
-        ):
-            return None
-
-        def mutator(queue: list[dict]) -> dict | None:
-            if any(item.get("to") == target and item.get("status") in {"inflight", "submitted", "delivered"} for item in queue):
-                return None
-            for item in queue:
-                if item.get("to") == target and item.get("status") == "pending":
-                    return dict(item)
-            return None
-
-        return self.queue.update(mutator)
+        return daemon_delivery.next_pending_candidate(self, target)
 
     def annotate_pending_pane_mode_block(self, target: str, message_id: str, mode: str) -> dict | None:
-        now_ts = time.time()
-        now_iso = utc_now()
-
-        def mutator(queue: list[dict]) -> dict | None:
-            for item in queue:
-                if item.get("id") != message_id or item.get("to") != target or item.get("status") != "pending":
-                    continue
-                prior_mode = str(item.get("pane_mode_blocked_mode") or "")
-                since_ts = pane_mode_block_since_ts(item)
-                started = since_ts is None
-                if since_ts is None:
-                    since_ts = now_ts
-                    item["pane_mode_blocked_since"] = now_iso
-                    item["pane_mode_blocked_since_ts"] = now_ts
-                if prior_mode and prior_mode != mode:
-                    item.pop("pane_mode_unforceable_logged", None)
-                    item.pop("pane_mode_cancel_failed_logged", None)
-                item.pop("pane_mode_probe_failed_logged", None)
-                item.pop("last_pane_mode_probe_error", None)
-                item["pane_mode_blocked_mode"] = mode
-                item["pane_mode_block_count"] = int(item.get("pane_mode_block_count") or 0) + 1
-                item["last_error"] = "pane_in_mode"
-                item["updated_ts"] = now_iso
-                result = dict(item)
-                result["_pane_mode_started"] = started
-                result["_pane_mode_blocked_age"] = max(0.0, now_ts - float(since_ts))
-                return result
-            return None
-
-        return self.queue.update(mutator)
+        return daemon_delivery.annotate_pending_pane_mode_block(self, target, message_id, mode)
 
     def clear_pane_mode_metadata(self, message_id: str) -> dict | None:
-        def mutator(queue: list[dict]) -> dict | None:
-            for item in queue:
-                if item.get("id") != message_id:
-                    continue
-                had_metadata = any(key in item for key in PANE_MODE_METADATA_KEYS)
-                if not had_metadata:
-                    return None
-                prior = dict(item)
-                for key in PANE_MODE_METADATA_KEYS:
-                    item.pop(key, None)
-                if item.get("last_error") in {"pane_in_mode", "pane_mode_unforceable", "pane_mode_cancel_failed", "pane_mode_probe_failed"}:
-                    item.pop("last_error", None)
-                item["updated_ts"] = utc_now()
-                return prior
-            return None
-
-        return self.queue.update(mutator)
+        return daemon_delivery.clear_pane_mode_metadata(self, message_id)
 
     def mark_pane_mode_unforceable(self, message_id: str) -> bool:
-        def mutator(queue: list[dict]) -> bool:
-            for item in queue:
-                if item.get("id") != message_id:
-                    continue
-                already = bool(item.get("pane_mode_unforceable_logged"))
-                item["pane_mode_unforceable_logged"] = True
-                item["last_error"] = "pane_mode_unforceable"
-                item["updated_ts"] = utc_now()
-                return not already
-            return False
-
-        return bool(self.queue.update(mutator))
+        return daemon_delivery.mark_pane_mode_unforceable(self, message_id)
 
     def mark_pane_mode_cancel_failed(self, message_id: str, error: str) -> bool:
-        def mutator(queue: list[dict]) -> bool:
-            for item in queue:
-                if item.get("id") != message_id:
-                    continue
-                already = bool(item.get("pane_mode_cancel_failed_logged"))
-                item["pane_mode_cancel_failed_logged"] = True
-                item["last_error"] = "pane_mode_cancel_failed"
-                item["last_pane_mode_cancel_error"] = error
-                item["updated_ts"] = utc_now()
-                return not already
-            return False
-
-        return bool(self.queue.update(mutator))
+        return daemon_delivery.mark_pane_mode_cancel_failed(self, message_id, error)
 
     def mark_pane_mode_probe_failed(self, message_id: str, error: str) -> bool:
-        def mutator(queue: list[dict]) -> bool:
-            for item in queue:
-                if item.get("id") != message_id:
-                    continue
-                already = bool(item.get("pane_mode_probe_failed_logged"))
-                item["pane_mode_probe_failed_logged"] = True
-                item["last_error"] = "pane_mode_probe_failed"
-                item["last_pane_mode_probe_error"] = error
-                item["updated_ts"] = utc_now()
-                return not already
-            return False
-
-        return bool(self.queue.update(mutator))
+        return daemon_delivery.mark_pane_mode_probe_failed(self, message_id, error)
 
     def defer_inflight_for_pane_mode_probe_failed(self, message: dict, error: str) -> dict | None:
-        message_id = str(message.get("id") or "")
-        target = str(message.get("to") or "")
-        now_iso = utc_now()
-
-        def mutator(queue: list[dict]) -> dict | None:
-            for item in queue:
-                if item.get("id") != message_id or item.get("to") != target or item.get("status") != "inflight":
-                    continue
-                already = bool(item.get("pane_mode_probe_failed_logged"))
-                item["status"] = "pending"
-                item["nonce"] = None
-                item["delivery_attempts"] = max(0, int(item.get("delivery_attempts") or 0) - 1)
-                item["pane_mode_probe_failed_logged"] = True
-                item["last_error"] = "pane_mode_probe_failed"
-                item["last_pane_mode_probe_error"] = error
-                item["updated_ts"] = now_iso
-                result = dict(item)
-                result["_pane_mode_probe_failed_first"] = not already
-                return result
-            return None
-
-        result = self.queue.update(mutator)
-        if result:
-            self.cancel_watchdogs_for_message(message_id, reason="pane_mode_probe_failed", phase=WATCHDOG_PHASE_DELIVERY)
-        return result
+        return daemon_delivery.defer_inflight_for_pane_mode_probe_failed(self, message, error)
 
     def blocked_duration(self, item: dict | None) -> float | None:
-        if not item:
-            return None
-        since_ts = pane_mode_block_since_ts(item)
-        if since_ts is None:
-            return None
-        return max(0.0, time.time() - since_ts)
+        return daemon_delivery.blocked_duration(self, item)
 
     def maybe_defer_for_pane_mode(self, target: str, pane: str, message: dict) -> bool:
-        status = self.pane_mode_status(pane)
-        if status.get("error"):
-            if self.mark_pane_mode_probe_failed(str(message.get("id") or ""), str(status.get("error") or "")):
-                self.safe_log(
-                    "pane_mode_probe_failed",
-                    target=target,
-                    pane=pane,
-                    message_id=message.get("id"),
-                    error=status.get("error"),
-                    phase="pre_reserve",
-                )
-            return True
-        if not status.get("in_mode"):
-            cleared = self.clear_pane_mode_metadata(str(message.get("id") or ""))
-            if cleared:
-                self.log(
-                    "pane_mode_block_cleared",
-                    target=target,
-                    pane=pane,
-                    message_id=message.get("id"),
-                    mode=cleared.get("pane_mode_blocked_mode"),
-                    blocked_duration_sec=self.blocked_duration(cleared),
-                )
-            return False
-
-        mode = str(status.get("mode") or "")
-        blocked = self.annotate_pending_pane_mode_block(target, str(message.get("id") or ""), mode)
-        if not blocked:
-            return True
-        if blocked.get("_pane_mode_started"):
-            self.log(
-                "pane_mode_block_started",
-                target=target,
-                pane=pane,
-                message_id=message.get("id"),
-                mode=mode,
-            )
-        age = float(blocked.get("_pane_mode_blocked_age") or 0.0)
-        if self.pane_mode_grace_seconds is None or age < self.pane_mode_grace_seconds:
-            return True
-        if mode not in PANE_MODE_FORCE_CANCEL_MODES:
-            if self.mark_pane_mode_unforceable(str(message.get("id") or "")):
-                self.log(
-                    "pane_mode_block_unforceable",
-                    target=target,
-                    pane=pane,
-                    message_id=message.get("id"),
-                    mode=mode,
-                    blocked_duration_sec=age,
-                )
-            return True
-
-        ok, error = self.force_cancel_pane_mode(pane, mode)
-        if not ok:
-            if self.mark_pane_mode_cancel_failed(str(message.get("id") or ""), error):
-                self.log(
-                    "pane_mode_force_cancelled",
-                    target=target,
-                    pane=pane,
-                    message_id=message.get("id"),
-                    mode=mode,
-                    blocked_duration_sec=age,
-                    success=False,
-                    error=error,
-                )
-            return True
-
-        after = self.pane_mode_status(pane)
-        if after.get("error"):
-            error = str(after.get("error"))
-            if self.mark_pane_mode_cancel_failed(str(message.get("id") or ""), error):
-                self.log(
-                    "pane_mode_force_cancelled",
-                    target=target,
-                    pane=pane,
-                    message_id=message.get("id"),
-                    mode=mode,
-                    blocked_duration_sec=age,
-                    success=False,
-                    error=error,
-                )
-            return True
-        if after.get("in_mode"):
-            error = f"pane still in mode {after.get('mode') or ''}".strip()
-            if self.mark_pane_mode_cancel_failed(str(message.get("id") or ""), error):
-                self.log(
-                    "pane_mode_force_cancelled",
-                    target=target,
-                    pane=pane,
-                    message_id=message.get("id"),
-                    mode=mode,
-                    blocked_duration_sec=age,
-                    success=False,
-                    error=error,
-                )
-            return True
-
-        self.clear_pane_mode_metadata(str(message.get("id") or ""))
-        self.log(
-            "pane_mode_force_cancelled",
-            target=target,
-            pane=pane,
-            message_id=message.get("id"),
-            mode=mode,
-            blocked_duration_sec=age,
-            success=True,
-        )
-        return False
+        return daemon_delivery.maybe_defer_for_pane_mode(self, target, pane, message)
 
     def defer_inflight_for_pane_mode(self, message: dict, mode: str) -> dict | None:
-        message_id = str(message.get("id") or "")
-        target = str(message.get("to") or "")
-        now_ts = time.time()
-        now_iso = utc_now()
-
-        def mutator(queue: list[dict]) -> dict | None:
-            for item in queue:
-                if item.get("id") != message_id or item.get("to") != target or item.get("status") != "inflight":
-                    continue
-                since_ts = pane_mode_block_since_ts(item)
-                started = since_ts is None
-                if since_ts is None:
-                    since_ts = pane_mode_block_since_ts(message) or now_ts
-                    item["pane_mode_blocked_since"] = message.get("pane_mode_blocked_since") or now_iso
-                    item["pane_mode_blocked_since_ts"] = since_ts
-                item["status"] = "pending"
-                item["nonce"] = None
-                item["pane_mode_blocked_mode"] = mode
-                item["pane_mode_block_count"] = int(item.get("pane_mode_block_count") or 0) + 1
-                item["delivery_attempts"] = max(0, int(item.get("delivery_attempts") or 0) - 1)
-                item["last_error"] = "pane_in_mode"
-                item["updated_ts"] = now_iso
-                result = dict(item)
-                result["_pane_mode_started"] = started
-                result["_pane_mode_blocked_age"] = max(0.0, now_ts - float(since_ts))
-                return result
-            return None
-
-        result = self.queue.update(mutator)
-        if result:
-            self.cancel_watchdogs_for_message(message_id, reason="pane_mode_deferred", phase=WATCHDOG_PHASE_DELIVERY)
-        return result
+        return daemon_delivery.defer_inflight_for_pane_mode(self, message, mode)
 
     def mark_enter_deferred_for_pane_mode(self, message_id: str, target: str, mode: str, error: str = "") -> dict | None:
-        now_ts = time.time()
-        now_iso = utc_now()
-
-        def mutator(queue: list[dict]) -> dict | None:
-            for item in queue:
-                if item.get("id") != message_id or item.get("to") != target or item.get("status") != "inflight":
-                    continue
-                started = "pane_mode_enter_deferred_since_ts" not in item
-                if started:
-                    item["pane_mode_enter_deferred_since"] = now_iso
-                    item["pane_mode_enter_deferred_since_ts"] = now_ts
-                item["pane_mode_enter_deferred_mode"] = mode
-                if error:
-                    item["last_pane_mode_probe_error"] = error
-                    item["last_error"] = "pane_mode_probe_failed_waiting_enter"
-                else:
-                    item.pop("last_pane_mode_probe_error", None)
-                    item["last_error"] = "pane_in_mode_waiting_enter"
-                item["updated_ts"] = now_iso
-                result = dict(item)
-                result["_pane_mode_enter_defer_started"] = started
-                return result
-            return None
-
-        return self.queue.update(mutator)
+        return daemon_delivery.mark_enter_deferred_for_pane_mode(self, message_id, target, mode, error=error)
 
     def clear_enter_deferred_metadata(self, message_id: str) -> None:
-        def mutator(queue: list[dict]) -> None:
-            for item in queue:
-                if item.get("id") != message_id:
-                    continue
-                for key in PANE_MODE_ENTER_DEFER_KEYS:
-                    item.pop(key, None)
-                item.pop("last_pane_mode_probe_error", None)
-                if item.get("last_error") in {"pane_in_mode_waiting_enter", "pane_mode_probe_failed_waiting_enter"}:
-                    item.pop("last_error", None)
-                item["updated_ts"] = utc_now()
-
-        self.queue.update(mutator)
+        return daemon_delivery.clear_enter_deferred_metadata(self, message_id)
 
     def _peer_result_redirect_os_reason(self, exc: OSError) -> str:
         if exc.errno in {errno.EACCES, errno.EPERM}:
@@ -2739,29 +2396,7 @@ class BridgeDaemon:
                     pass
 
     def queue_message(self, message: dict, log_event: bool = True, deliver: bool = True) -> None:
-        def mutator(queue: list[dict]) -> None:
-            if not any(item.get("id") == message["id"] for item in queue):
-                queue.append(message)
-
-        self.queue.update(mutator)
-        if log_event:
-            self.log(
-                "message_queued",
-                message_id=message["id"],
-                from_agent=message["from"],
-                to=message["to"],
-                kind=message.get("kind"),
-                intent=message["intent"],
-                causal_id=message["causal_id"],
-                hop_count=message["hop_count"],
-                auto_return=message["auto_return"],
-                reply_to=message.get("reply_to"),
-                aggregate_id=message.get("aggregate_id"),
-                aggregate_expected=message.get("aggregate_expected"),
-                source=message.get("source"),
-            )
-        if deliver:
-            self.try_deliver_command_aware(str(message["to"]), message_id=str(message.get("id") or ""))
+        return daemon_delivery.queue_message(self, message, log_event=log_event, deliver=deliver)
 
     def suppress_pending_watchdog_wakes(
         self,
@@ -2864,242 +2499,22 @@ class BridgeDaemon:
         return daemon_status.build_aggregate_status(self, caller, aggregate_id)
 
     def reserve_next(self, target: str) -> dict | None:
-        with self.state_lock:
-            if (
-                self.busy.get(target)
-                or self.reserved.get(target)
-                or self.interrupt_partial_failure_blocks.get(target)
-                or self.clear_reservations.get(target)
-            ):
-                return None
-
-            def mutator(queue: list[dict]) -> dict | None:
-                # `delivered` is also a delivery blocker so that, even after a
-                # daemon restart that wipes in-memory busy/reserved state, a
-                # message that was already injected into the peer's pane is
-                # not redelivered nor allowed to be overlaid by a fresh prompt
-                # before its terminal response_finished is observed.
-                if any(item.get("to") == target and item.get("status") in {"inflight", "submitted", "delivered"} for item in queue):
-                    return None
-                for item in queue:
-                    if item.get("to") != target or item.get("status") != "pending":
-                        continue
-                    now_iso = utc_now()
-                    item["status"] = "inflight"
-                    item["nonce"] = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
-                    item["inflight_ts"] = now_iso
-                    item["updated_ts"] = now_iso
-                    item["delivery_attempts"] = int(item.get("delivery_attempts") or 0) + 1
-                    return dict(item)
-                return None
-
-            message = self.queue.update(mutator)
-            if message:
-                self.arm_message_watchdog(message, WATCHDOG_PHASE_DELIVERY)
-            return message
+        return daemon_delivery.reserve_next(self, target)
 
     def try_deliver(self, target: str | None = None) -> None:
-        self.reload_participants()
-        with self.state_lock:
-            targets = [target] if target else sorted(self.participants)
-            for agent in targets:
-                if agent not in self.participants:
-                    continue
-                candidate = self.next_pending_candidate(agent)
-                if not candidate:
-                    continue
-                pane = self.resolve_target_pane(agent)
-                if pane and self.maybe_defer_for_pane_mode(agent, pane, candidate):
-                    continue
-                message = self.reserve_next(agent)
-                if not message:
-                    continue
-                self.deliver_reserved(message)
+        return daemon_delivery.try_deliver(self, target)
 
     def deliver_reserved(self, message: dict) -> None:
-        target = str(message["to"])
-        nonce = str(message["nonce"])
-        endpoint_detail = self.resolve_endpoint_detail(target, purpose="write")
-        if not endpoint_detail.get("ok"):
-            self.finalize_undeliverable_message(message, endpoint_detail, phase="pre_send")
-            return
-        pane = str(endpoint_detail.get("pane") or "")
-        mode_status = self.pane_mode_status(pane)
-        if mode_status.get("error"):
-            deferred = self.defer_inflight_for_pane_mode_probe_failed(message, str(mode_status.get("error") or ""))
-            if deferred and deferred.get("_pane_mode_probe_failed_first"):
-                self.safe_log(
-                    "pane_mode_probe_failed",
-                    target=target,
-                    pane=pane,
-                    message_id=message.get("id"),
-                    error=mode_status.get("error"),
-                    phase="pre_send",
-                )
-            return
-        elif mode_status.get("in_mode"):
-            mode = str(mode_status.get("mode") or "")
-            blocked = self.defer_inflight_for_pane_mode(message, mode)
-            if blocked and blocked.get("_pane_mode_started"):
-                self.log(
-                    "pane_mode_block_started",
-                    target=target,
-                    pane=pane,
-                    message_id=message.get("id"),
-                    mode=mode,
-                    phase="pre_send",
-                )
-            self.last_enter_ts.pop(str(message.get("id") or ""), None)
-            return
-        else:
-            self.clear_pane_mode_metadata(str(message.get("id") or ""))
-
-        self.reserved[target] = str(message["id"])
-        self.remember_nonce(nonce, message)
-        body_text = str(message.get("body") or "")
-        normalized_body_text = normalize_prompt_body_text(body_text)
-        if len(normalized_body_text) > MAX_PEER_BODY_CHARS:
-            self.log(
-                "body_truncated",
-                message_id=message.get("id"),
-                from_agent=message.get("from"),
-                to=target,
-                kind=message.get("kind"),
-                intent=message.get("intent"),
-                original_chars=len(body_text),
-                normalized_chars=len(normalized_body_text),
-                limit_chars=MAX_PEER_BODY_CHARS,
-            )
-        prompt = build_peer_prompt(message, nonce)
-        enter_deferred = False
-
-        try:
-            if not self.dry_run:
-                run_tmux_send_literal(
-                    pane,
-                    prompt,
-                    bridge_session=self.bridge_session,
-                    target_alias=target,
-                    message_id=str(message["id"]),
-                    nonce=nonce,
-                )
-                time.sleep(self.submit_delay)
-                enter_status = self.pane_mode_status(pane)
-                if enter_status.get("error"):
-                    enter_deferred = True
-                    error = str(enter_status.get("error") or "")
-                    defer_info = self.mark_enter_deferred_for_pane_mode(str(message["id"]), target, "probe_error", error=error)
-                    if defer_info and defer_info.get("_pane_mode_enter_defer_started"):
-                        self.safe_log(
-                            "pane_mode_probe_failed",
-                            target=target,
-                            pane=pane,
-                            message_id=message.get("id"),
-                            error=error,
-                            phase="pre_enter",
-                        )
-                elif enter_status.get("in_mode"):
-                    enter_deferred = True
-                    mode = str(enter_status.get("mode") or "")
-                    defer_info = self.mark_enter_deferred_for_pane_mode(str(message["id"]), target, mode)
-                    if defer_info and defer_info.get("_pane_mode_enter_defer_started"):
-                        self.log(
-                            "enter_deferred_pane_mode",
-                            message_id=message["id"],
-                            to=target,
-                            mode=mode,
-                        )
-                else:
-                    self.clear_enter_deferred_metadata(str(message["id"]))
-                    run_tmux_enter(pane)
-        except Exception as exc:
-            self.mark_message_pending(str(message["id"]), str(exc))
-            self.reserved[target] = None
-            self.discard_nonce(nonce)
-            self.log(
-                "message_delivery_failed",
-                message_id=message["id"],
-                to=target,
-                nonce=nonce,
-                error=str(exc),
-            )
-            return
-
-        self.last_enter_ts[str(message["id"])] = time.time()
-        self.log(
-            "message_delivery_attempted",
-            message_id=message["id"],
-            from_agent=message["from"],
-            to=target,
-            kind=message.get("kind"),
-            intent=message["intent"],
-            nonce=nonce,
-            causal_id=message["causal_id"],
-            hop_count=message["hop_count"],
-            auto_return=message["auto_return"],
-            aggregate_id=message.get("aggregate_id"),
-            dry_run=self.dry_run,
-            enter_deferred=enter_deferred,
-        )
+        return daemon_delivery.deliver_reserved(self, message)
 
     def mark_message_pending(self, message_id: str, error: str | None = None) -> None:
-        def mutator(queue: list[dict]) -> None:
-            for item in queue:
-                if item.get("id") != message_id:
-                    continue
-                item["status"] = "pending"
-                item["nonce"] = None
-                item["updated_ts"] = utc_now()
-                if error:
-                    item["last_error"] = error
-                    if not str(error).startswith("pane_"):
-                        for key in PANE_MODE_METADATA_KEYS + PANE_MODE_ENTER_DEFER_KEYS:
-                            item.pop(key, None)
-
-        self.queue.update(mutator)
-        self.cancel_watchdogs_for_message(message_id, reason="delivery_requeued", phase=WATCHDOG_PHASE_DELIVERY)
+        return daemon_delivery.mark_message_pending(self, message_id, error)
 
     def mark_message_submitted(self, message_id: str) -> None:
-        def mutator(queue: list[dict]) -> None:
-            for item in queue:
-                if item.get("id") != message_id:
-                    continue
-                item["status"] = "submitted"
-                item["updated_ts"] = utc_now()
-                item.pop("last_error", None)
-
-        self.queue.update(mutator)
+        return daemon_delivery.mark_message_submitted(self, message_id)
 
     def mark_message_delivered_by_id(self, agent: str, message_id: str) -> dict | None:
-        """Mark message status=delivered using id+recipient as the primary key.
-
-        v1.5.2 authoritative path. Verifies recipient and status before
-        flipping state — never trust hook-extracted nonce alone.
-        """
-        with self.state_lock:
-            def mutator(queue: list[dict]) -> dict | None:
-                for item in queue:
-                    if item.get("id") != message_id:
-                        continue
-                    if item.get("to") != agent or item.get("status") != "inflight":
-                        return None
-                    now_iso = utc_now()
-                    item["status"] = "delivered"
-                    item["delivered_ts"] = now_iso
-                    item["updated_ts"] = now_iso
-                    item.pop("last_error", None)
-                    for key in PANE_MODE_METADATA_KEYS + PANE_MODE_ENTER_DEFER_KEYS:
-                        item.pop(key, None)
-                    for key in RESTART_INFLIGHT_METADATA_KEYS:
-                        item.pop(key, None)
-                    return dict(item)
-                return None
-
-            message = self.queue.update(mutator)
-            if message:
-                self.cancel_watchdogs_for_message(str(message_id), reason="delivered", phase=WATCHDOG_PHASE_DELIVERY)
-                self.arm_message_watchdog(message, WATCHDOG_PHASE_RESPONSE)
-            return message
+        return daemon_delivery.mark_message_delivered_by_id(self, agent, message_id)
 
     def arm_message_watchdog(self, message: dict, phase: str) -> None:
         return daemon_watchdogs.arm_message_watchdog(self, message, phase)
@@ -3263,173 +2678,13 @@ class BridgeDaemon:
             lock_ctx.__exit__(None, None, None)
 
     def remove_delivered_message(self, target: str, message_id: str) -> dict | None:
-        def mutator(queue: list[dict]) -> dict | None:
-            found = None
-            kept = []
-            for item in queue:
-                if item.get("id") == message_id and item.get("to") == target:
-                    found = dict(item)
-                    continue
-                kept.append(item)
-            queue[:] = kept
-            return found
-
-        return self.queue.update(mutator)
+        return daemon_delivery.remove_delivered_message(self, target, message_id)
 
     def finalize_undeliverable_message(self, message: dict, endpoint_detail: dict, *, phase: str) -> dict | None:
-        message_id = str(message.get("id") or "")
-        target = str(message.get("to") or "")
-        if not message_id:
-            return None
-
-        def mutator(queue: list[dict]) -> dict | None:
-            found = None
-            kept = []
-            for item in queue:
-                if item.get("id") == message_id:
-                    found = dict(item)
-                    continue
-                kept.append(item)
-            queue[:] = kept
-            return found
-
-        removed = self.queue.update(mutator) or dict(message)
-        nonce = str(removed.get("nonce") or message.get("nonce") or "")
-        if nonce:
-            self.discard_nonce(nonce)
-        if self.reserved.get(target) == message_id:
-            self.reserved[target] = None
-        self.last_enter_ts.pop(message_id, None)
-        active = self.current_prompt_by_agent.get(target) or {}
-        if str(active.get("id") or "") == message_id:
-            self.current_prompt_by_agent.pop(target, None)
-            self.busy[target] = False
-        self.cancel_watchdogs_for_message(message_id, reason="endpoint_lost")
-        self.suppress_pending_watchdog_wakes(ref_message_id=message_id, reason="endpoint_lost")
-        self._record_message_tombstone(
-            target,
-            removed,
-            by_sender="bridge",
-            reason="endpoint_lost",
-            suppress_late_hooks=False,
-            prompt_submitted_seen=bool(removed.get("status") in {"submitted", "delivered"}),
-        )
-
-        reason = str(endpoint_detail.get("reason") or "endpoint_lost")
-        probe_status = str(endpoint_detail.get("probe_status") or "")
-        self.log(
-            "message_undeliverable",
-            message_id=message_id,
-            from_agent=removed.get("from"),
-            to=target,
-            kind=removed.get("kind"),
-            aggregate_id=removed.get("aggregate_id"),
-            reason=reason,
-            probe_status=probe_status,
-            detail=endpoint_detail.get("detail"),
-            phase=phase,
-        )
-
-        if removed.get("aggregate_id"):
-            self._record_aggregate_interrupted_reply(removed, by_sender="bridge", reason="endpoint_lost")
-            return removed
-
-        kind = normalize_kind(removed.get("kind"), "request")
-        requester = str(removed.get("from") or "")
-        if kind == "request" and bool(removed.get("auto_return")) and requester and requester != "bridge" and requester in self.participants:
-            body = (
-                f"[bridge:undeliverable] Message {message_id} to {target} could not be delivered because "
-                f"the target has no verified live endpoint ({reason}). The target may have exited, been killed, "
-                "or the tmux pane may have been reused. If the agent was resumed in another pane, ask the human "
-                "to submit any short prompt there so the bridge hook can re-attach it. Otherwise reattach/join "
-                "the target, or remove it from the room."
-            )
-            result = make_message(
-                sender="bridge",
-                target=requester,
-                intent="undeliverable_result",
-                body=body,
-                causal_id=str(removed.get("causal_id") or short_id("causal")),
-                hop_count=int(removed.get("hop_count") or 0),
-                auto_return=False,
-                kind="result",
-                reply_to=message_id,
-                source="endpoint_lost",
-            )
-            self.queue_message(result)
-        return removed
+        return daemon_delivery.finalize_undeliverable_message(self, message, endpoint_detail, phase=phase)
 
     def retry_enter_for_inflight(self) -> None:
-        now = time.time()
-        with self.state_lock:
-            for item in list(self.queue.read()):
-                if item.get("status") != "inflight":
-                    continue
-                msg_id = str(item.get("id") or "")
-                if not msg_id:
-                    continue
-                last = self.last_enter_ts.get(msg_id)
-                enter_deferred = bool(item.get("pane_mode_enter_deferred_since_ts"))
-                if last is None and not enter_deferred:
-                    continue
-                if last is not None and now - last < 1.0:
-                    continue
-                target = str(item.get("to") or "")
-                if target in self.clear_reservations:
-                    continue
-                endpoint_detail = self.resolve_endpoint_detail(target, purpose="write")
-                if not endpoint_detail.get("ok"):
-                    self.finalize_undeliverable_message(item, endpoint_detail, phase="enter_retry")
-                    self.last_enter_ts.pop(msg_id, None)
-                    continue
-                pane = str(endpoint_detail.get("pane") or "")
-                mode_status = self.pane_mode_status(pane)
-                if mode_status.get("error"):
-                    error = str(mode_status.get("error") or "")
-                    defer_info = self.mark_enter_deferred_for_pane_mode(msg_id, target, "probe_error", error=error)
-                    self.last_enter_ts[msg_id] = now
-                    if defer_info and defer_info.get("_pane_mode_enter_defer_started"):
-                        self.safe_log(
-                            "pane_mode_probe_failed",
-                            target=target,
-                            pane=pane,
-                            message_id=msg_id,
-                            error=error,
-                            phase="enter_retry",
-                        )
-                    continue
-                elif mode_status.get("in_mode"):
-                    mode = str(mode_status.get("mode") or "")
-                    defer_info = self.mark_enter_deferred_for_pane_mode(msg_id, target, mode)
-                    self.last_enter_ts[msg_id] = now
-                    if defer_info and defer_info.get("_pane_mode_enter_defer_started"):
-                        self.log(
-                            "enter_retry_deferred_pane_mode",
-                            message_id=msg_id,
-                            to=target,
-                            mode=mode,
-                        )
-                    continue
-                else:
-                    self.clear_enter_deferred_metadata(msg_id)
-                try:
-                    if not self.dry_run:
-                        run_tmux_enter(pane)
-                except Exception as exc:
-                    self.safe_log(
-                        "enter_retry_failed",
-                        message_id=msg_id,
-                        to=target,
-                        error=str(exc),
-                    )
-                    continue
-                self.last_enter_ts[msg_id] = now
-                self.log(
-                    "enter_retry",
-                    message_id=msg_id,
-                    to=target,
-                    attempts=int(item.get("delivery_attempts") or 0),
-                )
+        return daemon_delivery.retry_enter_for_inflight(self)
 
     def register_watchdog(self, message: dict) -> None:
         return daemon_watchdogs.register_watchdog(self, message)
