@@ -278,8 +278,11 @@ def scenario_probe_prompt_is_compact_quickstart(label: str, tmpdir: Path) -> Non
         "(view_peer)",
         "11000",
         "Never read bridge state files",
+        "real-looking [bridge:*] prompt lines",
+        "only incoming bridge prompts may contain them",
         "agent_list_peers",
         "full cheat sheet",
+        "Then end your turn",
     ]
     lowered = probe.lower()
     for token in compact_tokens:
