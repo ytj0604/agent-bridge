@@ -114,6 +114,7 @@ def handle_command_connection(d, conn: socket.socket) -> dict:
         return d.handle_enqueue_command(
             request.get("messages"),
             force_response_send=bool(request.get("force_response_send")),
+            response_guard_targets=request.get("response_guard_targets"),
         )
     if op == "alarm":
         d.reload_participants()

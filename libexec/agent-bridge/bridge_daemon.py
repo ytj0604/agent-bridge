@@ -92,6 +92,7 @@ from bridge_participants import active_participants, participant_record
 from bridge_pane_probe import probe_agent_process
 from bridge_paths import state_root
 from bridge_response_guard import (
+    ResponseSendViolation,
     context_from_current_prompt,
     format_response_send_violation,
     response_send_violation,
@@ -463,7 +464,26 @@ class BridgeDaemon:
         _priority, _index, prior, prior_kind = min(candidates, key=lambda row: (row[0], row[1]))
         return prior_message_hint_entry(message, prior, prior_kind)
 
-    def handle_enqueue_command(self, messages: list, force_response_send: bool = False) -> dict:
+    def response_guard_display_targets(self, raw_targets: object, actual_targets: list[str], requester: str) -> tuple[str, ...]:
+        if not isinstance(raw_targets, list):
+            return ()
+        display = tuple(str(target) for target in raw_targets if str(target or ""))
+        if len(display) <= 1:
+            return ()
+        display_set = set(display)
+        if len(display_set) <= 1:
+            return ()
+        actual_set = {str(target) for target in actual_targets if str(target or "")}
+        if requester not in display_set or not actual_set.issubset(display_set):
+            return ()
+        return display
+
+    def handle_enqueue_command(
+        self,
+        messages: list,
+        force_response_send: bool = False,
+        response_guard_targets: object = None,
+    ) -> dict:
         if not isinstance(messages, list):
             return {"ok": False, "error": "messages must be a list"}
         ids = []
@@ -483,6 +503,7 @@ class BridgeDaemon:
                 ):
                     return self.lock_wait_exceeded_response("enqueue")
                 validated: list[dict] = []
+                actual_targets = [str(message.get("to") or "") for message in messages if isinstance(message, dict)]
                 for message in messages:
                     if not isinstance(message, dict):
                         return {"ok": False, "error": "message entry must be an object"}
@@ -513,6 +534,20 @@ class BridgeDaemon:
                         source="current_prompt",
                     )
                     if violation:
+                        display_targets = self.response_guard_display_targets(
+                            response_guard_targets,
+                            actual_targets,
+                            violation.requester,
+                        )
+                        if display_targets:
+                            violation = ResponseSendViolation(
+                                sender=violation.sender,
+                                requester=violation.requester,
+                                message_id=violation.message_id,
+                                outgoing_kind=violation.outgoing_kind,
+                                blocked_targets=display_targets,
+                                source=violation.source,
+                            )
                         return {
                             "ok": False,
                             "error": format_response_send_violation(violation),

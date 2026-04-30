@@ -114,6 +114,8 @@ def scenarios() -> list[Scenario]:
         ('response_send_guard_socket_force_and_other_peer', moved['response_send_guard_socket_force_and_other_peer']),
         ('response_send_guard_socket_no_auto_return_allowed', moved['response_send_guard_socket_no_auto_return_allowed']),
         ('response_send_guard_socket_atomic_multi', moved['response_send_guard_socket_atomic_multi']),
+        ('response_send_guard_socket_mixed_target_wording', moved['response_send_guard_socket_mixed_target_wording']),
+        ('response_send_guard_socket_malformed_targets_do_not_bypass', moved['response_send_guard_socket_malformed_targets_do_not_bypass']),
         ('response_send_guard_socket_aggregate_and_held', moved['response_send_guard_socket_aggregate_and_held']),
         ('response_send_guard_after_response_finished_allowed', moved['response_send_guard_after_response_finished_allowed']),
         ('fallback_path_alarm_cancel', moved['fallback_path_alarm_cancel']),

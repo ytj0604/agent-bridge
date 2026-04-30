@@ -109,14 +109,21 @@ def response_send_violation(
 
 def format_response_send_violation(violation: ResponseSendViolation) -> str:
     extra = f"the outgoing target is that requester"
+    recovery = (
+        f"If you intentionally need a separate request/notice to {violation.requester}, "
+        "retry with --force."
+    )
     if len(violation.blocked_targets) > 1:
         extra = f"the outgoing target list includes that requester ({violation.requester})"
+        recovery = (
+            f"Remove {violation.requester} from the target list and resend to third-party peers only; "
+            f"use --force only if you intentionally need a separate request/notice to {violation.requester}."
+        )
     return (
         "agent_send_peer: response-time guard blocked/rejected this separate agent_send_peer "
         f"because you are responding to an auto-return peer request from {violation.requester} "
         f"(current_prompt.from={violation.requester}) and {extra}. Reply to {violation.requester} "
         "in the current response; bridge auto-returns that reply. third-party peer sends for "
         "review/collaboration are not blocked by this response-time guard, but other validations "
-        f"still apply. If you intentionally need a separate request/notice to {violation.requester}, "
-        "retry with --force."
+        f"still apply. {recovery}"
     )

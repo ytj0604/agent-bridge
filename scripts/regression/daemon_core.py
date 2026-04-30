@@ -173,6 +173,56 @@ def scenario_response_send_guard_socket_atomic_multi(label: str, tmpdir: Path) -
     assert_true(not any(e.get("event") == "message_queued" for e in read_events(tmpdir / "events.raw.jsonl")), f"{label}: socket guard must not append message_queued")
     print(f"  PASS  {label}")
 
+def scenario_response_send_guard_socket_mixed_target_wording(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91", "status": "active"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "status": "active"},
+        "carol": {"alias": "carol", "agent_type": "codex", "pane": "%93", "status": "active"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _set_response_context(d, "bob", "alice")
+    msg_to_carol = _qualifying_message("bob", "carol", kind="request", body="first")
+    msg_to_alice = _qualifying_message("bob", "alice", kind="request", body="second")
+    result = d.handle_enqueue_command(
+        [msg_to_carol, msg_to_alice],
+        response_guard_targets=["alice", "carol"],
+    )
+    assert_true(not result.get("ok"), f"{label}: mixed target list including requester must be blocked")
+    assert_true(result.get("error_kind") == "response_send_guard", f"{label}: structured error expected: {result}")
+    err = str(result.get("error") or "")
+    for token in (
+        "target list includes that requester",
+        "Remove alice from the target list",
+        "resend to third-party peers only",
+        "use --force only",
+        "current_prompt.from=alice",
+    ):
+        assert_true(token in err, f"{label}: mixed-target error missing {token!r}: {err!r}")
+    assert_true(d.queue.read() == [], f"{label}: socket guard must leave queue unchanged")
+    assert_true(not any(e.get("event") == "message_queued" for e in read_events(tmpdir / "events.raw.jsonl")), f"{label}: socket guard must not append message_queued")
+    print(f"  PASS  {label}")
+
+def scenario_response_send_guard_socket_malformed_targets_do_not_bypass(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91", "status": "active"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "status": "active"},
+        "carol": {"alias": "carol", "agent_type": "codex", "pane": "%93", "status": "active"},
+    }
+    d = make_daemon(tmpdir, participants)
+    _set_response_context(d, "bob", "alice")
+    msg_to_alice = _qualifying_message("bob", "alice", kind="request", body="wrong path")
+    result = d.handle_enqueue_command(
+        [msg_to_alice],
+        response_guard_targets=["carol"],
+    )
+    assert_true(not result.get("ok"), f"{label}: actual requester target must be blocked despite malformed display metadata")
+    assert_true(result.get("error_kind") == "response_send_guard", f"{label}: structured error expected: {result}")
+    err = str(result.get("error") or "")
+    assert_true("the outgoing target is that requester" in err, f"{label}: malformed metadata should fall back to actual target wording: {err!r}")
+    assert_true("target list includes that requester" not in err, f"{label}: malformed metadata must not control display targets: {err!r}")
+    assert_true(d.queue.read() == [], f"{label}: blocked socket send must not enqueue")
+    print(f"  PASS  {label}")
+
 def scenario_response_send_guard_socket_aggregate_and_held(label: str, tmpdir: Path) -> None:
     participants = {
         "alice": {"alias": "alice", "agent_type": "claude", "pane": "%91", "status": "active"},
@@ -3079,6 +3129,7 @@ def scenario_response_send_guard_socket_error_kind_parse(label: str, tmpdir: Pat
             "test-session",
             [{"id": "msg-test", "from": "bob", "to": "alice"}],
             force_response_send=True,
+            response_guard_targets=["alice"],
         )
         thread.join(timeout=2.0)
     finally:
@@ -3095,6 +3146,7 @@ def scenario_response_send_guard_socket_error_kind_parse(label: str, tmpdir: Pat
     assert_true(error == response["error"], f"{label}: error string preserved: {error!r}")
     assert_true(error_kind == "response_send_guard", f"{label}: error_kind surfaced: {error_kind!r}")
     assert_true(received and received[0].get("force_response_send") is True, f"{label}: force flag sent over socket: {received}")
+    assert_true(received and received[0].get("response_guard_targets") == ["alice"], f"{label}: original targets sent over socket: {received}")
     print(f"  PASS  {label}")
 
 def scenario_response_send_guard_fallback_blocks_unchanged(label: str, tmpdir: Path) -> None:
@@ -3304,6 +3356,8 @@ SCENARIOS = [
     ('response_send_guard_socket_force_and_other_peer', scenario_response_send_guard_socket_force_and_other_peer),
     ('response_send_guard_socket_no_auto_return_allowed', scenario_response_send_guard_socket_no_auto_return_allowed),
     ('response_send_guard_socket_atomic_multi', scenario_response_send_guard_socket_atomic_multi),
+    ('response_send_guard_socket_mixed_target_wording', scenario_response_send_guard_socket_mixed_target_wording),
+    ('response_send_guard_socket_malformed_targets_do_not_bypass', scenario_response_send_guard_socket_malformed_targets_do_not_bypass),
     ('response_send_guard_socket_aggregate_and_held', scenario_response_send_guard_socket_aggregate_and_held),
     ('response_send_guard_after_response_finished_allowed', scenario_response_send_guard_after_response_finished_allowed),
     ('ingressing_not_delivered_before_finalize', scenario_ingressing_not_delivered_before_finalize),

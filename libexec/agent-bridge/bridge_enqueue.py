@@ -124,13 +124,21 @@ def write_failure_message(path: Path, exc: OSError, ipc_error: str = "") -> str:
     return f"agent_send_peer: failed to write bridge queue/event state: {path}: {exc}.{suffix}"
 
 
-def enqueue_via_daemon_socket(bridge_session: str, messages: list[dict], *, force_response_send: bool = False) -> tuple[bool, list[str], list[dict], str, str]:
+def enqueue_via_daemon_socket(
+    bridge_session: str,
+    messages: list[dict],
+    *,
+    force_response_send: bool = False,
+    response_guard_targets: list[str] | None = None,
+) -> tuple[bool, list[str], list[dict], str, str]:
     socket_path = run_root() / f"{bridge_session}.sock"
     if not socket_path.exists():
         return False, [], [], "", ""
     payload = {"op": "enqueue", "messages": messages}
     if force_response_send:
         payload["force_response_send"] = True
+    if response_guard_targets:
+        payload["response_guard_targets"] = [str(target) for target in response_guard_targets if str(target or "")]
     request = json.dumps(payload, ensure_ascii=True) + "\n"
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
@@ -388,7 +396,12 @@ def main() -> int:
             if message.get("aggregate_id") == aggregate_id:
                 message["aggregate_message_ids"] = aggregate_message_ids
                 record["aggregate_message_ids"] = aggregate_message_ids
-    attempted_ipc, ipc_ids, ipc_hints, ipc_error, ipc_error_kind = enqueue_via_daemon_socket(bridge_session, messages, force_response_send=args.force)
+    attempted_ipc, ipc_ids, ipc_hints, ipc_error, ipc_error_kind = enqueue_via_daemon_socket(
+        bridge_session,
+        messages,
+        force_response_send=args.force,
+        response_guard_targets=list(targets),
+    )
     if attempted_ipc:
         if ipc_error:
             if ipc_error_kind == "response_send_guard":

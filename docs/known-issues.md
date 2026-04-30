@@ -261,29 +261,3 @@ default Codex sandbox, a `python3` subprocess returned
 `socket.AF_UNIX.connect('/tmp/agent-bridge-0/run/agent-bridge-auto.sock')` and
 `socket.AF_INET.connect(('127.0.0.1', <live-listener>))` despite
 `[sandbox_workspace_write] network_access = true` set in `~/.codex/config.toml`.
-
----
-
-### K-03: Daemon-socket mixed-target guard wording is less specific
-
-**Status**: current, low-priority diagnostic parity issue.
-
-**Symptom / risk**: During response-time send validation, a target list that
-includes the active requester plus third-party peers can produce more precise
-mixed-target wording on the file-fallback path than on the daemon-socket path.
-Socket validation can report the single-target requester wording instead.
-
-**Root cause**: File-fallback formatting still has the full target set. The
-daemon socket path validates per-message payloads, so daemon-side formatting
-lacks the original mixed target list.
-
-**Mitigation**: Behavior remains safe and atomic: sends containing the requester
-are rejected, third-party-only sends remain allowed by this guard, and the error
-still tells the model to reply to the requester in the current response.
-
-**Residual risk**: This is diagnostic consistency only, not a routing
-correctness issue. Future cleanup could pass target-set metadata into
-daemon-side validation to make socket and fallback wording identical.
-
-**Evidence**: `bridge_response_guard.py::format_response_send_violation`,
-`bridge_send_peer.py` response-guard tests, followup lineage `8273bca`.
