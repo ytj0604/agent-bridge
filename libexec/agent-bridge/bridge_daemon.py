@@ -789,13 +789,16 @@ class BridgeDaemon:
         return self.maintenance_scheduler.start(self)
 
     def stop_maintenance_scheduler(self) -> None:
-        return self.maintenance_scheduler.stop()
+        return self.maintenance_scheduler.stop(timeout=None)
 
     def wake_maintenance_scheduler(self) -> None:
         return self.maintenance_scheduler.wake()
 
     def maintenance_scheduler_running(self) -> bool:
         return self.maintenance_scheduler.is_running()
+
+    def run_maintenance_once(self) -> bool:
+        return self.maintenance_scheduler.run_once(self)
 
     def sender_blocked_by_clear(self, sender: str) -> bool:
         return daemon_clear_flow.sender_blocked_by_clear(self, sender)
@@ -2693,11 +2696,9 @@ class BridgeDaemon:
                 while True:
                     if self.stop_requested():
                         break
-                    self.requeue_stale_inflight()
+                    if self.once:
+                        self.run_maintenance_once()
                     self.retry_enter_for_inflight()
-                    self.check_watchdogs()
-                    self.expire_turn_id_mismatch_contexts()
-                    self._promote_aged_ingressing()
                     # Periodic delivery wake (throttled): hold release,
                     # watchdog fires, requeues, etc. can leave pending
                     # work that no incoming event nudges. Without this

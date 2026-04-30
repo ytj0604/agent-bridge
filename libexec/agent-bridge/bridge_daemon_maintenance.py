@@ -40,10 +40,18 @@ class DeliveryScheduler:
 
 
 class MaintenanceScheduler:
+    TASKS = (
+        ("stale_inflight", "requeue_stale_inflight"),
+        ("watchdogs", "check_watchdogs"),
+        ("turn_id_mismatch", "expire_turn_id_mismatch_contexts"),
+        ("aged_ingressing", "_promote_aged_ingressing"),
+    )
+
     def __init__(self) -> None:
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._run_lock = threading.Lock()
         self.start_count = 0
         self.stop_count = 0
 
@@ -61,12 +69,15 @@ class MaintenanceScheduler:
         self.start_count += 1
         self._thread.start()
 
-    def stop(self, timeout: float = 2.0) -> None:
+    def stop(self, timeout: float | None = None) -> None:
         self._stop_event.set()
         self._wake_event.set()
         thread = self._thread
         if thread is not None and thread.is_alive():
-            thread.join(timeout=max(0.0, float(timeout)))
+            if timeout is None:
+                thread.join()
+            else:
+                thread.join(timeout=max(0.0, float(timeout)))
         if thread is None or not thread.is_alive():
             self._thread = None
         self.stop_count += 1
@@ -78,7 +89,23 @@ class MaintenanceScheduler:
         thread = self._thread
         return bool(thread and thread.is_alive())
 
+    def run_once(self, d) -> bool:
+        if not self._run_lock.acquire(blocking=False):
+            return False
+        try:
+            for task_name, method_name in self.TASKS:
+                try:
+                    getattr(d, method_name)()
+                except Exception as exc:
+                    d.safe_log("maintenance_task_failed", task=task_name, error=repr(exc))
+        finally:
+            self._run_lock.release()
+        return True
+
     def loop(self, d) -> None:
         while not self._stop_event.is_set():
-            self._wake_event.wait(60.0)
+            self.run_once(d)
+            if self._stop_event.is_set():
+                break
+            self._wake_event.wait(0.25)
             self._wake_event.clear()
