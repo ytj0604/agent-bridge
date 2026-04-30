@@ -47,13 +47,22 @@ def pane_mode_block_since_ts(item: dict) -> float | None:
         return None
 
 
-def try_deliver_command_aware(d, target: str | None = None, *, message_id: str = "") -> None:
+def try_deliver_command_aware(
+    d,
+    target: str | None = None,
+    *,
+    message_id: str = "",
+    use_target_locks: bool = True,
+) -> None:
     if target and not d.command_delivery_allowed(str(target), message_id):
         return
     if target is None and not d.command_delivery_allowed("", message_id):
         return
     try:
-        d.try_deliver(target)
+        if use_target_locks:
+            d.try_deliver(target)
+        else:
+            d.try_deliver_legacy_state_locked(target)
     except Exception as exc:
         if exc.__class__.__name__ != "CommandLockWaitExceeded":
             raise
@@ -480,23 +489,34 @@ def reserve_next(d, target: str) -> dict | None:
         return message
 
 
-def try_deliver(d, target: str | None = None) -> None:
+def _try_deliver_targets_locked(d, targets: list[str]) -> None:
+    for agent in targets:
+        if agent not in d.participants:
+            continue
+        candidate = d.next_pending_candidate(agent)
+        if not candidate:
+            continue
+        pane = d.resolve_target_pane(agent)
+        if pane and d.maybe_defer_for_pane_mode(agent, pane, candidate):
+            continue
+        message = d.reserve_next(agent)
+        if not message:
+            continue
+        d.deliver_reserved(message)
+
+
+def try_deliver(d, target: str | None = None, *, use_target_locks: bool = True) -> None:
     d.reload_participants()
+    targets = [str(target)] if target else sorted(str(alias) for alias in d.participants)
+    if use_target_locks:
+        if d._state_lock_owned_by_current_thread():
+            raise RuntimeError("target-locking delivery cannot run while state_lock is owned")
+        with d.target_locks_for(targets):
+            with d.state_lock:
+                _try_deliver_targets_locked(d, targets)
+        return
     with d.state_lock:
-        targets = [target] if target else sorted(d.participants)
-        for agent in targets:
-            if agent not in d.participants:
-                continue
-            candidate = d.next_pending_candidate(agent)
-            if not candidate:
-                continue
-            pane = d.resolve_target_pane(agent)
-            if pane and d.maybe_defer_for_pane_mode(agent, pane, candidate):
-                continue
-            message = d.reserve_next(agent)
-            if not message:
-                continue
-            d.deliver_reserved(message)
+        _try_deliver_targets_locked(d, targets)
 
 
 def deliver_reserved(d, message: dict) -> None:

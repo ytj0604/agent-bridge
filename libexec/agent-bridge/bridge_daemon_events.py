@@ -63,7 +63,7 @@ def handle_prompt_submitted(d, record: dict) -> None:
     intercepted = False
     suppressed_interrupted_prompt = False
     message: dict = {}
-    with d.state_lock:
+    with d.target_state_lock([agent]):
         if d.handle_clear_prompt_submitted_locked(agent, record):
             return
         observed_nonce = record.get("nonce")
@@ -414,7 +414,9 @@ def handle_response_finished(d, record: dict) -> None:
     # so could cause the bridge to inject a fresh prompt on top of a
     # peer that is still mid-turn.
     run_delivery_after_lock = False
-    with d.state_lock:
+    post_lock_delivery_requests: list[tuple[str | None, bool, str]] = []
+    return_after_post_lock_delivery = False
+    with d.target_state_lock([sender]):
         text = record.get("last_assistant_message") or ""
         if d.handle_clear_response_finished_locked(sender, record):
             return
@@ -580,11 +582,11 @@ def handle_response_finished(d, record: dict) -> None:
                 d.busy[sender] = False
                 d.reserved[sender] = None
                 d.current_prompt_by_agent.pop(sender, None)
-                d.request_and_drain_delivery(sender, command_aware=False, reason="held_stop_sender")
-            d.request_and_drain_delivery(command_aware=False, reason="held_stop_global")
-            return
+                post_lock_delivery_requests.append((sender, False, "held_stop_sender"))
+            post_lock_delivery_requests.append((None, False, "held_stop_global"))
+            return_after_post_lock_delivery = True
 
-        if not run_delivery_after_lock and turn_id_mismatch:
+        if not return_after_post_lock_delivery and not run_delivery_after_lock and turn_id_mismatch:
             # A late Stop event for an old turn arrived while the peer
             # is processing a new turn. Skip routing now; a maintenance
             # sweep expires the active context later if the matching Stop
@@ -607,7 +609,7 @@ def handle_response_finished(d, record: dict) -> None:
                 )
             return
 
-        if not run_delivery_after_lock:
+        if not return_after_post_lock_delivery and not run_delivery_after_lock:
             # Normal terminal path: route (if applicable) and remove the
             # delivered message from queue regardless of whether routing
             # actually delivered text (notices, empty responses, inactive
@@ -619,6 +621,10 @@ def handle_response_finished(d, record: dict) -> None:
                 d.maybe_return_response(sender, text, context)
             d._cleanup_terminal_context_locked(sender, context, watchdog_reason="terminal_response")
             d.promote_pending_self_clear_locked(sender)
+    for target, command_aware, reason in post_lock_delivery_requests:
+        d.request_and_drain_delivery(target, command_aware=command_aware, reason=reason)
+    if return_after_post_lock_delivery:
+        return
     d.request_and_drain_delivery(sender, command_aware=False, reason="response_finished_sender")
     d.request_and_drain_delivery(command_aware=False, reason="response_finished_global")
 
@@ -639,12 +645,15 @@ def handle_external_message_queued(d, record: dict) -> None:
     # of the same event cannot re-cancel a fresh alarm.
     target = record.get("to")
     d.reload_participants()
+    deliver_target = ""
     with d.state_lock:
         msg_id = str(record.get("message_id") or "")
         if msg_id:
             d._apply_alarm_cancel_to_queued_message(msg_id)
         if target in d.participants:
-            d.try_deliver(str(target))
+            deliver_target = str(target)
+    if deliver_target:
+        d.try_deliver(deliver_target)
 
 
 def _drop_ingress_row_from_blocked_sender(d, message_id: str, *, phase: str) -> bool:

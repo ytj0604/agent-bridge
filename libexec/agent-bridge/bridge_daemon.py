@@ -91,6 +91,7 @@ from bridge_daemon_state import (
     ParticipantCache,
     RoutingState,
     StateField,
+    TargetLockManager,
     WatchdogState,
 )
 from bridge_daemon_tmux import (
@@ -361,6 +362,7 @@ class BridgeDaemon:
         # holding this lock, including Claude's short ESC -> C-c delay, so
         # hook events and replacement delivery cannot interleave between keys.
         self.lock_facade = LockFacade()
+        self.target_locks = TargetLockManager()
         self.delivery_scheduler = DeliveryScheduler()
         self.maintenance_scheduler = MaintenanceScheduler()
         self.submit_delay = args.submit_delay
@@ -750,6 +752,16 @@ class BridgeDaemon:
     def try_deliver_command_aware(self, target: str | None = None, *, message_id: str = "") -> None:
         return daemon_delivery.try_deliver_command_aware(self, target, message_id=message_id)
 
+    def try_deliver_command_aware_legacy_state_locked(self, target: str | None = None, *, message_id: str = "") -> None:
+        if not self._state_lock_owned_by_current_thread():
+            raise RuntimeError("legacy state-locked delivery requires state_lock ownership")
+        return daemon_delivery.try_deliver_command_aware(self, target, message_id=message_id, use_target_locks=False)
+
+    def try_deliver_legacy_state_locked(self, target: str | None = None) -> None:
+        if not self._state_lock_owned_by_current_thread():
+            raise RuntimeError("legacy state-locked delivery requires state_lock ownership")
+        return daemon_delivery.try_deliver(self, target, use_target_locks=False)
+
     def request_delivery(
         self,
         target: str | None = None,
@@ -766,7 +778,14 @@ class BridgeDaemon:
         )
 
     def drain_delivery_request(self, request: DeliveryRequest) -> None:
+        if self._state_lock_owned_by_current_thread():
+            return self.drain_delivery_request_legacy_state_locked(request)
         return self.delivery_scheduler.drain_inline(self, request)
+
+    def drain_delivery_request_legacy_state_locked(self, request: DeliveryRequest) -> None:
+        if not self._state_lock_owned_by_current_thread():
+            raise RuntimeError("legacy state-locked delivery requires state_lock ownership")
+        return self.delivery_scheduler.drain_legacy_state_locked(self, request)
 
     def request_and_drain_delivery(
         self,
@@ -799,6 +818,17 @@ class BridgeDaemon:
 
     def run_maintenance_once(self) -> bool:
         return self.maintenance_scheduler.run_once(self)
+
+    def target_locks_for(self, targets):
+        return self.target_locks.acquire(targets)
+
+    @contextmanager
+    def target_state_lock(self, targets):
+        if self._state_lock_owned_by_current_thread():
+            raise RuntimeError("target_state_lock cannot be entered while state_lock is owned")
+        with self.target_locks_for(targets):
+            with self.state_lock:
+                yield
 
     def maintenance_delivery_tick(self) -> None:
         # Periodic delivery wake (throttled): hold release, watchdog fires,
@@ -1564,8 +1594,8 @@ class BridgeDaemon:
     def reserve_next(self, target: str) -> dict | None:
         return daemon_delivery.reserve_next(self, target)
 
-    def try_deliver(self, target: str | None = None) -> None:
-        return daemon_delivery.try_deliver(self, target)
+    def try_deliver(self, target: str | None = None, *, use_target_locks: bool = True) -> None:
+        return daemon_delivery.try_deliver(self, target, use_target_locks=use_target_locks)
 
     def deliver_reserved(self, message: dict) -> None:
         return daemon_delivery.deliver_reserved(self, message)
@@ -2143,9 +2173,13 @@ class BridgeDaemon:
         if now - self.last_maintenance < 2.0:
             return
         with self.state_lock:
-            self._requeue_stale_inflight_locked(now)
+            stale_targets = self._requeue_stale_inflight_locked(now)
+        if stale_targets:
+            self.reload_participants()
+            for target in stale_targets:
+                self.try_deliver(target)
 
-    def _requeue_stale_inflight_locked(self, now: float) -> None:
+    def _requeue_stale_inflight_locked(self, now: float) -> list[str]:
         self.last_maintenance = now
         stale_targets: set[str] = set()
 
@@ -2193,9 +2227,12 @@ class BridgeDaemon:
                 reason="prompt_submit_timeout",
             )
 
-        self.reload_participants()
-        for target in stale_targets:
-            self.try_deliver(target)
+        sorted_targets = sorted(stale_targets)
+        if sorted_targets and not self._state_lock_owned_by_current_thread():
+            self.reload_participants()
+            for target in sorted_targets:
+                self.try_deliver(target)
+        return sorted_targets
 
     def handle_prompt_submitted(self, record: dict) -> None:
         return daemon_events.handle_prompt_submitted(self, record)

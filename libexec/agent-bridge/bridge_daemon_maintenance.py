@@ -38,6 +38,13 @@ class DeliveryScheduler:
             d.try_deliver(request.target)
         request.drained = True
 
+    def drain_legacy_state_locked(self, d, request: DeliveryRequest) -> None:
+        if request.command_aware:
+            d.try_deliver_command_aware_legacy_state_locked(request.target, message_id=request.message_id)
+        else:
+            d.try_deliver_legacy_state_locked(request.target)
+        request.drained = True
+
 
 class MaintenanceScheduler:
     TASKS = (

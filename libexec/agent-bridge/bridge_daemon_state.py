@@ -34,6 +34,45 @@ class BoundedSet:
         return True
 
 
+class TargetLockManager:
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._locks: dict[str, threading.RLock] = {}
+
+    def normalize_targets(self, targets) -> list[str]:
+        if isinstance(targets, str):
+            targets = [targets]
+        return sorted({str(target) for target in targets if str(target or "")})
+
+    def acquire(self, targets):
+        return _TargetLockContext(self, self.normalize_targets(targets))
+
+    def _locks_for(self, targets: list[str]) -> list[threading.RLock]:
+        with self._guard:
+            return [
+                self._locks.setdefault(target, threading.RLock())
+                for target in targets
+            ]
+
+
+class _TargetLockContext:
+    def __init__(self, manager: TargetLockManager, targets: list[str]) -> None:
+        self.manager = manager
+        self.targets = targets
+        self.locks: list[threading.RLock] = []
+
+    def __enter__(self) -> list[str]:
+        self.locks = self.manager._locks_for(self.targets)
+        for lock in self.locks:
+            lock.acquire()
+        return list(self.targets)
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        for lock in reversed(self.locks):
+            lock.release()
+        self.locks = []
+
+
 @dataclass
 class LockFacade:
     state_lock: threading.RLock = field(default_factory=threading.RLock)
