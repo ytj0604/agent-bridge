@@ -46,6 +46,9 @@ from bridge_daemon_messages import (
     one_line,
     prompt_body,
 )
+import bridge_daemon_commands as daemon_commands
+import bridge_daemon_status as daemon_status
+from bridge_daemon_status import AGGREGATE_STATUS_LEG_LIMIT, WAIT_STATUS_SECTION_LIMIT
 from bridge_daemon_store import AggregateStore, QueueStore
 from bridge_daemon_state import (
     BoundedSet,
@@ -162,8 +165,6 @@ WATCHDOG_PHASE_ALARM = "alarm"
 ALARM_CLIENT_WAKE_ID_RE = re.compile(r"^wake-[a-f0-9]{12}$")
 ALARM_WAKE_TOMBSTONE_TTL_SECONDS = 60 * 60
 ALARM_WAKE_TOMBSTONE_LIMIT = 4096
-WAIT_STATUS_SECTION_LIMIT = 50
-AGGREGATE_STATUS_LEG_LIMIT = 100
 PEER_RESULT_REDIRECT_PREVIEW_CHARS = 100
 PEER_RESULT_REDIRECT_WRAPPER_MAX_CHARS = 600
 PEER_RESULT_REDIRECT_DIRNAME = "replies"
@@ -479,83 +480,16 @@ class BridgeDaemon:
                 self.startup_backfill_summary = {"_error": {"status": "unknown", "reason": str(exc)}}
 
     def start_command_server(self) -> None:
-        if not self.command_socket:
-            return
-        if self.dry_run:
-            return
-        path = self.command_socket
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            server.bind(str(path))
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
-            server.listen(16)
-            server.settimeout(0.25)
-        except OSError as exc:
-            try:
-                server.close()
-            finally:
-                self.command_server_socket = None
-            self.log("command_socket_unavailable", command_socket=str(path), error=str(exc))
-            return
-        self.command_server_socket = server
-        self.command_server_thread = threading.Thread(target=self.command_server_loop, name="bridge-command-socket", daemon=True)
-        self.command_server_thread.start()
+        return daemon_commands.start_command_server(self)
 
     def stop_command_server(self) -> None:
-        server = self.command_server_socket
-        if server is not None:
-            try:
-                server.close()
-            except OSError:
-                pass
-            self.command_server_socket = None
-        if self.command_socket:
-            try:
-                self.command_socket.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
+        return daemon_commands.stop_command_server(self)
 
     def command_server_loop(self) -> None:
-        server = self.command_server_socket
-        if server is None:
-            return
-        while not self.stop_requested():
-            try:
-                conn, _ = server.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            worker = threading.Thread(
-                target=self.handle_command_worker,
-                args=(conn,),
-                name="bridge-command-worker",
-                daemon=True,
-            )
-            worker.start()
+        return daemon_commands.command_server_loop(self)
 
     def handle_command_worker(self, conn: socket.socket) -> None:
-        with conn:
-            try:
-                response = self.handle_command_connection(conn)
-            except CommandLockWaitExceeded as exc:
-                response = self.lock_wait_exceeded_response(exc.command_class)
-            finally:
-                self.command_context.info = {}
-            try:
-                conn.sendall((json.dumps(response, ensure_ascii=True) + "\n").encode("utf-8"))
-            except OSError:
-                pass
+        return daemon_commands.handle_command_worker(self, conn)
 
     def _finite_watchdog_delay(self, message: dict) -> float | None:
         if "watchdog_delay_sec" not in message:
@@ -712,251 +646,10 @@ class BridgeDaemon:
         return response
 
     def handle_command_connection(self, conn: socket.socket) -> dict:
-        peer_uid = self.peer_uid(conn)
-        if peer_uid is not None and peer_uid != os.getuid():
-            return {"ok": False, "error": f"peer uid {peer_uid} is not allowed"}
-        try:
-            raw = b""
-            while b"\n" not in raw and len(raw) < 2_000_000:
-                chunk = conn.recv(65536)
-                if not chunk:
-                    break
-                raw += chunk
-            request = json.loads(raw.decode("utf-8"))
-        except Exception as exc:
-            return {"ok": False, "error": f"invalid request: {exc}"}
-
-        if not isinstance(request, dict):
-            return {"ok": False, "error": "unsupported command"}
-        op = request.get("op")
-        self.begin_command_context(str(op or ""), request)
-        if op == "enqueue":
-            return self.handle_enqueue_command(
-                request.get("messages"),
-                force_response_send=bool(request.get("force_response_send")),
-            )
-        if op == "alarm":
-            self.reload_participants()
-            sender = str(request.get("from") or "")
-            if sender not in self.participants:
-                return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
-            delay = request.get("delay_seconds")
-            if delay is None:
-                return {"ok": False, "error": "delay_seconds required"}
-            try:
-                delay_value = float(delay)
-            except (TypeError, ValueError):
-                return {"ok": False, "error": "delay_seconds must be a number"}
-            if not math.isfinite(delay_value) or delay_value < 0:
-                return {"ok": False, "error": "delay_seconds must be a finite non-negative number"}
-            body = request.get("body")
-            wake_id = request.get("wake_id")
-            return self.register_alarm_result(
-                sender,
-                delay_value,
-                body if isinstance(body, str) else None,
-                wake_id=str(wake_id) if wake_id is not None else None,
-            )
-        if op == "interrupt":
-            self.reload_participants()
-            sender = str(request.get("from") or "")
-            target = str(request.get("target") or "")
-            if sender and sender != "bridge" and sender not in self.participants:
-                return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
-            if target not in self.participants:
-                return {"ok": False, "error": f"target {target!r} is not an active participant"}
-            result = self.handle_interrupt(sender, target)
-            if result.get("error_kind") == "lock_wait_exceeded":
-                return {"ok": False, "error": "lock_wait_exceeded", "error_kind": "lock_wait_exceeded"}
-            return {"ok": True, **result}
-        if op == "clear_peer":
-            self.reload_participants()
-            sender = str(request.get("from") or "")
-            force = bool(request.get("force"))
-            if sender and sender != "bridge" and sender not in self.participants:
-                return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
-            if request.get("targets") is not None:
-                if str(request.get("target") or ""):
-                    return {"ok": False, "error": "use either target or targets, not both", "error_kind": "malformed_targets"}
-                validation = self.validate_clear_targets_payload(sender or "bridge", request.get("targets"), force=force)
-                if not validation.get("ok"):
-                    return validation
-                targets = list(validation.get("targets") or [])
-                if len(targets) == 1:
-                    return self.handle_clear_peer(sender or "bridge", targets[0], force=force)
-                return self.handle_clear_peers(sender or "bridge", targets, force=force)
-            target = str(request.get("target") or "")
-            if target not in self.participants:
-                return {"ok": False, "error": f"target {target!r} is not an active participant"}
-            return self.handle_clear_peer(sender or "bridge", target, force=force)
-        if op == "clear_hold":
-            self.reload_participants()
-            sender = str(request.get("from") or "")
-            target = str(request.get("target") or "")
-            if sender and sender != "bridge" and sender not in self.participants:
-                return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
-            if target not in self.participants:
-                return {"ok": False, "error": f"target {target!r} is not an active participant"}
-            info = self.release_hold(target, reason=f"manual_clear_by_{sender or 'bridge'}", by_sender=sender)
-            if isinstance(info, dict) and info.get("_lock_wait_exceeded"):
-                return self.lock_wait_exceeded_response("clear_hold")
-            return {
-                "ok": True,
-                "had_hold": info is not None,
-                "info": info or {},
-                "warning": (
-                    "Forcing hold release before the peer's Stop event arrives can cause "
-                    "late responses to misroute, and clearing a partial interrupt gate can "
-                    "paste queued prompts into dirty input. Verify with --status that the peer "
-                    "is idle, then use agent_view_peer to confirm the input buffer is clear "
-                    "before clearing."
-                ),
-            }
-        if op == "extend_watchdog":
-            self.reload_participants()
-            sender = str(request.get("from") or "")
-            message_id = str(request.get("message_id") or "")
-            seconds = request.get("seconds")
-            if sender and sender != "bridge" and sender not in self.participants:
-                return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
-            if not message_id:
-                return {"ok": False, "error": "message_id required"}
-            try:
-                additional_sec = float(seconds)
-            except (TypeError, ValueError):
-                return {"ok": False, "error": "seconds must be a number"}
-            if not math.isfinite(additional_sec) or additional_sec <= 0:
-                return {"ok": False, "error": "seconds must be a finite positive number"}
-            ok, err, deadline = self.upsert_message_watchdog(sender, message_id, additional_sec)
-            if not ok:
-                error = err or "extend_failed"
-                response = {"ok": False, "error": error, "message_id": message_id}
-                hint = self.extend_watchdog_error_hint(error)
-                if hint:
-                    response["hint"] = hint
-                return response
-            return {"ok": True, "new_deadline": deadline, "message_id": message_id}
-        if op == "cancel_message":
-            self.reload_participants()
-            sender = str(request.get("from") or "")
-            message_id = str(request.get("message_id") or "")
-            if sender and sender != "bridge" and sender not in self.participants:
-                return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
-            if not message_id:
-                return {"ok": False, "error": "message_id required"}
-            result = self.cancel_message(sender, message_id)
-            if not result.get("ok"):
-                return result
-            target = str(result.get("target") or "")
-            if result.get("cancelled") and target:
-                self.try_deliver_command_aware(target, message_id=message_id)
-            return result
-        if op == "wait_status":
-            self.reload_participants()
-            sender = str(request.get("from") or "")
-            if not sender:
-                return {"ok": False, "error": "sender required"}
-            if sender == "bridge" or sender not in self.participants:
-                return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
-            return self.build_wait_status(sender)
-        if op == "aggregate_status":
-            self.reload_participants()
-            sender = str(request.get("from") or "")
-            aggregate_id = str(request.get("aggregate_id") or "")
-            if not sender:
-                return {"ok": False, "error": "sender required"}
-            if sender == "bridge" or sender not in self.participants:
-                return {"ok": False, "error": f"sender {sender!r} is not an active participant"}
-            if not aggregate_id:
-                return {"ok": False, "error": "aggregate_id_required"}
-            return self.build_aggregate_status(sender, aggregate_id)
-        if op == "status":
-            self.reload_participants()
-            target = str(request.get("target") or "")
-            peers = []
-            with self.command_state_lock(command_class="status"):
-                queue_snapshot = list(self.queue.read())
-                aliases = [target] if target else sorted(self.participants)
-                for alias in aliases:
-                    if alias not in self.participants:
-                        peers.append({"alias": alias, "active": False})
-                        continue
-                    participant = self.participants.get(alias) or {}
-                    held = self.held_interrupt.get(alias)
-                    partial_interrupt = self.interrupt_partial_failure_blocks.get(alias)
-                    cur = self.current_prompt_by_agent.get(alias) or {}
-                    pane = str(participant.get("pane") or self.panes.get(alias) or "")
-                    first_pending = next(
-                        (
-                            it for it in queue_snapshot
-                            if it.get("to") == alias and it.get("status") == "pending"
-                        ),
-                        {},
-                    )
-                    delivered_count = sum(
-                        1 for it in queue_snapshot
-                        if it.get("to") == alias and it.get("status") == "delivered"
-                    )
-                    pending_count = sum(
-                        1 for it in queue_snapshot
-                        if it.get("to") == alias and it.get("status") == "pending"
-                    )
-                    inflight_count = sum(
-                        1 for it in queue_snapshot
-                        if it.get("to") == alias and it.get("status") in {"inflight", "submitted"}
-                    )
-                    peers.append({
-                        "alias": alias,
-                        "active": True,
-                        "busy": bool(self.busy.get(alias)),
-                        "reserved_message_id": self.reserved.get(alias),
-                        "current_prompt_id": cur.get("id"),
-                        "current_prompt_from": cur.get("from"),
-                        "current_prompt_turn_id": cur.get("turn_id"),
-                        "held": held is not None,
-                        "held_info": held or {},
-                        "clear_active": alias in self.clear_reservations,
-                        "clear_info": {
-                            key: value
-                            for key, value in (self.clear_reservations.get(alias) or {}).items()
-                            if key not in {"condition"}
-                        },
-                        "self_clear_pending": alias in self.pending_self_clears,
-                        "self_clear_info": dict(self.pending_self_clears.get(alias) or {}),
-                        "interrupt_partial_failure_blocked": partial_interrupt is not None,
-                        "interrupt_partial_failure_info": partial_interrupt or {},
-                        "_pane": pane,
-                        "pane_mode_blocked_since": first_pending.get("pane_mode_blocked_since"),
-                        "pane_mode_blocked_mode": first_pending.get("pane_mode_blocked_mode"),
-                        "pane_mode_block_count": int(first_pending.get("pane_mode_block_count") or 0),
-                        "delivered_count": delivered_count,
-                        "inflight_count": inflight_count,
-                        "pending_count": pending_count,
-                    })
-            for peer in peers:
-                pane = peer.pop("_pane", "")
-                if not peer.get("active") or not pane:
-                    peer["pane_in_mode"] = False
-                    peer["pane_mode"] = ""
-                    continue
-                status = self.pane_mode_status(str(pane))
-                peer["pane_in_mode"] = bool(status.get("in_mode"))
-                peer["pane_mode"] = str(status.get("mode") or "")
-                if status.get("error"):
-                    peer["pane_mode_error"] = status.get("error")
-            return {"ok": True, "peers": peers}
-        return {"ok": False, "error": "unsupported command"}
+        return daemon_commands.handle_command_connection(self, conn)
 
     def peer_uid(self, conn: socket.socket) -> int | None:
-        so_peercred = getattr(socket, "SO_PEERCRED", None)
-        if so_peercred is None:
-            return None
-        try:
-            creds = conn.getsockopt(socket.SOL_SOCKET, so_peercred, struct.calcsize("3i"))
-            _pid, uid, _gid = struct.unpack("3i", creds)
-            return int(uid)
-        except OSError:
-            return None
+        return daemon_commands.peer_uid(self, conn)
 
     def begin_command_context(self, op: str, request: dict | None = None) -> None:
         request = request if isinstance(request, dict) else {}
@@ -3262,233 +2955,46 @@ class BridgeDaemon:
         return removed
 
     def _wait_status_section(self, items: list[dict], *, limit: int = WAIT_STATUS_SECTION_LIMIT) -> dict:
-        limited = items[:limit]
-        total = len(items)
-        return {
-            "total_count": total,
-            "returned_count": len(limited),
-            "truncated": total > len(limited),
-            "items": limited,
-        }
+        return daemon_status._wait_status_section(self, items, limit=limit)
 
     def _wait_status_deadline_iso(self, deadline: object) -> str:
-        try:
-            value = float(deadline)
-        except (TypeError, ValueError):
-            return ""
-        if not math.isfinite(value):
-            return ""
-        return datetime.fromtimestamp(value, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        return daemon_status._wait_status_deadline_iso(self, deadline)
 
     def _wait_status_message_watchdog_index(self, caller: str, watchdogs: dict[str, dict]) -> dict[str, list[dict]]:
-        by_message: dict[str, list[dict]] = {}
-        for wake_id, wd in watchdogs.items():
-            if wd.get("is_alarm"):
-                continue
-            if str(wd.get("sender") or "") != caller:
-                continue
-            message_id = str(wd.get("ref_message_id") or "")
-            if not message_id:
-                continue
-            by_message.setdefault(message_id, []).append({
-                "wake_id": wake_id,
-                "phase": self.normalize_watchdog_phase(wd),
-                "deadline": self._wait_status_deadline_iso(wd.get("deadline")),
-            })
-        return by_message
+        return daemon_status._wait_status_message_watchdog_index(self, caller, watchdogs)
 
     def _wait_status_counts(self, sections: dict[str, dict]) -> dict:
-        return {
-            name: {
-                "total_count": section.get("total_count", 0),
-                "returned_count": section.get("returned_count", 0),
-                "truncated": bool(section.get("truncated")),
-            }
-            for name, section in sections.items()
-        }
+        return daemon_status._wait_status_counts(self, sections)
 
     def _build_outstanding_requests(self, caller: str, queue: list[dict], watchdogs_by_message: dict[str, list[dict]]) -> list[dict]:
-        rows: list[dict] = []
-        active_statuses = {"pending", "inflight", "submitted", "delivered"}
-        for item in queue:
-            if str(item.get("from") or "") != caller:
-                continue
-            if normalize_kind(item.get("kind"), "request") != "request":
-                continue
-            if not bool(item.get("auto_return")):
-                continue
-            status = str(item.get("status") or "")
-            if status not in active_statuses:
-                continue
-            message_id = str(item.get("id") or "")
-            rows.append({
-                "message_id": message_id,
-                "target": item.get("to"),
-                "status": status,
-                "kind": normalize_kind(item.get("kind"), "request"),
-                "intent": item.get("intent"),
-                "created_ts": item.get("created_ts"),
-                "updated_ts": item.get("updated_ts"),
-                "inflight_ts": item.get("inflight_ts"),
-                "delivered_ts": item.get("delivered_ts"),
-                "aggregate_id": item.get("aggregate_id") or "",
-                "watchdog_wake_ids": [wd.get("wake_id") for wd in watchdogs_by_message.get(message_id, [])],
-            })
-        return rows
+        return daemon_status._build_outstanding_requests(self, caller, queue, watchdogs_by_message)
 
     def _build_wait_status_watchdogs(self, caller: str, watchdogs: dict[str, dict]) -> list[dict]:
-        rows: list[dict] = []
-        for wake_id, wd in watchdogs.items():
-            if wd.get("is_alarm"):
-                continue
-            if str(wd.get("sender") or "") != caller:
-                continue
-            rows.append({
-                "wake_id": wake_id,
-                "message_id": wd.get("ref_message_id") or "",
-                "aggregate_id": wd.get("ref_aggregate_id") or "",
-                "target": wd.get("ref_to") or "",
-                "phase": self.normalize_watchdog_phase(wd),
-                "deadline": self._wait_status_deadline_iso(wd.get("deadline")),
-                "kind": wd.get("ref_kind") or "",
-                "intent": wd.get("ref_intent") or "",
-            })
-        return rows
+        return daemon_status._build_wait_status_watchdogs(self, caller, watchdogs)
 
     def _build_wait_status_alarms(self, caller: str, watchdogs: dict[str, dict]) -> list[dict]:
-        rows: list[dict] = []
-        for wake_id, wd in watchdogs.items():
-            if not wd.get("is_alarm"):
-                continue
-            if str(wd.get("sender") or "") != caller:
-                continue
-            rows.append({
-                "wake_id": wake_id,
-                "deadline": self._wait_status_deadline_iso(wd.get("deadline")),
-                "note": str(wd.get("alarm_body") or ""),
-            })
-        return rows
+        return daemon_status._build_wait_status_alarms(self, caller, watchdogs)
 
     def _build_wait_status_pending_inbound(self, caller: str, queue: list[dict]) -> list[dict]:
-        rows: list[dict] = []
-        for item in queue:
-            if str(item.get("to") or "") != caller:
-                continue
-            if str(item.get("status") or "") != "pending":
-                continue
-            body = str(item.get("body") or "")
-            rows.append({
-                "message_id": item.get("id"),
-                "kind": normalize_kind(item.get("kind"), "notice"),
-                "from": item.get("from"),
-                "intent": item.get("intent"),
-                "created_ts": item.get("created_ts"),
-                "reply_to": item.get("reply_to"),
-                "ref_message_id": item.get("ref_message_id") or "",
-                "ref_aggregate_id": item.get("ref_aggregate_id") or "",
-                "source": item.get("source") or "",
-                "body_chars": len(body),
-            })
-        return rows
+        return daemon_status._build_wait_status_pending_inbound(self, caller, queue)
 
     def _build_wait_status_aggregates(self, caller: str, aggregates: dict) -> list[dict]:
-        rows: list[dict] = []
-        for aggregate_id, aggregate in (aggregates or {}).items():
-            if str(aggregate.get("requester") or "") != caller:
-                continue
-            if aggregate.get("delivered") or aggregate.get("status") == "complete":
-                continue
-            expected = [str(alias) for alias in aggregate.get("expected") or []]
-            replies = aggregate.get("replies") or {}
-            replied = sorted(str(alias) for alias in replies.keys())
-            missing = sorted(set(expected) - set(replied))
-            rows.append({
-                "aggregate_id": str(aggregate.get("id") or aggregate_id),
-                "causal_id": aggregate.get("causal_id") or "",
-                "intent": aggregate.get("intent") or "",
-                "expected_count": len(expected),
-                "replied_count": len(replied),
-                "missing_peers": missing,
-                "expected": expected,
-                "replied_peers": replied,
-                "message_ids": aggregate.get("message_ids") or {},
-                "updated_ts": aggregate.get("updated_ts") or "",
-            })
-        return rows
+        return daemon_status._build_wait_status_aggregates(self, caller, aggregates)
 
     def build_wait_status(self, caller: str) -> dict:
-        try:
-            with self.command_state_lock(command_class="wait_status"):
-                queue_snapshot = list(self.queue.read())
-                watchdog_snapshot = {wake_id: dict(wd) for wake_id, wd in self.watchdogs.items()}
-        except CommandLockWaitExceeded:
-            return self.lock_wait_exceeded_response("wait_status")
-        try:
-            aggregates = self.aggregates.read_aggregates()
-        except Exception:
-            aggregates = {}
-
-        # This is a best-effort debug snapshot: queue/watchdogs are atomic
-        # with each other, while aggregate JSON is read after releasing
-        # state_lock to preserve the daemon's lock ordering.
-        watchdogs_by_message = self._wait_status_message_watchdog_index(caller, watchdog_snapshot)
-        sections = {
-            "outstanding_requests": self._wait_status_section(
-                self._build_outstanding_requests(caller, queue_snapshot, watchdogs_by_message)
-            ),
-            "aggregate_waits": self._wait_status_section(self._build_wait_status_aggregates(caller, aggregates)),
-            "alarms": self._wait_status_section(self._build_wait_status_alarms(caller, watchdog_snapshot)),
-            "watchdogs": self._wait_status_section(self._build_wait_status_watchdogs(caller, watchdog_snapshot)),
-            "pending_inbound": self._wait_status_section(self._build_wait_status_pending_inbound(caller, queue_snapshot)),
-        }
-        return {
-            "ok": True,
-            "bridge_session": self.bridge_session,
-            "caller": caller,
-            "generated_ts": utc_now(),
-            "limits": {"per_section": WAIT_STATUS_SECTION_LIMIT},
-            "summary": self._wait_status_counts(sections),
-            **sections,
-        }
+        return daemon_status.build_wait_status(self, caller)
 
     def _aggregate_status_not_found(self, caller: str, aggregate_id: str, reason: str, **details) -> dict:
-        self.safe_log(
-            "aggregate_status_not_found",
-            caller=caller,
-            aggregate_id=aggregate_id,
-            reason=reason,
-            **details,
-        )
-        return {"ok": False, "error": "aggregate_not_found", "aggregate_id": aggregate_id}
+        return daemon_status._aggregate_status_not_found(self, caller, aggregate_id, reason, **details)
 
     def _aggregate_status_legacy_min_ts(self, values: list[object]) -> str:
-        candidates: list[tuple[float, str]] = []
-        for raw in values:
-            text = str(raw or "")
-            if not text:
-                continue
-            try:
-                ts = datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
-            except ValueError:
-                continue
-            candidates.append((ts, text))
-        if not candidates:
-            return ""
-        return min(candidates, key=lambda item: item[0])[1]
+        return daemon_status._aggregate_status_legacy_min_ts(self, values)
 
     def _aggregate_status_section(self, legs: list[dict]) -> dict:
-        limited = legs[:AGGREGATE_STATUS_LEG_LIMIT]
-        return {
-            "total_count": len(legs),
-            "returned_count": len(limited),
-            "truncated": len(legs) > len(limited),
-            "items": limited,
-        }
+        return daemon_status._aggregate_status_section(self, legs)
 
     def _aggregate_status_alias_list(self, raw: object) -> list[str]:
-        if not isinstance(raw, list):
-            return []
-        return [str(alias) for alias in raw if str(alias or "")]
+        return daemon_status._aggregate_status_alias_list(self, raw)
 
     def _aggregate_status_tombstone_for_message(
         self,
@@ -3496,23 +3002,10 @@ class BridgeDaemon:
         message_id: str,
         caller: str,
     ) -> dict | None:
-        if not message_id:
-            return None
-        for entries in tombstones.values():
-            for tombstone in entries:
-                if str(tombstone.get("message_id") or "") != message_id:
-                    continue
-                if str(tombstone.get("prior_sender") or "") != caller:
-                    continue
-                return tombstone
-        return None
+        return daemon_status._aggregate_status_tombstone_for_message(self, tombstones, message_id, caller)
 
     def _aggregate_terminal_status_from_reason(self, reason: str) -> str:
-        if reason in {"cancelled_by_sender", "prompt_intercepted", "interrupted"}:
-            return "cancelled"
-        if reason in {"endpoint_lost", "turn_id_mismatch_expired", "daemon_restart_lost_routing_ctx"}:
-            return "timeout"
-        return "timeout"
+        return daemon_status._aggregate_terminal_status_from_reason(self, reason)
 
     def _aggregate_status_response_watchdog(
         self,
@@ -3520,52 +3013,10 @@ class BridgeDaemon:
         aggregate_id: str,
         watchdogs: dict[str, dict],
     ) -> dict | None:
-        matches: list[tuple[float, str, dict]] = []
-        for wake_id, wd in watchdogs.items():
-            if wd.get("is_alarm"):
-                continue
-            if str(wd.get("sender") or "") != caller:
-                continue
-            if str(wd.get("ref_aggregate_id") or "") != aggregate_id:
-                continue
-            if self.normalize_watchdog_phase(wd) != WATCHDOG_PHASE_RESPONSE:
-                continue
-            try:
-                deadline = float(wd.get("deadline"))
-            except (TypeError, ValueError):
-                deadline = 0.0
-            matches.append((deadline, wake_id, wd))
-        if not matches:
-            return None
-        _deadline, wake_id, wd = sorted(matches, key=lambda item: (item[0], item[1]))[0]
-        return {
-            "wake_id": wake_id,
-            "phase": WATCHDOG_PHASE_RESPONSE,
-            "deadline": self._wait_status_deadline_iso(wd.get("deadline")),
-        }
+        return daemon_status._aggregate_status_response_watchdog(self, caller, aggregate_id, watchdogs)
 
     def _aggregate_status_reply_leg(self, alias: str, message_id: str, reply: dict, tombstone: dict | None = None) -> dict:
-        body = str(reply.get("body") or "")
-        synthetic = bool(reply.get("synthetic"))
-        reason = str(reply.get("synthetic_reason") or "")
-        if not synthetic and tombstone:
-            tombstone_reason = str(tombstone.get("reason") or "")
-            if tombstone_reason and tombstone_reason not in RESPONSE_LIKE_TOMBSTONE_REASONS:
-                synthetic = True
-                reason = tombstone_reason
-        status = self._aggregate_terminal_status_from_reason(reason) if synthetic else "responded"
-        leg = {
-            "target": alias,
-            "msg_id": message_id,
-            "status": status,
-            "response_received": not synthetic,
-            "response_chars": len(body),
-            "received_ts": reply.get("received_ts") or "",
-            "synthetic": synthetic,
-            "terminal_reason": reason,
-            "status_source": "aggregate_reply",
-        }
-        return leg
+        return daemon_status._aggregate_status_reply_leg(self, alias, message_id, reply, tombstone)
 
     def _aggregate_status_build_legs(
         self,
@@ -3576,191 +3027,18 @@ class BridgeDaemon:
         rows_by_alias: dict[str, dict],
         tombstones: dict[str, list[dict]],
     ) -> list[dict]:
-        legs: list[dict] = []
-        for alias in expected:
-            message_id = str(message_ids.get(alias) or (rows_by_alias.get(alias) or {}).get("id") or "")
-            reply = replies.get(alias)
-            tombstone = self._aggregate_status_tombstone_for_message(tombstones, message_id, caller)
-            if isinstance(reply, dict):
-                legs.append(self._aggregate_status_reply_leg(alias, message_id, reply, tombstone))
-                continue
-            row = rows_by_alias.get(alias)
-            if row:
-                legs.append({
-                    "target": alias,
-                    "msg_id": message_id,
-                    "status": str(row.get("status") or "pending"),
-                    "response_received": False,
-                    "response_chars": 0,
-                    "received_ts": "",
-                    "synthetic": False,
-                    "terminal_reason": "",
-                    "status_source": "queue",
-                })
-                continue
-            if tombstone:
-                reason = str(tombstone.get("reason") or "")
-                legs.append({
-                    "target": alias,
-                    "msg_id": message_id,
-                    "status": self._aggregate_terminal_status_from_reason(reason),
-                    "response_received": False,
-                    "response_chars": 0,
-                    "received_ts": "",
-                    "synthetic": True,
-                    "terminal_reason": reason,
-                    "status_source": "tombstone",
-                })
-                continue
-            legs.append({
-                "target": alias,
-                "msg_id": message_id,
-                "status": "pending",
-                "response_received": False,
-                "response_chars": 0,
-                "received_ts": "",
-                "synthetic": False,
-                "terminal_reason": "",
-                "status_source": "fallback",
-            })
-        return legs
+        return daemon_status._aggregate_status_build_legs(
+            self,
+            caller,
+            expected,
+            message_ids,
+            replies,
+            rows_by_alias,
+            tombstones,
+        )
 
     def build_aggregate_status(self, caller: str, aggregate_id: str) -> dict:
-        # Best-effort debug snapshot: queue/watchdogs/tombstones are atomic
-        # together; aggregate JSON is read afterwards to preserve lock order.
-        try:
-            with self.command_state_lock(command_class="aggregate_status"):
-                queue_snapshot = list(self.queue.read())
-                watchdog_snapshot = {wake_id: dict(wd) for wake_id, wd in self.watchdogs.items()}
-                tombstone_snapshot = {
-                    alias: [dict(entry) for entry in entries]
-                    for alias, entries in self.interrupted_turns.items()
-                }
-        except CommandLockWaitExceeded:
-            return self.lock_wait_exceeded_response("aggregate_status")
-        try:
-            aggregate = self.aggregates.get(aggregate_id)
-        except Exception:
-            aggregate = {}
-
-        matching_rows = [
-            dict(item)
-            for item in queue_snapshot
-            if str(item.get("aggregate_id") or "") == aggregate_id
-            and normalize_kind(item.get("kind"), "notice") == "request"
-            and bool(item.get("auto_return"))
-        ]
-        json_owner = str(aggregate.get("requester") or "")
-        queue_owners = sorted({str(item.get("from") or "") for item in matching_rows if str(item.get("from") or "")})
-        caller_watchdogs = [
-            wd for wd in watchdog_snapshot.values()
-            if str(wd.get("sender") or "") == caller
-            and str(wd.get("ref_aggregate_id") or "") == aggregate_id
-            and self.normalize_watchdog_phase(wd) == WATCHDOG_PHASE_RESPONSE
-            and not wd.get("is_alarm")
-        ]
-        watchdog_owner = caller if caller_watchdogs else ""
-        conflict = False
-        if len(queue_owners) > 1:
-            conflict = True
-        if json_owner and queue_owners and any(owner != json_owner for owner in queue_owners):
-            conflict = True
-        if json_owner and watchdog_owner and watchdog_owner != json_owner:
-            conflict = True
-        if not json_owner and queue_owners and watchdog_owner and queue_owners[0] != watchdog_owner:
-            conflict = True
-        if conflict:
-            return self._aggregate_status_not_found(
-                caller,
-                aggregate_id,
-                "source_owner_conflict",
-                json_owner=json_owner,
-                queue_owners=queue_owners,
-                watchdog_owner=watchdog_owner,
-            )
-
-        owner = json_owner or (queue_owners[0] if queue_owners else "") or watchdog_owner
-        if not owner:
-            return self._aggregate_status_not_found(caller, aggregate_id, "missing")
-        if owner != caller:
-            return self._aggregate_status_not_found(caller, aggregate_id, "foreign_owner")
-
-        owned_rows = [item for item in matching_rows if str(item.get("from") or "") == owner]
-        rows_by_alias = {
-            str(item.get("to") or ""): item
-            for item in owned_rows
-            if str(item.get("to") or "")
-        }
-        expected: list[str] = []
-        expected = self.merge_ordered_aliases(expected, self._aggregate_status_alias_list(aggregate.get("expected")))
-        for item in owned_rows:
-            expected = self.merge_ordered_aliases(expected, self._aggregate_status_alias_list(item.get("aggregate_expected")))
-        for wd in caller_watchdogs:
-            expected = self.merge_ordered_aliases(expected, self._aggregate_status_alias_list(wd.get("ref_aggregate_expected")))
-
-        message_ids: dict[str, str] = {}
-        raw_message_ids = aggregate.get("message_ids") or {}
-        if isinstance(raw_message_ids, dict):
-            message_ids.update({str(alias): str(message_id) for alias, message_id in raw_message_ids.items() if alias and message_id})
-        for item in owned_rows:
-            raw = item.get("aggregate_message_ids") or {}
-            if isinstance(raw, dict):
-                message_ids.update({str(alias): str(message_id) for alias, message_id in raw.items() if alias and message_id})
-            alias = str(item.get("to") or "")
-            if alias:
-                message_ids.setdefault(alias, str(item.get("id") or ""))
-        if not expected:
-            expected = self.merge_ordered_aliases(expected, list(message_ids.keys()))
-            expected = self.merge_ordered_aliases(expected, list(rows_by_alias.keys()))
-            replies_for_expected = aggregate.get("replies") or {}
-            if isinstance(replies_for_expected, dict):
-                expected = self.merge_ordered_aliases(expected, list(replies_for_expected.keys()))
-
-        replies = aggregate.get("replies") or {}
-        if not isinstance(replies, dict):
-            replies = {}
-        mode = str(aggregate.get("mode") or "")
-        if mode not in {"all", "partial"}:
-            row_modes = sorted({str(item.get("aggregate_mode") or "") for item in owned_rows if str(item.get("aggregate_mode") or "") in {"all", "partial"}})
-            mode = row_modes[0] if len(row_modes) == 1 else "unknown"
-        started_ts = str(aggregate.get("started_ts") or "")
-        if not started_ts:
-            started_ts = self._aggregate_status_legacy_min_ts(
-                [item.get("aggregate_started_ts") for item in owned_rows]
-                + [item.get("created_ts") for item in owned_rows]
-                + [aggregate.get("created_ts")]
-            )
-        legs = self._aggregate_status_build_legs(caller, expected, message_ids, replies, rows_by_alias, tombstone_snapshot)
-        replied_count = len([alias for alias in expected if alias in replies])
-        total_count = len(expected)
-        missing_count = max(0, total_count - replied_count)
-        status = str(aggregate.get("status") or "")
-        if aggregate.get("delivered") or status == "complete" or (total_count > 0 and replied_count >= total_count):
-            status = "complete"
-        else:
-            status = "collecting"
-
-        return {
-            "ok": True,
-            "bridge_session": self.bridge_session,
-            "caller": caller,
-            "aggregate_id": aggregate_id,
-            "generated_ts": utc_now(),
-            "status": status,
-            "mode": mode,
-            "started_ts": started_ts,
-            "completed_ts": aggregate.get("delivered_at") or "",
-            "replied_count": replied_count,
-            "total_count": total_count,
-            "missing_count": missing_count,
-            "limits": {"legs": AGGREGATE_STATUS_LEG_LIMIT},
-            "legs": self._aggregate_status_section(legs),
-            "aggregate_response_watchdog": self._aggregate_status_response_watchdog(
-                caller,
-                aggregate_id,
-                watchdog_snapshot,
-            ),
-        }
+        return daemon_status.build_aggregate_status(self, caller, aggregate_id)
 
     def reserve_next(self, target: str) -> dict | None:
         with self.state_lock:
