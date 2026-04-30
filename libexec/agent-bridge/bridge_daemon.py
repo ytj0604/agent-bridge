@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-from collections import OrderedDict
 from contextlib import contextmanager
 import hashlib
 import errno
@@ -48,6 +47,16 @@ from bridge_daemon_messages import (
     prompt_body,
 )
 from bridge_daemon_store import AggregateStore, QueueStore
+from bridge_daemon_state import (
+    BoundedSet,
+    ClearState,
+    LockFacade,
+    MaintenanceState,
+    ParticipantCache,
+    RoutingState,
+    StateField,
+    WatchdogState,
+)
 from bridge_daemon_tmux import (
     PANE_MODE_PROBE_TIMEOUT_SECONDS,
     TMUX_SEND_TIMEOUT_SECONDS,
@@ -203,21 +212,6 @@ def install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, _request_stop)
 
 
-class BoundedSet:
-    def __init__(self, max_size: int) -> None:
-        self.max_size = max(1, int(max_size))
-        self.items: OrderedDict[str, None] = OrderedDict()
-
-    def add(self, item: str) -> bool:
-        if item in self.items:
-            self.items.move_to_end(item)
-            return False
-        self.items[item] = None
-        while len(self.items) > self.max_size:
-            self.items.popitem(last=False)
-        return True
-
-
 class CommandLockWaitExceeded(RuntimeError):
     def __init__(self, command_class: str = "") -> None:
         self.command_class = command_class
@@ -357,6 +351,32 @@ def pane_mode_block_since_ts(item: dict) -> float | None:
 
 
 class BridgeDaemon:
+    session_state = StateField("participant_cache", "session_state")
+    participants = StateField("participant_cache", "participants")
+    panes = StateField("participant_cache", "panes")
+    session_mtime_ns = StateField("participant_cache", "session_mtime_ns")
+    startup_backfill_summary = StateField("participant_cache", "startup_backfill_summary")
+    busy = StateField("routing_state", "busy")
+    reserved = StateField("routing_state", "reserved")
+    current_prompt_by_agent = StateField("routing_state", "current_prompt_by_agent")
+    injected_by_nonce = StateField("routing_state", "injected_by_nonce")
+    last_enter_ts = StateField("routing_state", "last_enter_ts")
+    interrupted_turns = StateField("routing_state", "interrupted_turns")
+    processed_returns = StateField("watchdog_state", "processed_returns")
+    processed_capture_requests = StateField("watchdog_state", "processed_capture_requests")
+    watchdogs = StateField("watchdog_state", "watchdogs")
+    alarm_wake_tombstones = StateField("watchdog_state", "alarm_wake_tombstones")
+    held_interrupt = StateField("clear_state", "held_interrupt")
+    interrupt_partial_failure_blocks = StateField("clear_state", "interrupt_partial_failure_blocks")
+    clear_reservations = StateField("clear_state", "clear_reservations")
+    pending_self_clears = StateField("clear_state", "pending_self_clears")
+    last_maintenance = StateField("maintenance_state", "last_maintenance")
+    last_capture_cleanup = StateField("maintenance_state", "last_capture_cleanup")
+    last_ingressing_check = StateField("maintenance_state", "last_ingressing_check")
+    stop_logged = StateField("maintenance_state", "stop_logged")
+    last_delivery_tick = StateField("maintenance_state", "last_delivery_tick")
+    state_lock = StateField("lock_facade", "state_lock")
+
     def __init__(self, args: argparse.Namespace) -> None:
         self.state_file = Path(args.state_file)
         self.public_state_file = Path(args.public_state_file) if args.public_state_file else None
@@ -365,10 +385,25 @@ class BridgeDaemon:
         self.aggregates = AggregateStore(self.aggregate_file)
         self.args = args
         self.session_file = Path(args.session_file) if args.session_file else Path(args.queue_file).parent / "session.json"
-        self.session_state: dict = {}
-        self.participants: dict[str, dict] = {}
-        self.panes: dict[str, str] = {}
-        self.session_mtime_ns: int | None = None
+        self.participant_cache = ParticipantCache()
+        self.routing_state = RoutingState()
+        self.watchdog_state = WatchdogState(MAX_PROCESSED_RETURNS, MAX_PROCESSED_CAPTURE_REQUESTS)
+        self.clear_state = ClearState()
+        self.maintenance_state = MaintenanceState()
+        # Coarse RLock that serializes mutations to in-memory routing state
+        # (busy, reserved, current_prompt_by_agent, held_interrupt,
+        # interrupt_partial_failure_blocks,
+        # interrupted_turns, last_enter_ts, watchdogs, panes, participants caches) and gates
+        # event-handler / command-socket / maintenance interleaving.
+        # Lock ordering rule: state_lock is ALWAYS acquired before
+        # queue.update()'s file lock. Queue mutator callbacks must NOT
+        # call back into self.* methods or invoke logging — they should
+        # only manipulate the queue list and return data for callers to
+        # process outside the mutator.
+        # Interrupt handling also dispatches its tmux key sequence while
+        # holding this lock, including Claude's short ESC -> C-c delay, so
+        # hook events and replacement delivery cannot interleave between keys.
+        self.lock_facade = LockFacade()
         self.submit_delay = args.submit_delay
         self.submit_timeout = args.submit_timeout
         self.clear_post_clear_delay_seconds, clear_delay_warning = resolve_clear_post_clear_delay_seconds()
@@ -413,53 +448,21 @@ class BridgeDaemon:
         self.command_server_thread: threading.Thread | None = None
         self.command_server_socket: socket.socket | None = None
         self.once = args.once
-        self.busy: dict[str, bool] = {}
-        self.reserved: dict[str, str | None] = {}
-        self.current_prompt_by_agent: dict[str, dict] = {}
-        self.injected_by_nonce: OrderedDict[str, dict] = OrderedDict()
-        self.processed_returns = BoundedSet(MAX_PROCESSED_RETURNS)
-        self.processed_capture_requests = BoundedSet(MAX_PROCESSED_CAPTURE_REQUESTS)
-        self.last_maintenance = 0.0
-        self.last_capture_cleanup = 0.0
-        self.last_ingressing_check = 0.0
-        self.stop_logged = False
-        self.last_enter_ts: dict[str, float] = {}
-        self.watchdogs: dict[str, dict] = {}
-        self.alarm_wake_tombstones: OrderedDict[str, dict] = OrderedDict()
         # held_interrupt is a legacy/manual recovery marker. New default
         # interrupts no longer enter it; --clear-hold can still release old
         # or manually planted holds. It is informational for delivery: queued
         # corrections are allowed to flow without waiting for --clear-hold.
-        self.held_interrupt: dict[str, dict] = {}
         # A partial Claude interrupt (ESC succeeded but follow-up C-c failed)
         # leaves the pane input potentially dirty. This gate blocks all later
         # delivery to that target until another interrupt completes the full
         # configured key sequence, or an operator manually clears it.
-        self.interrupt_partial_failure_blocks: dict[str, dict] = {}
-        self.clear_reservations: dict[str, dict] = {}
-        self.pending_self_clears: dict[str, dict] = {}
         # interrupted_turns[alias] stores short-lived message tombstones. Some
         # suppress identifiable late prompt_submitted / response_finished events
         # from cancelled turns; all help model-facing commands distinguish
         # recently terminal ids from never-seen ids.
-        self.interrupted_turns: dict[str, list[dict]] = {}
-        # Coarse RLock that serializes mutations to in-memory routing state
-        # (busy, reserved, current_prompt_by_agent, held_interrupt,
-        # interrupt_partial_failure_blocks,
-        # interrupted_turns, last_enter_ts, watchdogs, panes, participants caches) and gates
-        # event-handler / command-socket / maintenance interleaving.
-        # Lock ordering rule: state_lock is ALWAYS acquired before
-        # queue.update()'s file lock. Queue mutator callbacks must NOT
-        # call back into self.* methods or invoke logging — they should
-        # only manipulate the queue list and return data for callers to
-        # process outside the mutator.
-        # Interrupt handling also dispatches its tmux key sequence while
-        # holding this lock, including Claude's short ESC -> C-c delay, so
-        # hook events and replacement delivery cannot interleave between keys.
-        self.state_lock = threading.RLock()
+        # command_context is intentionally left on BridgeDaemon: it is
+        # thread-local command execution context, not shared routing state.
         self.command_context = threading.local()
-        self.last_delivery_tick = 0.0
-        self.startup_backfill_summary: dict[str, dict] = {}
         try:
             removed_markers = cleanup_expired_or_orphaned(active_marker_ids={"__daemon_startup_no_active_clears__"})
             for marker in removed_markers:
