@@ -436,7 +436,12 @@ def queue_message(d, message: dict, log_event: bool = True, deliver: bool = True
             source=message.get("source"),
         )
     if deliver:
-        d.try_deliver_command_aware(str(message["to"]), message_id=str(message.get("id") or ""))
+        d.request_and_drain_delivery(
+            str(message["to"]),
+            message_id=str(message.get("id") or ""),
+            command_aware=True,
+            reason="queue_message",
+        )
 
 
 def reserve_next(d, target: str) -> dict | None:
