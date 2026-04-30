@@ -45,6 +45,9 @@ class MaintenanceScheduler:
         ("watchdogs", "check_watchdogs"),
         ("turn_id_mismatch", "expire_turn_id_mismatch_contexts"),
         ("aged_ingressing", "_promote_aged_ingressing"),
+        ("retry_enter", "retry_enter_for_inflight"),
+        ("delivery_tick", "maintenance_delivery_tick"),
+        ("capture_cleanup", "cleanup_capture_responses"),
     )
 
     def __init__(self) -> None:

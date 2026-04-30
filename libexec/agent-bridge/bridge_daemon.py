@@ -800,6 +800,15 @@ class BridgeDaemon:
     def run_maintenance_once(self) -> bool:
         return self.maintenance_scheduler.run_once(self)
 
+    def maintenance_delivery_tick(self) -> None:
+        # Periodic delivery wake (throttled): hold release, watchdog fires,
+        # requeues, etc. can leave pending work that no incoming event nudges.
+        # Without this tick the queue could stall indefinitely.
+        now = time.time()
+        if now - self.last_delivery_tick >= 0.5:
+            self.last_delivery_tick = now
+            self.try_deliver()
+
     def sender_blocked_by_clear(self, sender: str) -> bool:
         return daemon_clear_flow.sender_blocked_by_clear(self, sender)
 
@@ -2698,16 +2707,6 @@ class BridgeDaemon:
                         break
                     if self.once:
                         self.run_maintenance_once()
-                    self.retry_enter_for_inflight()
-                    # Periodic delivery wake (throttled): hold release,
-                    # watchdog fires, requeues, etc. can leave pending
-                    # work that no incoming event nudges. Without this
-                    # tick the queue could stall indefinitely.
-                    now = time.time()
-                    if now - self.last_delivery_tick >= 0.5:
-                        self.last_delivery_tick = now
-                        self.try_deliver()
-                    self.cleanup_capture_responses()
                     if self.stop_requested():
                         break
                     line = stream.readline()
