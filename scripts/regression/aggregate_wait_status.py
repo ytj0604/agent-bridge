@@ -327,6 +327,23 @@ def scenario_wait_status_empty_self_view(label: str, tmpdir: Path) -> None:
         assert_true((result.get("summary") or {}).get(section) == {k: payload.get(k) for k in ("total_count", "returned_count", "truncated")}, f"{label}: summary mismatch for {section}: {result}")
     print(f"  PASS  {label}")
 
+def scenario_wait_status_uses_watchdog_snapshot(label: str, tmpdir: Path) -> None:
+    d = make_daemon(tmpdir, _wait_status_participants())
+    alarm_id = d.register_alarm("alice", 120.0, "snapshot alarm")
+    calls = {"count": 0}
+    original_snapshot = d.watchdog_snapshot
+
+    def snapshot_spy() -> dict[str, dict]:
+        calls["count"] += 1
+        return original_snapshot()
+
+    d.watchdog_snapshot = snapshot_spy  # type: ignore[method-assign]
+    result = d.build_wait_status("alice")
+    alarms = _wait_status_section_items(result, "alarms")
+    assert_true(calls["count"] == 1, f"{label}: wait_status should use one watchdog snapshot, got {calls}")
+    assert_true(alarm_id and [row.get("wake_id") for row in alarms] == [alarm_id], f"{label}: alarm output should remain unchanged: {alarms}")
+    print(f"  PASS  {label}")
+
 def scenario_wait_status_outstanding_watchdogs_alarms_pending_inbound(label: str, tmpdir: Path) -> None:
     d = make_daemon(tmpdir, _wait_status_participants())
     now = time.time()
@@ -699,6 +716,7 @@ SCENARIOS = [
     ('aggregate_status_legacy_fallback_and_cap', scenario_aggregate_status_legacy_fallback_and_cap),
     ('aggregate_status_watchdog_only_anchor', scenario_aggregate_status_watchdog_only_anchor),
     ('wait_status_empty_self_view', scenario_wait_status_empty_self_view),
+    ('wait_status_uses_watchdog_snapshot', scenario_wait_status_uses_watchdog_snapshot),
     ('wait_status_outstanding_watchdogs_alarms_pending_inbound', scenario_wait_status_outstanding_watchdogs_alarms_pending_inbound),
     ('wait_status_aggregate_waits_privacy_and_completed_result', scenario_wait_status_aggregate_waits_privacy_and_completed_result),
     ('wait_status_caps_and_summary_counts', scenario_wait_status_caps_and_summary_counts),

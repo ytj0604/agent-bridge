@@ -311,6 +311,7 @@ def _handle_interrupt_under_target_lock(d, sender: str, target: str) -> dict:
     # queued replacement delivery could interleave with the interrupt key
     # sequence or same-target pane touch.
     default_post_lock, default_margin = d.command_budget("interrupt")
+    lock_ctx = None
     try:
         d.reload_participants()
         lock_ctx = d.command_state_lock(
@@ -351,7 +352,7 @@ def _handle_interrupt_under_target_lock(d, sender: str, target: str) -> dict:
                 probe_status=endpoint_detail.get("probe_status"),
                 finalized_message_ids=[item.get("id") for item in finalized],
             )
-            return {
+            result = {
                 "esc_sent": False,
                 "esc_error": reason,
                 "interrupt_ok": False,
@@ -361,6 +362,12 @@ def _handle_interrupt_under_target_lock(d, sender: str, target: str) -> dict:
                 "held": False,
                 "cancelled_message_ids": [item.get("id") for item in finalized],
             }
+            lock_ctx.__exit__(None, None, None)
+            lock_ctx = None
+            for item in finalized:
+                if item.get("aggregate_id"):
+                    d._record_aggregate_interrupted_reply(item, by_sender="bridge", reason="endpoint_lost")
+            return result
         participant = d.participants.get(target) or {}
         agent_type = str(participant.get("agent_type") or "")
         if agent_type not in PHYSICAL_AGENT_TYPES:
@@ -481,7 +488,12 @@ def _handle_interrupt_under_target_lock(d, sender: str, target: str) -> dict:
             cc_sent=cc_sent,
         )
     finally:
-        lock_ctx.__exit__(None, None, None)
+        if lock_ctx is not None:
+            lock_ctx.__exit__(None, None, None)
+
+    for cm in cancelled:
+        if cm.get("aggregate_id"):
+            d._record_aggregate_interrupted_reply(cm, by_sender=sender, reason="interrupted")
 
     # Kick delivery to the interrupted target so queued corrections run
     # promptly. If the configured key sequence only partially completed,

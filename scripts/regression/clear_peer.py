@@ -185,6 +185,77 @@ def scenario_clear_guard_force_truth_matches_policy(label: str, tmpdir: Path) ->
     print(f"  PASS  {label}")
 
 
+def scenario_clear_single_guard_reads_aggregates_outside_state_lock(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.aggregates.update(lambda data: data.setdefault("aggregates", {}).update({
+        "agg-clear-single-read": {
+            "id": "agg-clear-single-read",
+            "requester": "bob",
+            "expected": ["alice"],
+            "message_ids": {"alice": "msg-agg-single-read"},
+            "status": "collecting",
+            "delivered": False,
+        },
+    }))
+    read_lock_states: list[tuple[bool, bool]] = []
+    original_read_aggregates = d.aggregates.read_aggregates
+
+    def read_aggregates_spy() -> dict:
+        read_lock_states.append((d._state_lock_owned_by_current_thread(), d._watchdog_lock_owned_by_current_thread()))
+        return original_read_aggregates()
+
+    d.aggregates.read_aggregates = read_aggregates_spy  # type: ignore[method-assign]
+
+    result = d.handle_clear_peer("alice", "bob", force=False)
+
+    soft_codes = [item.get("code") for item in result.get("soft_blockers") or []]
+    assert_true(result.get("error_kind") == "clear_blocked", f"{label}: aggregate requester should block clear: {result}")
+    assert_true("target_aggregate_requester" in soft_codes, f"{label}: blocker should mention requester aggregate: {result}")
+    assert_true(read_lock_states and all(state == (False, False) for state in read_lock_states), f"{label}: aggregate reads must be outside state/watchdog locks: {read_lock_states}")
+    assert_true("bob" not in d.clear_reservations, f"{label}: blocked clear must not reserve target")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_multi_guard_reads_aggregates_outside_state_lock(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+        "carol": {"alias": "carol", "agent_type": "codex", "pane": "%93"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.aggregates.update(lambda data: data.setdefault("aggregates", {}).update({
+        "agg-clear-multi-read": {
+            "id": "agg-clear-multi-read",
+            "requester": "bob",
+            "expected": ["carol"],
+            "message_ids": {"carol": "msg-agg-multi-read"},
+            "status": "collecting",
+            "delivered": False,
+        },
+    }))
+    read_lock_states: list[tuple[bool, bool]] = []
+    original_read_aggregates = d.aggregates.read_aggregates
+
+    def read_aggregates_spy() -> dict:
+        read_lock_states.append((d._state_lock_owned_by_current_thread(), d._watchdog_lock_owned_by_current_thread()))
+        return original_read_aggregates()
+
+    d.aggregates.read_aggregates = read_aggregates_spy  # type: ignore[method-assign]
+
+    result = d.handle_clear_peers("alice", ["bob", "carol"], force=False)
+
+    soft_codes = [item.get("code") for item in result.get("soft_blockers") or []]
+    assert_true(result.get("error_kind") == "clear_blocked", f"{label}: aggregate requester should block multi-clear: {result}")
+    assert_true("target_aggregate_requester" in soft_codes, f"{label}: multi blocker should mention requester aggregate: {result}")
+    assert_true(read_lock_states and all(state == (False, False) for state in read_lock_states), f"{label}: multi aggregate reads must be outside state/watchdog locks: {read_lock_states}")
+    assert_true(not d.clear_reservations, f"{label}: blocked multi-clear must not reserve targets: {d.clear_reservations}")
+    print(f"  PASS  {label}")
+
+
 def _clear_batch_participants() -> dict[str, dict]:
     return {
         "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91", "status": "active"},
@@ -607,6 +678,33 @@ def scenario_clear_guard_blocks_pending_self_clear(label: str, tmpdir: Path) -> 
 
     assert_true(not result.ok, f"{label}: pending self-clear should block non-self clear")
     assert_true([violation.code for violation in result.hard_blockers] == ["clear_already_pending"], f"{label}: expected clear_already_pending hard blocker: {result}")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_guard_uses_watchdog_snapshot_for_target_alarms(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    wake_id = d.register_alarm("bob", 60.0, "clear guard alarm")
+    calls = {"count": 0}
+    original_snapshot = d.watchdog_snapshot
+
+    def snapshot_spy() -> dict[str, dict]:
+        calls["count"] += 1
+        return original_snapshot()
+
+    d.watchdog_snapshot = snapshot_spy  # type: ignore[method-assign]
+    result = d.clear_guard("bob", force=False)
+    refs = [
+        ref
+        for violation in result.soft_blockers
+        if violation.code == "target_owned_alarms"
+        for ref in violation.refs
+    ]
+    assert_true(calls["count"] == 1, f"{label}: clear_guard should snapshot watchdogs exactly once: {calls}")
+    assert_true(wake_id in refs, f"{label}: target-owned alarm blocker should remain visible: {result}")
     print(f"  PASS  {label}")
 
 
@@ -2014,8 +2112,8 @@ def scenario_command_state_lock_timeout_before_mutation(label: str, tmpdir: Path
         remaining=required + 0.02,
         label=label,
     )
-    assert_true(isinstance(value, dict) and value.get("error_kind") == "lock_wait_exceeded", f"{label}: alarm timeout response expected: {value}")
-    assert_true("wake-111111111111" not in d.watchdogs, f"{label}: alarm must not register after lock timeout")
+    assert_true(isinstance(value, dict) and value.get("ok") and value.get("wake_id") == "wake-111111111111", f"{label}: alarm should bypass state_lock after split: {value}")
+    assert_true("wake-111111111111" in d.watchdogs, f"{label}: alarm must register while state_lock is held")
 
     d = make_daemon(tmpdir / "cancel", participants)
     d.queue.update(lambda queue: queue.append(test_message("msg-lock-cancel", frm="alice", to="bob", status="pending")))
@@ -2103,6 +2201,40 @@ def scenario_command_state_lock_timeout_before_mutation(label: str, tmpdir: Path
     )
     assert_true(isinstance(value, dict) and value.get("error_kind") == "lock_wait_exceeded", f"{label}: clear_hold timeout response expected: {value}")
     assert_true("bob" in d.held_interrupt, f"{label}: clear_hold must not pop hold after lock timeout")
+    print(f"  PASS  {label}")
+
+
+def scenario_alarm_registration_split_from_state_lock(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91", "hook_session_id": "session-alice"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "hook_session_id": "session-bob"},
+    }
+    d = make_daemon(tmpdir, participants)
+    result: dict[str, object] = {}
+    started = threading.Event()
+
+    def worker() -> None:
+        try:
+            started.set()
+            _set_command_context_near_lock_deadline(d, "alarm", 0.01)
+            result["value"] = d.register_alarm_result("alice", 5.0, "split", wake_id="wake-222222222222")
+        except Exception as exc:
+            result["error"] = exc
+        finally:
+            d.command_context.info = {}
+
+    with d.state_lock:
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        assert_true(started.wait(1.0), f"{label}: alarm worker should start")
+        thread.join(1.0)
+        assert_true(not thread.is_alive(), f"{label}: alarm registration must complete before state_lock is released")
+        assert_true("wake-222222222222" in d.watchdogs, f"{label}: alarm should be visible while state_lock is still held")
+    thread.join(1.0)
+    assert_true("error" not in result, f"{label}: alarm worker raised {result.get('error')!r}")
+    value = result.get("value")
+    assert_true(isinstance(value, dict) and value.get("ok") and value.get("wake_id") == "wake-222222222222", f"{label}: split alarm result expected: {value}")
+    assert_true(len([wid for wid in d.watchdogs if wid == "wake-222222222222"]) == 1, f"{label}: exactly one alarm should be registered: {d.watchdogs}")
     print(f"  PASS  {label}")
 
 
@@ -2296,6 +2428,58 @@ def scenario_clear_marker_phase2_missing_forces_leave(label: str, tmpdir: Path) 
     assert_true(called and called[0].get("reason") == "clear_marker_phase2_missing", f"{label}: missing marker phase2 must force leave: {called}")
     events = read_events(Path(d.state_file))
     assert_true(any(e.get("event") == "clear_marker_phase2_missing" for e in events), f"{label}: explicit marker diagnostic required")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_prompt_force_leave_drains_aggregate_after_lock(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92"},
+        "carol": {"alias": "carol", "agent_type": "codex", "pane": "%93"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d._mark_participant_detached_for_clear = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    d._reload_participants_unlocked = lambda: None  # type: ignore[method-assign]
+    d.clear_reservations["bob"] = {
+        "target": "bob",
+        "caller": "alice",
+        "probe_id": "probe-missing-phase2-agg",
+        "identity_marker_id": "missing-marker",
+        "pane_touched": True,
+        "old_session_id": "old-session",
+        "new_session_id": "new-session",
+        "agent": "codex",
+        "condition": threading.Condition(d.state_lock),
+    }
+    aggregate_leg = test_message("msg-clear-prompt-agg", frm="carol", to="bob", status="pending")
+    aggregate_leg.update({
+        "aggregate_id": "agg-clear-prompt-force-leave",
+        "aggregate_expected": ["bob"],
+        "aggregate_message_ids": {"bob": "msg-clear-prompt-agg"},
+        "aggregate_mode": "all",
+        "aggregate_started_ts": utc_now(),
+    })
+    d.queue.update(lambda queue: queue.append(aggregate_leg))
+
+    d.handle_prompt_submitted({
+        "event": "prompt_submitted",
+        "agent": "bob",
+        "bridge_agent": "bob",
+        "attach_probe": "probe-missing-phase2-agg",
+        "session_id": "new-session-from-bus",
+        "turn_id": "turn-from-bus",
+    })
+
+    assert_true(_queue_item(d, "msg-clear-prompt-agg") is None, f"{label}: forced leave should remove aggregate leg")
+    aggregate_results = [
+        item for item in d.queue.read()
+        if item.get("source") == "aggregate_return"
+        and item.get("aggregate_id") == "agg-clear-prompt-force-leave"
+    ]
+    assert_true(
+        len(aggregate_results) == 1 and aggregate_results[0].get("to") == "carol",
+        f"{label}: aggregate synthetic reply must be drained after state lock release: {aggregate_results}",
+    )
     print(f"  PASS  {label}")
 
 
@@ -2670,6 +2854,60 @@ def scenario_force_clear_requester_dual_write_queue_and_active(label: str, tmpdi
     print(f"  PASS  {label}")
 
 
+def scenario_force_clear_aggregate_invalidation_survives_probe_failure(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91", "hook_session_id": "alice-session"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "hook_session_id": "bob-old", "target": "test:1.2"},
+        "worker": {"alias": "worker", "agent_type": "codex", "pane": "%93", "hook_session_id": "worker-session"},
+    }
+    with patched_environ(AGENT_BRIDGE_CONTROLLED_CLEARS=str(tmpdir / "controlled-clears.json")):
+        d = make_daemon(tmpdir, participants)
+        d.dry_run = False
+        d.clear_post_clear_delay_seconds = 0.0
+        d.resolve_endpoint_detail = lambda _target, purpose="write": {"ok": True, "pane": "%92", "reason": "ok"}  # type: ignore[method-assign]
+        d.pane_mode_status = lambda _pane: {"in_mode": False, "mode": "", "error": ""}  # type: ignore[method-assign]
+        d._mark_participant_detached_for_clear = lambda *args, **kwargs: None  # type: ignore[method-assign]
+        d._reload_participants_unlocked = lambda: None  # type: ignore[method-assign]
+        sends: list[str] = []
+
+        def fake_send(_pane: str, text: str, *, target: str, message_id: str) -> dict:
+            sends.append(text)
+            if text == "/clear":
+                return {"ok": True, "pane_touched": True, "error": ""}
+            return {"ok": False, "pane_touched": True, "error": "probe_failed"}
+
+        d._clear_tmux_send = fake_send  # type: ignore[method-assign]
+        d.aggregates.update(lambda data: data.setdefault("aggregates", {}).update({
+            "agg-force-probe-fail": {
+                "id": "agg-force-probe-fail",
+                "created_ts": utc_now(),
+                "requester": "bob",
+                "causal_id": "causal-force-probe-fail",
+                "intent": "message",
+                "mode": "all",
+                "started_ts": utc_now(),
+                "hop_count": 0,
+                "expected": ["worker"],
+                "message_ids": {"worker": "msg-force-probe-fail"},
+                "replies": {},
+                "status": "collecting",
+                "delivered": False,
+            },
+        }))
+
+        result = d.handle_clear_peer("alice", "bob", force=True)
+
+    aggregate = d.aggregates.get("agg-force-probe-fail")
+    assert_true(result.get("error_kind") == "probe_write_failed" and result.get("forced_leave") is True, f"{label}: probe failure should force leave: {result}")
+    assert_true(sends and sends[0] == "/clear" and len(sends) == 2, f"{label}: expected /clear then probe send: {sends}")
+    assert_true(
+        aggregate.get("status") == "cancelled_requester_cleared"
+        and aggregate.get("cancelled_by") == "alice",
+        f"{label}: requester aggregate must be invalidated before return: {aggregate}",
+    )
+    print(f"  PASS  {label}")
+
+
 def scenario_clear_aggregate_requester_late_reply_suppressed(label: str, tmpdir: Path) -> None:
     participants = {
         "requester": {"alias": "requester", "agent_type": "codex", "pane": "%91"},
@@ -2754,6 +2992,8 @@ SCENARIOS = [
     ('clear_reservation_blocks_delivery', scenario_clear_reservation_blocks_delivery),
     ('clear_guard_formatter_force_guidance', scenario_clear_guard_formatter_force_guidance),
     ('clear_guard_force_truth_matches_policy', scenario_clear_guard_force_truth_matches_policy),
+    ('clear_single_guard_reads_aggregates_outside_state_lock', scenario_clear_single_guard_reads_aggregates_outside_state_lock),
+    ('clear_multi_guard_reads_aggregates_outside_state_lock', scenario_clear_multi_guard_reads_aggregates_outside_state_lock),
     ('clear_multi_guard_pass_reserves_all', scenario_clear_multi_guard_pass_reserves_all),
     ('clear_multi_guard_hard_blocker_rejects_all', scenario_clear_multi_guard_hard_blocker_rejects_all),
     ('clear_multi_guard_soft_blocker_rejects_all', scenario_clear_multi_guard_soft_blocker_rejects_all),
@@ -2765,6 +3005,7 @@ SCENARIOS = [
     ('clear_multi_real_success_holds_until_batch_end', scenario_clear_multi_real_success_holds_until_batch_end),
     ('clear_multi_real_pre_pane_failure_holds_until_batch_end', scenario_clear_multi_real_pre_pane_failure_holds_until_batch_end),
     ('clear_guard_blocks_pending_self_clear', scenario_clear_guard_blocks_pending_self_clear),
+    ('clear_guard_uses_watchdog_snapshot_for_target_alarms', scenario_clear_guard_uses_watchdog_snapshot_for_target_alarms),
     ('clear_multi_daemon_validation', scenario_clear_multi_daemon_validation),
     ('clear_peer_cli_multi_and_compatibility', scenario_clear_peer_cli_multi_and_compatibility),
     ('clear_multi_timeout_and_formatter', scenario_clear_multi_timeout_and_formatter),
@@ -2783,17 +3024,20 @@ SCENARIOS = [
     ('clear_claude_post_clear_probe_pasted_and_completes', scenario_clear_claude_post_clear_probe_pasted_and_completes),
     ('clear_session_end_suppression_is_exact', scenario_clear_session_end_suppression_is_exact),
     ('command_state_lock_timeout_before_mutation', scenario_command_state_lock_timeout_before_mutation),
+    ('alarm_registration_split_from_state_lock', scenario_alarm_registration_split_from_state_lock),
     ('clear_success_delivery_defers_near_deadline', scenario_clear_success_delivery_defers_near_deadline),
     ('clear_success_delivery_lock_wait_does_not_fail_after_commit', scenario_clear_success_delivery_lock_wait_does_not_fail_after_commit),
     ('clear_waits_for_same_target_delivery_touch', scenario_clear_waits_for_same_target_delivery_touch),
     ('clear_probe_subprocess_timeouts', scenario_clear_probe_subprocess_timeouts),
     ('clear_marker_phase2_missing_forces_leave', scenario_clear_marker_phase2_missing_forces_leave),
+    ('clear_prompt_force_leave_drains_aggregate_after_lock', scenario_clear_prompt_force_leave_drains_aggregate_after_lock),
     ('clear_marker_phase2_rejects_record_turn_without_marker_turn', scenario_clear_marker_phase2_rejects_record_turn_without_marker_turn),
     ('run_clear_peer_phase2_failure_returns_immediately', scenario_run_clear_peer_phase2_failure_returns_immediately),
     ('clear_force_leave_cleans_identity_stores', scenario_clear_force_leave_cleans_identity_stores),
     ('clear_force_leave_unowned_lock_serializes_cleanup', scenario_clear_force_leave_unowned_lock_serializes_cleanup),
     ('clear_identity_helper_success_and_failure', scenario_clear_identity_helper_success_and_failure),
     ('force_clear_requester_dual_write_queue_and_active', scenario_force_clear_requester_dual_write_queue_and_active),
+    ('force_clear_aggregate_invalidation_survives_probe_failure', scenario_force_clear_aggregate_invalidation_survives_probe_failure),
     ('clear_aggregate_requester_late_reply_suppressed', scenario_clear_aggregate_requester_late_reply_suppressed),
     ('self_clear_promotion_and_cancel_notice_ordering', scenario_self_clear_promotion_and_cancel_notice_ordering),
     ('clear_marker_ttl_expiry_removes_marker', scenario_clear_marker_ttl_expiry_removes_marker),

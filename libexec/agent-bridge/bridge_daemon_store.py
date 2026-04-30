@@ -24,6 +24,8 @@ class QueueStore:
 class AggregateStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self.before_update: Callable[[], None] | None = None
+        self.before_read: Callable[[], None] | None = None
 
     @staticmethod
     def _default() -> dict:
@@ -40,6 +42,8 @@ class AggregateStore:
         return normalized
 
     def update(self, mutator: Callable[[dict], Any]) -> Any:
+        if self.before_update is not None:
+            self.before_update()
         with locked_json(self.path, self._default()) as data:
             if not isinstance(data.get("aggregates"), dict):
                 data["aggregates"] = {}
@@ -48,6 +52,8 @@ class AggregateStore:
             return result
 
     def read(self) -> dict:
+        if self.before_read is not None:
+            self.before_read()
         return self._normalize(read_json(self.path, self._default()))
 
     def read_aggregates(self) -> dict:

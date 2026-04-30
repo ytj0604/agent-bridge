@@ -606,9 +606,10 @@ def reserve_next(d, target: str) -> dict | None:
                 return dict(item)
             return None
 
-        message = d.queue.update(mutator)
-        if message:
-            d.arm_message_watchdog(message, WATCHDOG_PHASE_DELIVERY)
+        with d.watchdog_lock_context():
+            message = d.queue.update(mutator)
+            if message:
+                d.arm_message_watchdog(message, WATCHDOG_PHASE_DELIVERY)
         return message
 
 
@@ -792,8 +793,11 @@ def deliver_reserved(d, message: dict) -> None:
     with d.state_lock:
         endpoint_detail = d.resolve_endpoint_detail(target, purpose="write")
     if not endpoint_detail.get("ok"):
+        removed: dict | None = None
         with d.state_lock:
-            d.finalize_undeliverable_message(message, endpoint_detail, phase="pre_send")
+            removed = d.finalize_undeliverable_message(message, endpoint_detail, phase="pre_send")
+        if removed and removed.get("aggregate_id"):
+            d._record_aggregate_interrupted_reply(removed, by_sender="bridge", reason="endpoint_lost")
         return
     pane = str(endpoint_detail.get("pane") or "")
     mode_status = d.pane_mode_status(pane)
@@ -894,8 +898,9 @@ def mark_message_pending(d, message_id: str, error: str | None = None) -> None:
                     for key in PANE_TOUCH_METADATA_KEYS:
                         item.pop(key, None)
 
-    d.queue.update(mutator)
-    d.cancel_watchdogs_for_message(message_id, reason="delivery_requeued", phase=WATCHDOG_PHASE_DELIVERY)
+    with d.watchdog_lock_context():
+        d.queue.update(mutator)
+        d.cancel_watchdogs_for_message(message_id, reason="delivery_requeued", phase=WATCHDOG_PHASE_DELIVERY)
 
 
 def mark_message_submitted(d, message_id: str) -> None:
@@ -937,10 +942,11 @@ def mark_message_delivered_by_id(d, agent: str, message_id: str) -> dict | None:
                 return dict(item)
             return None
 
-        message = d.queue.update(mutator)
-        if message:
-            d.cancel_watchdogs_for_message(str(message_id), reason="delivered", phase=WATCHDOG_PHASE_DELIVERY)
-            d.arm_message_watchdog(message, WATCHDOG_PHASE_RESPONSE)
+        with d.watchdog_lock_context():
+            message = d.queue.update(mutator)
+            if message:
+                d.cancel_watchdogs_for_message(str(message_id), reason="delivered", phase=WATCHDOG_PHASE_DELIVERY)
+                d.arm_message_watchdog(message, WATCHDOG_PHASE_RESPONSE)
         return message
 
 
@@ -1014,7 +1020,6 @@ def finalize_undeliverable_message(d, message: dict, endpoint_detail: dict, *, p
     )
 
     if removed.get("aggregate_id"):
-        d._record_aggregate_interrupted_reply(removed, by_sender="bridge", reason="endpoint_lost")
         return removed
 
     kind = normalize_kind(removed.get("kind"), "request")
@@ -1045,6 +1050,7 @@ def finalize_undeliverable_message(d, message: dict, endpoint_detail: dict, *, p
 
 def retry_enter_for_inflight(d) -> None:
     now = time.time()
+    aggregate_endpoint_lost: list[dict] = []
     with d.state_lock:
         for item in list(d.queue.read()):
             if item.get("status") != "inflight":
@@ -1063,7 +1069,9 @@ def retry_enter_for_inflight(d) -> None:
                 continue
             endpoint_detail = d.resolve_endpoint_detail(target, purpose="write")
             if not endpoint_detail.get("ok"):
-                d.finalize_undeliverable_message(item, endpoint_detail, phase="enter_retry")
+                removed = d.finalize_undeliverable_message(item, endpoint_detail, phase="enter_retry")
+                if removed and removed.get("aggregate_id"):
+                    aggregate_endpoint_lost.append(removed)
                 d.last_enter_ts.pop(msg_id, None)
                 continue
             pane = str(endpoint_detail.get("pane") or "")
@@ -1114,3 +1122,5 @@ def retry_enter_for_inflight(d) -> None:
                 to=target,
                 attempts=int(item.get("delivery_attempts") or 0),
             )
+    for removed in aggregate_endpoint_lost:
+        d._record_aggregate_interrupted_reply(removed, by_sender="bridge", reason="endpoint_lost")

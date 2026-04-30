@@ -63,188 +63,202 @@ def handle_prompt_submitted(d, record: dict) -> None:
     intercepted = False
     suppressed_interrupted_prompt = False
     message: dict = {}
+    post_lock_aggregate_cancelled: list[dict] = []
+    clear_prompt_handled = False
+    clear_prompt_reservation: dict | None = None
     with d.target_state_lock([agent]):
+        clear_prompt_reservation = d.clear_reservations.get(agent)
         if d.handle_clear_prompt_submitted_locked(agent, record):
-            return
-        observed_nonce = record.get("nonce")
-        record_turn_id = record.get("turn_id")
-        interrupted_prompt = d._match_interrupted_prompt(agent, observed_nonce, record_turn_id)
-        if interrupted_prompt:
-            interrupted_prompt["prompt_submitted_seen"] = True
-            if record_turn_id and not interrupted_prompt.get("turn_id"):
-                interrupted_prompt["turn_id"] = str(record_turn_id)
-            suppressed_interrupted_prompt = True
-            d.log(
-                "interrupted_prompt_submitted_suppressed",
-                agent=agent,
-                nonce=observed_nonce,
-                turn_id=record_turn_id,
-                interrupted_message_id=interrupted_prompt.get("message_id"),
-                superseded_by_prompt=interrupted_prompt.get("superseded_by_prompt"),
-            )
+            clear_prompt_handled = True
         else:
-            current_context = d.current_prompt_by_agent.get(agent, {}) or {}
-            current_context_id = str(current_context.get("id") or "")
-            current_context_turn_id = current_context.get("turn_id")
-            duplicate_by_nonce = (
-                observed_nonce
-                and current_context.get("nonce")
-                and observed_nonce == current_context.get("nonce")
-                and record_turn_id == current_context_turn_id
-            )
-            duplicate_by_turn = False
-            if current_context_id and record_turn_id is not None and record_turn_id == current_context_turn_id:
-                duplicate_by_turn = any(
-                    item.get("id") == current_context_id
-                    and item.get("to") == agent
-                    and item.get("status") == "delivered"
-                    for item in d.queue.read()
-                )
-            if duplicate_by_nonce or duplicate_by_turn:
+            observed_nonce = record.get("nonce")
+            record_turn_id = record.get("turn_id")
+            interrupted_prompt = d._match_interrupted_prompt(agent, observed_nonce, record_turn_id)
+            if interrupted_prompt:
+                interrupted_prompt["prompt_submitted_seen"] = True
+                if record_turn_id and not interrupted_prompt.get("turn_id"):
+                    interrupted_prompt["turn_id"] = str(record_turn_id)
+                suppressed_interrupted_prompt = True
                 d.log(
-                    "duplicate_prompt_submitted",
+                    "interrupted_prompt_submitted_suppressed",
                     agent=agent,
                     nonce=observed_nonce,
                     turn_id=record_turn_id,
-                    existing_message_id=current_context.get("id"),
-                    duplicate_match="nonce_turn" if duplicate_by_nonce else "turn_delivered",
+                    interrupted_message_id=interrupted_prompt.get("message_id"),
+                    superseded_by_prompt=interrupted_prompt.get("superseded_by_prompt"),
                 )
-                return
-
-            # v1.5.2: daemon state is the authoritative identity. Find the
-            # message the daemon believes was just delivered to this agent;
-            # the hook-extracted nonce is treated as a hint that must
-            # cross-check against the candidate's nonce. Anything that
-            # doesn't match cleanly is fail-closed (no delivered mutation,
-            # treated as a user-typed prompt for ctx purposes).
-            candidate = d.find_inflight_candidate(agent)
-
-            if candidate:
-                candidate_nonce = candidate.get("nonce")
-                candidate_id = str(candidate.get("id") or "")
-                if not observed_nonce:
-                    # User typing collided with bridge inject (or hook
-                    # payload arrived without the [bridge:nonce] prefix).
-                    # Do NOT mark delivered. Leave the candidate in
-                    # `inflight`; `requeue_stale_inflight` will revert it
-                    # to `pending` after submit_timeout. Cancel the
-                    # retry-enter loop now so the daemon doesn't spam
-                    # `Enter` into a pane the human is typing in.
-                    if candidate_id:
-                        d.last_enter_ts.pop(candidate_id, None)
-                    d.log(
-                        "nonce_missing_for_candidate",
-                        agent=agent,
-                        candidate_message_id=candidate.get("id"),
-                        candidate_nonce=candidate_nonce,
+            else:
+                current_context = d.current_prompt_by_agent.get(agent, {}) or {}
+                current_context_id = str(current_context.get("id") or "")
+                current_context_turn_id = current_context.get("turn_id")
+                duplicate_by_nonce = (
+                    observed_nonce
+                    and current_context.get("nonce")
+                    and observed_nonce == current_context.get("nonce")
+                    and record_turn_id == current_context_turn_id
+                )
+                duplicate_by_turn = False
+                if current_context_id and record_turn_id is not None and record_turn_id == current_context_turn_id:
+                    duplicate_by_turn = any(
+                        item.get("id") == current_context_id
+                        and item.get("to") == agent
+                        and item.get("status") == "delivered"
+                        for item in d.queue.read()
                     )
-                elif candidate_nonce and observed_nonce != candidate_nonce:
-                    if candidate_id:
-                        d.last_enter_ts.pop(candidate_id, None)
+                if duplicate_by_nonce or duplicate_by_turn:
                     d.log(
-                        "nonce_mismatch",
+                        "duplicate_prompt_submitted",
                         agent=agent,
-                        observed_nonce=observed_nonce,
-                        candidate_message_id=candidate.get("id"),
-                        candidate_nonce=candidate_nonce,
+                        nonce=observed_nonce,
+                        turn_id=record_turn_id,
+                        existing_message_id=current_context.get("id"),
+                        duplicate_match="nonce_turn" if duplicate_by_nonce else "turn_delivered",
                     )
-                else:
-                    marked = d.mark_message_delivered_by_id(agent, str(candidate["id"]))
-                    if marked:
-                        message = marked
-                    else:
-                        # find_inflight_candidate already filtered by
-                        # to=agent and status=inflight; reaching here means
-                        # the queue moved between the two reads. Defensive
-                        # log only.
+                    return
+
+                # v1.5.2: daemon state is the authoritative identity. Find the
+                # message the daemon believes was just delivered to this agent;
+                # the hook-extracted nonce is treated as a hint that must
+                # cross-check against the candidate's nonce. Anything that
+                # doesn't match cleanly is fail-closed (no delivered mutation,
+                # treated as a user-typed prompt for ctx purposes).
+                candidate = d.find_inflight_candidate(agent)
+
+                if candidate:
+                    candidate_nonce = candidate.get("nonce")
+                    candidate_id = str(candidate.get("id") or "")
+                    if not observed_nonce:
+                        # User typing collided with bridge inject (or hook
+                        # payload arrived without the [bridge:nonce] prefix).
+                        # Do NOT mark delivered. Leave the candidate in
+                        # `inflight`; `requeue_stale_inflight` will revert it
+                        # to `pending` after submit_timeout. Cancel the
+                        # retry-enter loop now so the daemon doesn't spam
+                        # `Enter` into a pane the human is typing in.
                         if candidate_id:
                             d.last_enter_ts.pop(candidate_id, None)
                         d.log(
-                            "delivery_recipient_mismatch",
+                            "nonce_missing_for_candidate",
                             agent=agent,
                             candidate_message_id=candidate.get("id"),
+                            candidate_nonce=candidate_nonce,
+                        )
+                    elif candidate_nonce and observed_nonce != candidate_nonce:
+                        if candidate_id:
+                            d.last_enter_ts.pop(candidate_id, None)
+                        d.log(
+                            "nonce_mismatch",
+                            agent=agent,
+                            observed_nonce=observed_nonce,
+                            candidate_message_id=candidate.get("id"),
+                            candidate_nonce=candidate_nonce,
+                        )
+                    else:
+                        marked = d.mark_message_delivered_by_id(agent, str(candidate["id"]))
+                        if marked:
+                            message = marked
+                        else:
+                            # find_inflight_candidate already filtered by
+                            # to=agent and status=inflight; reaching here means
+                            # the queue moved between the two reads. Defensive
+                            # log only.
+                            if candidate_id:
+                                d.last_enter_ts.pop(candidate_id, None)
+                            d.log(
+                                "delivery_recipient_mismatch",
+                                agent=agent,
+                                candidate_message_id=candidate.get("id"),
+                                observed_nonce=observed_nonce,
+                            )
+                else:
+                    # No daemon-side candidate. This is a user-typed prompt.
+                    # An observed_nonce here means the user (or some quoted
+                    # text) included a [bridge:...] prefix -- log for diagnostics
+                    # but do not bind the ctx to it.
+                    if observed_nonce:
+                        d.log(
+                            "orphan_nonce_in_user_prompt",
+                            agent=agent,
                             observed_nonce=observed_nonce,
                         )
-            else:
-                # No daemon-side candidate. This is a user-typed prompt.
-                # An observed_nonce here means the user (or some quoted
-                # text) included a [bridge:...] prefix — log for diagnostics
-                # but do not bind the ctx to it.
-                if observed_nonce:
-                    d.log(
-                        "orphan_nonce_in_user_prompt",
-                        agent=agent,
-                        observed_nonce=observed_nonce,
-                    )
 
-            if message.get("id"):
-                d.last_enter_ts.pop(str(message["id"]), None)
+                if message.get("id"):
+                    d.last_enter_ts.pop(str(message["id"]), None)
 
-            if not message.get("id"):
-                queue_now = list(d.queue.read())
-                delivered_rows = [
-                    item for item in queue_now
-                    if item.get("to") == agent and item.get("status") == "delivered"
-                ]
-                active_context = d.current_prompt_by_agent.get(agent, {}) or {}
-                if active_context.get("id") or delivered_rows:
-                    active_context = d.current_prompt_by_agent.pop(agent, {}) or {}
-                    cancelled = d._cancel_active_messages_for_target(
-                        agent,
-                        active_context=active_context,
-                        reason="prompt_intercepted",
-                        by_sender="bridge",
-                        cancel_statuses={"delivered"},
-                        notify_sources=True,
-                    )
-                    intercepted = True
-                    d.log(
-                        "active_prompt_intercepted",
-                        agent=agent,
-                        prior_message_id=active_context.get("id"),
-                        turn_id=record_turn_id,
-                        reason="prompt_intercepted",
-                        cancelled_message_ids=[cm.get("id") for cm in cancelled],
-                        cancelled_count=len(cancelled),
-                        observed_nonce_present=bool(observed_nonce),
-                        candidate_message_id=candidate.get("id") if candidate else None,
-                    )
+                if not message.get("id"):
+                    queue_now = list(d.queue.read())
+                    delivered_rows = [
+                        item for item in queue_now
+                        if item.get("to") == agent and item.get("status") == "delivered"
+                    ]
+                    active_context = d.current_prompt_by_agent.get(agent, {}) or {}
+                    if active_context.get("id") or delivered_rows:
+                        active_context = d.current_prompt_by_agent.pop(agent, {}) or {}
+                        cancelled = d._cancel_active_messages_for_target(
+                            agent,
+                            active_context=active_context,
+                            reason="prompt_intercepted",
+                            by_sender="bridge",
+                            cancel_statuses={"delivered"},
+                            notify_sources=True,
+                        )
+                        post_lock_aggregate_cancelled.extend(
+                            dict(cm) for cm in cancelled if cm.get("aggregate_id")
+                        )
+                        intercepted = True
+                        d.log(
+                            "active_prompt_intercepted",
+                            agent=agent,
+                            prior_message_id=active_context.get("id"),
+                            turn_id=record_turn_id,
+                            reason="prompt_intercepted",
+                            cancelled_message_ids=[cm.get("id") for cm in cancelled],
+                            cancelled_count=len(cancelled),
+                            observed_nonce_present=bool(observed_nonce),
+                            candidate_message_id=candidate.get("id") if candidate else None,
+                        )
 
-            d._supersede_interrupted_no_turn_suppression(
-                agent,
-                turn_id=record_turn_id,
-                message_id=message.get("id"),
-            )
-            d.busy[agent] = True
-            d.reserved[agent] = None
-            d.current_prompt_by_agent[agent] = {
-                "id": message.get("id"),
-                # ctx nonce comes from the matched message only; orphan
-                # nonces from user prompts must NOT be stored here, or
-                # discard_nonce at terminal time would clear unrelated
-                # cache entries.
-                "nonce": message.get("nonce"),
-                "causal_id": message.get("causal_id"),
-                "hop_count": int(message.get("hop_count") or 0),
-                "from": message.get("from"),
-                "kind": normalize_kind(message.get("kind"), "notice") if message else None,
-                "intent": message.get("intent"),
-                "auto_return": bool(message.get("auto_return")),
-                "aggregate_id": message.get("aggregate_id"),
-                "aggregate_expected": message.get("aggregate_expected"),
-                "aggregate_message_ids": message.get("aggregate_message_ids"),
-                "aggregate_mode": message.get("aggregate_mode"),
-                "aggregate_started_ts": message.get("aggregate_started_ts"),
-                "requester_cleared": bool(message.get("requester_cleared")),
-                "requester_cleared_alias": message.get("requester_cleared_alias"),
-                "requester_cleared_at": message.get("requester_cleared_at"),
-                "requester_cleared_by": message.get("requester_cleared_by"),
-                "turn_id": record.get("turn_id"),
-            }
+                d._supersede_interrupted_no_turn_suppression(
+                    agent,
+                    turn_id=record_turn_id,
+                    message_id=message.get("id"),
+                )
+                d.busy[agent] = True
+                d.reserved[agent] = None
+                d.current_prompt_by_agent[agent] = {
+                    "id": message.get("id"),
+                    # ctx nonce comes from the matched message only; orphan
+                    # nonces from user prompts must NOT be stored here, or
+                    # discard_nonce at terminal time would clear unrelated
+                    # cache entries.
+                    "nonce": message.get("nonce"),
+                    "causal_id": message.get("causal_id"),
+                    "hop_count": int(message.get("hop_count") or 0),
+                    "from": message.get("from"),
+                    "kind": normalize_kind(message.get("kind"), "notice") if message else None,
+                    "intent": message.get("intent"),
+                    "auto_return": bool(message.get("auto_return")),
+                    "aggregate_id": message.get("aggregate_id"),
+                    "aggregate_expected": message.get("aggregate_expected"),
+                    "aggregate_message_ids": message.get("aggregate_message_ids"),
+                    "aggregate_mode": message.get("aggregate_mode"),
+                    "aggregate_started_ts": message.get("aggregate_started_ts"),
+                    "requester_cleared": bool(message.get("requester_cleared")),
+                    "requester_cleared_alias": message.get("requester_cleared_alias"),
+                    "requester_cleared_at": message.get("requester_cleared_at"),
+                    "requester_cleared_by": message.get("requester_cleared_by"),
+                    "turn_id": record.get("turn_id"),
+                }
 
+    if clear_prompt_handled:
+        clear_caller = str(clear_prompt_reservation.get("caller") or "bridge") if clear_prompt_reservation else "bridge"
+        d.drain_force_leave_aggregate_replies(clear_prompt_reservation, caller=clear_caller)
+        return
     if suppressed_interrupted_prompt:
         d.try_deliver(agent)
         return
+    for cm in post_lock_aggregate_cancelled:
+        d._record_aggregate_interrupted_reply(cm, by_sender="bridge", reason="prompt_intercepted")
     if message.get("id"):
         d.log(
             "message_delivered",
@@ -415,7 +429,9 @@ def handle_response_finished(d, record: dict) -> None:
     # peer that is still mid-turn.
     run_delivery_after_lock = False
     post_lock_delivery_requests: list[tuple[str | None, bool, str]] = []
+    post_lock_response_return: tuple[str, str, dict] | None = None
     return_after_post_lock_delivery = False
+    self_clear_aggregate_snapshot = d.aggregates.read_aggregates()
     with d.target_state_lock([sender]):
         text = record.get("last_assistant_message") or ""
         if d.handle_clear_response_finished_locked(sender, record):
@@ -506,7 +522,7 @@ def handle_response_finished(d, record: dict) -> None:
                     context,
                     watchdog_reason="interrupted_tombstone_terminal",
                 )
-                d.promote_pending_self_clear_locked(sender)
+                d.promote_pending_self_clear_locked(sender, aggregate_snapshot=self_clear_aggregate_snapshot)
                 run_delivery_after_lock = True
             else:
                 return
@@ -618,9 +634,15 @@ def handle_response_finished(d, record: dict) -> None:
             # a request whose response was empty / had no active requester
             # would leave its watchdog alive and fire a bogus wake later.
             if first_time:
-                d.maybe_return_response(sender, text, context)
+                if context.get("aggregate_id"):
+                    post_lock_response_return = (sender, text, dict(context))
+                else:
+                    d.maybe_return_response(sender, text, context)
             d._cleanup_terminal_context_locked(sender, context, watchdog_reason="terminal_response")
-            d.promote_pending_self_clear_locked(sender)
+            d.promote_pending_self_clear_locked(sender, aggregate_snapshot=self_clear_aggregate_snapshot)
+    if post_lock_response_return:
+        response_sender, response_text, response_context = post_lock_response_return
+        d.maybe_return_response(response_sender, response_text, response_context)
     for target, command_aware, reason in post_lock_delivery_requests:
         d.request_and_drain_delivery(target, command_aware=command_aware, reason=reason)
     if return_after_post_lock_delivery:

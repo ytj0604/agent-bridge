@@ -77,6 +77,7 @@ def _clear_guard_from_snapshots(
     force: bool,
     queue_snapshot: list[dict],
     aggregates: dict,
+    watchdogs: dict[str, dict],
 ) -> ClearGuardResult:
     hard: list[ClearViolation] = []
     soft: list[ClearViolation] = []
@@ -126,7 +127,7 @@ def _clear_guard_from_snapshots(
         )
     target_alarms = [
         wake_id
-        for wake_id, wd in d.watchdogs.items()
+        for wake_id, wd in watchdogs.items()
         if wd and wd.get("is_alarm") and str(wd.get("sender") or "") == target
     ]
     if target_alarms:
@@ -160,6 +161,7 @@ def _clear_guard_from_snapshots(
 
 
 def clear_guard(d, target: str, *, force: bool) -> ClearGuardResult:
+    watchdogs = d.watchdog_snapshot()
     queue_snapshot = list(d.queue.read())
     aggregates = d.aggregates.read_aggregates()
     return _clear_guard_from_snapshots(
@@ -168,6 +170,7 @@ def clear_guard(d, target: str, *, force: bool) -> ClearGuardResult:
         force=force,
         queue_snapshot=queue_snapshot,
         aggregates=aggregates,
+        watchdogs=watchdogs,
     )
 
 
@@ -178,7 +181,9 @@ def clear_guard_multi(
     force: bool,
     queue_snapshot: list[dict],
     aggregates: dict,
+    watchdogs: dict[str, dict] | None = None,
 ) -> ClearGuardResult:
+    watchdogs = d.watchdog_snapshot() if watchdogs is None else watchdogs
     hard: list[ClearViolation] = []
     soft: list[ClearViolation] = []
     for target in targets:
@@ -188,6 +193,7 @@ def clear_guard_multi(
             force=force,
             queue_snapshot=queue_snapshot,
             aggregates=aggregates,
+            watchdogs=watchdogs,
         )
         hard.extend(result.hard_blockers)
         soft.extend(result.soft_blockers)
@@ -199,18 +205,46 @@ def clear_guard_multi(
     )
 
 
+def apply_force_clear_aggregate_invalidation(d, target: str, caller: str, now_iso: str) -> list[str]:
+    cancelled_aggregates: list[str] = []
+
+    def aggregate_mutator(data: dict) -> None:
+        aggregates = data.setdefault("aggregates", {})
+        for agg_id, aggregate in list(aggregates.items()):
+            if not isinstance(aggregate, dict):
+                continue
+            if str(aggregate.get("requester") or "") != target:
+                continue
+            if str(aggregate.get("status") or "") == "complete":
+                continue
+            aggregate["status"] = "cancelled_requester_cleared"
+            aggregate["cancelled_at"] = now_iso
+            aggregate["cancelled_by"] = caller
+            aggregate["delivered"] = False
+            aggregate["updated_ts"] = now_iso
+            cancelled_aggregates.append(str(agg_id))
+
+    d.aggregates.update(aggregate_mutator)
+    for agg_id in cancelled_aggregates:
+        d.cancel_watchdogs_for_aggregate(agg_id, reason="requester_cleared")
+        d.suppress_pending_watchdog_wakes(ref_aggregate_id=agg_id, reason="requester_cleared")
+    return cancelled_aggregates
+
+
 def apply_force_clear_invalidation(d, target: str, caller: str) -> dict:
     now_iso = utc_now()
     cancelled_alarms: list[str] = []
     removed_rows: list[dict] = []
     requester_cleared_ids: list[str] = []
     cancelled_aggregates: list[str] = []
-    for wake_id, wd in list(d.watchdogs.items()):
-        if wd and wd.get("is_alarm") and str(wd.get("sender") or "") == target:
-            removed = d.watchdogs.pop(wake_id, None)
-            if removed:
-                d._record_alarm_wake_tombstone(wake_id, removed, "cancelled_by_clear")
-                cancelled_alarms.append(wake_id)
+    aggregate_interrupted_rows: list[dict] = []
+    with d.watchdog_lock_context():
+        for wake_id, wd in list(d.watchdogs.items()):
+            if wd and wd.get("is_alarm") and str(wd.get("sender") or "") == target:
+                removed = d.watchdogs.pop(wake_id, None)
+                if removed:
+                    d._record_alarm_wake_tombstone(wake_id, removed, "cancelled_by_clear")
+                    cancelled_alarms.append(wake_id)
 
     def queue_mutator(queue: list[dict]) -> None:
         kept: list[dict] = []
@@ -248,7 +282,7 @@ def apply_force_clear_invalidation(d, target: str, caller: str) -> dict:
             prompt_submitted_seen=False,
         )
         if row.get("aggregate_id"):
-            d._record_aggregate_interrupted_reply(row, by_sender=caller, reason="cancelled_by_clear")
+            aggregate_interrupted_rows.append(dict(row))
     for msg_id in requester_cleared_ids:
         d.cancel_watchdogs_for_message(msg_id, reason="requester_cleared")
         d.suppress_pending_watchdog_wakes(ref_message_id=msg_id, reason="requester_cleared")
@@ -272,26 +306,11 @@ def apply_force_clear_invalidation(d, target: str, caller: str) -> dict:
             by_sender=caller,
         )
 
-    def aggregate_mutator(data: dict) -> None:
-        aggregates = data.setdefault("aggregates", {})
-        for agg_id, aggregate in list(aggregates.items()):
-            if not isinstance(aggregate, dict):
-                continue
-            if str(aggregate.get("requester") or "") != target:
-                continue
-            if str(aggregate.get("status") or "") == "complete":
-                continue
-            aggregate["status"] = "cancelled_requester_cleared"
-            aggregate["cancelled_at"] = now_iso
-            aggregate["cancelled_by"] = caller
-            aggregate["delivered"] = False
-            aggregate["updated_ts"] = now_iso
-            cancelled_aggregates.append(str(agg_id))
-
-    d.aggregates.update(aggregate_mutator)
-    for agg_id in cancelled_aggregates:
-        d.cancel_watchdogs_for_aggregate(agg_id, reason="requester_cleared")
-        d.suppress_pending_watchdog_wakes(ref_aggregate_id=agg_id, reason="requester_cleared")
+    aggregate_invalidation_pending = d._state_lock_owned_by_current_thread() or d._watchdog_lock_owned_by_current_thread()
+    if not aggregate_invalidation_pending:
+        cancelled_aggregates = apply_force_clear_aggregate_invalidation(d, target, caller, now_iso)
+        for row in aggregate_interrupted_rows:
+            d._record_aggregate_interrupted_reply(row, by_sender=caller, reason="cancelled_by_clear")
     d.log(
         "clear_force_invalidated",
         target=target,
@@ -306,6 +325,9 @@ def apply_force_clear_invalidation(d, target: str, caller: str) -> dict:
         "removed_message_ids": [row.get("id") for row in removed_rows],
         "requester_cleared_message_ids": requester_cleared_ids,
         "cancelled_aggregate_ids": cancelled_aggregates,
+        "aggregate_invalidation_pending": aggregate_invalidation_pending,
+        "aggregate_invalidation_ts": now_iso if aggregate_invalidation_pending else "",
+        "aggregate_interrupted_rows": aggregate_interrupted_rows if aggregate_invalidation_pending else [],
     }
 
 
@@ -315,8 +337,10 @@ def force_leave_after_clear_failure(d, target: str, *, caller: str, reason: str,
     # originating command budget is exhausted, so take the raw state lock
     # here rather than re-entering command_state_lock.
     if not d._state_lock_owned_by_current_thread():
+        reservation_ref = reservation or d.clear_reservations.get(target) or {}
         with d.state_lock:
-            d.force_leave_after_clear_failure(target, caller=caller, reason=reason, reservation=reservation)
+            d.force_leave_after_clear_failure(target, caller=caller, reason=reason, reservation=reservation_ref)
+        drain_force_leave_aggregate_replies(d, reservation_ref, caller=caller)
         return
     reservation = reservation or d.clear_reservations.get(target) or {}
     reservation["forced_leave"] = True
@@ -351,13 +375,18 @@ def force_leave_after_clear_failure(d, target: str, *, caller: str, reason: str,
             d.cancel_watchdogs_for_message(msg_id, reason="clear_forced_leave")
             d.suppress_pending_watchdog_wakes(ref_message_id=msg_id, reason="clear_forced_leave")
         if row.get("aggregate_id"):
-            d._record_aggregate_interrupted_reply(row, by_sender=caller, reason="endpoint_lost", deliver=False)
-    for wake_id, wd in list(d.watchdogs.items()):
-        if wd and str(wd.get("sender") or "") == target:
-            removed = d.watchdogs.pop(wake_id, None)
-            if removed and removed.get("is_alarm"):
-                d._record_alarm_wake_tombstone(wake_id, removed, "clear_forced_leave")
-            d.log("watchdog_cancelled", wake_id=wake_id, reason="clear_forced_leave")
+            reservation.setdefault("forced_leave_aggregate_interrupted_rows", []).append(dict(row))
+    cancelled_watchdogs: list[tuple[str, dict]] = []
+    with d.watchdog_lock_context():
+        for wake_id, wd in list(d.watchdogs.items()):
+            if wd and str(wd.get("sender") or "") == target:
+                removed = d.watchdogs.pop(wake_id, None)
+                if removed:
+                    if removed.get("is_alarm"):
+                        d._record_alarm_wake_tombstone(wake_id, removed, "clear_forced_leave")
+                    cancelled_watchdogs.append((wake_id, removed))
+    for wake_id, _wd in cancelled_watchdogs:
+        d.log("watchdog_cancelled", wake_id=wake_id, reason="clear_forced_leave")
     d.busy[target] = False
     d.reserved[target] = None
     d.current_prompt_by_agent.pop(target, None)
@@ -401,6 +430,36 @@ def force_leave_after_clear_failure(d, target: str, *, caller: str, reason: str,
         reason=reason,
         removed_message_ids=[row.get("id") for row in removed_rows],
     )
+
+
+def drain_force_leave_aggregate_replies(d, reservation: dict | None, *, caller: str) -> None:
+    if not isinstance(reservation, dict):
+        return
+    rows = list(reservation.get("forced_leave_aggregate_interrupted_rows") or [])
+    reservation["forced_leave_aggregate_interrupted_rows"] = []
+    for row in rows:
+        if isinstance(row, dict):
+            d._record_aggregate_interrupted_reply(row, by_sender=caller, reason="endpoint_lost", deliver=False)
+
+
+def drain_force_invalidation_aggregate_phase(d, reservation: dict | None, target: str, caller: str) -> None:
+    if not isinstance(reservation, dict):
+        return
+    force_invalidation = reservation.get("force_invalidation")
+    if not isinstance(force_invalidation, dict) or not force_invalidation.get("aggregate_invalidation_pending"):
+        return
+    cancelled = apply_force_clear_aggregate_invalidation(
+        d,
+        target,
+        caller,
+        str(force_invalidation.get("aggregate_invalidation_ts") or utc_now()),
+    )
+    force_invalidation["cancelled_aggregate_ids"] = cancelled
+    force_invalidation["aggregate_invalidation_pending"] = False
+    for row in list(force_invalidation.get("aggregate_interrupted_rows") or []):
+        if isinstance(row, dict):
+            d._record_aggregate_interrupted_reply(row, by_sender=caller, reason="cancelled_by_clear")
+    force_invalidation["aggregate_interrupted_rows"] = []
 
 
 def _mark_participant_detached_for_clear(
@@ -602,6 +661,7 @@ def handle_clear_peers(d, sender: str, targets: list[str], *, force: bool) -> di
         return d.handle_clear_peer(sender, targets[0], force=force)
 
     reservations: dict[str, dict] = {}
+    aggregate_snapshot = d.aggregates.read_aggregates()
     try:
         lock_ctx = d.command_state_lock(
             post_lock_worst_case=d.clear_peer_batch_post_lock_worst_case_seconds(len(targets)),
@@ -626,12 +686,11 @@ def handle_clear_peers(d, sender: str, targets: list[str], *, force: bool) -> di
             return validation
         targets = list(validation.get("targets") or [])
         queue_snapshot = list(d.queue.read())
-        aggregates = d.aggregates.read_aggregates()
         guard = d.clear_guard_multi(
             targets,
             force=False,
             queue_snapshot=queue_snapshot,
-            aggregates=aggregates,
+            aggregates=aggregate_snapshot,
         )
         if not guard.ok:
             return {
@@ -798,6 +857,9 @@ def run_clear_peer(
     reservation: dict | None = existing_reservation
     participant: dict = {}
     endpoint_detail: dict = {}
+    aggregate_snapshot: dict = {}
+    if reservation is None:
+        aggregate_snapshot = d.aggregates.read_aggregates()
     # Clear still performs its existing state-lock protected tmux sends until
     # Stage 15b. The target lock only spans the pane-touching section so hook
     # events can reacquire the target during the clear probe wait.
@@ -836,7 +898,14 @@ def run_clear_peer(
             return {"ok": False, "error": f"target {target!r} is not an active participant"}
         participant = dict(d.participants.get(target) or {})
         if reservation is None:
-            guard = d.clear_guard(target, force=force)
+            guard = _clear_guard_from_snapshots(
+                d,
+                target,
+                force=force,
+                queue_snapshot=list(d.queue.read()),
+                aggregates=aggregate_snapshot,
+                watchdogs=d.watchdog_snapshot(),
+            )
             if not guard.ok:
                 return {
                     "ok": False,
@@ -962,6 +1031,8 @@ def run_clear_peer(
         state_lock_ctx.__exit__(None, None, None)
         if target_lock_held:
             target_lock_ctx.__exit__(None, None, None)
+        drain_force_invalidation_aggregate_phase(d, reservation, target, caller)
+        drain_force_leave_aggregate_replies(d, reservation, caller=caller)
 
     agent_type = str(participant.get("agent_type") or reservation.get("agent") or "")
     new_session_id = str(reservation.get("new_session_id") or "")
@@ -1051,6 +1122,7 @@ def run_clear_peer(
         )
     finally:
         final_lock_ctx.__exit__(None, None, None)
+        drain_force_leave_aggregate_replies(d, reservation, caller=caller)
     if not hold_reservation_after_success:
         d.request_and_drain_delivery(target, command_aware=True, reason="clear_success")
     return {"ok": True, "target": target, "cleared": True, "force": bool(force), "new_session_id": reservation.get("new_session_id")}
@@ -1160,7 +1232,7 @@ def handle_clear_response_finished_locked(d, agent: str, record: dict) -> bool:
     return True
 
 
-def promote_pending_self_clear_locked(d, sender: str) -> None:
+def promote_pending_self_clear_locked(d, sender: str, aggregate_snapshot: dict | None = None) -> None:
     pending = d.pending_self_clears.pop(sender, None)
     if not pending:
         return
@@ -1168,7 +1240,16 @@ def promote_pending_self_clear_locked(d, sender: str) -> None:
     d.reload_participants()
     if sender not in d.participants:
         return
-    guard = d.clear_guard(sender, force=force)
+    if aggregate_snapshot is None:
+        aggregate_snapshot = {} if d._state_lock_owned_by_current_thread() else d.aggregates.read_aggregates()
+    guard = _clear_guard_from_snapshots(
+        d,
+        sender,
+        force=force,
+        queue_snapshot=list(d.queue.read()),
+        aggregates=aggregate_snapshot,
+        watchdogs=d.watchdog_snapshot(),
+    )
     if not guard.ok:
         notice = make_message(
             sender="bridge",

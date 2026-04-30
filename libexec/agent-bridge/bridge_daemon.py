@@ -323,6 +323,7 @@ class BridgeDaemon:
     interrupted_turns = StateField("routing_state", "interrupted_turns")
     processed_returns = StateField("watchdog_state", "processed_returns")
     processed_capture_requests = StateField("watchdog_state", "processed_capture_requests")
+    watchdog_lock = StateField("watchdog_state", "watchdog_lock")
     watchdogs = StateField("watchdog_state", "watchdogs")
     alarm_wake_tombstones = StateField("watchdog_state", "alarm_wake_tombstones")
     held_interrupt = StateField("clear_state", "held_interrupt")
@@ -347,8 +348,16 @@ class BridgeDaemon:
         self.participant_cache = ParticipantCache()
         self.routing_state = RoutingState()
         self.watchdog_state = WatchdogState(MAX_PROCESSED_RETURNS, MAX_PROCESSED_CAPTURE_REQUESTS)
+        self.aggregates.before_update = self.assert_aggregate_update_allowed
+        self.aggregates.before_read = self.assert_aggregate_update_allowed
         self.clear_state = ClearState()
         self.maintenance_state = MaintenanceState()
+        # Stage 14 physical lock order for routing paths:
+        # target lock(s), acquired in sorted alias order -> state_lock ->
+        # watchdog_lock -> queue store/file lock. Watchdog-only operations
+        # such as alarm registration may take watchdog_lock without
+        # state_lock. Aggregate store/file mutation stays outside this
+        # chain: aggregate phase first, release, then routing phase.
         # Coarse RLock that serializes mutations to in-memory routing state
         # (busy, reserved, current_prompt_by_agent, held_interrupt,
         # interrupt_partial_failure_blocks,
@@ -649,6 +658,31 @@ class BridgeDaemon:
             return bool(is_owned())
         except Exception:
             return False
+
+    def _watchdog_lock_owned_by_current_thread(self) -> bool:
+        is_owned = getattr(self.watchdog_lock, "_is_owned", None)
+        if not callable(is_owned):
+            return False
+        try:
+            return bool(is_owned())
+        except Exception:
+            return False
+
+    @contextmanager
+    def watchdog_lock_context(self):
+        self.watchdog_lock.acquire()
+        try:
+            yield
+        finally:
+            self.watchdog_lock.release()
+
+    def assert_aggregate_update_allowed(self) -> None:
+        if self._state_lock_owned_by_current_thread() or self._watchdog_lock_owned_by_current_thread():
+            raise RuntimeError("AggregateStore access cannot run under state_lock or watchdog_lock")
+
+    def watchdog_snapshot(self) -> dict[str, dict]:
+        with self.watchdog_lock_context():
+            return {wake_id: dict(wd) for wake_id, wd in self.watchdogs.items()}
 
     @contextmanager
     def command_state_lock(
@@ -1009,11 +1043,14 @@ class BridgeDaemon:
     def handle_clear_prompt_submitted_locked(self, agent: str, record: dict) -> bool:
         return daemon_clear_flow.handle_clear_prompt_submitted_locked(self, agent, record)
 
+    def drain_force_leave_aggregate_replies(self, reservation: dict | None, *, caller: str) -> None:
+        return daemon_clear_flow.drain_force_leave_aggregate_replies(self, reservation, caller=caller)
+
     def handle_clear_response_finished_locked(self, agent: str, record: dict) -> bool:
         return daemon_clear_flow.handle_clear_response_finished_locked(self, agent, record)
 
-    def promote_pending_self_clear_locked(self, sender: str) -> None:
-        return daemon_clear_flow.promote_pending_self_clear_locked(self, sender)
+    def promote_pending_self_clear_locked(self, sender: str, aggregate_snapshot: dict | None = None) -> None:
+        return daemon_clear_flow.promote_pending_self_clear_locked(self, sender, aggregate_snapshot=aggregate_snapshot)
 
     def _self_clear_worker(self, target: str, reservation: dict) -> None:
         return daemon_clear_flow._self_clear_worker(self, target, reservation)
@@ -1711,6 +1748,8 @@ class BridgeDaemon:
         if not preliminary_target:
             return {"ok": False, "error": "message_not_found", "message_id": message_id}
 
+        post_lock_aggregate_reply: dict | None = None
+        post_lock_result: dict | None = None
         with self.target_locks_for([preliminary_target]):
             try:
                 lock_ctx = self.command_state_lock(
@@ -1806,7 +1845,7 @@ class BridgeDaemon:
                     prompt_submitted_seen=False,
                 )
                 if removed.get("aggregate_id"):
-                    self._record_aggregate_interrupted_reply(removed, by_sender=sender, reason="cancelled_by_sender")
+                    post_lock_aggregate_reply = dict(removed)
                 self.log(
                     "message_cancelled",
                     message_id=message_id,
@@ -1816,7 +1855,7 @@ class BridgeDaemon:
                     aggregate_id=removed.get("aggregate_id"),
                     by_sender=sender,
                 )
-                return {
+                post_lock_result = {
                     "ok": True,
                     "message_id": message_id,
                     "cancelled": True,
@@ -1831,6 +1870,11 @@ class BridgeDaemon:
                 }
             finally:
                 lock_ctx.__exit__(None, None, None)
+        if post_lock_aggregate_reply:
+            self._record_aggregate_interrupted_reply(post_lock_aggregate_reply, by_sender=sender, reason="cancelled_by_sender")
+        if post_lock_result is not None:
+            return post_lock_result
+        return {"ok": False, "error": "message_not_found", "message_id": message_id}
 
     def remove_delivered_message(self, target: str, message_id: str) -> dict | None:
         return daemon_delivery.remove_delivered_message(self, target, message_id)
@@ -1896,8 +1940,11 @@ class BridgeDaemon:
     def watchdog_fire_skip_reason(self, wd: dict) -> str:
         return daemon_watchdogs.watchdog_fire_skip_reason(self, wd)
 
-    def fire_watchdog(self, wake_id: str, wd: dict) -> None:
-        return daemon_watchdogs.fire_watchdog(self, wake_id, wd)
+    def watchdog_wake_superseded(self, wake_id: str, wd: dict) -> bool:
+        return daemon_watchdogs.watchdog_wake_superseded(self, wake_id, wd)
+
+    def fire_watchdog(self, wake_id: str, wd: dict, *, already_popped: bool = False) -> None:
+        return daemon_watchdogs.fire_watchdog(self, wake_id, wd, already_popped=already_popped)
 
     def _cancel_active_messages_for_target(
         self,
@@ -2000,10 +2047,6 @@ class BridgeDaemon:
                     reason=reason,
                 )
                 self.queue_message(notice)
-
-        for cm in cancelled:
-            if cm.get("aggregate_id"):
-                self._record_aggregate_interrupted_reply(cm, by_sender=by_sender, reason=reason)
 
         return cancelled
 
@@ -2131,7 +2174,7 @@ class BridgeDaemon:
         message_id = str(context.get("id") or "")
         aggregate_id = str(context.get("aggregate_id") or "")
         post_watchdog_grace = max(0.0, float(self.turn_id_mismatch_post_watchdog_grace_seconds))
-        for wd in self.watchdogs.values():
+        for wd in self.watchdog_snapshot().values():
             if not wd or wd.get("is_alarm"):
                 continue
             if self.normalize_watchdog_phase(wd) != WATCHDOG_PHASE_RESPONSE:

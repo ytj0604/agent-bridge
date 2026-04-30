@@ -101,6 +101,7 @@ class RoutingState:
 class WatchdogState:
     max_processed_returns: int
     max_processed_capture_requests: int
+    watchdog_lock: threading.RLock = field(default_factory=threading.RLock)
     processed_returns: BoundedSet = field(init=False)
     processed_capture_requests: BoundedSet = field(init=False)
     watchdogs: dict[str, dict] = field(default_factory=dict)

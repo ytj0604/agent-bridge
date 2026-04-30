@@ -118,12 +118,13 @@ def _maybe_cancel_alarms_for_incoming(d, message: dict) -> None:
     if sender == "bridge" or sender == target:
         return
     cancelled: list[tuple[str, dict]] = []
-    for wake_id in list(d.watchdogs.keys()):
-        wd = d.watchdogs.get(wake_id)
-        if wd and wd.get("is_alarm") and wd.get("sender") == target:
-            removed = d.watchdogs.pop(wake_id)
-            d._record_alarm_wake_tombstone(wake_id, removed, "registered_then_cancelled")
-            cancelled.append((wake_id, removed))
+    with d.watchdog_lock_context():
+        for wake_id in list(d.watchdogs.keys()):
+            wd = d.watchdogs.get(wake_id)
+            if wd and wd.get("is_alarm") and wd.get("sender") == target:
+                removed = d.watchdogs.pop(wake_id)
+                d._record_alarm_wake_tombstone(wake_id, removed, "registered_then_cancelled")
+                cancelled.append((wake_id, removed))
     if not cancelled:
         return
     notes: list[str] = []
@@ -282,9 +283,10 @@ def extend_watchdog_error_hint(d, error: str | None) -> str:
 
 
 def upsert_message_watchdog(d, sender: str, message_id: str, additional_sec: float) -> tuple[bool, str | None, str | None]:
-    # All validation + upsert inside a single state_lock acquire so the
-    # checks and the registration cannot interleave with delivery,
-    # cancellation, or termination of the same message.
+    # All validation + upsert stays inside state_lock, with watchdog_lock
+    # acquired before reading queue state and replacing the wake. This keeps
+    # extend_wait serialized with delivery/cancellation while preserving the
+    # Stage 14 state_lock -> watchdog_lock -> queue order.
     # Returns (ok, error_code, new_deadline_iso).
     post_lock_worst_case, margin = d.command_budget("extend_watchdog")
     try:
@@ -305,41 +307,42 @@ def upsert_message_watchdog(d, sender: str, message_id: str, additional_sec: flo
             command_class="extend_watchdog",
         ):
             return False, "lock_wait_exceeded", None
-        queue = list(d.queue.read())
-        item = next((it for it in queue if it.get("id") == message_id), None)
-        if not item:
-            tombstone = d._find_message_tombstone(message_id)
-            if tombstone:
-                owner = str(tombstone.get("prior_sender") or "")
-                if owner and owner != sender:
-                    return False, "not_owner", None
-                return False, d.tombstone_extend_error(tombstone), None
-            return False, "message_unknown", None
-        if str(item.get("from") or "") != sender:
-            return False, "not_owner", None
-        status = str(item.get("status") or "")
-        if status not in {"inflight", "submitted", "delivered"}:
-            return False, "message_not_extendable_state", None
-        if not bool(item.get("auto_return")):
-            return False, WATCHDOG_REQUIRES_AUTO_RETURN_ERROR, None
-        if item.get("aggregate_id") and status == "delivered":
-            return False, "aggregate_extend_not_supported", None
-        try:
-            additional_value = float(additional_sec)
-        except (TypeError, ValueError):
-            return False, "seconds_must_be_positive", None
-        if not math.isfinite(additional_value) or additional_value <= 0:
-            return False, "seconds_must_be_positive", None
-        new_deadline = datetime.now(timezone.utc) + timedelta(seconds=additional_value)
-        new_deadline_iso = new_deadline.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        phase = WATCHDOG_PHASE_RESPONSE if status == "delivered" else WATCHDOG_PHASE_DELIVERY
-        arm_msg = dict(item)
-        arm_msg["watchdog_phase"] = phase
-        arm_msg["watchdog_phase_started_ts"] = (
-            item.get("delivered_ts") if phase == WATCHDOG_PHASE_RESPONSE else item.get("inflight_ts")
-        ) or item.get("updated_ts") or item.get("created_ts")
-        arm_msg["watchdog_at"] = new_deadline_iso
-        d.register_watchdog(arm_msg)
+        with d.watchdog_lock_context():
+            queue = list(d.queue.read())
+            item = next((it for it in queue if it.get("id") == message_id), None)
+            if not item:
+                tombstone = d._find_message_tombstone(message_id)
+                if tombstone:
+                    owner = str(tombstone.get("prior_sender") or "")
+                    if owner and owner != sender:
+                        return False, "not_owner", None
+                    return False, d.tombstone_extend_error(tombstone), None
+                return False, "message_unknown", None
+            if str(item.get("from") or "") != sender:
+                return False, "not_owner", None
+            status = str(item.get("status") or "")
+            if status not in {"inflight", "submitted", "delivered"}:
+                return False, "message_not_extendable_state", None
+            if not bool(item.get("auto_return")):
+                return False, WATCHDOG_REQUIRES_AUTO_RETURN_ERROR, None
+            if item.get("aggregate_id") and status == "delivered":
+                return False, "aggregate_extend_not_supported", None
+            try:
+                additional_value = float(additional_sec)
+            except (TypeError, ValueError):
+                return False, "seconds_must_be_positive", None
+            if not math.isfinite(additional_value) or additional_value <= 0:
+                return False, "seconds_must_be_positive", None
+            new_deadline = datetime.now(timezone.utc) + timedelta(seconds=additional_value)
+            new_deadline_iso = new_deadline.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            phase = WATCHDOG_PHASE_RESPONSE if status == "delivered" else WATCHDOG_PHASE_DELIVERY
+            arm_msg = dict(item)
+            arm_msg["watchdog_phase"] = phase
+            arm_msg["watchdog_phase_started_ts"] = (
+                item.get("delivered_ts") if phase == WATCHDOG_PHASE_RESPONSE else item.get("inflight_ts")
+            ) or item.get("updated_ts") or item.get("created_ts")
+            arm_msg["watchdog_at"] = new_deadline_iso
+            _register_watchdog_locked(d, arm_msg)
         d.log(
             "watchdog_extended",
             message_id=message_id,
@@ -353,7 +356,7 @@ def upsert_message_watchdog(d, sender: str, message_id: str, additional_sec: flo
         lock_ctx.__exit__(None, None, None)
 
 
-def register_watchdog(d, message: dict) -> None:
+def _register_watchdog_locked(d, message: dict) -> None:
     deadline_iso = message.get("watchdog_at")
     if not deadline_iso:
         return
@@ -373,57 +376,61 @@ def register_watchdog(d, message: dict) -> None:
     aggregate_id = message.get("aggregate_id")
     message_id = message.get("id")
     phase = d.normalize_watchdog_phase(message)
-    with d.state_lock:
-        if aggregate_id and phase == WATCHDOG_PHASE_RESPONSE:
-            # Aggregate response watches are aggregate-wide: one wake tells
-            # the requester that the broadcast has not completed.
-            for existing in d.watchdogs.values():
-                if (
-                    existing
-                    and existing.get("ref_aggregate_id") == aggregate_id
-                    and d.normalize_watchdog_phase(existing) == WATCHDOG_PHASE_RESPONSE
-                    and not existing.get("is_alarm")
-                ):
-                    return
-        elif message_id:
-            # Delivery watches are per leg, including aggregate legs. For
-            # non-aggregate requests the response watch replaces the
-            # delivery watch by message id.
-            for wake_id_existing in list(d.watchdogs.keys()):
-                existing = d.watchdogs.get(wake_id_existing)
-                if not existing or existing.get("is_alarm") or existing.get("ref_message_id") != message_id:
-                    continue
-                existing_phase = d.normalize_watchdog_phase(existing)
-                if aggregate_id and phase == WATCHDOG_PHASE_DELIVERY and existing_phase != WATCHDOG_PHASE_DELIVERY:
-                    continue
-                d.watchdogs.pop(wake_id_existing, None)
-        wake_id = short_id("wake")
-        d.watchdogs[wake_id] = {
-            "sender": sender,
-            "deadline": deadline,
-            "watchdog_phase": phase,
-            "ref_message_id": message.get("id"),
-            "ref_aggregate_id": message.get("aggregate_id"),
-            "ref_to": message.get("to"),
-            "ref_kind": normalize_kind(message.get("kind"), "request"),
-            "ref_intent": message.get("intent"),
-            "ref_causal_id": message.get("causal_id"),
-            "ref_aggregate_expected": list(message.get("aggregate_expected") or []),
-            "ref_created_ts": message.get("created_ts"),
-            "ref_phase_started_ts": message.get("watchdog_phase_started_ts"),
-            "is_alarm": bool(message.get("alarm")),
-        }
-        d.log(
-            "watchdog_registered",
-            wake_id=wake_id,
-            sender=sender,
-            ref_message_id=message.get("id"),
-            ref_aggregate_id=message.get("aggregate_id"),
-            deadline=deadline_iso,
-            kind=message.get("kind"),
-            watchdog_phase=phase,
-            is_alarm=bool(message.get("alarm")),
-        )
+    if aggregate_id and phase == WATCHDOG_PHASE_RESPONSE:
+        # Aggregate response watches are aggregate-wide: one wake tells
+        # the requester that the broadcast has not completed.
+        for existing in d.watchdogs.values():
+            if (
+                existing
+                and existing.get("ref_aggregate_id") == aggregate_id
+                and d.normalize_watchdog_phase(existing) == WATCHDOG_PHASE_RESPONSE
+                and not existing.get("is_alarm")
+            ):
+                return
+    elif message_id:
+        # Delivery watches are per leg, including aggregate legs. For
+        # non-aggregate requests the response watch replaces the delivery
+        # watch by message id.
+        for wake_id_existing in list(d.watchdogs.keys()):
+            existing = d.watchdogs.get(wake_id_existing)
+            if not existing or existing.get("is_alarm") or existing.get("ref_message_id") != message_id:
+                continue
+            existing_phase = d.normalize_watchdog_phase(existing)
+            if aggregate_id and phase == WATCHDOG_PHASE_DELIVERY and existing_phase != WATCHDOG_PHASE_DELIVERY:
+                continue
+            d.watchdogs.pop(wake_id_existing, None)
+    wake_id = short_id("wake")
+    d.watchdogs[wake_id] = {
+        "sender": sender,
+        "deadline": deadline,
+        "watchdog_phase": phase,
+        "ref_message_id": message.get("id"),
+        "ref_aggregate_id": message.get("aggregate_id"),
+        "ref_to": message.get("to"),
+        "ref_kind": normalize_kind(message.get("kind"), "request"),
+        "ref_intent": message.get("intent"),
+        "ref_causal_id": message.get("causal_id"),
+        "ref_aggregate_expected": list(message.get("aggregate_expected") or []),
+        "ref_created_ts": message.get("created_ts"),
+        "ref_phase_started_ts": message.get("watchdog_phase_started_ts"),
+        "is_alarm": bool(message.get("alarm")),
+    }
+    d.log(
+        "watchdog_registered",
+        wake_id=wake_id,
+        sender=sender,
+        ref_message_id=message.get("id"),
+        ref_aggregate_id=message.get("aggregate_id"),
+        deadline=deadline_iso,
+        kind=message.get("kind"),
+        watchdog_phase=phase,
+        is_alarm=bool(message.get("alarm")),
+    )
+
+
+def register_watchdog(d, message: dict) -> None:
+    with d.watchdog_lock_context():
+        _register_watchdog_locked(d, message)
 
 
 def normalize_watchdog_phase(d, wd: dict) -> str:
@@ -528,25 +535,7 @@ def register_alarm_result(
     if not ALARM_CLIENT_WAKE_ID_RE.fullmatch(requested_wake_id):
         return {"ok": False, "error": "wake_id must match wake-[a-f0-9]{12}"}
     deadline = time.time() + delay
-    post_lock_worst_case, margin = d.command_budget("alarm")
-    try:
-        lock_ctx = d.command_state_lock(
-            post_lock_worst_case=post_lock_worst_case,
-            margin=margin,
-            command_class="alarm",
-        )
-        lock_ctx.__enter__()
-    except Exception as exc:
-        if not _is_command_lock_wait_exceeded(exc):
-            raise
-        return d.lock_wait_exceeded_response("alarm")
-    try:
-        if not d.command_deadline_ok(
-            post_lock_worst_case=post_lock_worst_case,
-            margin=margin,
-            command_class="alarm",
-        ):
-            return d.lock_wait_exceeded_response("alarm")
+    with d.watchdog_lock_context():
         d._prune_alarm_wake_tombstones()
         if not client_supplied_wake_id:
             while requested_wake_id in d.watchdogs or requested_wake_id in d.alarm_wake_tombstones:
@@ -607,8 +596,6 @@ def register_alarm_result(
             sender=sender,
             delay_seconds=delay,
         )
-    finally:
-        lock_ctx.__exit__(None, None, None)
     return {"ok": True, "wake_id": requested_wake_id, "alarm_status": "registered", "duplicate": False}
 
 
@@ -620,13 +607,18 @@ def register_alarm(d, sender: str, delay_seconds: float, body: str | None = None
 
 
 def check_watchdogs(d) -> None:
-    with d.state_lock:
+    with d.watchdog_lock_context():
         if not d.watchdogs:
             return
         now = time.time()
-        due = [(wake_id, wd) for wake_id, wd in list(d.watchdogs.items()) if now >= wd.get("deadline", now + 1)]
-        for wake_id, wd in due:
-            d.fire_watchdog(wake_id, wd)
+        due: list[tuple[str, dict]] = []
+        for wake_id, wd in list(d.watchdogs.items()):
+            if now >= wd.get("deadline", now + 1):
+                removed = d.watchdogs.pop(wake_id, None)
+                if removed:
+                    due.append((wake_id, dict(removed)))
+    for wake_id, wd in due:
+        d.fire_watchdog(wake_id, wd, already_popped=True)
 
 
 def stamp_turn_id_mismatch_post_watchdog_unblock(d, wd: dict) -> None:
@@ -802,13 +794,34 @@ def watchdog_fire_skip_reason(d, wd: dict) -> str:
     return f"unknown_phase_{phase}"
 
 
-def fire_watchdog(d, wake_id: str, wd: dict) -> None:
+def watchdog_wake_superseded(d, wake_id: str, wd: dict) -> bool:
+    phase = d.normalize_watchdog_phase(wd)
+    message_id = str(wd.get("ref_message_id") or "")
+    aggregate_id = str(wd.get("ref_aggregate_id") or "")
+    with d.watchdog_lock_context():
+        if wake_id in d.watchdogs:
+            return True
+        for existing in d.watchdogs.values():
+            if not existing or existing.get("is_alarm") or phase != d.normalize_watchdog_phase(existing):
+                continue
+            if message_id and existing.get("ref_message_id") == message_id:
+                return True
+            if aggregate_id and existing.get("ref_aggregate_id") == aggregate_id:
+                return True
+    return False
+
+
+def fire_watchdog(d, wake_id: str, wd: dict, *, already_popped: bool = False) -> None:
     sender = str(wd.get("sender") or "")
     d.reload_participants()
     if not sender or sender not in d.participants:
-        removed = d.watchdogs.pop(wake_id, None)
+        removed = dict(wd)
+        if not already_popped:
+            with d.watchdog_lock_context():
+                removed = d.watchdogs.pop(wake_id, None) or removed
         if removed and removed.get("is_alarm"):
-            d._record_alarm_wake_tombstone(wake_id, removed, "sender_inactive")
+            with d.watchdog_lock_context():
+                d._record_alarm_wake_tombstone(wake_id, removed, "sender_inactive")
         d.log(
             "watchdog_fire_skipped",
             wake_id=wake_id,
@@ -816,11 +829,26 @@ def fire_watchdog(d, wake_id: str, wd: dict) -> None:
             reason="sender_not_active",
         )
         return
+    if already_popped and d.watchdog_wake_superseded(wake_id, wd):
+        d.log(
+            "watchdog_skipped_stale",
+            wake_id=wake_id,
+            sender=sender,
+            ref_message_id=wd.get("ref_message_id"),
+            ref_aggregate_id=wd.get("ref_aggregate_id"),
+            watchdog_phase=d.normalize_watchdog_phase(wd),
+            reason="superseded_after_pop",
+        )
+        return
     skip_reason = d.watchdog_fire_skip_reason(wd)
     if skip_reason:
-        removed = d.watchdogs.pop(wake_id, None)
+        removed = dict(wd)
+        if not already_popped:
+            with d.watchdog_lock_context():
+                removed = d.watchdogs.pop(wake_id, None) or removed
         if removed and removed.get("is_alarm"):
-            d._record_alarm_wake_tombstone(wake_id, removed, f"skipped_{skip_reason}")
+            with d.watchdog_lock_context():
+                d._record_alarm_wake_tombstone(wake_id, removed, f"skipped_{skip_reason}")
         d.log(
             "watchdog_skipped_stale",
             wake_id=wake_id,
@@ -832,10 +860,26 @@ def fire_watchdog(d, wake_id: str, wd: dict) -> None:
         )
         return
     d.stamp_turn_id_mismatch_post_watchdog_unblock(wd)
-    removed = d.watchdogs.pop(wake_id, None)
+    removed = dict(wd)
+    if not already_popped:
+        with d.watchdog_lock_context():
+            removed = d.watchdogs.pop(wake_id, None) or removed
     if removed and removed.get("is_alarm"):
-        d._record_alarm_wake_tombstone(wake_id, removed, "fired")
+        with d.watchdog_lock_context():
+            d._record_alarm_wake_tombstone(wake_id, removed, "fired")
     body = d.build_watchdog_fire_text(wd)
+    final_skip_reason = d.watchdog_fire_skip_reason(wd)
+    if final_skip_reason or (already_popped and d.watchdog_wake_superseded(wake_id, wd)):
+        d.log(
+            "watchdog_skipped_stale",
+            wake_id=wake_id,
+            sender=sender,
+            ref_message_id=wd.get("ref_message_id"),
+            ref_aggregate_id=wd.get("ref_aggregate_id"),
+            watchdog_phase=d.normalize_watchdog_phase(wd),
+            reason=final_skip_reason or "superseded_after_pop",
+        )
+        return
     synthetic = {
         "id": short_id("msg"),
         "created_ts": utc_now(),
@@ -880,40 +924,48 @@ def cancel_watchdogs_for_message(
 ) -> None:
     if not message_id:
         return
-    for wake_id in list(d.watchdogs.keys()):
-        wd = d.watchdogs.get(wake_id)
-        if (
-            wd
-            and wd.get("ref_message_id") == message_id
-            and not wd.get("is_alarm")
-            and (phase is None or d.normalize_watchdog_phase(wd) == phase)
-        ):
-            d.watchdogs.pop(wake_id, None)
-            d.log(
-                "watchdog_cancelled",
-                wake_id=wake_id,
-                reason=reason,
-                ref_message_id=message_id,
-                watchdog_phase=d.normalize_watchdog_phase(wd),
-            )
+    cancelled: list[tuple[str, dict]] = []
+    with d.watchdog_lock_context():
+        for wake_id in list(d.watchdogs.keys()):
+            wd = d.watchdogs.get(wake_id)
+            if (
+                wd
+                and wd.get("ref_message_id") == message_id
+                and not wd.get("is_alarm")
+                and (phase is None or d.normalize_watchdog_phase(wd) == phase)
+            ):
+                d.watchdogs.pop(wake_id, None)
+                cancelled.append((wake_id, wd))
+    for wake_id, wd in cancelled:
+        d.log(
+            "watchdog_cancelled",
+            wake_id=wake_id,
+            reason=reason,
+            ref_message_id=message_id,
+            watchdog_phase=d.normalize_watchdog_phase(wd),
+        )
 
 
 def cancel_watchdogs_for_aggregate(d, aggregate_id: str | None, reason: str = "aggregate_complete") -> None:
     if not aggregate_id:
         return
-    for wake_id in list(d.watchdogs.keys()):
-        wd = d.watchdogs.get(wake_id)
-        if (
-            wd
-            and wd.get("ref_aggregate_id") == aggregate_id
-            and d.normalize_watchdog_phase(wd) == WATCHDOG_PHASE_RESPONSE
-            and not wd.get("is_alarm")
-        ):
-            d.watchdogs.pop(wake_id, None)
-            d.log(
-                "watchdog_cancelled",
-                wake_id=wake_id,
-                reason=reason,
-                ref_aggregate_id=aggregate_id,
-                watchdog_phase=d.normalize_watchdog_phase(wd),
-            )
+    cancelled: list[tuple[str, dict]] = []
+    with d.watchdog_lock_context():
+        for wake_id in list(d.watchdogs.keys()):
+            wd = d.watchdogs.get(wake_id)
+            if (
+                wd
+                and wd.get("ref_aggregate_id") == aggregate_id
+                and d.normalize_watchdog_phase(wd) == WATCHDOG_PHASE_RESPONSE
+                and not wd.get("is_alarm")
+            ):
+                d.watchdogs.pop(wake_id, None)
+                cancelled.append((wake_id, wd))
+    for wake_id, wd in cancelled:
+        d.log(
+            "watchdog_cancelled",
+            wake_id=wake_id,
+            reason=reason,
+            ref_aggregate_id=aggregate_id,
+            watchdog_phase=d.normalize_watchdog_phase(wd),
+        )

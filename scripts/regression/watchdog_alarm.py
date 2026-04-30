@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 import argparse
 import io
 import json
@@ -853,6 +853,115 @@ def scenario_aggregate_completion_suppresses_pending_watchdog_wake(label: str, t
     assert_true(not ok and err == "message_recently_responded", f"{label}: completed aggregate leg should not be unknown: ok={ok}, err={err!r}")
     print(f"  PASS  {label}")
 
+def scenario_aggregate_completion_lock_order_spies(label: str, tmpdir: Path) -> None:
+    participants = {
+        "manager": {"alias": "manager", "agent_type": "claude", "pane": "%90"},
+        "w1": {"alias": "w1", "agent_type": "codex", "pane": "%91"},
+        "w2": {"alias": "w2", "agent_type": "codex", "pane": "%92"},
+    }
+    d = make_daemon(tmpdir, participants)
+    d.try_deliver = lambda *args, **kwargs: None  # type: ignore[assignment]
+    agg_id = "agg-lock-order"
+    context = {
+        "aggregate_id": agg_id,
+        "from": "manager",
+        "aggregate_expected": ["w1", "w2"],
+        "aggregate_message_ids": {"w1": "msg-agg-lock-w1", "w2": "msg-agg-lock-w2"},
+        "causal_id": "causal-agg-lock",
+        "intent": "review",
+        "hop_count": 1,
+    }
+    _plant_watchdog(
+        d,
+        "wake-agg-lock-order",
+        sender="manager",
+        message_id="msg-agg-lock-w1",
+        aggregate_id=agg_id,
+        to="w1",
+        deadline=time.time() + 60.0,
+    )
+
+    active = {"aggregate": False}
+    original_aggregate_update = d.aggregates.update
+    original_queue_update = d.queue.update
+    original_cancel_aggregate = d.cancel_watchdogs_for_aggregate
+
+    def aggregate_update_spy(mutator):
+        assert_true(not d._state_lock_owned_by_current_thread(), f"{label}: aggregate update must not run under state_lock")
+        assert_true(not d._watchdog_lock_owned_by_current_thread(), f"{label}: aggregate update must not run under watchdog_lock")
+        active["aggregate"] = True
+        try:
+            return original_aggregate_update(mutator)
+        finally:
+            active["aggregate"] = False
+
+    def queue_update_spy(mutator):
+        assert_true(not active["aggregate"], f"{label}: queue update must not run while aggregate mutation is active")
+        return original_queue_update(mutator)
+
+    def cancel_aggregate_spy(aggregate_id: str | None, reason: str = "aggregate_complete") -> None:
+        assert_true(not active["aggregate"], f"{label}: watchdog cancellation must not run while aggregate mutation is active")
+        return original_cancel_aggregate(aggregate_id, reason=reason)
+
+    d.aggregates.update = aggregate_update_spy  # type: ignore[method-assign]
+    d.queue.update = queue_update_spy  # type: ignore[method-assign]
+    d.cancel_watchdogs_for_aggregate = cancel_aggregate_spy  # type: ignore[method-assign]
+
+    d.collect_aggregate_response("w1", "w1 ok", {**context, "id": "msg-agg-lock-w1"})
+    d.collect_aggregate_response("w2", "w2 ok", {**context, "id": "msg-agg-lock-w2"})
+
+    result = next((it for it in d.queue.read() if it.get("source") == "aggregate_return" and it.get("aggregate_id") == agg_id), None)
+    assert_true(result is not None, f"{label}: aggregate result should be queued after phased completion")
+    assert_true(not any(wd.get("ref_aggregate_id") == agg_id for wd in d.watchdogs.values()), f"{label}: aggregate watchdog should be cancelled after aggregate phase")
+    print(f"  PASS  {label}")
+
+def scenario_aggregate_store_update_hook_installed(label: str, tmpdir: Path) -> None:
+    participants = {"manager": {"alias": "manager", "agent_type": "claude", "pane": "%90"}}
+    d = make_daemon(tmpdir, participants)
+    hook = d.aggregates.before_update
+    assert_true(
+        callable(hook)
+        and getattr(hook, "__self__", None) is d
+        and getattr(hook, "__name__", "") == "assert_aggregate_update_allowed",
+        f"{label}: aggregate store update hook should be wired to daemon assertion",
+    )
+    read_hook = d.aggregates.before_read
+    assert_true(
+        callable(read_hook)
+        and getattr(read_hook, "__self__", None) is d
+        and getattr(read_hook, "__name__", "") == "assert_aggregate_update_allowed",
+        f"{label}: aggregate store read hook should be wired to daemon assertion",
+    )
+    raised = False
+    try:
+        with d.state_lock:
+            d.aggregates.update(lambda data: data)
+    except RuntimeError as exc:
+        raised = "AggregateStore access cannot run under state_lock or watchdog_lock" in str(exc)
+    assert_true(raised, f"{label}: aggregate store update should fail under state_lock")
+    raised_watchdog = False
+    try:
+        with d.watchdog_lock_context():
+            d.aggregates.update(lambda data: data)
+    except RuntimeError as exc:
+        raised_watchdog = "AggregateStore access cannot run under state_lock or watchdog_lock" in str(exc)
+    assert_true(raised_watchdog, f"{label}: aggregate store update should fail under watchdog_lock")
+    read_raised = False
+    try:
+        with d.state_lock:
+            d.aggregates.read_aggregates()
+    except RuntimeError as exc:
+        read_raised = "AggregateStore access cannot run under state_lock or watchdog_lock" in str(exc)
+    assert_true(read_raised, f"{label}: aggregate store read should fail under state_lock")
+    get_raised = False
+    try:
+        with d.watchdog_lock_context():
+            d.aggregates.get("agg-missing")
+    except RuntimeError as exc:
+        get_raised = "AggregateStore access cannot run under state_lock or watchdog_lock" in str(exc)
+    assert_true(get_raised, f"{label}: aggregate store get should fail under watchdog_lock")
+    print(f"  PASS  {label}")
+
 def scenario_duplicate_enqueue_does_not_cancel_alarm(label: str, tmpdir: Path) -> None:
     # If the same message_id is enqueued twice (rare, but possible from an
     # external IPC retry), the second enqueue is dropped at the queue
@@ -930,6 +1039,114 @@ def scenario_replay_does_not_cancel_later_alarm(label: str, tmpdir: Path) -> Non
     record = {"event": "message_queued", "message_id": msg["id"], "from_agent": "codex", "to": "claude", "kind": "request"}
     d.handle_external_message_queued(record)
     assert_true(new_alarm in d.watchdogs, f"{label}: replay of finalized message must NOT cancel a NEWER alarm")
+    print(f"  PASS  {label}")
+
+def scenario_ingress_finalize_alarm_cancel_watchdog_lock_atomic(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    wake_id = _enqueue_alarm(d, "claude", note="atomic ingress alarm")
+    msg = _qualifying_message("codex", "claude", kind="request", body="atomic body")
+    msg["id"] = "msg-atomic-ingress"
+    d.queue.update(lambda queue: queue.append(msg) or None)
+    lock_observations: list[bool] = []
+    original_watchdog_lock_context = d.watchdog_lock_context
+
+    @contextmanager
+    def watchdog_lock_spy():
+        lock_observations.append(d._state_lock_owned_by_current_thread())
+        with original_watchdog_lock_context():
+            yield
+
+    d.watchdog_lock_context = watchdog_lock_spy  # type: ignore[method-assign]
+    with d.state_lock:
+        d._apply_alarm_cancel_to_queued_message("msg-atomic-ingress")
+        queued = _queue_item(d, "msg-atomic-ingress")
+        assert_true(queued is not None and queued.get("status") == "pending", f"{label}: status should promote while state_lock is held: {queued}")
+        assert_true(str(queued.get("body") or "").startswith("[bridge:alarm_cancelled]"), f"{label}: body should be prepended in same finalize: {queued}")
+        assert_true(wake_id not in d.watchdogs, f"{label}: alarm should be cancelled in same finalize")
+    newer = _enqueue_alarm(d, "claude", note="newer alarm after finalize")
+    with d.state_lock:
+        d._apply_alarm_cancel_to_queued_message("msg-atomic-ingress")
+    assert_true(newer in d.watchdogs, f"{label}: replay of finalized ingress row must not cancel newer alarm")
+    assert_true(lock_observations and lock_observations[0] is True, f"{label}: alarm cancel should enter watchdog_lock while state_lock is owned: {lock_observations}")
+    print(f"  PASS  {label}")
+
+def scenario_watchdog_fire_snapshot_pop_skips_superseded_wake(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = _delivered_request("msg-wd-superseded", "claude", "codex")
+    msg["watchdog_delay_sec"] = 60.0
+    d.queue.update(lambda queue: queue.append(msg) or None)
+    wake_id = _plant_watchdog(
+        d,
+        "wake-superseded-old",
+        sender="claude",
+        message_id="msg-wd-superseded",
+        to="codex",
+        deadline=time.time() - 1.0,
+    )
+    d.watchdogs[wake_id]["watchdog_phase"] = "response"
+    original_fire = d.fire_watchdog
+    replacement = dict(msg)
+    replacement["watchdog_phase"] = "response"
+    replacement["watchdog_phase_started_ts"] = replacement.get("delivered_ts") or replacement.get("updated_ts")
+    replacement["watchdog_at"] = "2999-01-01T00:00:00.000000Z"
+
+    def fire_after_replacement(pop_wake_id: str, wd: dict, *, already_popped: bool = False) -> None:
+        d.register_watchdog(replacement)
+        original_fire(pop_wake_id, wd, already_popped=already_popped)
+
+    d.fire_watchdog = fire_after_replacement  # type: ignore[method-assign]
+    d.check_watchdogs()
+
+    notices = [it for it in d.queue.read() if it.get("intent") == "watchdog_wake" and it.get("ref_message_id") == "msg-wd-superseded"]
+    fresh = [
+        (wid, wd)
+        for wid, wd in d.watchdogs.items()
+        if wd.get("ref_message_id") == "msg-wd-superseded" and wd.get("watchdog_phase") == "response"
+    ]
+    assert_true(not notices, f"{label}: stale popped wake must not enqueue notice after replacement: {notices}")
+    assert_true(len(fresh) == 1 and fresh[0][0] != wake_id, f"{label}: fresh replacement watchdog should remain active: {d.watchdogs}")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    assert_true(any(e.get("event") == "watchdog_skipped_stale" and e.get("reason") == "superseded_after_pop" for e in events), f"{label}: superseded skip should be logged: {events}")
+    print(f"  PASS  {label}")
+
+def scenario_watchdog_fire_final_revalidation_after_terminal_cleanup(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = _delivered_request("msg-wd-terminal-race", "claude", "codex")
+    d.queue.update(lambda queue: queue.append(msg) or None)
+    wake_id = _plant_watchdog(
+        d,
+        "wake-terminal-race",
+        sender="claude",
+        message_id="msg-wd-terminal-race",
+        to="codex",
+        deadline=time.time() - 1.0,
+    )
+    d.watchdogs[wake_id]["watchdog_phase"] = "response"
+    original_build = d.build_watchdog_fire_text
+
+    def build_and_terminal_cleanup(wd: dict) -> str:
+        text = original_build(wd)
+        d.remove_delivered_message("codex", "msg-wd-terminal-race")
+        d._record_message_tombstone(
+            "codex",
+            {"id": "msg-wd-terminal-race", "from": "claude"},
+            by_sender="bridge",
+            reason="terminal_response",
+            suppress_late_hooks=False,
+            prompt_submitted_seen=True,
+        )
+        return text
+
+    d.build_watchdog_fire_text = build_and_terminal_cleanup  # type: ignore[method-assign]
+    d.check_watchdogs()
+    notices = [it for it in d.queue.read() if it.get("intent") == "watchdog_wake" and it.get("ref_message_id") == "msg-wd-terminal-race"]
+    assert_true(not notices, f"{label}: terminal cleanup after initial check must suppress stale wake: {notices}")
+    events = read_events(tmpdir / "events.raw.jsonl")
+    skipped = [e for e in events if e.get("event") == "watchdog_skipped_stale" and e.get("wake_id") == wake_id]
+    assert_true(skipped and "terminal_response" in str(skipped[-1].get("reason") or ""), f"{label}: final terminal skip should be logged: {skipped}")
     print(f"  PASS  {label}")
 
 def scenario_aged_ingressing_does_not_cancel_alarms(label: str, tmpdir: Path) -> None:
@@ -1802,6 +2019,7 @@ SCENARIOS = [
     ('socket_path_alarm_cancel', scenario_socket_path_alarm_cancel),
     ('fallback_path_alarm_cancel', scenario_fallback_path_alarm_cancel),
     ('replay_does_not_cancel_later_alarm', scenario_replay_does_not_cancel_later_alarm),
+    ('ingress_finalize_alarm_cancel_watchdog_lock_atomic', scenario_ingress_finalize_alarm_cancel_watchdog_lock_atomic),
     ('aged_ingressing_does_not_cancel_alarms', scenario_aged_ingressing_does_not_cancel_alarms),
     ('alarm_not_cancelled_by_result', scenario_alarm_not_cancelled_by_result),
     ('alarm_not_cancelled_by_bridge', scenario_alarm_not_cancelled_by_bridge),
@@ -1829,6 +2047,10 @@ SCENARIOS = [
     ('delivery_watchdog_aggregate_interrupt_cancels_leg_only', scenario_delivery_watchdog_aggregate_interrupt_cancels_leg_only),
     ('aggregate_response_watchdog_text_uses_progress', scenario_aggregate_response_watchdog_text_uses_progress),
     ('aggregate_completion_suppresses_pending_watchdog_wake', scenario_aggregate_completion_suppresses_pending_watchdog_wake),
+    ('aggregate_completion_lock_order_spies', scenario_aggregate_completion_lock_order_spies),
+    ('aggregate_store_update_hook_installed', scenario_aggregate_store_update_hook_installed),
+    ('watchdog_fire_snapshot_pop_skips_superseded_wake', scenario_watchdog_fire_snapshot_pop_skips_superseded_wake),
+    ('watchdog_fire_final_revalidation_after_terminal_cleanup', scenario_watchdog_fire_final_revalidation_after_terminal_cleanup),
     ('duplicate_enqueue_does_not_cancel_alarm', scenario_duplicate_enqueue_does_not_cancel_alarm),
     ('alarm_op_invalid_delay_is_rejected', scenario_alarm_op_invalid_delay_is_rejected_not_crashed),
     ('extend_wait_zero_negative_nan_inf_rejected', scenario_extend_wait_zero_negative_nan_inf_rejected),
