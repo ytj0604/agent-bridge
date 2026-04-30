@@ -64,6 +64,14 @@ bridge_run
 - `bridge_run` — open the pane picker and attach a new room. Run with `--help` for flags (custom session name, etc.).
 - `bridge_manage` — interactive: list active rooms, join/leave agents, tail daemon log, stop a daemon.
 
+## Development
+
+Run the regression suite with:
+
+```bash
+python3 scripts/run_regressions.py
+```
+
 ## Configuration
 
 - `AGENT_BRIDGE_DEFAULT_WATCHDOG_SEC` — default request watchdog in seconds; `0` disables the default.

@@ -573,7 +573,7 @@ def scenario_view_peer_since_last_matches_changed_volatile_chrome(label: str, tm
     stable = [
         "Review finding HIGH-1 process identity validation keeps endpoint safe",
         "Implementation note bridge_view_peer stable anchor cursor stores unique windows",
-        "Validation command python3 scripts/regression_interrupt.py completed cleanly",
+        "Validation command python3 scripts/run_regressions.py completed cleanly",
         "Reviewer summary msg-abc123 confirms since-last behavior is stable",
     ]
     previous = ["old output before cursor", *stable, "\u273b Churned for 4m 1s", "\u2500" * 40, "\u276f", "  \u23f5\u23f5 bypass permissions on (shift+tab to cycle)"]
@@ -591,7 +591,7 @@ def scenario_view_peer_since_last_legacy_tail_derives_stable_anchor(label: str, 
         "Legacy cursor retained useful file path /tmp/agent-bridge-share/review.md",
         "Secondary reviewer response msg-legacy confirms stable matching can recover",
         "Bridge command agent_view_peer codex-reviewer --since-last should advance",
-        "Regression note python3 scripts/regression_interrupt.py covers legacy tails",
+        "Regression note python3 scripts/run_regressions.py covers legacy tails",
     ]
     previous_tail = [*stable, "\u273b Churned for 56s", "\u2500" * 40, "\u276f"]
     current = [*stable, "Fresh line after legacy cursor should appear", "\u273b Churned for 1m 2s"]
@@ -613,7 +613,7 @@ def scenario_view_peer_since_last_ambiguous_current_anchor_skips_to_unique(label
     unique_anchor = [
         "Unique cursor anchor line one includes msg-unique-001 for disambiguation",
         "Unique cursor anchor line two references bridge_view_peer.py implementation",
-        "Unique cursor anchor line three references scripts/regression_interrupt.py",
+        "Unique cursor anchor line three references scripts/run_regressions.py",
         "Unique cursor anchor line four references agent_view_peer since-last",
     ]
     cursor = {
@@ -635,7 +635,7 @@ def scenario_view_peer_since_last_matches_anchor_before_long_delta(label: str, t
     anchor = [
         "Long delta anchor line one includes msg-long-001 and detail",
         "Long delta anchor line two references bridge_view_peer.py implementation",
-        "Long delta anchor line three references scripts/regression_interrupt.py",
+        "Long delta anchor line three references scripts/run_regressions.py",
         "Long delta anchor line four references agent_view_peer since-last",
     ]
     current = [
@@ -680,7 +680,7 @@ def scenario_view_peer_since_last_uncertain_does_not_advance_cursor(label: str, 
                     "lines": [
                         "Missing anchor one contains msg-missing-001 and enough detail",
                         "Missing anchor two contains bridge_view_peer.py and enough detail",
-                        "Missing anchor three contains regression_interrupt.py and detail",
+                        "Missing anchor three contains run_regressions.py and detail",
                         "Missing anchor four contains agent_view_peer --since-last detail",
                     ],
                     "stable_count": 4,
@@ -730,7 +730,7 @@ def scenario_view_peer_since_last_upgrade_reset_when_no_legacy_anchor(label: str
         bv.capture_text = lambda *args, **kwargs: "\n".join([
             "Upgrade reset current line one includes msg-reset-001 detail",
             "Upgrade reset current line two references bridge_view_peer.py detail",
-            "Upgrade reset current line three references regression_interrupt.py",
+            "Upgrade reset current line three references run_regressions.py",
             "Upgrade reset current line four references agent_view_peer cursor v2",
         ])  # type: ignore[assignment]
         args = argparse.Namespace(raw=False, capture_file=None, capture_timeout=0.1)
@@ -811,7 +811,7 @@ def scenario_view_peer_since_last_claude_status_lines_do_not_anchor(label: str, 
     bv = _import_view_peer()
     stable = [
         "Claude status anchor test line one references bridge_view_peer.py msg-status-001",
-        "Claude status anchor test line two references scripts/regression_interrupt.py",
+        "Claude status anchor test line two references scripts/run_regressions.py",
         "Claude status anchor test line three references agent_view_peer since-last",
         "Claude status anchor test line four references volatile filtering behavior",
     ]
@@ -835,7 +835,7 @@ def scenario_view_peer_since_last_filters_stored_volatile_anchor_lines(label: st
     stable = [
         "Stored filtered anchor stable line one includes msg-filter-001 and enough detail",
         "Stored filtered anchor stable line two references bridge_view_peer.py details",
-        "Stored filtered anchor stable line three references scripts/regression_interrupt.py details",
+        "Stored filtered anchor stable line three references scripts/run_regressions.py details",
     ]
     cursor = {"since_anchors": [{"lines": [status, *stable], "stable_count": 4}]}
     current = [*stable, "Fresh semantic output after filtered stored anchor should appear"]
@@ -856,7 +856,7 @@ def scenario_view_peer_since_last_skips_shortened_stored_anchor_that_fails_quali
     valid = [
         "Valid fallback anchor line one includes msg-valid-001 and detail",
         "Valid fallback anchor line two references bridge_view_peer.py behavior",
-        "Valid fallback anchor line three references scripts/regression_interrupt.py",
+        "Valid fallback anchor line three references scripts/run_regressions.py",
         "Valid fallback anchor line four references agent_view_peer since-last",
     ]
     cursor = {
@@ -877,7 +877,7 @@ def scenario_view_peer_since_last_volatile_only_claude_status_delta(label: str, 
     stable = [
         "Claude volatile delta anchor one includes msg-claude-volatile-001 detail",
         "Claude volatile delta anchor two references bridge_view_peer.py detail",
-        "Claude volatile delta anchor three references regression_interrupt.py",
+        "Claude volatile delta anchor three references run_regressions.py",
         "Claude volatile delta anchor four references agent_view_peer since-last",
     ]
     current = [*stable, "\u273d Saut\u00e9ing\u2026 (running stop hook \u00b7 13s \u00b7 \u2193 326 tokens)"]
@@ -914,7 +914,7 @@ def scenario_view_peer_since_last_volatile_only_delta(label: str, tmpdir: Path) 
     stable = [
         "Volatile only test anchor one includes msg-volatile-001 detail",
         "Volatile only test anchor two references bridge_view_peer.py detail",
-        "Volatile only test anchor three references regression_interrupt.py",
+        "Volatile only test anchor three references run_regressions.py",
         "Volatile only test anchor four references agent_view_peer since-last",
     ]
     previous = [*stable, "\u273b Churned for 10s"]
@@ -930,7 +930,7 @@ def scenario_view_peer_since_last_short_delta_consumed_once(label: str, tmpdir: 
     bv = _import_view_peer()
     stable = [
         "Short consumed anchor one includes msg-short-001 and bridge_view_peer.py",
-        "Short consumed anchor two references scripts/regression_interrupt.py",
+        "Short consumed anchor two references scripts/run_regressions.py",
         "Short consumed anchor three references agent_view_peer since-last behavior",
         "Short consumed anchor four references causal-short-consumed detail",
     ]
@@ -956,7 +956,7 @@ def scenario_view_peer_since_last_request_plus_short_reply_consumed_after_cursor
     try:
         stable = [
             "Request consumed base anchor one includes msg-request-consumed-001 bridge_view_peer.py",
-            "Request consumed base anchor two references scripts/regression_interrupt.py",
+            "Request consumed base anchor two references scripts/run_regressions.py",
             "Request consumed base anchor three references agent_view_peer since-last behavior",
             "Request consumed base anchor four references causal-request-consumed detail",
         ]
@@ -997,7 +997,7 @@ def scenario_view_peer_since_last_consumed_tail_does_not_hide_new_duplicate(labe
     bv = _import_view_peer()
     stable = [
         "Duplicate consumed anchor one includes msg-dup-001 and bridge_view_peer.py",
-        "Duplicate consumed anchor two references scripts/regression_interrupt.py",
+        "Duplicate consumed anchor two references scripts/run_regressions.py",
         "Duplicate consumed anchor three references agent_view_peer since-last behavior",
         "Duplicate consumed anchor four references causal-duplicate detail",
     ]
@@ -1022,7 +1022,7 @@ def scenario_view_peer_since_last_consumed_tail_anchor_change_resets(label: str,
     bv = _import_view_peer()
     stable = [
         "Anchor change line one includes msg-anchor-change-001 bridge_view_peer.py",
-        "Anchor change line two references scripts/regression_interrupt.py",
+        "Anchor change line two references scripts/run_regressions.py",
         "Anchor change line three references agent_view_peer since-last behavior",
         "Anchor change line four references causal-anchor-change detail",
     ]
@@ -1041,7 +1041,7 @@ def scenario_view_peer_since_last_consumed_tail_mismatch_clears(label: str, tmpd
     bv = _import_view_peer()
     stable = [
         "Mismatch consumed anchor one includes msg-mismatch-001 bridge_view_peer.py",
-        "Mismatch consumed anchor two references scripts/regression_interrupt.py",
+        "Mismatch consumed anchor two references scripts/run_regressions.py",
         "Mismatch consumed anchor three references agent_view_peer since-last behavior",
         "Mismatch consumed anchor four references causal-mismatch detail",
     ]
@@ -1072,7 +1072,7 @@ def scenario_view_peer_since_last_consumed_tail_ignores_volatile_churn(label: st
     bv = _import_view_peer()
     stable = [
         "Volatile consumed anchor one includes msg-volatile-consumed-001 bridge_view_peer.py",
-        "Volatile consumed anchor two references scripts/regression_interrupt.py",
+        "Volatile consumed anchor two references scripts/run_regressions.py",
         "Volatile consumed anchor three references agent_view_peer since-last behavior",
         "Volatile consumed anchor four references causal-volatile-consumed detail",
     ]
@@ -1091,7 +1091,7 @@ def scenario_view_peer_since_last_codex_prompt_placeholder_not_anchor(label: str
     bv = _import_view_peer()
     stable = [
         "Codex prompt anchor one includes msg-codex-prompt-001 bridge_view_peer.py",
-        "Codex prompt anchor two references scripts/regression_interrupt.py",
+        "Codex prompt anchor two references scripts/run_regressions.py",
         "Codex prompt anchor three references agent_view_peer since-last behavior",
         "Codex prompt anchor four references causal-codex-prompt detail",
     ]
@@ -1121,7 +1121,7 @@ def scenario_view_peer_since_last_filters_stored_codex_prompt_placeholder_anchor
     prompt = "\u203a Improve documentation in @filename"
     stable = [
         "Stored codex prompt stable one includes msg-stored-codex-001 bridge_view_peer.py",
-        "Stored codex prompt stable two references scripts/regression_interrupt.py",
+        "Stored codex prompt stable two references scripts/run_regressions.py",
         "Stored codex prompt stable three references agent_view_peer since-last behavior",
     ]
     cursor = {"since_anchors": [{"lines": [prompt, *stable], "stable_count": 4}]}
@@ -1138,7 +1138,7 @@ def scenario_view_peer_since_last_preserves_codex_bridge_prompt_lines(label: str
     stable = [
         bridge_line,
         "Bridge prompt preserve stable two references bridge_view_peer.py detail",
-        "Bridge prompt preserve stable three references scripts/regression_interrupt.py",
+        "Bridge prompt preserve stable three references scripts/run_regressions.py",
         "Bridge prompt preserve stable four references agent_view_peer since-last",
     ]
     anchors = bv.build_since_anchors(stable)
@@ -1151,7 +1151,7 @@ def scenario_view_peer_since_last_preserves_trailing_semantic_codex_arrow(label:
     bv = _import_view_peer()
     stable = [
         "Semantic codex arrow anchor one includes msg-arrow-001 bridge_view_peer.py",
-        "Semantic codex arrow anchor two references scripts/regression_interrupt.py",
+        "Semantic codex arrow anchor two references scripts/run_regressions.py",
         "Semantic codex arrow anchor three references agent_view_peer since-last behavior",
         "Semantic codex arrow anchor four references causal-arrow detail",
     ]
@@ -1168,7 +1168,7 @@ def scenario_view_peer_since_last_preserves_semantic_codex_arrow_before_footer(l
     bv = _import_view_peer()
     stable = [
         "Semantic codex footer anchor one includes msg-arrow-footer-001 bridge_view_peer.py",
-        "Semantic codex footer anchor two references scripts/regression_interrupt.py",
+        "Semantic codex footer anchor two references scripts/run_regressions.py",
         "Semantic codex footer anchor three references agent_view_peer since-last behavior",
         "Semantic codex footer anchor four references causal-arrow-footer detail",
     ]
@@ -1187,7 +1187,7 @@ def scenario_view_peer_since_last_claude_partial_status_fragments_are_volatile(l
     assert_true(bv.is_since_volatile_line("\u00b7 Precipitating\u2026 (5s \u00b7 \u2193 1 tokens)"), f"{label}: middle-dot payload status should be volatile")
     stable = [
         "Partial status anchor one includes msg-partial-001 bridge_view_peer.py",
-        "Partial status anchor two references scripts/regression_interrupt.py",
+        "Partial status anchor two references scripts/run_regressions.py",
         "Partial status anchor three references agent_view_peer since-last behavior",
         "Partial status anchor four references causal-partial detail",
     ]
@@ -1209,7 +1209,7 @@ def scenario_view_peer_since_last_partial_status_preserves_prose(label: str, tmp
         assert_true(not bv.is_since_volatile_line(line), f"{label}: prose/no-ellipsis line must remain visible: {line!r}")
     stable = [
         "Partial prose anchor one includes msg-partial-prose-001 bridge_view_peer.py",
-        "Partial prose anchor two references scripts/regression_interrupt.py",
+        "Partial prose anchor two references scripts/run_regressions.py",
         "Partial prose anchor three references agent_view_peer since-last behavior",
         "Partial prose anchor four references causal-partial-prose detail",
     ]

@@ -1,5 +1,11 @@
 # Regression Suite Split Plan
 
+Status: completed. The current official entrypoint is
+`python3 scripts/run_regressions.py`; the old `scripts/regression_interrupt.py`
+wrapper was removed after the split finished. The plan body below is kept as a
+historical execution record, including the legacy command name used during the
+split.
+
 This document describes how to split `scripts/regression_interrupt.py` into
 smaller regression modules without changing test behavior. The current suite is
 still runnable in about 20-25 seconds, so the priority is maintainability and

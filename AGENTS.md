@@ -15,7 +15,7 @@ There is no compile step. Common commands:
 ./install.sh --dry-run              # preview shim and hook installation
 ./install.sh --yes                  # install shims and hooks non-interactively
 bin/bridge_healthcheck.sh           # validate local dependencies and config
-python3 scripts/regression_interrupt.py  # run daemon regression checks
+python3 scripts/run_regressions.py  # run daemon regression checks
 ./uninstall.sh --dry-run            # preview uninstall behavior
 ```
 
@@ -26,7 +26,7 @@ Model-facing sends support both `agent_send_peer --to <alias> 'message'` and sho
 Target Python 3.10+ and Bash 4+. Use 4-space Python indentation, `snake_case`, and type hints where useful. Keep shell scripts executable, with `#!/usr/bin/env bash` and `set -euo pipefail`. Preserve `bridge_*` for bridge internals and `agent_*` for model-facing commands. No project-wide formatter is configured.
 
 ## Testing Guidelines
-The main regression suite is `scripts/regression_interrupt.py`; it runs the daemon in `dry_run` mode against temporary state. Add `scenario_<behavior>` functions for daemon lifecycle, queue, interrupt, watchdog, or aggregate changes. For install, hook, or wrapper changes, run `./install.sh --dry-run` and `bin/bridge_healthcheck.sh`. Manually exercise `bridge_run` for tmux delivery changes when practical.
+The main regression suite is `scripts/run_regressions.py`; it runs the daemon in `dry_run` mode against temporary state. Add `scenario_<behavior>` functions under `scripts/regression/` for daemon lifecycle, queue, interrupt, watchdog, or aggregate changes. For install, hook, or wrapper changes, run `./install.sh --dry-run` and `bin/bridge_healthcheck.sh`. Manually exercise `bridge_run` for tmux delivery changes when practical.
 
 ## Commit & Pull Request Guidelines
 Recent history uses short, capitalized imperative subjects such as `Add daemon reload`, `Fix capture bug`, and `Update session identity issue`. Keep subjects focused, preferably under 72 characters. PRs should describe behavior changes, list validation commands, note manual tmux testing, and call out hook, shim, runtime path, or uninstall changes.

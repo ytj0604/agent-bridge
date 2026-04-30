@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stable entrypoint for the Agent Bridge regression suite."""
+"""Official entrypoint for the Agent Bridge regression suite."""
 
 from __future__ import annotations
 

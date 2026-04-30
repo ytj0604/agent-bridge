@@ -2,6 +2,10 @@
 
 Date: 2026-04-29
 
+Postscript: on 2026-04-30, the stable entrypoint was renamed to
+`scripts/run_regressions.py` and the old `scripts/regression_interrupt.py`
+wrapper was removed.
+
 Phase 6 scope: final cleanup after all regression scenarios were moved out of
 `scripts/regression_interrupt.py`.
 
