@@ -703,7 +703,7 @@ def handle_clear_peers(d, sender: str, targets: list[str], *, force: bool) -> di
                     released_targets.append(target)
                     d.log("clear_peer_batch_reservation_released", target=target, by_sender=sender)
         for target in released_targets:
-            d.try_deliver_command_aware(target)
+            d.request_and_drain_delivery(target, command_aware=True, reason="clear_batch_release")
 
     summary = d.clear_batch_summary(results)
     d.log("clear_peer_batch_completed", by_sender=sender, targets=targets, summary=summary)
@@ -1038,7 +1038,7 @@ def run_clear_peer(
     finally:
         final_lock_ctx.__exit__(None, None, None)
     if not hold_reservation_after_success:
-        d.try_deliver_command_aware(target)
+        d.request_and_drain_delivery(target, command_aware=True, reason="clear_success")
     return {"ok": True, "target": target, "cleared": True, "force": bool(force), "new_session_id": reservation.get("new_session_id")}
 
 

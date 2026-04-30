@@ -485,7 +485,7 @@ def handle_interrupt(d, sender: str, target: str) -> dict:
     # leave queued work pending rather than appending to a possibly dirty
     # prompt buffer.
     if interrupt_ok:
-        d.try_deliver_command_aware(target)
+        d.request_and_drain_delivery(target, command_aware=True, reason="interrupt_success")
     else:
         d.log(
             "interrupt_delivery_skipped",
@@ -596,6 +596,6 @@ def release_hold(d, target: str, reason: str, by_sender: str | None = None) -> d
         partial_cc_error=(partial_block or {}).get("cc_error"),
         hold_duration_ms=hold_duration_ms,
     )
-    d.try_deliver_command_aware(target)
-    d.try_deliver_command_aware()
+    d.request_and_drain_delivery(target, command_aware=True, reason="hold_release_target")
+    d.request_and_drain_delivery(command_aware=True, reason="hold_release_global")
     return info

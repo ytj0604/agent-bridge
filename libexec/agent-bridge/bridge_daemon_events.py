@@ -580,8 +580,8 @@ def handle_response_finished(d, record: dict) -> None:
                 d.busy[sender] = False
                 d.reserved[sender] = None
                 d.current_prompt_by_agent.pop(sender, None)
-                d.try_deliver(sender)
-            d.try_deliver()
+                d.request_and_drain_delivery(sender, command_aware=False, reason="held_stop_sender")
+            d.request_and_drain_delivery(command_aware=False, reason="held_stop_global")
             return
 
         if not run_delivery_after_lock and turn_id_mismatch:
@@ -619,8 +619,8 @@ def handle_response_finished(d, record: dict) -> None:
                 d.maybe_return_response(sender, text, context)
             d._cleanup_terminal_context_locked(sender, context, watchdog_reason="terminal_response")
             d.promote_pending_self_clear_locked(sender)
-    d.try_deliver(sender)
-    d.try_deliver()
+    d.request_and_drain_delivery(sender, command_aware=False, reason="response_finished_sender")
+    d.request_and_drain_delivery(command_aware=False, reason="response_finished_global")
 
 
 def handle_external_message_queued(d, record: dict) -> None:
