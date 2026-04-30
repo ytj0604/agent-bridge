@@ -38,6 +38,7 @@ class TargetLockManager:
     def __init__(self) -> None:
         self._guard = threading.Lock()
         self._locks: dict[str, threading.RLock] = {}
+        self._local = threading.local()
 
     def normalize_targets(self, targets) -> list[str]:
         if isinstance(targets, str):
@@ -46,6 +47,19 @@ class TargetLockManager:
 
     def acquire(self, targets):
         return _TargetLockContext(self, self.normalize_targets(targets))
+
+    def owned_by_current_thread(self, target: str) -> bool:
+        counts = getattr(self._local, "owned_counts", None)
+        if not counts:
+            return False
+        return int(counts.get(str(target or ""), 0)) > 0
+
+    def _owned_counts(self) -> dict[str, int]:
+        counts = getattr(self._local, "owned_counts", None)
+        if counts is None:
+            counts = {}
+            self._local.owned_counts = counts
+        return counts
 
     def _locks_for(self, targets: list[str]) -> list[threading.RLock]:
         with self._guard:
@@ -65,12 +79,24 @@ class _TargetLockContext:
         self.locks = self.manager._locks_for(self.targets)
         for lock in self.locks:
             lock.acquire()
+        counts = self.manager._owned_counts()
+        for target in self.targets:
+            counts[target] = int(counts.get(target, 0)) + 1
         return list(self.targets)
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        for lock in reversed(self.locks):
-            lock.release()
-        self.locks = []
+        try:
+            counts = self.manager._owned_counts()
+            for target in reversed(self.targets):
+                depth = int(counts.get(target, 0)) - 1
+                if depth > 0:
+                    counts[target] = depth
+                else:
+                    counts.pop(target, None)
+        finally:
+            for lock in reversed(self.locks):
+                lock.release()
+            self.locks = []
 
 
 @dataclass

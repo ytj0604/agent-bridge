@@ -305,98 +305,125 @@ def _handle_interrupt_under_target_lock(d, sender: str, target: str) -> dict:
     #      "[interrupted]" reply recorded into the aggregate, so the
     #      aggregate can still complete from the remaining peers'
     #      replies (and so the aggregate watchdog isn't dropped).
-    # IMPORTANT: the caller holds the target lock for this target, then
-    # pane resolve, key dispatch, and state mutation all run inside
-    # state_lock. Otherwise a prompt_submitted/response_finished event or
-    # queued replacement delivery could interleave with the interrupt key
-    # sequence or same-target pane touch.
-    default_post_lock, default_margin = d.command_budget("interrupt")
-    lock_ctx = None
+    # IMPORTANT: the caller holds the target lock for this target across the
+    # whole sequence, including pane resolve, key dispatch, state mutation, and
+    # the success delivery drain. state_lock is taken only for short shared
+    # daemon-state mutation phases; slow tmux IO and the ESC -> C-c delay run
+    # outside it, but still under the target lock.
+    _, default_margin = d.command_budget("interrupt")
+    cancelled: list[dict] = []
+    interrupt_keys: list[str] = ["Escape"]
+    cc_sent: bool | None = None
+    cc_error: str | None = None
+    interrupt_ok = False
+    prior_active_message_id = None
+    active_context: dict = {}
+    tombstones: list[dict] = []
+    should_send_cc = False
+    participant_snapshot: dict = {}
     try:
         d.reload_participants()
-        lock_ctx = d.command_state_lock(
-            post_lock_worst_case=INTERRUPT_SEND_KEY_TIMEOUT_SECONDS,
-            margin=default_margin,
-            command_class="interrupt",
-        )
-        lock_ctx.__enter__()
     except Exception as exc:
         if not _is_command_lock_wait_exceeded(exc):
             raise
         return _lock_wait_response("interrupt", interrupt_shape=True)
+
     try:
-        if not d.command_deadline_ok(
-            post_lock_worst_case=default_post_lock,
-            margin=default_margin,
-            command_class="interrupt",
-        ):
-            return _lock_wait_response("interrupt", interrupt_shape=True)
-        endpoint_detail = d.resolve_endpoint_detail(target, purpose="write")
-        pane = str(endpoint_detail.get("pane") or "") if endpoint_detail.get("ok") else ""
-        if not pane:
-            reason = str(endpoint_detail.get("reason") or "no_pane")
-            finalized: list[dict] = []
-            if endpoint_detail.get("should_detach") or endpoint_detail.get("probe_status") == "mismatch":
-                for item in list(d.queue.read()):
-                    if item.get("to") == target and item.get("status") in {"delivered", "inflight", "submitted"}:
-                        removed = d.finalize_undeliverable_message(item, endpoint_detail, phase="interrupt_endpoint_lost")
-                        if removed:
-                            finalized.append(removed)
-                d.busy[target] = False
-                d.reserved[target] = None
-            d.log(
-                "esc_failed",
-                target=target,
-                by_sender=sender,
-                error=reason,
-                probe_status=endpoint_detail.get("probe_status"),
-                finalized_message_ids=[item.get("id") for item in finalized],
-            )
-            result = {
-                "esc_sent": False,
-                "esc_error": reason,
-                "interrupt_ok": False,
-                "interrupt_keys": [],
-                "cc_sent": None,
-                "cc_error": None,
-                "held": False,
-                "cancelled_message_ids": [item.get("id") for item in finalized],
-            }
-            lock_ctx.__exit__(None, None, None)
-            lock_ctx = None
-            for item in finalized:
-                if item.get("aggregate_id"):
-                    d._record_aggregate_interrupted_reply(item, by_sender="bridge", reason="endpoint_lost")
-            return result
-        participant = d.participants.get(target) or {}
-        agent_type = str(participant.get("agent_type") or "")
-        if agent_type not in PHYSICAL_AGENT_TYPES:
-            d.safe_log("interrupt_unknown_agent_type", target=target, agent_type=agent_type)
-
-        active_context_before = d.current_prompt_by_agent.get(target) or {}
-        had_active = d.target_has_active_interrupt_work(target, active_context_before)
-
-        interrupt_keys: list[str] = ["Escape"]
-        if not d.command_deadline_ok(
+        with d.command_state_lock(
             post_lock_worst_case=INTERRUPT_SEND_KEY_TIMEOUT_SECONDS,
             margin=default_margin,
             command_class="interrupt",
         ):
-            return _lock_wait_response("interrupt", interrupt_shape=True)
-        esc_ok, esc_error = d.send_interrupt_key(pane, "Escape")
-        if not esc_ok:
-            d.log("esc_failed", target=target, by_sender=sender, error=esc_error)
-            return {
-                "esc_sent": False,
-                "esc_error": esc_error,
-                "interrupt_ok": False,
-                "interrupt_keys": interrupt_keys,
-                "cc_sent": None,
-                "cc_error": None,
-                "held": False,
-                "cancelled_message_ids": [],
-            }
+            if not d.command_deadline_ok(
+                post_lock_worst_case=INTERRUPT_SEND_KEY_TIMEOUT_SECONDS,
+                margin=default_margin,
+                command_class="interrupt",
+            ):
+                return _lock_wait_response("interrupt", interrupt_shape=True)
+            participant_snapshot = dict(d.participants.get(target) or {})
+    except Exception as exc:
+        if not _is_command_lock_wait_exceeded(exc):
+            raise
+        return _lock_wait_response("interrupt", interrupt_shape=True)
 
+    endpoint_detail = d.probe_endpoint_detail_from_snapshot(target, participant_snapshot, purpose="write")
+    pane = str(endpoint_detail.get("pane") or "") if endpoint_detail.get("ok") else ""
+    reason = str(endpoint_detail.get("reason") or "no_pane")
+    finalized: list[dict] = []
+    try:
+        with d.command_state_lock(
+            post_lock_worst_case=0.0,
+            margin=default_margin,
+            command_class="interrupt",
+        ):
+            d.apply_endpoint_detail_cache_locked(target, endpoint_detail)
+            if not pane:
+                if endpoint_detail.get("should_detach") or endpoint_detail.get("probe_status") == "mismatch":
+                    for item in list(d.queue.read()):
+                        if item.get("to") == target and item.get("status") in {"delivered", "inflight", "submitted"}:
+                            removed = d.finalize_undeliverable_message(item, endpoint_detail, phase="interrupt_endpoint_lost")
+                            if removed:
+                                finalized.append(removed)
+                    d.busy[target] = False
+                    d.reserved[target] = None
+                d.log(
+                    "esc_failed",
+                    target=target,
+                    by_sender=sender,
+                    error=reason,
+                    probe_status=endpoint_detail.get("probe_status"),
+                    finalized_message_ids=[item.get("id") for item in finalized],
+                )
+            else:
+                participant = dict(d.participants.get(target) or {})
+                agent_type = str(participant.get("agent_type") or "")
+                active_context_before = dict(d.current_prompt_by_agent.get(target) or {})
+                had_active = d.target_has_active_interrupt_work(target, active_context_before)
+    except Exception as exc:
+        if not _is_command_lock_wait_exceeded(exc):
+            raise
+        return _lock_wait_response("interrupt", interrupt_shape=True)
+
+    if not pane:
+        for item in finalized:
+            if item.get("aggregate_id"):
+                d._record_aggregate_interrupted_reply(item, by_sender="bridge", reason="endpoint_lost")
+        return {
+            "esc_sent": False,
+            "esc_error": reason,
+            "interrupt_ok": False,
+            "interrupt_keys": [],
+            "cc_sent": None,
+            "cc_error": None,
+            "held": False,
+            "cancelled_message_ids": [item.get("id") for item in finalized],
+        }
+
+    if agent_type not in PHYSICAL_AGENT_TYPES:
+        d.safe_log("interrupt_unknown_agent_type", target=target, agent_type=agent_type)
+
+    if not d.command_deadline_ok(
+        post_lock_worst_case=INTERRUPT_SEND_KEY_TIMEOUT_SECONDS,
+        margin=default_margin,
+        command_class="interrupt",
+    ):
+        return _lock_wait_response("interrupt", interrupt_shape=True)
+
+    esc_ok, esc_error = d.send_interrupt_key(pane, "Escape")
+    if not esc_ok:
+        d.log("esc_failed", target=target, by_sender=sender, error=esc_error)
+        return {
+            "esc_sent": False,
+            "esc_error": esc_error,
+            "interrupt_ok": False,
+            "interrupt_keys": interrupt_keys,
+            "cc_sent": None,
+            "cc_error": None,
+            "held": False,
+            "cancelled_message_ids": [],
+        }
+
+    with d.state_lock:
         active_context = d.current_prompt_by_agent.pop(target, {}) or {}
         cancelled = d._cancel_active_messages_for_target(
             target,
@@ -406,7 +433,6 @@ def _handle_interrupt_under_target_lock(d, sender: str, target: str) -> dict:
             cancel_statuses={"delivered", "inflight", "submitted"},
             notify_sources=True,
         )
-
         tombstones = d._record_interrupted_turns(target, active_context, cancelled, sender)
         prior_active_message_id = active_context.get("id")
         should_send_cc = (
@@ -414,27 +440,28 @@ def _handle_interrupt_under_target_lock(d, sender: str, target: str) -> dict:
             and "C-c" in d.claude_interrupt_keys
             and had_active
         )
-        cc_sent: bool | None = None
-        cc_error: str | None = None
-        if should_send_cc:
-            if not d.dry_run and d.interrupt_key_delay_seconds > 0:
-                time.sleep(d.interrupt_key_delay_seconds)
-            interrupt_keys.append("C-c")
-            if not d.command_deadline_ok(
-                post_lock_worst_case=INTERRUPT_SEND_KEY_TIMEOUT_SECONDS,
-                margin=default_margin,
-                command_class="interrupt",
-            ):
-                cc_sent = False
-                cc_error = "lock_wait_exceeded"
+
+    if should_send_cc:
+        if not d.dry_run and d.interrupt_key_delay_seconds > 0:
+            time.sleep(d.interrupt_key_delay_seconds)
+        interrupt_keys.append("C-c")
+        if not d.command_deadline_ok(
+            post_lock_worst_case=INTERRUPT_SEND_KEY_TIMEOUT_SECONDS,
+            margin=default_margin,
+            command_class="interrupt",
+        ):
+            cc_sent = False
+            cc_error = "lock_wait_exceeded"
+            d.log("cc_send_failed", target=target, by_sender=sender, error=cc_error)
+        else:
+            cc_ok, cc_error_text = d.send_interrupt_key(pane, "C-c")
+            cc_sent = cc_ok
+            if not cc_ok:
+                cc_error = cc_error_text
                 d.log("cc_send_failed", target=target, by_sender=sender, error=cc_error)
-            else:
-                cc_ok, cc_error_text = d.send_interrupt_key(pane, "C-c")
-                cc_sent = cc_ok
-                if not cc_ok:
-                    cc_error = cc_error_text
-                    d.log("cc_send_failed", target=target, by_sender=sender, error=cc_error)
-        interrupt_ok = cc_sent is not False
+
+    interrupt_ok = cc_sent is not False
+    with d.state_lock:
         d.busy[target] = False
         d.reserved[target] = None
         if interrupt_ok:
@@ -487,9 +514,6 @@ def _handle_interrupt_under_target_lock(d, sender: str, target: str) -> dict:
             interrupt_ok=interrupt_ok,
             cc_sent=cc_sent,
         )
-    finally:
-        if lock_ctx is not None:
-            lock_ctx.__exit__(None, None, None)
 
     for cm in cancelled:
         if cm.get("aggregate_id"):

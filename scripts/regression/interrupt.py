@@ -341,7 +341,7 @@ def scenario_interrupt_claude_cc_failure_does_not_revert_state(label: str, tmpdi
     print(f"  PASS  {label}")
 
 
-def scenario_interrupt_holds_state_lock_through_sequence(label: str, tmpdir: Path) -> None:
+def scenario_interrupt_key_dispatch_uses_target_lock_not_state_lock(label: str, tmpdir: Path) -> None:
     d = _make_interrupt_key_daemon(tmpdir, "claude")
     records: list[dict] = []
     _record_interrupt_keys(d, records)
@@ -351,25 +351,91 @@ def scenario_interrupt_holds_state_lock_through_sequence(label: str, tmpdir: Pat
 
     cc_records = [record for record in records if record.get("key") == "C-c"]
     assert_true(cc_records, f"{label}: C-c should be sent for active claude interrupt")
-    assert_true(all(record.get("lock_held") is True for record in records), f"{label}: key dispatch must stay under state_lock: {records}")
+    assert_true(all(record.get("state_lock_held") is False for record in records), f"{label}: key dispatch must run outside state_lock: {records}")
+    assert_true(all(record.get("target_lock_held") is True for record in records), f"{label}: key dispatch must stay under target lock: {records}")
     print(f"  PASS  {label}")
 
 
 def scenario_interrupt_no_try_deliver_between_keys(label: str, tmpdir: Path) -> None:
     d = _make_interrupt_key_daemon(tmpdir, "claude")
     calls: list[str] = []
+    delivery_started = threading.Event()
+    delivery_done = threading.Event()
+    d.queue.update(lambda queue: queue.append(test_message("msg-replacement", frm="alice", to="bob", status="pending")) or None)
+
+    def attempt_delivery() -> None:
+        calls.append("try_deliver_thread:start")
+        delivery_started.set()
+        d.try_deliver("bob")
+        calls.append("try_deliver_thread:done")
+        delivery_done.set()
 
     def recorder(_pane: str, key: str) -> tuple[bool, str]:
         calls.append(f"key:{key}")
+        if key == "Escape":
+            threading.Thread(target=attempt_delivery).start()
+            assert_true(delivery_started.wait(5.0), f"{label}: delivery attempt did not start")
+            time.sleep(0.05)
+            assert_true(not delivery_done.is_set(), f"{label}: same-target delivery must wait for interrupt target lock: {calls}")
         return True, ""
 
     d.send_interrupt_key = recorder  # type: ignore[method-assign]
-    d.try_deliver = lambda target=None: calls.append(f"try_deliver:{target}")  # type: ignore[method-assign]
+    original_deliver_reserved = d.deliver_reserved
+
+    def deliver_reserved(message: dict) -> None:
+        calls.append(f"deliver_reserved:{message.get('id')}")
+        original_deliver_reserved(message)
+
+    d.deliver_reserved = deliver_reserved  # type: ignore[method-assign]
     _make_delivered_context(d, "msg-old", "alice", "bob", "n-old", turn_id="turn-old")
 
     d.handle_interrupt(sender="alice", target="bob")
 
-    assert_true(calls == ["key:Escape", "key:C-c", "try_deliver:bob"], f"{label}: try_deliver must not interleave between keys: {calls}")
+    assert_true(delivery_done.wait(5.0), f"{label}: blocked delivery thread did not finish")
+    deliver_index = next((idx for idx, call in enumerate(calls) if call == "deliver_reserved:msg-replacement"), -1)
+    cc_index = next((idx for idx, call in enumerate(calls) if call == "key:C-c"), -1)
+    assert_true(cc_index >= 0 and deliver_index > cc_index, f"{label}: replacement delivery must not interleave between keys: {calls}")
+    print(f"  PASS  {label}")
+
+
+def scenario_interrupt_endpoint_cache_apply_uses_state_lock(label: str, tmpdir: Path) -> None:
+    d = _make_interrupt_key_daemon(tmpdir, "claude")
+    probe_records: list[dict] = []
+    apply_records: list[dict] = []
+    key_records: list[dict] = []
+    _record_interrupt_keys(d, key_records)
+    original_apply = d.apply_endpoint_detail_cache_locked
+
+    def probe(target: str, participant: dict, *, purpose: str = "write") -> dict:
+        probe_records.append({
+            "target": target,
+            "participant_alias": participant.get("alias"),
+            "state_lock": d.state_lock._is_owned(),
+            "target_lock": d._target_lock_owned_by_current_thread(target),
+            "purpose": purpose,
+        })
+        return {"ok": True, "pane": "%92", "reason": "verified", "probe_status": "verified", "detail": "", "should_detach": False}
+
+    def apply(target: str, detail: dict) -> None:
+        apply_records.append({
+            "target": target,
+            "pane": detail.get("pane"),
+            "state_lock": d.state_lock._is_owned(),
+            "target_lock": d._target_lock_owned_by_current_thread(target),
+        })
+        original_apply(target, detail)
+
+    d.probe_endpoint_detail_from_snapshot = probe  # type: ignore[method-assign]
+    d.apply_endpoint_detail_cache_locked = apply  # type: ignore[method-assign]
+    _make_delivered_context(d, "msg-old", "alice", "bob", "n-old", turn_id="turn-old")
+
+    result = d.handle_interrupt(sender="alice", target="bob")
+
+    assert_true(result.get("interrupt_ok") is True, f"{label}: interrupt should succeed: {result}")
+    assert_true(probe_records and probe_records[0].get("state_lock") is False, f"{label}: endpoint probe should run outside state_lock: {probe_records}")
+    assert_true(probe_records[0].get("target_lock") is True, f"{label}: endpoint probe should run under target lock: {probe_records}")
+    assert_true(apply_records and all(record.get("state_lock") is True for record in apply_records), f"{label}: endpoint cache apply should run under state_lock: {apply_records}")
+    assert_true(all(record.get("target_lock") is True for record in apply_records), f"{label}: endpoint cache apply should retain target lock: {apply_records}")
     print(f"  PASS  {label}")
 
 
@@ -396,7 +462,9 @@ def scenario_interrupt_waits_for_same_target_delivery_touch(label: str, tmpdir: 
         events.append(f"enter_lock:{d.state_lock._is_owned()}")
 
     def interrupt_key(_pane: str, key: str) -> tuple[bool, str]:
-        events.append(f"key:{key}:lock:{d.state_lock._is_owned()}")
+        events.append(
+            f"key:{key}:state:{d.state_lock._is_owned()}:target:{d._target_lock_owned_by_current_thread('bob')}"
+        )
         return True, ""
 
     d.pane_mode_status = pane_mode  # type: ignore[method-assign]
@@ -423,7 +491,10 @@ def scenario_interrupt_waits_for_same_target_delivery_touch(label: str, tmpdir: 
     key_index = next((idx for idx, event in enumerate(events) if event.startswith("key:Escape")), -1)
     paste_end_index = next((idx for idx, event in enumerate(events) if event.startswith("paste_end")), -1)
     assert_true(paste_end_index >= 0 and key_index > paste_end_index, f"{label}: interrupt keys must come after paste end: {events}")
-    assert_true(any(event == "key:C-c:lock:True" for event in events), f"{label}: claude C-c should still be state-lock protected: {events}")
+    assert_true(
+        any(event == "key:C-c:state:False:target:True" for event in events),
+        f"{label}: claude C-c should run under target lock but outside state_lock: {events}",
+    )
     assert_true(_queue_item(d, "msg-delivery-touch") is None, f"{label}: interrupt should cancel the pane-touched row")
     print(f"  PASS  {label}")
 
@@ -1136,13 +1207,20 @@ def _make_interrupt_key_daemon(tmpdir: Path, target_agent_type: str = "claude"):
             "should_detach": False,
         }
 
-    d.resolve_endpoint_detail = fake_resolve  # type: ignore[method-assign]
+    d.probe_endpoint_detail_from_snapshot = lambda target, _participant, purpose="write": fake_resolve(target, purpose=purpose)  # type: ignore[method-assign]
     return d
 
 
 def _record_interrupt_keys(d, records: list[dict], *, fail_key: str = "") -> None:
     def recorder(pane: str, key: str) -> tuple[bool, str]:
-        records.append({"pane": pane, "key": key, "lock_held": d.state_lock._is_owned()})
+        state_lock_held = d.state_lock._is_owned()
+        records.append({
+            "pane": pane,
+            "key": key,
+            "lock_held": state_lock_held,
+            "state_lock_held": state_lock_held,
+            "target_lock_held": d._target_lock_owned_by_current_thread("bob"),
+        })
         if fail_key and key == fail_key:
             return False, f"{key} failed"
         return True, ""
@@ -1165,8 +1243,9 @@ SCENARIOS = [
     ('interrupt_unknown_type_falls_back_to_esc', scenario_interrupt_unknown_type_falls_back_to_esc),
     ('interrupt_claude_idle_skips_cc', scenario_interrupt_claude_idle_skips_cc),
     ('interrupt_claude_cc_failure_does_not_revert_state', scenario_interrupt_claude_cc_failure_does_not_revert_state),
-    ('interrupt_holds_state_lock_through_sequence', scenario_interrupt_holds_state_lock_through_sequence),
+    ('interrupt_key_dispatch_uses_target_lock_not_state_lock', scenario_interrupt_key_dispatch_uses_target_lock_not_state_lock),
     ('interrupt_no_try_deliver_between_keys', scenario_interrupt_no_try_deliver_between_keys),
+    ('interrupt_endpoint_cache_apply_uses_state_lock', scenario_interrupt_endpoint_cache_apply_uses_state_lock),
     ('interrupt_waits_for_same_target_delivery_touch', scenario_interrupt_waits_for_same_target_delivery_touch),
     ('interrupt_env_override_disables_cc', scenario_interrupt_env_override_disables_cc),
     ('interrupt_key_delay_env_nonfinite_uses_default', scenario_interrupt_key_delay_env_nonfinite_uses_default),

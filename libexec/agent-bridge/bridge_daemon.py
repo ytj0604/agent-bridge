@@ -368,9 +368,12 @@ class BridgeDaemon:
         # call back into self.* methods or invoke logging — they should
         # only manipulate the queue list and return data for callers to
         # process outside the mutator.
-        # Interrupt handling also dispatches its tmux key sequence while
-        # holding this lock, including Claude's short ESC -> C-c delay, so
-        # hook events and replacement delivery cannot interleave between keys.
+        # Interrupt handling holds the target lock across pane resolution,
+        # key dispatch, active cancellation, tombstone recording, partial
+        # failure updates, and the success delivery drain. state_lock is used
+        # only for the short shared-state mutation phases within that target
+        # sequence, so slow tmux IO and the ESC -> C-c delay do not block
+        # unrelated targets.
         self.lock_facade = LockFacade()
         self.target_locks = TargetLockManager()
         self.delivery_scheduler = DeliveryScheduler()
@@ -667,6 +670,9 @@ class BridgeDaemon:
             return bool(is_owned())
         except Exception:
             return False
+
+    def _target_lock_owned_by_current_thread(self, target: str) -> bool:
+        return self.target_locks.owned_by_current_thread(target)
 
     @contextmanager
     def watchdog_lock_context(self):
@@ -1262,17 +1268,18 @@ class BridgeDaemon:
         return cancel_tmux_pane_mode(pane)
 
     def resolve_endpoint_detail(self, target: str, *, purpose: str = "write") -> dict:
-        participant = self.participants.get(target)
+        with self.state_lock:
+            participant = dict(self.participants.get(target) or {})
+        detail = self.probe_endpoint_detail_from_snapshot(target, participant, purpose=purpose)
+        with self.state_lock:
+            self.apply_endpoint_detail_cache_locked(target, detail)
+        return detail
+
+    def probe_endpoint_detail_from_snapshot(self, target: str, participant: dict, *, purpose: str = "write") -> dict:
         if not participant:
-            self.panes.pop(target, None)
             return {"ok": False, "pane": "", "reason": "unknown_target", "probe_status": "", "detail": "", "should_detach": False}
         detail = resolve_participant_endpoint_detail(self.bridge_session or "", target, participant, purpose=purpose)
         if detail.get("ok"):
-            self.panes[target] = str(detail.get("pane") or "")
-            if detail.get("reconnected"):
-                self.session_mtime_ns = None
-                self.reload_participants()
-                self.panes[target] = str(detail.get("pane") or "")
             return detail
         # Unit-style dry-run scenarios historically omit hook identities. Keep
         # that test fixture convenience, but real tmux writes never take this
@@ -1280,10 +1287,20 @@ class BridgeDaemon:
         if self.dry_run and not participant.get("hook_session_id"):
             pane = str(participant.get("pane") or "")
             if pane:
-                self.panes[target] = pane
                 return {"ok": True, "pane": pane, "reason": "dry_run_unverified", "probe_status": "", "detail": "", "should_detach": False}
-        self.panes.pop(target, None)
         return detail
+
+    def apply_endpoint_detail_cache_locked(self, target: str, detail: dict) -> None:
+        if not self._state_lock_owned_by_current_thread():
+            raise RuntimeError("endpoint cache updates require state_lock ownership")
+        if detail.get("ok"):
+            self.panes[target] = str(detail.get("pane") or "")
+            if detail.get("reconnected"):
+                self.session_mtime_ns = None
+                self._reload_participants_unlocked()
+                self.panes[target] = str(detail.get("pane") or "")
+        else:
+            self.panes.pop(target, None)
 
     def resolve_target_pane(self, target: str) -> str:
         detail = self.resolve_endpoint_detail(target, purpose="write")

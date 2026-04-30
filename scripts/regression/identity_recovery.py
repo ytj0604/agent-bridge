@@ -1252,7 +1252,7 @@ def scenario_interrupt_endpoint_lost_finalizes_delivered_non_aggregate(label: st
     d = make_daemon(tmpdir, participants)
     d.dry_run = False
     d.busy["alice"] = True
-    d.resolve_endpoint_detail = lambda target, purpose="write": {"ok": False, "pane": "", "reason": "process_mismatch", "probe_status": "mismatch", "detail": "gone", "should_detach": True}  # type: ignore[method-assign]
+    d.probe_endpoint_detail_from_snapshot = lambda target, _participant, purpose="write": {"ok": False, "pane": "", "reason": "process_mismatch", "probe_status": "mismatch", "detail": "gone", "should_detach": True}  # type: ignore[method-assign]
     msg = test_message("msg-delivered-lost", frm="alice", to="bob", status="delivered")
     d.queue.update(lambda queue: queue.append(msg))
     d.current_prompt_by_agent["bob"] = {"id": "msg-delivered-lost", "from": "alice", "auto_return": True}
@@ -1272,7 +1272,7 @@ def scenario_interrupt_endpoint_lost_finalizes_delivered_aggregate(label: str, t
     d = make_daemon(tmpdir, participants)
     d.dry_run = False
     d.busy["alice"] = True
-    d.resolve_endpoint_detail = lambda target, purpose="write": {"ok": False, "pane": "", "reason": "process_mismatch", "probe_status": "mismatch", "detail": "gone", "should_detach": True}  # type: ignore[method-assign]
+    d.probe_endpoint_detail_from_snapshot = lambda target, _participant, purpose="write": {"ok": False, "pane": "", "reason": "process_mismatch", "probe_status": "mismatch", "detail": "gone", "should_detach": True}  # type: ignore[method-assign]
     msg = test_message("msg-agg-lost", frm="alice", to="bob", status="delivered")
     msg["aggregate_id"] = "agg-lost"
     msg["aggregate_expected"] = ["bob"]
