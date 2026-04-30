@@ -39,6 +39,26 @@ from bridge_clear_guard import (
     format_clear_guard_result,
     target_originated_requests,
 )
+from bridge_daemon_messages import (
+    PROMPT_BODY_CONTROL_TRANSLATION,
+    build_peer_prompt,
+    kind_expects_response,
+    make_message,
+    normalize_prompt_body_text,
+    one_line,
+    prompt_body,
+)
+from bridge_daemon_tmux import (
+    PANE_MODE_PROBE_TIMEOUT_SECONDS,
+    TMUX_SEND_TIMEOUT_SECONDS,
+    _tmux_buffer_component,
+    cancel_tmux_pane_mode,
+    probe_tmux_pane_mode,
+    run_tmux_enter,
+    run_tmux_send_literal,
+    run_tmux_send_literal_touch_result,
+    tmux_prompt_buffer_name,
+)
 from bridge_identity import (
     backfill_session_process_identities,
     live_record_matches,
@@ -84,9 +104,7 @@ CAPTURE_RESPONSE_TTL_SECONDS = 60 * 60
 PANE_MODE_GRACE_DEFAULT_SECONDS = 180.0
 TURN_ID_MISMATCH_GRACE_DEFAULT_SECONDS = 300.0
 TURN_ID_MISMATCH_POST_WATCHDOG_GRACE_DEFAULT_SECONDS = 1.0
-PANE_MODE_PROBE_TIMEOUT_SECONDS = 0.3
 PANE_MODE_FORCE_CANCEL_MODES = {"copy-mode", "copy-mode-vi", "view-mode"}
-TMUX_SEND_TIMEOUT_SECONDS = 5.0
 TMUX_DELIVERY_WORST_CASE_SECONDS = 20.0
 CLEAR_PROBE_TIMEOUT_SECONDS = 180.0
 CLEAR_POST_CLEAR_DELAY_DEFAULT_SECONDS = 1.0
@@ -173,15 +191,6 @@ WATCHDOG_REQUIRES_AUTO_RETURN_TEXT = (
     "watchdog requires auto_return; use --no-auto-return without --watchdog or set --watchdog 0"
 )
 _STOP_SIGNAL: int | None = None
-PROMPT_BODY_CONTROL_TRANSLATION = {
-    codepoint: None
-    for codepoint in (
-        *range(0x00, 0x09),
-        *range(0x0B, 0x20),
-        0x7F,
-        *range(0x80, 0xA0),
-    )
-}
 
 
 def _request_stop(signum: int, _frame: object) -> None:
@@ -220,186 +229,6 @@ class PeerResultRedirectError(RuntimeError):
         self.reason = reason
         self.detail = detail
         super().__init__(detail or reason)
-
-
-def one_line(text: str) -> str:
-    return " ".join(str(text).split())
-
-
-def normalize_prompt_body_text(text: str) -> str:
-    raw = str(text).replace("\r\n", "\n").replace("\r", "\n")
-    return raw.translate(PROMPT_BODY_CONTROL_TRANSLATION)
-
-
-def prompt_body(text: str) -> str:
-    raw = normalize_prompt_body_text(text)
-    if len(raw) > MAX_PEER_BODY_CHARS:
-        raw = raw[:MAX_PEER_BODY_CHARS] + "\n[bridge truncated peer body]"
-    return raw
-
-
-def kind_expects_response(kind: str) -> bool:
-    return kind == "request"
-
-
-def _tmux_buffer_component(value: object, fallback: str) -> str:
-    raw = str(value or fallback)
-    safe = "".join(
-        ch if ("a" <= ch <= "z" or "A" <= ch <= "Z" or "0" <= ch <= "9" or ch in "._-") else "-"
-        for ch in raw
-    ).strip("._-")
-    if not safe:
-        safe = fallback
-    if len(safe) > 48:
-        digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:10]
-        safe = f"{safe[:37]}-{digest}"
-    return safe
-
-
-def tmux_prompt_buffer_name(
-    bridge_session: str,
-    target_alias: str,
-    message_id: str,
-    nonce: str,
-) -> str:
-    components = [
-        _tmux_buffer_component(bridge_session, "session"),
-        _tmux_buffer_component(target_alias, "target"),
-        _tmux_buffer_component(message_id, "message"),
-        _tmux_buffer_component(nonce, "nonce"),
-        str(os.getpid()),
-        uuid.uuid4().hex[:12],
-    ]
-    return "bridge-" + "-".join(components)
-
-
-def run_tmux_send_literal(
-    target: str,
-    prompt: str,
-    *,
-    bridge_session: str = "",
-    target_alias: str = "",
-    message_id: str = "",
-    nonce: str = "",
-) -> None:
-    buffer_name = tmux_prompt_buffer_name(bridge_session, target_alias or target, message_id, nonce)
-    try:
-        subprocess.run(
-            ["tmux", "load-buffer", "-b", buffer_name, "-"],
-            input=prompt.encode("utf-8"),
-            check=True,
-            timeout=TMUX_SEND_TIMEOUT_SECONDS,
-        )
-        subprocess.run(
-            ["tmux", "paste-buffer", "-p", "-r", "-d", "-b", buffer_name, "-t", target],
-            check=True,
-            timeout=TMUX_SEND_TIMEOUT_SECONDS,
-        )
-    finally:
-        try:
-            subprocess.run(
-                ["tmux", "delete-buffer", "-b", buffer_name],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=TMUX_SEND_TIMEOUT_SECONDS,
-            )
-        except Exception:
-            pass
-
-
-def run_tmux_enter(target: str) -> None:
-    subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True, timeout=TMUX_SEND_TIMEOUT_SECONDS)
-
-
-def run_tmux_send_literal_touch_result(
-    target: str,
-    prompt: str,
-    *,
-    bridge_session: str = "",
-    target_alias: str = "",
-    message_id: str = "",
-    nonce: str = "",
-) -> dict:
-    """Send literal text and Enter, reporting whether pane input may be mutated."""
-    buffer_name = tmux_prompt_buffer_name(bridge_session, target_alias or target, message_id, nonce)
-    pane_touched = False
-    try:
-        try:
-            subprocess.run(
-                ["tmux", "load-buffer", "-b", buffer_name, "-"],
-                input=prompt.encode("utf-8"),
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=TMUX_SEND_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:
-            return {"ok": False, "pane_touched": False, "error": f"load-buffer: {exc}"}
-        try:
-            subprocess.run(
-                ["tmux", "paste-buffer", "-p", "-r", "-d", "-b", buffer_name, "-t", target],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=TMUX_SEND_TIMEOUT_SECONDS,
-            )
-            pane_touched = True
-        except Exception as exc:
-            return {"ok": False, "pane_touched": True, "error": f"paste-buffer: {exc}"}
-        try:
-            subprocess.run(
-                ["tmux", "send-keys", "-t", target, "Enter"],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=TMUX_SEND_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:
-            return {"ok": False, "pane_touched": True, "error": f"enter: {exc}"}
-        return {"ok": True, "pane_touched": pane_touched, "error": ""}
-    finally:
-        try:
-            subprocess.run(
-                ["tmux", "delete-buffer", "-b", buffer_name],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=TMUX_SEND_TIMEOUT_SECONDS,
-            )
-        except Exception:
-            pass
-
-
-def probe_tmux_pane_mode(target: str) -> dict:
-    try:
-        proc = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", target, "#{pane_in_mode}\t#{pane_mode}"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=PANE_MODE_PROBE_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:
-        return {"in_mode": False, "mode": "", "error": str(exc)}
-    flag, _, mode = proc.stdout.rstrip("\n").partition("\t")
-    return {"in_mode": flag.strip() == "1", "mode": mode.strip(), "error": ""}
-
-
-def cancel_tmux_pane_mode(target: str) -> tuple[bool, str]:
-    try:
-        subprocess.run(
-            ["tmux", "send-keys", "-t", target, "-X", "cancel"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=PANE_MODE_PROBE_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:
-        return False, str(exc)
-    return True, ""
 
 
 def resolve_pane_mode_grace_seconds() -> tuple[float | None, str | None]:
@@ -525,72 +354,6 @@ def pane_mode_block_since_ts(item: dict) -> float | None:
         return datetime.fromisoformat(str(raw_iso).replace("Z", "+00:00")).timestamp()
     except (TypeError, ValueError):
         return None
-
-
-def build_peer_prompt(message: dict, nonce: str) -> str:
-    sender = str(message["from"])
-    kind = normalize_kind(message.get("kind"), "request")
-    details = [f"from={sender}", f"kind={kind}"]
-    if kind == "result" and message.get("reply_to"):
-        details.append(f"in_reply_to={message.get('reply_to')}")
-    if message.get("causal_id"):
-        details.append(f"causal_id={message.get('causal_id')}")
-    if message.get("aggregate_id"):
-        details.append(f"aggregate_id={message.get('aggregate_id')}")
-    if kind == "request":
-        label = "Request"
-        if message.get("requester_cleared"):
-            cleared = str(message.get("requester_cleared_alias") or sender)
-            hint = (
-                f"Reply normally for local completion; requester {cleared} was cleared, "
-                "so bridge will not deliver this reply back."
-            )
-        else:
-            hint = "Reply normally; do not call agent_send_peer; bridge auto-returns your reply."
-    elif kind == "result":
-        label = "Result"
-        hint = "Use locally; do not reply to peer."
-    else:
-        label = "Notice"
-        hint = "FYI; no reply needed."
-
-    prefix = one_line(f"[bridge:{nonce}] {' '.join(details)}. {hint}")
-    return f"{prefix} {label}: {prompt_body(message['body'])}"
-
-
-def make_message(
-    sender: str,
-    target: str,
-    intent: str,
-    body: str,
-    causal_id: str | None = None,
-    hop_count: int = 0,
-    auto_return: bool | None = None,
-    kind: str = "request",
-    reply_to: str | None = None,
-    source: str = "daemon",
-) -> dict:
-    kind = normalize_kind(kind)
-    if auto_return is None:
-        auto_return = sender != "bridge" and target != "bridge" and kind_expects_response(kind)
-    return {
-        "id": short_id("msg"),
-        "created_ts": utc_now(),
-        "updated_ts": utc_now(),
-        "from": sender,
-        "to": target,
-        "kind": kind,
-        "intent": intent,
-        "body": str(body),
-        "causal_id": causal_id or short_id("causal"),
-        "hop_count": int(hop_count),
-        "auto_return": bool(auto_return),
-        "reply_to": reply_to,
-        "source": source,
-        "status": "pending",
-        "nonce": None,
-        "delivery_attempts": 0,
-    }
 
 
 class QueueStore:
