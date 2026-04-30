@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 from contextlib import contextmanager
-import hashlib
 import errno
 import json
 import math
@@ -10,40 +9,22 @@ import re
 import signal
 import socket
 import stat
-import struct
 import subprocess
 import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 
-from bridge_clear_marker import (
-    cleanup_expired_or_orphaned,
-    find_for_clear_window,
-    make_marker,
-    read_markers,
-    remove_marker,
-    ttl_for_clear_lifetime,
-    update_marker,
-    write_marker,
-)
-from bridge_clear_guard import (
-    ClearGuardResult,
-    ClearViolation,
-    active_queue_rows,
-    cancellable_queue_rows,
-    format_clear_guard_result,
-    target_originated_requests,
-)
+from bridge_clear_marker import cleanup_expired_or_orphaned
+from bridge_clear_guard import ClearGuardResult
+# Re-exported compatibility helpers/constants used by regressions and public
+# wrappers during the staged daemon split.
 from bridge_daemon_messages import (
-    PROMPT_BODY_CONTROL_TRANSLATION,
     build_peer_prompt,
-    kind_expects_response,
     make_message,
     normalize_prompt_body_text,
-    one_line,
     prompt_body,
 )
 import bridge_daemon_aggregates as daemon_aggregates
@@ -55,14 +36,8 @@ import bridge_daemon_interrupts as daemon_interrupts
 import bridge_daemon_status as daemon_status
 import bridge_daemon_watchdogs as daemon_watchdogs
 from bridge_daemon_delivery import (
-    PANE_MODE_ENTER_DEFER_KEYS,
-    PANE_MODE_FORCE_CANCEL_MODES,
-    PANE_MODE_METADATA_KEYS,
-    RESTART_INFLIGHT_METADATA_KEYS,
     TMUX_DELIVERY_WORST_CASE_SECONDS,
-    pane_mode_block_since_ts,
 )
-from bridge_daemon_events import EMPTY_RESPONSE_BODY
 from bridge_daemon_clear_flow import (
     CLEAR_CLIENT_TIMEOUT_SECONDS,
     CLEAR_LOCK_WAIT_BUDGET_SECONDS,
@@ -77,14 +52,11 @@ from bridge_daemon_interrupts import (
     INTERRUPT_KEY_DELAY_MAX_SECONDS,
     INTERRUPT_KEY_DELAY_MIN_SECONDS,
     INTERRUPT_SEND_KEY_TIMEOUT_SECONDS,
-    INTERRUPTED_TOMBSTONE_LIMIT_PER_AGENT,
-    INTERRUPTED_TOMBSTONE_TTL_SECONDS,
 )
 from bridge_daemon_maintenance import DeliveryRequest, DeliveryScheduler, MaintenanceScheduler
 from bridge_daemon_status import AGGREGATE_STATUS_LEG_LIMIT, WAIT_STATUS_SECTION_LIMIT
 from bridge_daemon_store import AggregateStore, QueueStore
 from bridge_daemon_state import (
-    BoundedSet,
     ClearState,
     LockFacade,
     MaintenanceState,
@@ -95,28 +67,18 @@ from bridge_daemon_state import (
     WatchdogState,
 )
 from bridge_daemon_tmux import (
-    PANE_MODE_PROBE_TIMEOUT_SECONDS,
-    TMUX_SEND_TIMEOUT_SECONDS,
-    _tmux_buffer_component,
     cancel_tmux_pane_mode,
     probe_tmux_pane_mode,
     run_tmux_paste_literal_touch_result,
     run_tmux_enter,
     run_tmux_send_literal,
     run_tmux_send_literal_touch_result,
-    tmux_prompt_buffer_name,
 )
 from bridge_daemon_watchdogs import (
     ALARM_CLIENT_WAKE_ID_RE,
-    ALARM_WAKE_TOMBSTONE_LIMIT,
-    ALARM_WAKE_TOMBSTONE_TTL_SECONDS,
     EXTEND_WATCHDOG_HINTS,
-    RESPONSE_LIKE_TOMBSTONE_REASONS,
-    WATCHDOG_PHASE_ALARM,
     WATCHDOG_PHASE_DELIVERY,
     WATCHDOG_PHASE_RESPONSE,
-    WATCHDOG_REQUIRES_AUTO_RETURN_ERROR,
-    WATCHDOG_REQUIRES_AUTO_RETURN_TEXT,
 )
 from bridge_identity import (
     backfill_session_process_identities,
@@ -126,10 +88,9 @@ from bridge_identity import (
     resolve_participant_endpoint_detail,
     verified_process_identity,
 )
-from bridge_instructions import probe_prompt
-from bridge_participants import active_participants, format_peer_summary, participant_record
+from bridge_participants import active_participants, participant_record
 from bridge_pane_probe import probe_agent_process
-from bridge_paths import model_bin_dir, state_root
+from bridge_paths import state_root
 from bridge_response_guard import (
     context_from_current_prompt,
     format_response_send_violation,
@@ -142,7 +103,6 @@ from bridge_util import (
     SHARED_PAYLOAD_ROOT,
     append_jsonl,
     classify_prior_for_hint,
-    locked_json,
     normalize_kind,
     prior_message_hint_candidates,
     prior_message_hint_entry,
@@ -352,28 +312,27 @@ class BridgeDaemon:
         self.aggregates.before_read = self.assert_aggregate_update_allowed
         self.clear_state = ClearState()
         self.maintenance_state = MaintenanceState()
-        # Stage 14 physical lock order for routing paths:
-        # target lock(s), acquired in sorted alias order -> state_lock ->
-        # watchdog_lock -> queue store/file lock. Watchdog-only operations
-        # such as alarm registration may take watchdog_lock without
-        # state_lock. Aggregate store/file mutation stays outside this
-        # chain: aggregate phase first, release, then routing phase.
-        # Coarse RLock that serializes mutations to in-memory routing state
-        # (busy, reserved, current_prompt_by_agent, held_interrupt,
-        # interrupt_partial_failure_blocks,
-        # interrupted_turns, last_enter_ts, watchdogs, panes, participants caches) and gates
-        # event-handler / command-socket / maintenance interleaving.
-        # Lock ordering rule: state_lock is ALWAYS acquired before
-        # queue.update()'s file lock. Queue mutator callbacks must NOT
-        # call back into self.* methods or invoke logging — they should
-        # only manipulate the queue list and return data for callers to
-        # process outside the mutator.
-        # Interrupt handling holds the target lock across pane resolution,
-        # key dispatch, active cancellation, tombstone recording, partial
-        # failure updates, and the success delivery drain. state_lock is used
-        # only for the short shared-state mutation phases within that target
-        # sequence, so slow tmux IO and the ESC -> C-c delay do not block
-        # unrelated targets.
+        # Service ownership and final lock order:
+        # - bridge_daemon.py remains the facade/CLI orchestrator.
+        # - bridge_daemon_state.py owns in-memory domains and target locks.
+        # - bridge_daemon_store.py owns queue/aggregate file stores.
+        # - delivery/events/interrupts/clear_flow/watchdogs/status/aggregates
+        #   own their named routing services behind this facade.
+        # - Routing paths acquire target lock(s) first, in sorted alias order,
+        #   then state_lock, then watchdog_lock, then QueueStore.update()'s
+        #   file lock. Watchdog-only operations such as alarm registration may
+        #   take watchdog_lock without state_lock.
+        # - AggregateStore mutation is deliberately outside that chain:
+        #   aggregate phase first, release, then routing/target/watchdog work.
+        # - state_lock protects short shared-state/cache mutations
+        #   (participants, panes, busy/reserved/current_prompt, nonce and
+        #   tombstone caches). Normal delivery/interrupt/clear pane-touch
+        #   paths run outside state_lock under the relevant target lock or
+        #   reservation gate; legacy state-locked delivery drains remain only
+        #   for callers that already own state_lock.
+        # Queue mutator callbacks must not call back into daemon methods, log,
+        # run tmux, or acquire unrelated daemon locks; they only mutate queue
+        # rows and return data for callers to process after the file lock exits.
         self.lock_facade = LockFacade()
         self.target_locks = TargetLockManager()
         self.delivery_scheduler = DeliveryScheduler()

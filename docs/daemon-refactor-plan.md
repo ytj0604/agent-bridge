@@ -1,8 +1,8 @@
 # Daemon Split And Lock Refactor Plan
 
-Status: draft plan. This document is the working plan for splitting
-`libexec/agent-bridge/bridge_daemon.py` and later reducing lock contention
-without weakening routing correctness.
+Status: implemented through Stage 16. This document records the staged split of
+`libexec/agent-bridge/bridge_daemon.py` and the lock-contention reduction work
+done without weakening routing correctness.
 
 The plan intentionally separates code-structure work from lock-behavior work.
 The first stages must preserve behavior and keep the existing single
@@ -90,8 +90,9 @@ write scope. Review prompts must include:
 
 These invariants apply to every stage.
 
-- Preserve the current lock ordering until a stage explicitly changes it:
-  daemon state lock before `QueueStore.update()` before queue file lock.
+- Preserve the stage-local lock ordering until a stage explicitly changes it.
+  Final Stage 16 routing order is target lock(s) in sorted alias order, then
+  `state_lock`, then `watchdog_lock`, then `QueueStore.update()`'s file lock.
 - Queue mutator callbacks must not call back into daemon methods, log, run
   tmux, or acquire unrelated daemon locks.
 - Do not call aggregate JSON mutators while holding queue file locks. If a
@@ -100,10 +101,9 @@ These invariants apply to every stage.
 - Prefer no nested aggregate JSON/file lock. Operations that need aggregate
   mutation and routing effects should mutate or snapshot the aggregate store,
   release it, then perform target/watchdog/queue effects in a separate phase.
-- The intended later physical-lock order is: room/global snapshot lock, target
-  lock(s) in sorted alias order, watchdog/alarm lock, then queue store/file
-  lock. Aggregate store/file mutation should not be nested inside that chain
-  unless a stage documents and tests a stricter order.
+- Aggregate store/file mutation should not be nested inside that chain unless a
+  stage documents and tests a stricter order. The implemented pattern is
+  aggregate phase first, release, then routing/target/watchdog/queue effects.
 - A target may have at most one active inbound turn. Any queue row with
   `status in {"inflight", "submitted", "delivered"}` blocks fresh delivery to
   that target.

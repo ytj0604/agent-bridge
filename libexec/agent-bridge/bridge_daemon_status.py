@@ -189,9 +189,9 @@ def build_wait_status(d, caller: str) -> dict:
     except Exception:
         aggregates = {}
 
-    # Best-effort debug snapshot: watchdogs are snapshotted under their
-    # physical lock while state_lock is held, then aggregate JSON is read
-    # after releasing daemon locks to preserve Stage 14 ordering.
+    # Best-effort debug snapshot: queue/watchdog state is snapshotted under
+    # daemon locks, then aggregate JSON is read after release so AggregateStore
+    # stays outside the routing lock chain.
     watchdogs_by_message = _wait_status_message_watchdog_index(d, caller, watchdog_snapshot)
     sections = {
         "outstanding_requests": _wait_status_section(d, 
@@ -387,9 +387,9 @@ def _aggregate_status_build_legs(
     return legs
 
 def build_aggregate_status(d, caller: str, aggregate_id: str) -> dict:
-    # Best-effort debug snapshot: watchdogs are snapshotted under their
-    # physical lock while state_lock is held; aggregate JSON is read
-    # afterwards to preserve Stage 14 lock order.
+    # Best-effort debug snapshot: queue/watchdog state is snapshotted under
+    # daemon locks, then aggregate JSON is read after release so AggregateStore
+    # stays outside the routing lock chain.
     try:
         with d.command_state_lock(command_class="aggregate_status"):
             watchdog_snapshot = d.watchdog_snapshot()

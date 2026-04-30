@@ -23,15 +23,16 @@ redesign work could harden several of them later.
 Bridge prompts and human input share the same tmux pane. The daemon can validate
 nonce/status and route protocol results, but it cannot force the model's text to
 semantically address the peer rather than the human when pane context is mixed.
-Evidence: `bridge_daemon.py::handle_prompt_submitted`,
-`bridge_daemon.py::handle_response_finished`.
+Evidence: `bridge_daemon_events.py::handle_prompt_submitted`,
+`bridge_daemon_events.py::handle_response_finished`.
 
 ### In-Memory Live Routing State
 
-Current prompts, reservations, watchdogs, alarms, `last_enter_ts`, interrupt
-holds, partial-failure gates, and recent tombstones are daemon memory. Queue rows
-and aggregate JSON persist, but restart can lose live routing context. Evidence:
-`bridge_daemon.py::BridgeDaemon.__init__`,
+Current prompts, clear reservations, target locks, watchdogs, alarms,
+`last_enter_ts`, interrupt holds, partial-failure gates, and recent tombstones
+are daemon memory. Queue rows and aggregate JSON persist, but restart can lose
+live routing context. Evidence: `bridge_daemon.py::BridgeDaemon.__init__`,
+`bridge_daemon.py::_preserve_startup_inflight_messages`,
 `bridge_daemon.py::_recover_orphan_delivered_messages`, `bridge_daemon_ctl.py`.
 
 Pre-existing `status="inflight"` queue rows are preserved after daemon restart
@@ -41,13 +42,41 @@ row by nonce; if that hook never arrives, operator recovery is explicit via
 `agent_interrupt_peer <alias>` or `agent_cancel_message <msg_id>` when the row is
 still safely cancellable.
 
+### Lock Order And Service Boundaries
+
+The daemon is split into service modules, but `BridgeDaemon` remains the facade
+and compatibility surface for command handlers, hooks, and regression tests.
+The final routing lock order is target lock(s) in sorted alias order, then
+`state_lock`, then `watchdog_lock`, then the queue file lock used by
+`QueueStore.update()`. Watchdog-only operations such as `agent_alarm`
+registration may take `watchdog_lock` without `state_lock`. `AggregateStore`
+reads and writes are intentionally kept outside that chain: aggregate state is
+snapshotted or mutated first, released, and then routing/watchdog/queue effects
+run in a separate phase.
+
+`state_lock` is still a deliberate coarse region for short shared-state and
+room-level cache mutations: participant/session cache, pane cache, busy/reserved
+flags, current prompt contexts, nonce caches, and tombstones. Slow tmux IO for
+normal delivery, interrupt, and controlled-clear pane-touch paths runs outside
+`state_lock`, guarded by per-target locks or clear reservations instead. A
+small compatibility path still drains delivery while `state_lock` is already
+held for callers that cannot yet switch lock ownership. During controlled
+clear, reservations keep delivery gated while `run_clear_peer` may release and
+reacquire the target lock around settle/probe waits. Evidence:
+`bridge_daemon.py::BridgeDaemon.__init__`,
+`bridge_daemon_state.py::TargetLockManager`,
+`bridge_daemon_delivery.py::try_deliver`,
+`bridge_daemon_maintenance.py::DeliveryScheduler`,
+`bridge_daemon_interrupts.py::handle_interrupt`, and
+`bridge_daemon_clear_flow.py::run_clear_peer`.
+
 ### Bounded Tombstone Window
 
 Recent terminal/idempotency tombstones are best-effort memory: 600 seconds and
 16 records per target agent. They improve near-term diagnostics and stale wake
 suppression, not durable history. Evidence:
-`INTERRUPTED_TOMBSTONE_TTL_SECONDS`,
-`INTERRUPTED_TOMBSTONE_LIMIT_PER_AGENT`.
+`bridge_daemon_interrupts.py::INTERRUPTED_TOMBSTONE_TTL_SECONDS`,
+`bridge_daemon_interrupts.py::INTERRUPTED_TOMBSTONE_LIMIT_PER_AGENT`.
 
 ### Best-Effort Status Snapshots
 
@@ -55,8 +84,8 @@ suppression, not durable history. Evidence:
 transactional state dumps. Queue/watchdog state is snapshotted under daemon
 lock; aggregate JSON is read afterward to avoid lock-order risk. `wake_id`
 values are also in-memory correlation ids only. Evidence:
-`bridge_daemon.py::build_wait_status`,
-`bridge_daemon.py::build_aggregate_status`.
+`bridge_daemon_status.py::build_wait_status`,
+`bridge_daemon_status.py::build_aggregate_status`.
 
 ### Multi-Clear Atomic Guard, Best-Effort Execution
 
@@ -66,7 +95,8 @@ reserves every target before any pane is touched. Execution is sequential and
 best-effort after that point. A later pane/probe/identity failure can produce
 mixed `cleared`, `forced_leave`, and `failed` results, and inbound delivery to
 all batch targets is held for the duration of the batch. Evidence:
-`bridge_daemon.py::handle_clear_peers`, `bridge_daemon.py::run_clear_peer`.
+`bridge_daemon_clear_flow.py::handle_clear_peers`,
+`bridge_daemon_clear_flow.py::run_clear_peer`.
 
 ### Model-Facing Payload Limits And Stable Body Errors
 
@@ -163,9 +193,9 @@ during bridge delivery, and use `agent_view_peer`, `agent_wait_status`, or
 **Residual risk**: Fully closing this requires a stronger out-of-band inbox or
 prompt-body integrity check that survives model TUI behavior.
 
-**Evidence**: `bridge_daemon.py::handle_prompt_submitted`,
-`bridge_daemon.py::handle_response_finished`,
-`bridge_daemon.py::find_inflight_candidate`, fix lineage `93bce7c`.
+**Evidence**: `bridge_daemon_events.py::handle_prompt_submitted`,
+`bridge_daemon_events.py::handle_response_finished`,
+`bridge_daemon_events.py::find_inflight_candidate`, fix lineage `93bce7c`.
 
 ---
 
@@ -222,8 +252,8 @@ Routing State* structural limit above — alarm-cancel state is daemon memory
 and does not survive into the recovery path.
 
 **Evidence**: `bridge_enqueue.py::enqueue_via_daemon_socket`, `bridge_enqueue.py`
-file-fallback block, `bridge_daemon.py::handle_external_message_queued`,
-`bridge_daemon.py::_apply_alarm_cancel_to_queued_message`,
+file-fallback block, `bridge_daemon_events.py::handle_external_message_queued`,
+`bridge_daemon_events.py::_apply_alarm_cancel_to_queued_message`,
 `bridge_daemon.py::_recover_ingressing_messages`, and
 `bridge_daemon.py::_promote_aged_ingressing`. Empirical probe (2026-04-28): in
 default Codex sandbox, a `python3` subprocess returned

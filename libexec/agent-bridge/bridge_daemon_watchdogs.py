@@ -286,7 +286,7 @@ def upsert_message_watchdog(d, sender: str, message_id: str, additional_sec: flo
     # All validation + upsert stays inside state_lock, with watchdog_lock
     # acquired before reading queue state and replacing the wake. This keeps
     # extend_wait serialized with delivery/cancellation while preserving the
-    # Stage 14 state_lock -> watchdog_lock -> queue order.
+    # final state_lock -> watchdog_lock -> queue order.
     # Returns (ok, error_code, new_deadline_iso).
     post_lock_worst_case, margin = d.command_budget("extend_watchdog")
     try:

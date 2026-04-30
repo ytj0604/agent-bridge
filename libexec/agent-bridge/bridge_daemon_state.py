@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""In-memory state domains for the daemon facade.
+
+BridgeDaemon exposes these fields through StateField descriptors so older
+tests and command paths can keep using d.busy/d.watchdogs/etc. The ownership is
+still split by domain: participant cache, routing state, watchdog/alarm state,
+clear/interrupt state, maintenance timers, and the lock facade.
+"""
+
 from collections import OrderedDict
 from dataclasses import dataclass, field
 import threading
@@ -35,6 +43,8 @@ class BoundedSet:
 
 
 class TargetLockManager:
+    """Acquire per-target locks in deterministic alias order."""
+
     def __init__(self) -> None:
         self._guard = threading.Lock()
         self._locks: dict[str, threading.RLock] = {}
@@ -101,6 +111,9 @@ class _TargetLockContext:
 
 @dataclass
 class LockFacade:
+    # Coarse shared-state lock. Routing code should take target locks first
+    # when mutating target-owned state, then this lock for the short shared
+    # cache mutation phase.
     state_lock: threading.RLock = field(default_factory=threading.RLock)
 
 
