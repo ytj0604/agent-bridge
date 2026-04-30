@@ -80,6 +80,7 @@ from bridge_daemon_interrupts import (
     INTERRUPTED_TOMBSTONE_LIMIT_PER_AGENT,
     INTERRUPTED_TOMBSTONE_TTL_SECONDS,
 )
+from bridge_daemon_maintenance import DeliveryRequest, DeliveryScheduler
 from bridge_daemon_status import AGGREGATE_STATUS_LEG_LIMIT, WAIT_STATUS_SECTION_LIMIT
 from bridge_daemon_store import AggregateStore, QueueStore
 from bridge_daemon_state import (
@@ -360,6 +361,7 @@ class BridgeDaemon:
         # holding this lock, including Claude's short ESC -> C-c delay, so
         # hook events and replacement delivery cannot interleave between keys.
         self.lock_facade = LockFacade()
+        self.delivery_scheduler = DeliveryScheduler()
         self.submit_delay = args.submit_delay
         self.submit_timeout = args.submit_timeout
         self.clear_post_clear_delay_seconds, clear_delay_warning = resolve_clear_post_clear_delay_seconds()
@@ -746,6 +748,41 @@ class BridgeDaemon:
 
     def try_deliver_command_aware(self, target: str | None = None, *, message_id: str = "") -> None:
         return daemon_delivery.try_deliver_command_aware(self, target, message_id=message_id)
+
+    def request_delivery(
+        self,
+        target: str | None = None,
+        *,
+        message_id: str = "",
+        command_aware: bool = False,
+        reason: str = "",
+    ) -> DeliveryRequest:
+        return self.delivery_scheduler.request_delivery(
+            target,
+            message_id=message_id,
+            command_aware=command_aware,
+            reason=reason,
+        )
+
+    def drain_delivery_request(self, request: DeliveryRequest) -> None:
+        return self.delivery_scheduler.drain_inline(self, request)
+
+    def request_and_drain_delivery(
+        self,
+        target: str | None = None,
+        *,
+        message_id: str = "",
+        command_aware: bool = False,
+        reason: str = "",
+    ) -> DeliveryRequest:
+        request = self.request_delivery(
+            target,
+            message_id=message_id,
+            command_aware=command_aware,
+            reason=reason,
+        )
+        self.drain_delivery_request(request)
+        return request
 
     def sender_blocked_by_clear(self, sender: str) -> bool:
         return daemon_clear_flow.sender_blocked_by_clear(self, sender)
