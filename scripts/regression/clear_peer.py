@@ -356,6 +356,52 @@ def scenario_clear_multi_guard_pass_reserves_all(label: str, tmpdir: Path) -> No
     print(f"  PASS  {label}")
 
 
+def scenario_clear_multi_guard_and_reservation_hold_target_locks(label: str, tmpdir: Path) -> None:
+    targets = ["bob", "carol", "dave"]
+    d = make_daemon(tmpdir, _clear_batch_participants())
+    original_guard_multi = d.clear_guard_multi
+    original_new_reservation = d._new_clear_reservation
+    guard_checked = False
+    reservation_checked: list[str] = []
+    gate_checked = False
+
+    def guard_spy(targets_arg, **kwargs):
+        nonlocal guard_checked
+        guard_checked = True
+        assert_true(
+            all(d._target_lock_owned_by_current_thread(target) for target in targets),
+            f"{label}: guard must hold every batch target lock",
+        )
+        return original_guard_multi(targets_arg, **kwargs)
+
+    def new_reservation_spy(caller: str, target: str, *, force: bool, participant: dict, pane: str = "") -> dict:
+        assert_true(d._target_lock_owned_by_current_thread(target), f"{label}: reservation for {target} must hold target lock")
+        reservation_checked.append(target)
+        return original_new_reservation(caller, target, force=force, participant=participant, pane=pane)
+
+    def check_reservation_gate() -> None:
+        nonlocal gate_checked
+        gate_checked = True
+        for target in targets:
+            message_id = f"msg-gated-{target}"
+            d.queue.update(lambda queue, mid=message_id, tgt=target: queue.append(test_message(mid, frm="alice", to=tgt, status="pending")))
+            d.try_deliver(target)
+            row = _queue_item(d, message_id) or {}
+            assert_true(row.get("status") == "pending", f"{label}: {target} inbound must stay pending behind batch reservation: {row}")
+
+    d.clear_guard_multi = guard_spy  # type: ignore[method-assign]
+    d._new_clear_reservation = new_reservation_spy  # type: ignore[method-assign]
+    _install_fake_clear_runner(d, expected_targets=targets, on_first_touch=check_reservation_gate)
+
+    result = d.handle_clear_peers("alice", ["dave", "bob", "carol"], force=False)
+
+    assert_true(result.get("ok") is True, f"{label}: batch should succeed: {result}")
+    assert_true(guard_checked, f"{label}: guard spy did not run")
+    assert_true(sorted(reservation_checked) == targets, f"{label}: reservations not checked for all targets: {reservation_checked}")
+    assert_true(gate_checked, f"{label}: reservation gate check did not run")
+    print(f"  PASS  {label}")
+
+
 def scenario_clear_multi_guard_hard_blocker_rejects_all(label: str, tmpdir: Path) -> None:
     d = make_daemon(tmpdir, _clear_batch_participants())
     d.queue.update(lambda queue: queue.append(test_message("msg-hard-clear", frm="alice", to="carol", status="submitted")))
@@ -1491,7 +1537,8 @@ def scenario_clear_post_clear_delay_config_and_settle(label: str, tmpdir: Path) 
                     reservation["failure_reason"] = "test_stop"
                     condition = reservation.get("condition")
                     if isinstance(condition, threading.Condition):
-                        condition.notify_all()
+                        with condition:
+                            condition.notify_all()
                     break
             time.sleep(0.005)
         thread.join(1.0)
@@ -1532,12 +1579,80 @@ def scenario_clear_post_clear_delay_config_and_settle(label: str, tmpdir: Path) 
                     reservation["failure_reason"] = "test_stop"
                     condition = reservation.get("condition")
                     if isinstance(condition, threading.Condition):
-                        condition.notify_all()
+                        with condition:
+                            condition.notify_all()
                     break
             time.sleep(0.005)
         thread.join(1.0)
         assert_true(saw_long_settle, f"{label}: long settle marker should be inspectable, result={result}")
         assert_true(not thread.is_alive(), f"{label}: long-settle runner should stop after injected failure")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_settle_public_failure_wakes_before_delay(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91", "hook_session_id": "alice-session"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "hook_session_id": "old-session", "target": "test:1.2"},
+    }
+    with patched_environ(
+        AGENT_BRIDGE_CONTROLLED_CLEARS=str(tmpdir / "controlled-clears.json"),
+        AGENT_BRIDGE_CLEAR_POST_CLEAR_DELAY_SEC="1.0",
+    ):
+        d = make_daemon(tmpdir, participants)
+        d.dry_run = False
+        d.resolve_endpoint_detail = lambda _target, purpose="write": {"ok": True, "pane": "%92", "reason": "ok"}  # type: ignore[method-assign]
+        d.pane_mode_status = lambda _pane: {"in_mode": False, "mode": "", "error": ""}  # type: ignore[method-assign]
+        d._mark_participant_detached_for_clear = lambda *args, **kwargs: None  # type: ignore[method-assign]
+        d._reload_participants_unlocked = lambda: None  # type: ignore[method-assign]
+        sends: list[str] = []
+        result: dict[str, object] = {}
+
+        def fake_send(_pane: str, text: str, *, target: str, message_id: str) -> dict:
+            sends.append(text)
+            return {"ok": True, "pane_touched": True, "error": ""}
+
+        d._clear_tmux_send = fake_send  # type: ignore[method-assign]
+
+        def runner() -> None:
+            result["value"] = d.run_clear_peer("alice", "bob", force=False)
+
+        started = time.monotonic()
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        probe_id = ""
+        for _ in range(200):
+            reservation = d.clear_reservations.get("bob") or {}
+            if reservation.get("phase") == "post_clear_settle":
+                probe_id = str(reservation.get("probe_id") or "")
+                break
+            time.sleep(0.005)
+        assert_true(probe_id, f"{label}: clear did not enter settle phase")
+
+        event_done = threading.Event()
+
+        def submit_phase2_failure() -> None:
+            d.handle_prompt_submitted({
+                "event": "prompt_submitted",
+                "agent": "bob",
+                "bridge_agent": "bob",
+                "attach_probe": probe_id,
+                "session_id": "new-session-from-bus",
+                "turn_id": "turn-from-bus",
+            })
+            event_done.set()
+
+        event_thread = threading.Thread(target=submit_phase2_failure, daemon=True)
+        event_thread.start()
+        event_thread.join(0.3)
+        assert_true(not event_thread.is_alive() and event_done.is_set(), f"{label}: public prompt failure should not wait for full settle delay")
+        thread.join(0.5)
+        elapsed = time.monotonic() - started
+        assert_true(not thread.is_alive(), f"{label}: clear runner should wake promptly after public failure")
+        value = result.get("value")
+        assert_true(isinstance(value, dict) and value.get("error_kind") == "clear_marker_phase2_missing", f"{label}: phase2 failure expected: {value}")
+        assert_true(value.get("forced_leave") is True, f"{label}: pane-touched phase2 failure should force leave before waking waiter: {value}")
+        assert_true(sends == ["/clear"], f"{label}: probe should not be pasted after phase2 failure during settle: {sends}")
+        assert_true(elapsed < 0.9, f"{label}: failure should beat configured settle delay, elapsed={elapsed:.3f}")
     print(f"  PASS  {label}")
 
 
@@ -2360,6 +2475,57 @@ def scenario_clear_waits_for_same_target_delivery_touch(label: str, tmpdir: Path
     print(f"  PASS  {label}")
 
 
+def scenario_clear_tmux_phase_uses_target_lock_not_state_lock(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91", "hook_session_id": "alice-session"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "hook_session_id": "bob-old", "target": "test:1.2"},
+    }
+    with patched_environ(AGENT_BRIDGE_CONTROLLED_CLEARS=str(tmpdir / "controlled-clears.json")):
+        d = make_daemon(tmpdir, participants)
+        d.dry_run = False
+        d.clear_post_clear_delay_seconds = 0.0
+        d.resolve_endpoint_detail = lambda _target, purpose="write": {"ok": True, "pane": "%92", "reason": "ok"}  # type: ignore[method-assign]
+        lock_observations: list[dict] = []
+
+        def pane_mode(_pane: str) -> dict:
+            lock_observations.append({
+                "phase": "pane_mode",
+                "state_lock": d.state_lock._is_owned(),
+                "target_lock": d._target_lock_owned_by_current_thread("bob"),
+            })
+            return {"in_mode": False, "mode": "", "error": ""}
+
+        def clear_send(_pane: str, text: str, *, target: str, message_id: str) -> dict:
+            lock_observations.append({
+                "phase": "send",
+                "text": text,
+                "state_lock": d.state_lock._is_owned(),
+                "target_lock": d._target_lock_owned_by_current_thread(target),
+            })
+            if text != "/clear":
+                reservation = d.clear_reservations.get(target) or {}
+                reservation["probe_prompt_submitted"] = True
+                reservation["probe_response_finished"] = True
+                reservation["new_session_id"] = f"{target}-new"
+            return {"ok": True, "pane_touched": True, "error": ""}
+
+        d.pane_mode_status = pane_mode  # type: ignore[method-assign]
+        d._clear_tmux_send = clear_send  # type: ignore[method-assign]
+        original_replace = _patch_clear_identity_success(d)
+        try:
+            result = d.handle_clear_peer("alice", "bob", force=False)
+        finally:
+            bridge_daemon.replace_attached_session_identity_for_clear = original_replace  # type: ignore[assignment]
+
+    assert_true(result.get("ok") is True and result.get("cleared") is True, f"{label}: clear should succeed: {result}")
+    assert_true(lock_observations, f"{label}: expected pane observations")
+    assert_true(
+        all(record.get("state_lock") is False and record.get("target_lock") is True for record in lock_observations),
+        f"{label}: clear tmux/pane-mode phase must hold target lock but not state_lock: {lock_observations}",
+    )
+    print(f"  PASS  {label}")
+
+
 def scenario_clear_probe_subprocess_timeouts(label: str, tmpdir: Path) -> None:
     calls: list[dict] = []
     original_probe_run = bridge_pane_probe.subprocess.run
@@ -2593,6 +2759,76 @@ def scenario_run_clear_peer_phase2_failure_returns_immediately(label: str, tmpdi
         assert_true(isinstance(value, dict) and value.get("error_kind") == "clear_marker_phase2_missing", f"{label}: concrete phase2 error expected: {value}")
         assert_true(elapsed < 1.0, f"{label}: phase2 failure should not wait for probe timeout, elapsed={elapsed:.3f}s")
         assert_true(forced == ["clear_marker_phase2_missing"], f"{label}: forced-leave should be invoked exactly once with concrete reason: {forced}")
+    print(f"  PASS  {label}")
+
+
+def scenario_clear_phase2_failure_waits_for_force_leave_cleanup(label: str, tmpdir: Path) -> None:
+    marker_file = tmpdir / "controlled-clears.json"
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91", "hook_session_id": "session-alice"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "hook_session_id": "old-session", "target": "test:1.2"},
+    }
+    with patched_environ(
+        AGENT_BRIDGE_CONTROLLED_CLEARS=str(marker_file),
+        AGENT_BRIDGE_CLEAR_POST_CLEAR_DELAY_SEC="0",
+    ):
+        d = make_daemon(tmpdir, participants)
+        d.dry_run = False
+        d.resolve_endpoint_detail = lambda _target, purpose="write": {"ok": True, "pane": "%92", "reason": "ok"}  # type: ignore[method-assign]
+        d.pane_mode_status = lambda _pane: {"in_mode": False, "mode": "", "error": ""}  # type: ignore[method-assign]
+        d._clear_tmux_send = lambda _pane, _text, *, target, message_id: {"ok": True, "pane_touched": True, "error": ""}  # type: ignore[method-assign]
+        force_started = threading.Event()
+        release_force = threading.Event()
+        force_done = threading.Event()
+
+        def slow_force_leave(target: str, *, caller: str, reason: str, reservation: dict) -> None:
+            force_started.set()
+            assert_true(release_force.wait(2.0), f"{label}: release_force not set")
+            reservation["forced_leave"] = True
+            reservation["forced_leave_reason"] = reason
+            d.clear_reservations.pop(target, None)
+            force_done.set()
+
+        d.force_leave_after_clear_failure = slow_force_leave  # type: ignore[method-assign]
+        result: dict[str, object] = {}
+
+        def runner() -> None:
+            result["value"] = d.run_clear_peer("alice", "bob", force=False)
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        probe_id = ""
+        for _ in range(100):
+            reservation = d.clear_reservations.get("bob") or {}
+            if reservation.get("phase") == "waiting_probe":
+                probe_id = str(reservation.get("probe_id") or "")
+                break
+            time.sleep(0.01)
+        assert_true(probe_id, f"{label}: clear did not reach waiting_probe")
+
+        event_thread = threading.Thread(
+            target=lambda: d.handle_prompt_submitted({
+                "event": "prompt_submitted",
+                "agent": "bob",
+                "bridge_agent": "bob",
+                "attach_probe": probe_id,
+                "session_id": "new-session-from-bus",
+                "turn_id": "turn-phase2",
+            }),
+            daemon=True,
+        )
+        event_thread.start()
+        assert_true(force_started.wait(1.0), f"{label}: phase2 failure did not enter forced leave")
+        thread.join(0.1)
+        assert_true(thread.is_alive(), f"{label}: runner must not wake before forced-leave cleanup finishes")
+        release_force.set()
+        event_thread.join(1.0)
+        thread.join(1.0)
+        assert_true(not event_thread.is_alive() and not thread.is_alive(), f"{label}: threads should finish")
+        assert_true(force_done.is_set(), f"{label}: forced leave cleanup should complete")
+        value = result.get("value")
+        assert_true(isinstance(value, dict) and value.get("error_kind") == "clear_marker_phase2_missing", f"{label}: phase2 failure expected: {value}")
+        assert_true(value.get("forced_leave") is True, f"{label}: waiter should observe forced_leave=True after cleanup: {value}")
     print(f"  PASS  {label}")
 
 
@@ -2908,6 +3144,85 @@ def scenario_force_clear_aggregate_invalidation_survives_probe_failure(label: st
     print(f"  PASS  {label}")
 
 
+def scenario_force_clear_integrated_invalidates_soft_state(label: str, tmpdir: Path) -> None:
+    participants = {
+        "alice": {"alias": "alice", "agent_type": "codex", "pane": "%91", "hook_session_id": "alice-session"},
+        "bob": {"alias": "bob", "agent_type": "codex", "pane": "%92", "hook_session_id": "bob-old", "target": "test:1.2"},
+        "responder": {"alias": "responder", "agent_type": "codex", "pane": "%93", "hook_session_id": "responder-session"},
+        "worker": {"alias": "worker", "agent_type": "codex", "pane": "%94", "hook_session_id": "worker-session"},
+    }
+    with patched_environ(AGENT_BRIDGE_CONTROLLED_CLEARS=str(tmpdir / "controlled-clears.json")):
+        d = make_daemon(tmpdir, participants)
+        d.dry_run = False
+        d.clear_post_clear_delay_seconds = 0.0
+        d.resolve_endpoint_detail = lambda _target, purpose="write": {"ok": True, "pane": "%92", "reason": "ok"}  # type: ignore[method-assign]
+        d.pane_mode_status = lambda _pane: {"in_mode": False, "mode": "", "error": ""}  # type: ignore[method-assign]
+        inbound = test_message("msg-force-inbound", frm="alice", to="bob", status="pending")
+        originated = test_message("msg-force-originated", frm="bob", to="responder", status="pending")
+        originated["kind"] = "request"
+        originated["auto_return"] = True
+        d.queue.update(lambda queue: queue.extend([inbound, originated]))
+        wake_id = d.register_alarm("bob", 60.0, "wake")
+        d.current_prompt_by_agent["worker"] = {
+            "id": "msg-force-active",
+            "from": "bob",
+            "to": "worker",
+            "kind": "request",
+            "auto_return": True,
+        }
+        d.aggregates.update(lambda data: data.setdefault("aggregates", {}).update({
+            "agg-force-integrated": {
+                "id": "agg-force-integrated",
+                "created_ts": utc_now(),
+                "requester": "bob",
+                "causal_id": "causal-force-integrated",
+                "intent": "message",
+                "mode": "all",
+                "started_ts": utc_now(),
+                "hop_count": 0,
+                "expected": ["worker"],
+                "message_ids": {"worker": "msg-force-active"},
+                "replies": {},
+                "status": "collecting",
+                "delivered": False,
+            },
+        }))
+        aggregate_lock_states: list[tuple[bool, bool]] = []
+        original_aggregate_update = d.aggregates.update
+
+        def aggregate_update_spy(mutator):
+            aggregate_lock_states.append((d._state_lock_owned_by_current_thread(), d._watchdog_lock_owned_by_current_thread()))
+            return original_aggregate_update(mutator)
+
+        def clear_send(_pane: str, text: str, *, target: str, message_id: str) -> dict:
+            if text != "/clear":
+                reservation = d.clear_reservations.get(target) or {}
+                reservation["probe_prompt_submitted"] = True
+                reservation["probe_response_finished"] = True
+                reservation["new_session_id"] = f"{target}-new"
+            return {"ok": True, "pane_touched": True, "error": ""}
+
+        d.aggregates.update = aggregate_update_spy  # type: ignore[method-assign]
+        d._clear_tmux_send = clear_send  # type: ignore[method-assign]
+        original_replace = _patch_clear_identity_success(d)
+        try:
+            result = d.handle_clear_peer("alice", "bob", force=True)
+        finally:
+            bridge_daemon.replace_attached_session_identity_for_clear = original_replace  # type: ignore[assignment]
+
+    originated_after = _queue_item(d, "msg-force-originated") or {}
+    active_after = d.current_prompt_by_agent.get("worker") or {}
+    aggregate = d.aggregates.get("agg-force-integrated")
+    assert_true(result.get("ok") is True and result.get("cleared") is True, f"{label}: force clear should succeed: {result}")
+    assert_true(_queue_item(d, "msg-force-inbound") is None, f"{label}: cancellable inbound row should be removed")
+    assert_true(wake_id not in d.watchdogs, f"{label}: target-owned alarm should be cancelled")
+    assert_true(originated_after.get("requester_cleared") is True and originated_after.get("auto_return") is False, f"{label}: originated request row should be requester-cleared: {originated_after}")
+    assert_true(active_after.get("requester_cleared") is True and active_after.get("auto_return") is False, f"{label}: active requester context should be requester-cleared: {active_after}")
+    assert_true(aggregate.get("status") == "cancelled_requester_cleared", f"{label}: requester aggregate should be cancelled: {aggregate}")
+    assert_true(aggregate_lock_states and aggregate_lock_states[-1] == (False, False), f"{label}: aggregate invalidation must drain outside state/watchdog locks: {aggregate_lock_states}")
+    print(f"  PASS  {label}")
+
+
 def scenario_clear_aggregate_requester_late_reply_suppressed(label: str, tmpdir: Path) -> None:
     participants = {
         "requester": {"alias": "requester", "agent_type": "codex", "pane": "%91"},
@@ -2995,6 +3310,7 @@ SCENARIOS = [
     ('clear_single_guard_reads_aggregates_outside_state_lock', scenario_clear_single_guard_reads_aggregates_outside_state_lock),
     ('clear_multi_guard_reads_aggregates_outside_state_lock', scenario_clear_multi_guard_reads_aggregates_outside_state_lock),
     ('clear_multi_guard_pass_reserves_all', scenario_clear_multi_guard_pass_reserves_all),
+    ('clear_multi_guard_and_reservation_hold_target_locks', scenario_clear_multi_guard_and_reservation_hold_target_locks),
     ('clear_multi_guard_hard_blocker_rejects_all', scenario_clear_multi_guard_hard_blocker_rejects_all),
     ('clear_multi_guard_soft_blocker_rejects_all', scenario_clear_multi_guard_soft_blocker_rejects_all),
     ('clear_multi_partial_outcomes_and_cleanup', scenario_clear_multi_partial_outcomes_and_cleanup),
@@ -3017,6 +3333,7 @@ SCENARIOS = [
     ('clear_with_existing_inbound_queue_routes_replies', scenario_clear_with_existing_inbound_queue_routes_replies),
     ('clear_file_fallback_blocked_sender_aged_ingress', scenario_clear_file_fallback_blocked_sender_aged_ingress),
     ('clear_post_clear_delay_config_and_settle', scenario_clear_post_clear_delay_config_and_settle),
+    ('clear_settle_public_failure_wakes_before_delay', scenario_clear_settle_public_failure_wakes_before_delay),
     ('clear_settle_pane_not_ready_forces_leave', scenario_clear_settle_pane_not_ready_forces_leave),
     ('clear_identity_helper_preserves_verified_live_identity', scenario_clear_identity_helper_preserves_verified_live_identity),
     ('clear_requires_verified_process_identity', scenario_clear_requires_verified_process_identity),
@@ -3028,16 +3345,19 @@ SCENARIOS = [
     ('clear_success_delivery_defers_near_deadline', scenario_clear_success_delivery_defers_near_deadline),
     ('clear_success_delivery_lock_wait_does_not_fail_after_commit', scenario_clear_success_delivery_lock_wait_does_not_fail_after_commit),
     ('clear_waits_for_same_target_delivery_touch', scenario_clear_waits_for_same_target_delivery_touch),
+    ('clear_tmux_phase_uses_target_lock_not_state_lock', scenario_clear_tmux_phase_uses_target_lock_not_state_lock),
     ('clear_probe_subprocess_timeouts', scenario_clear_probe_subprocess_timeouts),
     ('clear_marker_phase2_missing_forces_leave', scenario_clear_marker_phase2_missing_forces_leave),
     ('clear_prompt_force_leave_drains_aggregate_after_lock', scenario_clear_prompt_force_leave_drains_aggregate_after_lock),
     ('clear_marker_phase2_rejects_record_turn_without_marker_turn', scenario_clear_marker_phase2_rejects_record_turn_without_marker_turn),
     ('run_clear_peer_phase2_failure_returns_immediately', scenario_run_clear_peer_phase2_failure_returns_immediately),
+    ('clear_phase2_failure_waits_for_force_leave_cleanup', scenario_clear_phase2_failure_waits_for_force_leave_cleanup),
     ('clear_force_leave_cleans_identity_stores', scenario_clear_force_leave_cleans_identity_stores),
     ('clear_force_leave_unowned_lock_serializes_cleanup', scenario_clear_force_leave_unowned_lock_serializes_cleanup),
     ('clear_identity_helper_success_and_failure', scenario_clear_identity_helper_success_and_failure),
     ('force_clear_requester_dual_write_queue_and_active', scenario_force_clear_requester_dual_write_queue_and_active),
     ('force_clear_aggregate_invalidation_survives_probe_failure', scenario_force_clear_aggregate_invalidation_survives_probe_failure),
+    ('force_clear_integrated_invalidates_soft_state', scenario_force_clear_integrated_invalidates_soft_state),
     ('clear_aggregate_requester_late_reply_suppressed', scenario_clear_aggregate_requester_late_reply_suppressed),
     ('self_clear_promotion_and_cancel_notice_ordering', scenario_self_clear_promotion_and_cancel_notice_ordering),
     ('clear_marker_ttl_expiry_removes_marker', scenario_clear_marker_ttl_expiry_removes_marker),

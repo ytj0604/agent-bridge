@@ -337,9 +337,10 @@ def force_leave_after_clear_failure(d, target: str, *, caller: str, reason: str,
     # originating command budget is exhausted, so take the raw state lock
     # here rather than re-entering command_state_lock.
     if not d._state_lock_owned_by_current_thread():
-        reservation_ref = reservation or d.clear_reservations.get(target) or {}
-        with d.state_lock:
-            d.force_leave_after_clear_failure(target, caller=caller, reason=reason, reservation=reservation_ref)
+        with d.target_locks_for([target]):
+            with d.state_lock:
+                reservation_ref = reservation or d.clear_reservations.get(target) or {}
+                d.force_leave_after_clear_failure(target, caller=caller, reason=reason, reservation=reservation_ref)
         drain_force_leave_aggregate_replies(d, reservation_ref, caller=caller)
         return
     reservation = reservation or d.clear_reservations.get(target) or {}
@@ -615,6 +616,14 @@ def hold_clear_reservation_for_batch_failure(d, reservation: dict | None, reason
     reservation["batch_hold_failure_reason"] = reason
 
 
+def notify_clear_condition(reservation: dict) -> None:
+    condition = reservation.get("condition")
+    if not isinstance(condition, threading.Condition):
+        return
+    with condition:
+        condition.notify_all()
+
+
 def handle_clear_peer(d, sender: str, target: str, *, force: bool) -> dict:
     if not target:
         return {"ok": False, "error": "target required"}
@@ -662,56 +671,57 @@ def handle_clear_peers(d, sender: str, targets: list[str], *, force: bool) -> di
 
     reservations: dict[str, dict] = {}
     aggregate_snapshot = d.aggregates.read_aggregates()
-    try:
-        lock_ctx = d.command_state_lock(
-            post_lock_worst_case=d.clear_peer_batch_post_lock_worst_case_seconds(len(targets)),
-            margin=20.0,
-            command_class="clear_peer",
-        )
-        lock_ctx.__enter__()
-    except Exception as exc:
-        if not _is_command_lock_wait_exceeded(exc):
-            raise
-        return d.lock_wait_exceeded_response("clear_peer")
-    try:
-        if not d.command_deadline_ok(
-            post_lock_worst_case=d.clear_peer_batch_post_lock_worst_case_seconds(len(targets)),
-            margin=20.0,
-            command_class="clear_peer",
-        ):
+    with d.target_locks_for(targets):
+        try:
+            lock_ctx = d.command_state_lock(
+                post_lock_worst_case=d.clear_peer_batch_post_lock_worst_case_seconds(len(targets)),
+                margin=20.0,
+                command_class="clear_peer",
+            )
+            lock_ctx.__enter__()
+        except Exception as exc:
+            if not _is_command_lock_wait_exceeded(exc):
+                raise
             return d.lock_wait_exceeded_response("clear_peer")
-        d._reload_participants_unlocked()
-        validation = d.validate_clear_targets_payload(sender, targets, force=force)
-        if not validation.get("ok"):
-            return validation
-        targets = list(validation.get("targets") or [])
-        queue_snapshot = list(d.queue.read())
-        guard = d.clear_guard_multi(
-            targets,
-            force=False,
-            queue_snapshot=queue_snapshot,
-            aggregates=aggregate_snapshot,
-        )
-        if not guard.ok:
-            return {
-                "ok": False,
-                "error": format_clear_guard_result(
-                    guard,
-                    suppress_force_hint=True,
-                    include_targets=True,
-                ),
-                "error_kind": "clear_blocked",
-                "hard_blockers": [v.__dict__ for v in guard.hard_blockers],
-                "soft_blockers": [v.__dict__ for v in guard.soft_blockers],
-            }
-        for target in targets:
-            participant = dict(d.participants.get(target) or {})
-            reservation = d._new_clear_reservation(sender, target, force=False, participant=participant)
-            reservations[target] = reservation
-            d.clear_reservations[target] = reservation
-        d.log("clear_peer_batch_reserved", by_sender=sender, targets=targets)
-    finally:
-        lock_ctx.__exit__(None, None, None)
+        try:
+            if not d.command_deadline_ok(
+                post_lock_worst_case=d.clear_peer_batch_post_lock_worst_case_seconds(len(targets)),
+                margin=20.0,
+                command_class="clear_peer",
+            ):
+                return d.lock_wait_exceeded_response("clear_peer")
+            d._reload_participants_unlocked()
+            validation = d.validate_clear_targets_payload(sender, targets, force=force)
+            if not validation.get("ok"):
+                return validation
+            targets = list(validation.get("targets") or [])
+            queue_snapshot = list(d.queue.read())
+            guard = d.clear_guard_multi(
+                targets,
+                force=False,
+                queue_snapshot=queue_snapshot,
+                aggregates=aggregate_snapshot,
+            )
+            if not guard.ok:
+                return {
+                    "ok": False,
+                    "error": format_clear_guard_result(
+                        guard,
+                        suppress_force_hint=True,
+                        include_targets=True,
+                    ),
+                    "error_kind": "clear_blocked",
+                    "hard_blockers": [v.__dict__ for v in guard.hard_blockers],
+                    "soft_blockers": [v.__dict__ for v in guard.soft_blockers],
+                }
+            for target in targets:
+                participant = dict(d.participants.get(target) or {})
+                reservation = d._new_clear_reservation(sender, target, force=False, participant=participant)
+                reservations[target] = reservation
+                d.clear_reservations[target] = reservation
+            d.log("clear_peer_batch_reserved", by_sender=sender, targets=targets)
+        finally:
+            lock_ctx.__exit__(None, None, None)
 
     results: list[dict] = []
     try:
@@ -743,7 +753,7 @@ def handle_clear_peers(d, sender: str, targets: list[str], *, force: bool) -> di
                     }
                 else:
                     result = {"ok": False, "error": str(exc), "error_kind": "exception", "target": target}
-                    with d.state_lock:
+                    with d.target_state_lock([target]):
                         if d.clear_reservations.get(target) is reservation:
                             marker_id_value = str(reservation.get("identity_marker_id") or "")
                             if marker_id_value:
@@ -752,7 +762,7 @@ def handle_clear_peers(d, sender: str, targets: list[str], *, force: bool) -> di
             results.append(d.normalize_clear_batch_result(target, result if isinstance(result, dict) else {}))
     finally:
         released_targets: list[str] = []
-        with d.state_lock:
+        with d.target_state_lock(list(reservations)):
             for target, reservation in reservations.items():
                 if d.clear_reservations.get(target) is reservation:
                     marker_id_value = str(reservation.get("identity_marker_id") or "")
@@ -789,7 +799,7 @@ def _new_clear_reservation(d, caller: str, target: str, *, force: bool, particip
         "identity_marker_id": "",
         "pane": pane,
         "agent": str(participant.get("agent_type") or ""),
-        "condition": threading.Condition(d.state_lock),
+        "condition": threading.Condition(threading.RLock()),
     }
 
 
@@ -838,11 +848,12 @@ def _wait_for_clear_settle_locked(d, reservation: dict) -> None:
     if not isinstance(condition, threading.Condition):
         return
     deadline = time.time() + delay
-    while not reservation.get("failure_reason"):
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            break
-        condition.wait(min(remaining, 0.25))
+    with condition:
+        while not reservation.get("failure_reason"):
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            condition.wait(min(remaining, 0.25))
 
 
 def run_clear_peer(
@@ -860,90 +871,106 @@ def run_clear_peer(
     aggregate_snapshot: dict = {}
     if reservation is None:
         aggregate_snapshot = d.aggregates.read_aggregates()
-    # Clear still performs its existing state-lock protected tmux sends until
-    # Stage 15b. The target lock only spans the pane-touching section so hook
-    # events can reacquire the target during the clear probe wait.
-    target_lock_ctx = d.target_locks_for([target])
-    target_lock_ctx.__enter__()
-    target_lock_held = True
-    try:
-        state_lock_ctx = d.command_state_lock(
-            post_lock_worst_case=d.clear_peer_post_lock_worst_case_seconds(),
-            margin=20.0,
-            command_class="clear_peer",
-        )
-        state_lock_ctx.__enter__()
-    except Exception as exc:
+    target_lock_ctx = None
+    target_lock_held = False
+
+    def acquire_target_lock() -> None:
+        nonlocal target_lock_ctx, target_lock_held
         if target_lock_held:
-            target_lock_ctx.__exit__(None, None, None)
-            target_lock_held = False
-        if not _is_command_lock_wait_exceeded(exc):
-            raise
-        if hold_reservation_after_success:
-            d.hold_clear_reservation_for_batch_failure(reservation, "lock_wait_exceeded")
-        return d.lock_wait_exceeded_response("clear_peer")
+            return
+        target_lock_ctx = d.target_locks_for([target])
+        target_lock_ctx.__enter__()
+        target_lock_held = True
+
+    def release_target_lock() -> None:
+        nonlocal target_lock_ctx, target_lock_held
+        if not target_lock_held or target_lock_ctx is None:
+            return
+        target_lock_ctx.__exit__(None, None, None)
+        target_lock_ctx = None
+        target_lock_held = False
+
     try:
-        if not d.command_deadline_ok(
-            post_lock_worst_case=d.clear_peer_post_lock_worst_case_seconds(),
-            margin=20.0,
-            command_class="clear_peer",
-        ):
+        acquire_target_lock()
+        try:
+            state_lock_ctx = d.command_state_lock(
+                post_lock_worst_case=d.clear_peer_post_lock_worst_case_seconds(),
+                margin=20.0,
+                command_class="clear_peer",
+            )
+            state_lock_ctx.__enter__()
+        except Exception as exc:
+            if not _is_command_lock_wait_exceeded(exc):
+                raise
             if hold_reservation_after_success:
                 d.hold_clear_reservation_for_batch_failure(reservation, "lock_wait_exceeded")
             return d.lock_wait_exceeded_response("clear_peer")
-        d._reload_participants_unlocked()
-        if target not in d.participants:
-            if hold_reservation_after_success:
-                d.hold_clear_reservation_for_batch_failure(reservation, "target_inactive")
-            return {"ok": False, "error": f"target {target!r} is not an active participant"}
-        participant = dict(d.participants.get(target) or {})
-        if reservation is None:
-            guard = _clear_guard_from_snapshots(
-                d,
-                target,
-                force=force,
-                queue_snapshot=list(d.queue.read()),
-                aggregates=aggregate_snapshot,
-                watchdogs=d.watchdog_snapshot(),
-            )
-            if not guard.ok:
-                return {
-                    "ok": False,
-                    "error": format_clear_guard_result(guard),
-                    "error_kind": "clear_blocked",
-                    "hard_blockers": [v.__dict__ for v in guard.hard_blockers],
-                    "soft_blockers": [v.__dict__ for v in guard.soft_blockers],
-                }
-            reservation = d._new_clear_reservation(caller, target, force=force, participant=participant)
-            d.clear_reservations[target] = reservation
-        else:
-            d.clear_reservations[target] = reservation
-            reservation.setdefault("condition", threading.Condition(d.state_lock))
-            reservation.setdefault("deadline_ts", time.time() + CLEAR_PROBE_TIMEOUT_SECONDS)
-            reservation.setdefault("phase", "reserved")
-            reservation.setdefault("force", bool(force))
+        try:
+            if not d.command_deadline_ok(
+                post_lock_worst_case=d.clear_peer_post_lock_worst_case_seconds(),
+                margin=20.0,
+                command_class="clear_peer",
+            ):
+                if hold_reservation_after_success:
+                    d.hold_clear_reservation_for_batch_failure(reservation, "lock_wait_exceeded")
+                return d.lock_wait_exceeded_response("clear_peer")
+            d._reload_participants_unlocked()
+            if target not in d.participants:
+                if hold_reservation_after_success:
+                    d.hold_clear_reservation_for_batch_failure(reservation, "target_inactive")
+                return {"ok": False, "error": f"target {target!r} is not an active participant"}
+            participant = dict(d.participants.get(target) or {})
+            if reservation is None:
+                guard = _clear_guard_from_snapshots(
+                    d,
+                    target,
+                    force=force,
+                    queue_snapshot=list(d.queue.read()),
+                    aggregates=aggregate_snapshot,
+                    watchdogs=d.watchdog_snapshot(),
+                )
+                if not guard.ok:
+                    return {
+                        "ok": False,
+                        "error": format_clear_guard_result(guard),
+                        "error_kind": "clear_blocked",
+                        "hard_blockers": [v.__dict__ for v in guard.hard_blockers],
+                        "soft_blockers": [v.__dict__ for v in guard.soft_blockers],
+                    }
+                reservation = d._new_clear_reservation(caller, target, force=force, participant=participant)
+                d.clear_reservations[target] = reservation
+            else:
+                d.clear_reservations[target] = reservation
+                reservation.setdefault("condition", threading.Condition(threading.RLock()))
+                reservation.setdefault("deadline_ts", time.time() + CLEAR_PROBE_TIMEOUT_SECONDS)
+                reservation.setdefault("phase", "reserved")
+                reservation.setdefault("force", bool(force))
+        finally:
+            state_lock_ctx.__exit__(None, None, None)
 
         endpoint_detail = d.resolve_endpoint_detail(target, purpose="write")
         pane = str(endpoint_detail.get("pane") or "") if endpoint_detail.get("ok") else ""
         if not pane:
-            if hold_reservation_after_success:
-                d.hold_clear_reservation_for_batch_failure(reservation, "endpoint_lost")
-            else:
-                d.clear_reservations.pop(target, None)
-                marker_id_existing = str(reservation.get("identity_marker_id") or "")
-                if marker_id_existing:
-                    remove_marker(marker_id_existing)
+            with d.state_lock:
+                if hold_reservation_after_success:
+                    d.hold_clear_reservation_for_batch_failure(reservation, "endpoint_lost")
+                else:
+                    d.clear_reservations.pop(target, None)
+                    marker_id_existing = str((reservation or {}).get("identity_marker_id") or "")
+                    if marker_id_existing:
+                        remove_marker(marker_id_existing)
             return {"ok": False, "error": str(endpoint_detail.get("reason") or "endpoint_lost"), "error_kind": "endpoint_lost", "target": target}
         reservation["pane"] = pane
         mode_status = d.pane_mode_status(pane)
         if mode_status.get("error") or mode_status.get("in_mode"):
-            if hold_reservation_after_success:
-                d.hold_clear_reservation_for_batch_failure(reservation, "pane_not_ready")
-            else:
-                d.clear_reservations.pop(target, None)
-                marker_id_existing = str(reservation.get("identity_marker_id") or "")
-                if marker_id_existing:
-                    remove_marker(marker_id_existing)
+            with d.state_lock:
+                if hold_reservation_after_success:
+                    d.hold_clear_reservation_for_batch_failure(reservation, "pane_not_ready")
+                else:
+                    d.clear_reservations.pop(target, None)
+                    marker_id_existing = str(reservation.get("identity_marker_id") or "")
+                    if marker_id_existing:
+                        remove_marker(marker_id_existing)
             return {"ok": False, "error": str(mode_status.get("error") or "pane_in_mode"), "error_kind": "pane_not_ready", "target": target}
 
         marker_id_value = d._write_clear_marker_locked(reservation, participant, pane)
@@ -954,11 +981,12 @@ def run_clear_peer(
             if reservation.get("pane_touched"):
                 d.force_leave_after_clear_failure(target, caller=caller, reason=f"clear_write_failed:{clear_status.get('error')}", reservation=reservation)
             else:
-                if hold_reservation_after_success:
-                    d.hold_clear_reservation_for_batch_failure(reservation, "clear_write_failed")
-                else:
-                    d.clear_reservations.pop(target, None)
-                    remove_marker(marker_id_value)
+                with d.state_lock:
+                    if hold_reservation_after_success:
+                        d.hold_clear_reservation_for_batch_failure(reservation, "clear_write_failed")
+                    else:
+                        d.clear_reservations.pop(target, None)
+                        remove_marker(marker_id_value)
             return {
                 "ok": False,
                 "error": str(clear_status.get("error") or "clear_write_failed"),
@@ -968,6 +996,7 @@ def run_clear_peer(
                 "target": target,
             }
 
+        release_target_lock()
         d._wait_for_clear_settle_locked(reservation)
         if reservation.get("failure_reason"):
             return {
@@ -977,6 +1006,7 @@ def run_clear_peer(
                 "forced_leave": bool(reservation.get("forced_leave")),
                 "target": target,
             }
+        acquire_target_lock()
         settle_mode_status = d.pane_mode_status(pane)
         if settle_mode_status.get("error") or settle_mode_status.get("in_mode"):
             reason_detail = str(settle_mode_status.get("error") or settle_mode_status.get("mode") or "pane_in_mode")
@@ -986,7 +1016,8 @@ def run_clear_peer(
 
         if force:
             try:
-                reservation["force_invalidation"] = d.apply_force_clear_invalidation(target, caller)
+                with d.state_lock:
+                    reservation["force_invalidation"] = d.apply_force_clear_invalidation(target, caller)
             except Exception as exc:
                 d.safe_log("clear_force_invalidation_failed", target=target, by_sender=caller, error=str(exc))
                 d.force_leave_after_clear_failure(target, caller=caller, reason=f"force_invalidation_failed:{exc}", reservation=reservation)
@@ -1001,9 +1032,7 @@ def run_clear_peer(
         reservation["phase"] = "waiting_probe"
         reservation["deadline_ts"] = time.time() + CLEAR_PROBE_TIMEOUT_SECONDS
         d.log("clear_probe_sent", target=target, by_sender=caller, probe_id=reservation.get("probe_id"))
-        if target_lock_held:
-            target_lock_ctx.__exit__(None, None, None)
-            target_lock_held = False
+        release_target_lock()
 
         if d.dry_run:
             reservation["phase"] = "probe_finished"
@@ -1012,11 +1041,12 @@ def run_clear_peer(
             reservation["new_session_id"] = reservation.get("old_session_id") or "dry-run-session"
 
         condition = reservation["condition"]
-        while not reservation.get("probe_response_finished") and not reservation.get("failure_reason"):
-            remaining = float(reservation.get("deadline_ts") or time.time()) - time.time()
-            if remaining <= 0:
-                break
-            condition.wait(min(remaining, 1.0))
+        with condition:
+            while not reservation.get("probe_response_finished") and not reservation.get("failure_reason"):
+                remaining = float(reservation.get("deadline_ts") or time.time()) - time.time()
+                if remaining <= 0:
+                    break
+                condition.wait(min(remaining, 1.0))
         failure_reason = str(reservation.get("failure_reason") or "")
         if failure_reason:
             return {"ok": False, "error": failure_reason, "error_kind": failure_reason, "forced_leave": bool(reservation.get("forced_leave")), "target": target}
@@ -1028,9 +1058,7 @@ def run_clear_peer(
         if marker_id_value:
             update_marker(marker_id_value, lambda current: {**current, "phase": "finalizing"})
     finally:
-        state_lock_ctx.__exit__(None, None, None)
-        if target_lock_held:
-            target_lock_ctx.__exit__(None, None, None)
+        release_target_lock()
         drain_force_invalidation_aggregate_phase(d, reservation, target, caller)
         drain_force_leave_aggregate_replies(d, reservation, caller=caller)
 
@@ -1064,65 +1092,66 @@ def run_clear_peer(
             process_identity=process_identity,
         )
 
-    try:
-        final_lock_ctx = d.command_state_lock(
-            post_lock_worst_case=COMMAND_DEFAULT_POST_LOCK_WORST_CASE_SECONDS,
-            margin=COMMAND_SAFETY_MARGIN_SECONDS,
-            command_class="clear_peer",
-        )
-        final_lock_ctx.__enter__()
-    except Exception as exc:
-        if not _is_command_lock_wait_exceeded(exc):
-            raise
-        d.force_leave_after_clear_failure(target, caller=caller, reason="lock_wait_exceeded_after_identity", reservation=reservation)
-        response = d.lock_wait_exceeded_response("clear_peer")
-        response.update({"forced_leave": True, "target": target})
-        return response
-    try:
-        if not helper_result.get("ok"):
-            d.force_leave_after_clear_failure(target, caller=caller, reason=f"identity_replace_failed:{helper_result.get('error')}", reservation=reservation)
-            return {
-                "ok": False,
-                "error": str(helper_result.get("error") or "identity_replace_failed"),
-                "error_kind": "identity_replace_failed",
-                "forced_leave": True,
-                "target": target,
-            }
-        if identity_required and not verified_process_identity(helper_result.get("live_record") or {}):
-            d.force_leave_after_clear_failure(target, caller=caller, reason="clear_process_identity_unverified", reservation=reservation)
-            return {
-                "ok": False,
-                "error": "clear_process_identity_unverified",
-                "error_kind": "clear_process_identity_unverified",
-                "forced_leave": True,
-                "target": target,
-            }
-        marker_id_value = str(reservation.get("identity_marker_id") or "")
-        if marker_id_value:
-            remove_marker(marker_id_value)
-            reservation["identity_marker_id"] = ""
-        if hold_reservation_after_success:
-            reservation["phase"] = "batch_hold"
-            reservation["batch_hold_complete"] = True
-        else:
-            d.clear_reservations.pop(target, None)
-        d.pending_self_clears.pop(target, None)
-        d.busy[target] = False
-        d.reserved[target] = None
-        d.current_prompt_by_agent.pop(target, None)
-        d.session_mtime_ns = None
-        d._reload_participants_unlocked()
-        d.log(
-            "clear_peer_completed",
-            target=target,
-            by_sender=caller,
-            force=bool(force),
-            probe_id=reservation.get("probe_id"),
-            new_session_id=reservation.get("new_session_id"),
-        )
-    finally:
-        final_lock_ctx.__exit__(None, None, None)
-        drain_force_leave_aggregate_replies(d, reservation, caller=caller)
+    with d.target_locks_for([target]):
+        try:
+            final_lock_ctx = d.command_state_lock(
+                post_lock_worst_case=COMMAND_DEFAULT_POST_LOCK_WORST_CASE_SECONDS,
+                margin=COMMAND_SAFETY_MARGIN_SECONDS,
+                command_class="clear_peer",
+            )
+            final_lock_ctx.__enter__()
+        except Exception as exc:
+            if not _is_command_lock_wait_exceeded(exc):
+                raise
+            d.force_leave_after_clear_failure(target, caller=caller, reason="lock_wait_exceeded_after_identity", reservation=reservation)
+            response = d.lock_wait_exceeded_response("clear_peer")
+            response.update({"forced_leave": True, "target": target})
+            return response
+        try:
+            if not helper_result.get("ok"):
+                d.force_leave_after_clear_failure(target, caller=caller, reason=f"identity_replace_failed:{helper_result.get('error')}", reservation=reservation)
+                return {
+                    "ok": False,
+                    "error": str(helper_result.get("error") or "identity_replace_failed"),
+                    "error_kind": "identity_replace_failed",
+                    "forced_leave": True,
+                    "target": target,
+                }
+            if identity_required and not verified_process_identity(helper_result.get("live_record") or {}):
+                d.force_leave_after_clear_failure(target, caller=caller, reason="clear_process_identity_unverified", reservation=reservation)
+                return {
+                    "ok": False,
+                    "error": "clear_process_identity_unverified",
+                    "error_kind": "clear_process_identity_unverified",
+                    "forced_leave": True,
+                    "target": target,
+                }
+            marker_id_value = str(reservation.get("identity_marker_id") or "")
+            if marker_id_value:
+                remove_marker(marker_id_value)
+                reservation["identity_marker_id"] = ""
+            if hold_reservation_after_success:
+                reservation["phase"] = "batch_hold"
+                reservation["batch_hold_complete"] = True
+            else:
+                d.clear_reservations.pop(target, None)
+            d.pending_self_clears.pop(target, None)
+            d.busy[target] = False
+            d.reserved[target] = None
+            d.current_prompt_by_agent.pop(target, None)
+            d.session_mtime_ns = None
+            d._reload_participants_unlocked()
+            d.log(
+                "clear_peer_completed",
+                target=target,
+                by_sender=caller,
+                force=bool(force),
+                probe_id=reservation.get("probe_id"),
+                new_session_id=reservation.get("new_session_id"),
+            )
+        finally:
+            final_lock_ctx.__exit__(None, None, None)
+            drain_force_leave_aggregate_replies(d, reservation, caller=caller)
     if not hold_reservation_after_success:
         d.request_and_drain_delivery(target, command_aware=True, reason="clear_success")
     return {"ok": True, "target": target, "cleared": True, "force": bool(force), "new_session_id": reservation.get("new_session_id")}
@@ -1148,9 +1177,6 @@ def handle_clear_prompt_submitted_locked(d, agent: str, record: dict) -> bool:
         if not (phase_ok and marker_new_session and turn_ids_compatible):
             reservation["phase"] = "failed"
             reservation["failure_reason"] = "clear_marker_phase2_missing"
-            condition = reservation.get("condition")
-            if isinstance(condition, threading.Condition):
-                condition.notify_all()
             d.log(
                 "clear_marker_phase2_missing",
                 target=agent,
@@ -1170,6 +1196,7 @@ def handle_clear_prompt_submitted_locked(d, agent: str, record: dict) -> bool:
                     reason="clear_marker_phase2_missing",
                     reservation=reservation,
                 )
+            notify_clear_condition(reservation)
             return True
         reservation["new_session_id"] = marker_new_session
         reservation["probe_turn_id"] = marker_turn_id
@@ -1208,9 +1235,7 @@ def handle_clear_response_finished_locked(d, agent: str, record: dict) -> bool:
             reservation["new_session_id"] = response_session_id
         if response_turn_id:
             reservation["probe_turn_id"] = response_turn_id
-        condition = reservation.get("condition")
-        if isinstance(condition, threading.Condition):
-            condition.notify_all()
+        notify_clear_condition(reservation)
         d.log(
             "clear_probe_response_finished",
             target=agent,

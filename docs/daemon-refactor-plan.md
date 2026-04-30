@@ -789,6 +789,14 @@ Checklist:
   requester-originated requests, and incomplete aggregates consistently.
 - Condition/wait signaling for clear probe remains correct after lock changes.
 
+Implementation note:
+
+- Stage 15b may replace clear reservations' `Condition(state_lock)` with a
+  reservation-local condition, provided prompt-submitted failure,
+  response-finished success, and clear settle waits are covered in the same
+  change. The condition is only a wake primitive; target locks remain the
+  serialization boundary for clear pane-touch phases.
+
 ## Stage 16: Cleanup And Documentation
 
 Goal: remove temporary compatibility once the new structure is stable.
