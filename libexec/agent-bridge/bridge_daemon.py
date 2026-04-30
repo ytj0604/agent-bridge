@@ -80,7 +80,7 @@ from bridge_daemon_interrupts import (
     INTERRUPTED_TOMBSTONE_LIMIT_PER_AGENT,
     INTERRUPTED_TOMBSTONE_TTL_SECONDS,
 )
-from bridge_daemon_maintenance import DeliveryRequest, DeliveryScheduler
+from bridge_daemon_maintenance import DeliveryRequest, DeliveryScheduler, MaintenanceScheduler
 from bridge_daemon_status import AGGREGATE_STATUS_LEG_LIMIT, WAIT_STATUS_SECTION_LIMIT
 from bridge_daemon_store import AggregateStore, QueueStore
 from bridge_daemon_state import (
@@ -362,6 +362,7 @@ class BridgeDaemon:
         # hook events and replacement delivery cannot interleave between keys.
         self.lock_facade = LockFacade()
         self.delivery_scheduler = DeliveryScheduler()
+        self.maintenance_scheduler = MaintenanceScheduler()
         self.submit_delay = args.submit_delay
         self.submit_timeout = args.submit_timeout
         self.clear_post_clear_delay_seconds, clear_delay_warning = resolve_clear_post_clear_delay_seconds()
@@ -783,6 +784,18 @@ class BridgeDaemon:
         )
         self.drain_delivery_request(request)
         return request
+
+    def start_maintenance_scheduler(self) -> None:
+        return self.maintenance_scheduler.start(self)
+
+    def stop_maintenance_scheduler(self) -> None:
+        return self.maintenance_scheduler.stop()
+
+    def wake_maintenance_scheduler(self) -> None:
+        return self.maintenance_scheduler.wake()
+
+    def maintenance_scheduler_running(self) -> bool:
+        return self.maintenance_scheduler.is_running()
 
     def sender_blocked_by_clear(self, sender: str) -> bool:
         return daemon_clear_flow.sender_blocked_by_clear(self, sender)
@@ -2617,9 +2630,11 @@ class BridgeDaemon:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state_file.touch(exist_ok=True)
         self.start_command_server()
-        self.cleanup_capture_responses(force=True)
 
         try:
+            if not self.once:
+                self.start_maintenance_scheduler()
+            self.cleanup_capture_responses(force=True)
             with self.state_file.open("r", encoding="utf-8") as stream:
                 if not self.from_start:
                     stream.seek(0, os.SEEK_END)
@@ -2710,6 +2725,7 @@ class BridgeDaemon:
 
                 self.log("daemon_stopped")
         finally:
+            self.stop_maintenance_scheduler()
             self.stop_command_server()
 
 
