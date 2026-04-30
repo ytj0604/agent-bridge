@@ -19,7 +19,6 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
 
 from bridge_clear_marker import (
     cleanup_expired_or_orphaned,
@@ -48,6 +47,7 @@ from bridge_daemon_messages import (
     one_line,
     prompt_body,
 )
+from bridge_daemon_store import AggregateStore, QueueStore
 from bridge_daemon_tmux import (
     PANE_MODE_PROBE_TIMEOUT_SECONDS,
     TMUX_SEND_TIMEOUT_SECONDS,
@@ -356,25 +356,13 @@ def pane_mode_block_since_ts(item: dict) -> float | None:
         return None
 
 
-class QueueStore:
-    def __init__(self, path: str) -> None:
-        self.path = Path(path)
-
-    def update(self, mutator: Callable[[list[dict]], Any]) -> Any:
-        with locked_json(self.path, []) as queue:
-            result = mutator(queue)
-            return result
-
-    def read(self) -> list[dict]:
-        return self.update(lambda queue: list(queue))
-
-
 class BridgeDaemon:
     def __init__(self, args: argparse.Namespace) -> None:
         self.state_file = Path(args.state_file)
         self.public_state_file = Path(args.public_state_file) if args.public_state_file else None
         self.queue = QueueStore(args.queue_file)
         self.aggregate_file = Path(args.queue_file).parent / "aggregates.json"
+        self.aggregates = AggregateStore(self.aggregate_file)
         self.args = args
         self.session_file = Path(args.session_file) if args.session_file else Path(args.queue_file).parent / "session.json"
         self.session_state: dict = {}
@@ -1272,12 +1260,12 @@ class BridgeDaemon:
 
     def clear_guard(self, target: str, *, force: bool) -> ClearGuardResult:
         queue_snapshot = list(self.queue.read())
-        aggregates = read_json(self.aggregate_file, {"version": 1, "aggregates": {}}).get("aggregates") or {}
+        aggregates = self.aggregates.read_aggregates()
         return self._clear_guard_from_snapshots(
             target,
             force=force,
             queue_snapshot=queue_snapshot,
-            aggregates=aggregates if isinstance(aggregates, dict) else {},
+            aggregates=aggregates,
         )
 
     def clear_guard_multi(
@@ -1395,8 +1383,7 @@ class BridgeDaemon:
                 aggregate["updated_ts"] = now_iso
                 cancelled_aggregates.append(str(agg_id))
 
-        with locked_json(self.aggregate_file, {"version": 1, "aggregates": {}}) as data:
-            aggregate_mutator(data)
+        self.aggregates.update(aggregate_mutator)
         for agg_id in cancelled_aggregates:
             self.cancel_watchdogs_for_aggregate(agg_id, reason="requester_cleared")
             self.suppress_pending_watchdog_wakes(ref_aggregate_id=agg_id, reason="requester_cleared")
@@ -1706,13 +1693,12 @@ class BridgeDaemon:
                     return validation
                 targets = list(validation.get("targets") or [])
                 queue_snapshot = list(self.queue.read())
-                aggregate_data = read_json(self.aggregate_file, {"version": 1, "aggregates": {}})
-                aggregates = aggregate_data.get("aggregates") if isinstance(aggregate_data, dict) else {}
+                aggregates = self.aggregates.read_aggregates()
                 guard = self.clear_guard_multi(
                     targets,
                     force=False,
                     queue_snapshot=queue_snapshot,
-                    aggregates=aggregates if isinstance(aggregates, dict) else {},
+                    aggregates=aggregates,
                 )
                 if not guard.ok:
                     return {
@@ -3435,8 +3421,7 @@ class BridgeDaemon:
         except CommandLockWaitExceeded:
             return self.lock_wait_exceeded_response("wait_status")
         try:
-            aggregate_data = read_json(self.aggregate_file, {"aggregates": {}})
-            aggregates = aggregate_data.get("aggregates") or {}
+            aggregates = self.aggregates.read_aggregates()
         except Exception:
             aggregates = {}
 
@@ -3651,8 +3636,7 @@ class BridgeDaemon:
         except CommandLockWaitExceeded:
             return self.lock_wait_exceeded_response("aggregate_status")
         try:
-            aggregate_data = read_json(self.aggregate_file, {"aggregates": {}})
-            aggregate = (aggregate_data.get("aggregates") or {}).get(aggregate_id) or {}
+            aggregate = self.aggregates.get(aggregate_id)
         except Exception:
             aggregate = {}
 
@@ -4820,8 +4804,7 @@ class BridgeDaemon:
 
     def _aggregate_watchdog_progress_text(self, aggregate_id: str, wd: dict) -> str:
         try:
-            data = read_json(self.aggregate_file, {"aggregates": {}})
-            agg = (data.get("aggregates") or {}).get(aggregate_id) or {}
+            agg = self.aggregates.get(aggregate_id)
             replies = agg.get("replies") or {}
             expected = agg.get("expected") or wd.get("ref_aggregate_expected") or []
         except Exception:
@@ -4857,8 +4840,7 @@ class BridgeDaemon:
             return ""
         if phase == WATCHDOG_PHASE_RESPONSE and aggregate_id:
             try:
-                data = read_json(self.aggregate_file, {"aggregates": {}})
-                aggregate = (data.get("aggregates") or {}).get(aggregate_id) or {}
+                aggregate = self.aggregates.get(aggregate_id)
             except Exception:
                 aggregate = {}
             if aggregate and (aggregate.get("delivered") or aggregate.get("status") == "complete"):
@@ -6268,8 +6250,7 @@ class BridgeDaemon:
                 return dict(aggregate)
             return None
 
-        with locked_json(self.aggregate_file, {"version": 1, "aggregates": {}}) as data:
-            completed = mutator(data)
+        completed = self.aggregates.update(mutator)
 
         if completed and completed.get("_cancelled_requester_cleared"):
             self.log(
@@ -6286,8 +6267,7 @@ class BridgeDaemon:
         if completed:
             received_count = len(completed.get("replies") or {})
         else:
-            aggregate_data = read_json(self.aggregate_file, {"aggregates": {}})
-            aggregate = (aggregate_data.get("aggregates") or {}).get(aggregate_id) or {}
+            aggregate = self.aggregates.get(aggregate_id)
             received_count = len(aggregate.get("replies") or {})
             expected_count = len(aggregate.get("expected") or expected)
         self.log(
