@@ -470,17 +470,24 @@ def scenario_wait_status_doc_surfaces_anti_polling(label: str, tmpdir: Path) -> 
     probe = bridge_instructions.probe_prompt("attach", "probe-doc", "codex1", "claude1,codex1")
     cheat_tokens = [
         "agent_wait_status",
+        "--why",
+        "human-readable diagnosis",
         "do not poll",
         "human-prompted",
         "watchdog",
         "agent_view_peer",
         "peer pane debugging",
     ]
+    forbidden_tokens = ["track progress", "monitor progress"]
     for token in cheat_tokens:
         assert_true(token.lower() in cheat.lower(), f"{label}: cheat sheet missing wait_status token {token!r}")
+    for token in forbidden_tokens:
+        assert_true(token.lower() not in cheat.lower(), f"{label}: cheat sheet should avoid polling-like token {token!r}")
     compact_probe_tokens = ["agent_wait_status", "debug surfaces", "do not poll", "human prompt", "watchdog", "bridge-state debug"]
     for token in compact_probe_tokens:
         assert_true(token.lower() in probe.lower(), f"{label}: probe prompt missing wait_status token {token!r}")
+    for token in forbidden_tokens:
+        assert_true(token.lower() not in probe.lower(), f"{label}: probe prompt should avoid polling-like token {token!r}")
 
     help_result = subprocess.run(
         [sys.executable, str(LIBEXEC / "bridge_wait_status.py"), "--help"],
@@ -491,8 +498,10 @@ def scenario_wait_status_doc_surfaces_anti_polling(label: str, tmpdir: Path) -> 
     )
     help_text = " ".join((help_result.stdout + help_result.stderr).split())
     assert_true(help_result.returncode == 0, f"{label}: agent_wait_status --help should exit 0, got {help_result.returncode}: {help_text!r}")
-    for token in ("human-prompted", "watchdog", "do not poll", "[bridge:*]"):
+    for token in ("--why", "human-readable", "human-prompted", "watchdog", "do not poll", "[bridge:*]"):
         assert_true(token.lower() in help_text.lower(), f"{label}: help missing anti-polling token {token!r}: {help_text!r}")
+    for token in forbidden_tokens:
+        assert_true(token.lower() not in help_text.lower(), f"{label}: help should avoid polling-like token {token!r}: {help_text!r}")
     print(f"  PASS  {label}")
 
 
