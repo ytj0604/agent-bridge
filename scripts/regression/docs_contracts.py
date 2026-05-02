@@ -1,16 +1,87 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 from .harness import (
     LIBEXEC,
+    ROOT,
     assert_true,
 )
 
 import bridge_instructions  # noqa: E402
 import bridge_response_guard  # noqa: E402
+
+
+def scenario_agent_bridge_help_and_status_contract(label: str, tmpdir: Path) -> None:
+    env = dict(os.environ)
+    env["AGENT_BRIDGE_STATE_DIR"] = str(tmpdir / "state")
+    env["AGENT_BRIDGE_RUN_DIR"] = str(tmpdir / "run")
+    env["AGENT_BRIDGE_LOG_DIR"] = str(tmpdir / "log")
+
+    help_result = subprocess.run(
+        [str(ROOT / "bin" / "agent-bridge"), "--help"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    help_text = help_result.stdout + help_result.stderr
+    assert_true(help_result.returncode == 0, f"{label}: agent-bridge --help exits 0: {help_text!r}")
+    for token in ("attach", "create", "manage", "status", "healthcheck", "bridge_run", "bridge_manage"):
+        assert_true(token in help_text, f"{label}: help missing {token!r}: {help_text!r}")
+
+    unknown = subprocess.run(
+        [str(ROOT / "bin" / "agent-bridge"), "bogus"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert_true(unknown.returncode == 2, f"{label}: unknown command exits 2, got {unknown.returncode}: {unknown.stderr!r}")
+    assert_true("unknown command" in unknown.stderr, f"{label}: unknown command explains failure: {unknown.stderr!r}")
+
+    status = subprocess.run(
+        [str(ROOT / "bin" / "agent-bridge"), "status"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    direct = subprocess.run(
+        [sys.executable, str(LIBEXEC / "bridge_daemon_ctl.py"), "status", "--all"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert_true(status.returncode == direct.returncode, f"{label}: status return parity: {status.returncode} vs {direct.returncode}")
+    assert_true(status.stdout == direct.stdout, f"{label}: status stdout parity: {status.stdout!r} vs {direct.stdout!r}")
+
+    piped_status = subprocess.run(
+        [str(ROOT / "bin" / "agent-bridge")],
+        input="3\n",
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert_true(piped_status.returncode == 0, f"{label}: piped menu Status should exit 0: stdout={piped_status.stdout!r} stderr={piped_status.stderr!r}")
+    assert_true("Traceback" not in piped_status.stderr, f"{label}: piped menu fallback must not traceback: {piped_status.stderr!r}")
+    assert_true(direct.stdout in piped_status.stdout, f"{label}: piped menu Status should print all-room status: {piped_status.stdout!r}")
+    print(f"  PASS  {label}")
 
 
 def scenario_view_peer_doc_surfaces_disclose_search_semantics(label: str, tmpdir: Path) -> None:
@@ -544,6 +615,7 @@ def scenario_aggregate_status_doc_surfaces_leg_level_and_anti_polling(label: str
 
 
 SCENARIOS = [
+    ('agent_bridge_help_and_status_contract', scenario_agent_bridge_help_and_status_contract),
     ('view_peer_doc_surfaces_disclose_search_semantics', scenario_view_peer_doc_surfaces_disclose_search_semantics),
     ('interrupt_peer_doc_surfaces_disclose_no_op_race', scenario_interrupt_peer_doc_surfaces_disclose_no_op_race),
     ('interrupt_peer_doc_surfaces_no_queued_active_directive', scenario_interrupt_peer_doc_surfaces_no_queued_active_directive),

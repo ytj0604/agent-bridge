@@ -112,6 +112,7 @@ def main() -> int:
         add(label, ok, detail)
     add("python3", shutil.which("python3") is not None, shutil.which("python3") or "not found")
     add("tmux", shutil.which("tmux") is not None, shutil.which("tmux") or "not found")
+    add("agent_bridge_on_path", shutil.which("agent-bridge") is not None, shutil.which("agent-bridge") or "not found")
     add("bridge_run_on_path", shutil.which("bridge_run") is not None, shutil.which("bridge_run") or "not found")
     add("bridge_manage_on_path", shutil.which("bridge_manage") is not None, shutil.which("bridge_manage") or "not found")
     add("bridge_healthcheck_on_path", shutil.which("bridge_healthcheck") is not None, shutil.which("bridge_healthcheck") or "not found")
@@ -125,9 +126,11 @@ def main() -> int:
     add("agent_cancel_message_on_path", shutil.which("agent_cancel_message") is not None, shutil.which("agent_cancel_message") or "not found")
     add("agent_wait_status_on_path", shutil.which("agent_wait_status") is not None, shutil.which("agent_wait_status") or "not found")
     add("agent_aggregate_status_on_path", shutil.which("agent_aggregate_status") is not None, shutil.which("agent_aggregate_status") or "not found")
+    add("agent_bridge_underscore_not_on_path", shutil.which("agent_bridge") is None, shutil.which("agent_bridge") or "not found")
     add("bridge_peer_not_on_path", shutil.which("bridge_peer") is None, shutil.which("bridge_peer") or "not found")
     add("list_peer_not_on_path", shutil.which("list_peer") is None, shutil.which("list_peer") or "not found")
     executable_targets = [
+        ("agent_bridge_target", bin_dir() / "agent-bridge"),
         ("bridge_run_target", bin_dir() / "bridge_run.sh"),
         ("bridge_manage_target", bin_dir() / "bridge_manage.sh"),
         ("bridge_healthcheck_target", bin_dir() / "bridge_healthcheck.sh"),
@@ -170,6 +173,7 @@ def main() -> int:
         "log_dir",
         "python3",
         "tmux",
+        "agent_bridge_on_path",
         "agent_send_peer_on_path",
         "agent_list_peers_on_path",
         "agent_view_peer_on_path",
@@ -180,8 +184,10 @@ def main() -> int:
         "agent_cancel_message_on_path",
         "agent_wait_status_on_path",
         "agent_aggregate_status_on_path",
+        "agent_bridge_underscore_not_on_path",
         "bridge_peer_not_on_path",
         "list_peer_not_on_path",
+        "agent_bridge_target",
         "bridge_run_target",
         "bridge_manage_target",
         "bridge_healthcheck_target",

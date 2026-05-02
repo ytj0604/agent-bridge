@@ -86,6 +86,54 @@ def _write_fake_uninstall_tree(root: Path) -> None:
         shutil.copy2(LIBEXEC / name, libexec / name)
 
 
+def _write_fake_cli_tree(root: Path, marker: Path) -> None:
+    bin_dir = root / "bin"
+    libexec = root / "libexec" / "agent-bridge"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    libexec.mkdir(parents=True, exist_ok=True)
+    for name in ("agent-bridge", "bridge_run.sh", "bridge_manage.sh"):
+        shutil.copy2(ROOT / "bin" / name, bin_dir / name)
+        os.chmod(bin_dir / name, 0o755)
+    shutil.copy2(ROOT / "libexec" / "agent-bridge" / "bridge_common.sh", libexec / "bridge_common.sh")
+    (libexec / "bridge_paths.py").write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "root = Path(__file__).resolve().parents[2]\n"
+        "kind = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+        "mapping = {'state': root / 'state', 'run': root / 'run', 'log': root / 'log'}\n"
+        "print(mapping.get(kind, root))\n",
+        encoding="utf-8",
+    )
+    (libexec / "bridge_attach.py").write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(marker)!r}).write_text('attach ' + ' '.join(sys.argv[1:]) + '\\n', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    (libexec / "bridge_daemon_ctl.py").write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"with pathlib.Path({str(marker)!r}).open('a', encoding='utf-8') as fh:\n"
+        "    fh.write('daemon_ctl ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+        "print('daemon status')\n",
+        encoding="utf-8",
+    )
+    (libexec / "bridge_manage_summary.py").write_text(
+        "#!/usr/bin/env python3\n"
+        "print('Agents:\\n- worker codex active target=test:1.1 pane=%1')\n",
+        encoding="utf-8",
+    )
+    (libexec / "bridge_select.py").write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"with pathlib.Path({str(marker)!r}).open('a', encoding='utf-8') as fh:\n"
+        "    fh.write('select ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+        "print('9')\n",
+        encoding="utf-8",
+    )
+
+
 def _run_fake_uninstall(
     root: Path,
     *,
@@ -170,6 +218,110 @@ def scenario_uninstall_sh_hook_helper_failure_aborts(label: str, tmpdir: Path) -
     print(f"  PASS  {label}")
 
 
+def scenario_uninstall_sh_removes_agent_bridge_shim(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "uninstall-agent-bridge-shim"
+    root.mkdir()
+    _write_fake_uninstall_tree(root)
+    env = _fake_install_env(tmpdir / "remove-agent-bridge-env")
+    bin_dir = Path(env["XDG_BIN_HOME"])
+    bin_dir.mkdir(parents=True)
+    for name in ("agent-bridge", "bridge_run", "bridge_manage"):
+        path = bin_dir / name
+        path.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        os.chmod(path, 0o755)
+
+    proc = _run_fake_uninstall(root, env=env, extra_args=["--keep-hooks"])
+    assert_true(proc.returncode == 0, f"{label}: uninstall should succeed: {proc.stderr!r}")
+    for name in ("agent-bridge", "bridge_run", "bridge_manage"):
+        assert_true(not (bin_dir / name).exists(), f"{label}: {name} shim should be removed")
+
+    proc_again = _run_fake_uninstall(root, env=env, extra_args=["--keep-hooks"])
+    assert_true(proc_again.returncode == 0, f"{label}: second uninstall should be idempotent when shims are absent: {proc_again.stderr!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_legacy_wrappers_use_in_tree_agent_bridge(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "wrapper-tree"
+    marker = tmpdir / "wrapper-marker.txt"
+    _write_fake_cli_tree(root, marker)
+    sentinel = tmpdir / "sentinel"
+    sentinel.mkdir()
+    (sentinel / "agent-bridge").write_text(
+        "#!/usr/bin/env bash\n"
+        "echo sentinel agent-bridge should not run >&2\n"
+        "exit 44\n",
+        encoding="utf-8",
+    )
+    os.chmod(sentinel / "agent-bridge", 0o755)
+    env = _fake_install_env(tmpdir / "wrapper-env", path_prefix=sentinel)
+
+    run_proc = subprocess.run(
+        [str(root / "bin" / "bridge_run.sh"), "-s", "RoomA"],
+        input="",
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert_true(run_proc.returncode == 0, f"{label}: bridge_run wrapper should not hit PATH sentinel: {run_proc.stderr!r}")
+    assert_true(marker.read_text(encoding="utf-8") == "attach -s RoomA\n", f"{label}: bridge_run should call in-tree dispatcher attach path")
+
+    marker.write_text("", encoding="utf-8")
+    manage_proc = subprocess.run(
+        [str(root / "bin" / "bridge_manage.sh"), "--status"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert_true(manage_proc.returncode == 0, f"{label}: bridge_manage wrapper should not hit PATH sentinel: {manage_proc.stderr!r}")
+    assert_true(marker.read_text(encoding="utf-8") == "daemon_ctl status --all\n", f"{label}: bridge_manage --status should call all-room status")
+    print(f"  PASS  {label}")
+
+
+def scenario_agent_bridge_attach_and_manage_dispatch_contracts(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "dispatch-tree"
+    marker = tmpdir / "dispatch-marker.txt"
+    _write_fake_cli_tree(root, marker)
+    env = _fake_install_env(tmpdir / "dispatch-env")
+
+    attach_proc = subprocess.run(
+        [str(root / "bin" / "agent-bridge"), "attach", "-s", "RoomB"],
+        input="",
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert_true(attach_proc.returncode == 0, f"{label}: attach -s should succeed: {attach_proc.stderr!r}")
+    assert_true(marker.read_text(encoding="utf-8") == "attach -s RoomB\n", f"{label}: attach should reach bridge_attach.py with -s RoomB")
+
+    marker.write_text("", encoding="utf-8")
+    status_proc = subprocess.run(
+        [str(root / "bin" / "agent-bridge"), "manage", "--status"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert_true(status_proc.returncode == 0, f"{label}: manage --status should succeed: {status_proc.stderr!r}")
+    assert_true(marker.read_text(encoding="utf-8") == "daemon_ctl status --all\n", f"{label}: manage --status should not enter a menu")
+
+    marker.write_text("", encoding="utf-8")
+    manage_proc = subprocess.run(
+        [str(root / "bin" / "agent-bridge"), "manage", "-s", "RoomC"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert_true(manage_proc.returncode == 0, f"{label}: manage -s should enter preselected room menu: {manage_proc.stderr!r}")
+    marker_text = marker.read_text(encoding="utf-8")
+    assert_true("daemon_ctl status --json" not in marker_text, f"{label}: manage -s should skip room selection: {marker_text!r}")
+    assert_true("select --title Room: RoomC" in marker_text, f"{label}: manage -s should render room action menu: {marker_text!r}")
+    print(f"  PASS  {label}")
+
+
 def _write_fake_install_tree(root: Path, *, omit: Path | None = None) -> None:
     shutil.copy2(ROOT / "install.sh", root / "install.sh")
     helper = root / "libexec" / "agent-bridge" / "bridge_set_editor_mode.py"
@@ -230,6 +382,10 @@ def _write_fake_healthcheck_tree(root: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         os.chmod(target, 0o755)
+    for name in ("bridge_run", "bridge_manage", "bridge_healthcheck"):
+        shim = root / "bin" / name
+        shim.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        os.chmod(shim, 0o755)
 
 
 def _write_fake_hook_installer(root: Path, *, exit_code: int = 0, argv_file: Path | None = None) -> Path:
@@ -294,6 +450,16 @@ def _run_fake_install(
 def _run_fake_healthcheck(root: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["bash", str(root / "bin" / "bridge_healthcheck.sh")],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+
+def _run_fake_healthcheck_json(root: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", str(root / "bin" / "bridge_healthcheck.sh"), "--json"],
         capture_output=True,
         text=True,
         env=env,
@@ -394,31 +560,91 @@ def scenario_bridge_healthcheck_sh_python_version_gate(label: str, tmpdir: Path)
     print(f"  PASS  {label}")
 
 
+def scenario_bridge_healthcheck_agent_bridge_contracts(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "healthcheck-agent-bridge"
+    root.mkdir()
+    _write_fake_healthcheck_tree(root)
+    fake311 = _write_fake_python3(tmpdir / "hc-agent-bridge-python", "3.11.9")
+    env = _fake_healthcheck_env(tmpdir / "hc-agent-bridge-env", root, fake311)
+
+    proc = _run_fake_healthcheck_json(root, env)
+    assert_true(proc.returncode == 0, f"{label}: healthcheck should pass with agent-bridge command: {proc.stderr!r}")
+    checks = {item["name"]: item for item in json.loads(proc.stdout)}
+    for name in ("agent_bridge_on_path", "agent_bridge_target", "agent_bridge_underscore_not_on_path"):
+        assert_true(name in checks, f"{label}: missing healthcheck row {name!r}: {checks}")
+        assert_true(checks[name]["ok"], f"{label}: {name} should pass: {checks[name]}")
+
+    underscore = fake311 / "agent_bridge"
+    underscore.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    os.chmod(underscore, 0o755)
+    failed = _run_fake_healthcheck_json(root, env)
+    assert_true(failed.returncode == 1, f"{label}: underscore command collision should hard-fail healthcheck")
+    failed_checks = {item["name"]: item for item in json.loads(failed.stdout)}
+    assert_true(
+        not failed_checks["agent_bridge_underscore_not_on_path"]["ok"],
+        f"{label}: underscore collision row should fail: {failed_checks['agent_bridge_underscore_not_on_path']}",
+    )
+    print(f"  PASS  {label}")
+
+
 def scenario_install_sh_chmods_target_or_fails(label: str, tmpdir: Path) -> None:
     positive_root = tmpdir / "install-positive"
     positive_root.mkdir()
     _write_fake_install_tree(positive_root)
+    agent_bridge_target = positive_root / "bin" / "agent-bridge"
     alarm_target = positive_root / "model-bin" / "agent_alarm"
+    assert_true(not os.access(agent_bridge_target, os.X_OK), f"{label}: precondition agent-bridge target starts non-executable")
     assert_true(not os.access(alarm_target, os.X_OK), f"{label}: precondition target starts non-executable")
     proc = _run_fake_install(positive_root, tmpdir / "shims-positive")
     assert_true(proc.returncode == 0, f"{label}: install should recover non-executable targets, got {proc.returncode}: {proc.stderr}")
+    assert_true(os.access(agent_bridge_target, os.X_OK), f"{label}: install should chmod agent-bridge target executable")
     assert_true(os.access(alarm_target, os.X_OK), f"{label}: install should chmod shim target executable")
+    assert_true(os.access(tmpdir / "shims-positive" / "agent-bridge", os.X_OK), f"{label}: agent-bridge shim itself should be executable")
     assert_true(os.access(tmpdir / "shims-positive" / "agent_alarm", os.X_OK), f"{label}: shim itself should be executable")
 
-    missing_root = tmpdir / "install-missing"
-    missing_root.mkdir()
-    _write_fake_install_tree(missing_root, omit=Path("model-bin/agent_alarm"))
-    proc = _run_fake_install(missing_root, tmpdir / "shims-missing")
+    missing_agent_bridge_root = tmpdir / "install-missing-agent-bridge"
+    missing_agent_bridge_root.mkdir()
+    _write_fake_install_tree(missing_agent_bridge_root, omit=Path("bin/agent-bridge"))
+    proc = _run_fake_install(missing_agent_bridge_root, tmpdir / "shims-missing-agent-bridge")
     assert_true(proc.returncode != 0, f"{label}: missing shim target must hard fail")
-    assert_true("missing shim target for agent_alarm" in proc.stderr, f"{label}: missing-target stderr should name shim: {proc.stderr!r}")
+    assert_true("missing shim target for agent-bridge" in proc.stderr, f"{label}: missing-target stderr should name shim: {proc.stderr!r}")
 
-    failing_root = tmpdir / "install-failing"
-    failing_root.mkdir()
-    _write_fake_install_tree(failing_root)
-    fakebin = tmpdir / "fakebin"
-    fakebin.mkdir()
-    fake_chmod = fakebin / "chmod"
-    fake_chmod.write_text(
+    missing_alarm_root = tmpdir / "install-missing-agent-alarm"
+    missing_alarm_root.mkdir()
+    _write_fake_install_tree(missing_alarm_root, omit=Path("model-bin/agent_alarm"))
+    proc = _run_fake_install(missing_alarm_root, tmpdir / "shims-missing-agent-alarm")
+    assert_true(proc.returncode != 0, f"{label}: missing model shim target must hard fail")
+    assert_true("missing shim target for agent_alarm" in proc.stderr, f"{label}: missing model-target stderr should name shim: {proc.stderr!r}")
+
+    failing_agent_bridge_root = tmpdir / "install-failing-agent-bridge"
+    failing_agent_bridge_root.mkdir()
+    _write_fake_install_tree(failing_agent_bridge_root)
+    fakebin_agent_bridge = tmpdir / "fakebin-agent-bridge"
+    fakebin_agent_bridge.mkdir()
+    fake_chmod_agent_bridge = fakebin_agent_bridge / "chmod"
+    fake_chmod_agent_bridge.write_text(
+        "#!/usr/bin/env bash\n"
+        "case \"$*\" in\n"
+        "  *bin/agent-bridge*) echo fake chmod failure >&2; exit 42 ;;\n"
+        "esac\n"
+        "exec /bin/chmod \"$@\"\n",
+        encoding="utf-8",
+    )
+    os.chmod(fake_chmod_agent_bridge, 0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{fakebin_agent_bridge}:{env.get('PATH', '')}"
+    proc = _run_fake_install(failing_agent_bridge_root, tmpdir / "shims-failing-agent-bridge", env=env)
+    assert_true(proc.returncode != 0, f"{label}: chmod failure must hard fail")
+    assert_true("cannot make shim target executable for agent-bridge" in proc.stderr, f"{label}: chmod failure stderr should name shim: {proc.stderr!r}")
+    assert_true(not os.access(failing_agent_bridge_root / "bin" / "agent-bridge", os.X_OK), f"{label}: failed chmod target should remain non-executable")
+
+    failing_alarm_root = tmpdir / "install-failing-agent-alarm"
+    failing_alarm_root.mkdir()
+    _write_fake_install_tree(failing_alarm_root)
+    fakebin_alarm = tmpdir / "fakebin-agent-alarm"
+    fakebin_alarm.mkdir()
+    fake_chmod_alarm = fakebin_alarm / "chmod"
+    fake_chmod_alarm.write_text(
         "#!/usr/bin/env bash\n"
         "case \"$*\" in\n"
         "  *model-bin/agent_alarm*) echo fake chmod failure >&2; exit 42 ;;\n"
@@ -426,13 +652,13 @@ def scenario_install_sh_chmods_target_or_fails(label: str, tmpdir: Path) -> None
         "exec /bin/chmod \"$@\"\n",
         encoding="utf-8",
     )
-    os.chmod(fake_chmod, 0o755)
+    os.chmod(fake_chmod_alarm, 0o755)
     env = dict(os.environ)
-    env["PATH"] = f"{fakebin}:{env.get('PATH', '')}"
-    proc = _run_fake_install(failing_root, tmpdir / "shims-failing", env=env)
-    assert_true(proc.returncode != 0, f"{label}: chmod failure must hard fail")
-    assert_true("cannot make shim target executable for agent_alarm" in proc.stderr, f"{label}: chmod failure stderr should name shim: {proc.stderr!r}")
-    assert_true(not os.access(failing_root / "model-bin" / "agent_alarm", os.X_OK), f"{label}: failed chmod target should remain non-executable")
+    env["PATH"] = f"{fakebin_alarm}:{env.get('PATH', '')}"
+    proc = _run_fake_install(failing_alarm_root, tmpdir / "shims-failing-agent-alarm", env=env)
+    assert_true(proc.returncode != 0, f"{label}: model chmod failure must hard fail")
+    assert_true("cannot make shim target executable for agent_alarm" in proc.stderr, f"{label}: model chmod failure stderr should name shim: {proc.stderr!r}")
+    assert_true(not os.access(failing_alarm_root / "model-bin" / "agent_alarm", os.X_OK), f"{label}: failed model target should remain non-executable")
     print(f"  PASS  {label}")
 
 
@@ -1155,11 +1381,15 @@ SCENARIOS = [
     ('uninstall_sh_non_dry_run_removes_hook_entries', scenario_uninstall_sh_non_dry_run_removes_hook_entries),
     ('uninstall_sh_keep_hooks_skips_helper_under_dry_run', scenario_uninstall_sh_keep_hooks_skips_helper_under_dry_run),
     ('uninstall_sh_hook_helper_failure_aborts', scenario_uninstall_sh_hook_helper_failure_aborts),
+    ('uninstall_sh_removes_agent_bridge_shim', scenario_uninstall_sh_removes_agent_bridge_shim),
+    ('legacy_wrappers_use_in_tree_agent_bridge', scenario_legacy_wrappers_use_in_tree_agent_bridge),
+    ('agent_bridge_attach_and_manage_dispatch_contracts', scenario_agent_bridge_attach_and_manage_dispatch_contracts),
     ('direct_exec_targets_executable', scenario_direct_exec_targets_executable),
     ('healthcheck_executable_helper_distinguishes_states', scenario_healthcheck_executable_helper_distinguishes_states),
     ('python_env_override_removed_from_tracked_files', scenario_python_env_override_removed_from_tracked_files),
     ('install_sh_python_version_gate', scenario_install_sh_python_version_gate),
     ('bridge_healthcheck_sh_python_version_gate', scenario_bridge_healthcheck_sh_python_version_gate),
+    ('bridge_healthcheck_agent_bridge_contracts', scenario_bridge_healthcheck_agent_bridge_contracts),
     ('install_sh_chmods_target_or_fails', scenario_install_sh_chmods_target_or_fails),
     ('install_sh_default_updates_shell_rc', scenario_install_sh_default_updates_shell_rc),
     ('install_sh_shell_rc_dry_run_and_opt_out', scenario_install_sh_shell_rc_dry_run_and_opt_out),

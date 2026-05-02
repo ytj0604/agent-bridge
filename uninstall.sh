@@ -84,6 +84,7 @@ fi
 
 if [[ "$remove_shims" == "1" ]]; then
   for name in \
+    agent-bridge \
     bridge_run \
     bridge_manage \
     bridge_healthcheck \

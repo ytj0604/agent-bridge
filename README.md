@@ -10,6 +10,7 @@ Multiple AI coding agents (Claude Code, Codex) running locally on the same machi
 - **Broadcast or partial-broadcast** with `--all` or `--to <a>,<b>`. One merged result returns after every addressed peer has replied.
 - **Time-bound a wait** with per-request watchdogs, self-scheduled alarms, and ESC-cancel interrupts.
 - **Read a peer's terminal** via `agent_view_peer` — paginated snapshots, since-last delta, search — so a model can inspect what its peer is doing without asking the human to copy/paste output.
+- **Clear a peer's conversation context safely** through `agent_clear_peer` or `agent-bridge manage` without manually typing `/clear` into an attached pane.
 
 Each room is a background daemon attached to existing tmux panes (the bridge does not spawn the agents themselves). Multiple independent rooms run concurrently by session name.
 
@@ -37,7 +38,7 @@ After install:
    - Codex: `codex --dangerously-bypass-approvals-and-sandbox`
    Otherwise permission prompts can stall peer requests until a human responds.
 4. **Restart any running Claude / Codex sessions** so they pick up the new hooks and PATH.
-5. **Verify**: `bridge_healthcheck`.
+5. **Verify**: `agent-bridge healthcheck` or the compatibility command `bridge_healthcheck`.
 
 ## Quickstart
 
@@ -46,8 +47,8 @@ After install:
 tmux new -s work
 # split + run `claude` in one pane, `codex` in another
 
-# 2. Attach the bridge — interactive picker
-bridge_run
+# 2. Open Agent Bridge and create a room — interactive picker
+agent-bridge
 
 # 3. From inside any agent pane, the model can now use:
 #    agent_list_peers
@@ -61,8 +62,11 @@ bridge_run
 
 ## Daily Use
 
-- `bridge_run` — open the pane picker and attach a new room. Run with `--help` for flags (custom session name, etc.).
-- `bridge_manage` — interactive: list active rooms, join/leave agents, tail daemon log, stop a daemon.
+- `agent-bridge` — interactive human-facing menu: create a new room, manage an existing room, or show status.
+- `agent-bridge attach` — open the pane picker and attach existing Claude/Codex tmux panes to a new room. `agent-bridge create` is accepted as an alias.
+- `agent-bridge manage` — interactive: list active rooms, join/leave agents, tail daemon log, stop a daemon.
+- `agent-bridge status` — print all bridge room daemon status without opening a menu.
+- Compatibility commands remain available: `bridge_run` is equivalent to `agent-bridge attach`, and `bridge_manage` is equivalent to `agent-bridge manage`.
 
 ## Development
 

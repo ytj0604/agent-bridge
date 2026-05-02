@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+_bridge_bin_dir="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent)' "${BASH_SOURCE[0]}")"
+_bridge_root="$(cd "$_bridge_bin_dir/.." >/dev/null 2>&1 && pwd -P)"
+source "$_bridge_root/libexec/agent-bridge/bridge_common.sh"
+
+default_session="agent-bridge-auto"
+session=""
+session_explicit=0
+
+usage() {
+  local code="${1:-2}"
+  cat >&2 <<'EOF'
+usage: agent-bridge [command] [options]
+
+Human-facing Agent Bridge command.
+
+Commands:
+  attach, create             Attach existing Claude/Codex tmux panes to a new room
+  manage                     Manage an existing room
+  status                     Show all bridge room daemon status
+  healthcheck                Validate local dependencies and config
+  help                       Show this help
+
+Running without a command opens an interactive menu:
+  Create new room
+  Manage existing room
+  Status
+  Quit
+
+Without an attached TTY, the menu falls back to numbered stdin selection.
+
+Compatibility commands:
+  bridge_run                 Equivalent to: agent-bridge attach
+  bridge_manage              Equivalent to: agent-bridge manage
+EOF
+  exit "$code"
+}
+
+create_usage() {
+  local code="${1:-2}"
+  cat >&2 <<'EOF'
+usage: agent-bridge attach [options]
+       agent-bridge create [options]
+
+Attach existing Claude/Codex tmux panes to a new bridge room.
+
+Prerequisite:
+  Start Claude Code and/or Codex in tmux panes first, then run this command.
+  Agent Bridge does not launch agents; it only attaches already-running panes.
+
+Options:
+  -s, --session NAME          Bridge room/state name; skips the room-name prompt
+  -h, --help                  Show this help
+
+If -s is omitted, the command prompts:
+  Room name [agent-bridge-auto]:
+
+If the default room already exists, the suggested default becomes
+agent-bridge-auto-2, agent-bridge-auto-3, etc. A name typed explicitly at the
+prompt is used as-is.
+EOF
+  exit "$code"
+}
+
+manage_usage() {
+  local code="${1:-2}"
+  cat >&2 <<'EOF'
+usage: agent-bridge manage [-s session] [--status]
+
+Interactive bridge room manager.
+
+Options:
+  -s, --session NAME          Manage this room directly; skips room selection
+  --status                    Show all bridge room daemon status and exit
+  -h, --help                  Show this help
+EOF
+  exit "$code"
+}
+
+bridge_has_tty() {
+  [[ -r /dev/tty && -w /dev/tty ]] && { : </dev/tty >/dev/tty; } 2>/dev/null
+}
+
+choose_default_session() {
+  "$BRIDGE_PYTHON" - "$BRIDGE_STATE_DIR" "$BRIDGE_RUN_DIR" "$default_session" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+state_dir = Path(sys.argv[1])
+run_dir = Path(sys.argv[2])
+base = sys.argv[3]
+
+
+def exists(name: str) -> bool:
+    return (
+        (state_dir / name / "session.json").exists()
+        or (run_dir / f"{name}.pid").exists()
+        or (run_dir / f"{name}.json").exists()
+    )
+
+
+match = re.match(r"^(.*?)-(\d+)$", base)
+prefix = match.group(1) if match else base
+start = int(match.group(2)) if match else 1
+
+if not exists(base):
+    print(base)
+    raise SystemExit(0)
+
+idx = max(2, start + 1)
+while True:
+    candidate = f"{prefix}-{idx}"
+    if not exists(candidate):
+        print(candidate)
+        raise SystemExit(0)
+    idx += 1
+PY
+}
+
+validate_session_name() {
+  local value="$1"
+  "$BRIDGE_PYTHON" - "$value" <<'PY'
+import re
+import sys
+
+name = sys.argv[1]
+if not re.match(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$", name):
+    print("agent-bridge attach: room name must start with a letter and contain only letters, digits, _, ., -", file=sys.stderr)
+    raise SystemExit(2)
+PY
+}
+
+prompt_session_name() {
+  local suggested value
+  suggested="$(choose_default_session)"
+  if bridge_has_tty; then
+    value="$(bridge_prompt_line "Room name [$suggested]: " </dev/tty)" || exit 130
+  else
+    value="$suggested"
+  fi
+  value="${value:-$suggested}"
+  validate_session_name "$value"
+  session="$value"
+}
+
+cmd_attach() {
+  session=""
+  session_explicit=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -s|--session)
+        session="$2"
+        session_explicit=1
+        shift 2
+        ;;
+      -h|--help)
+        create_usage 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        create_usage
+        ;;
+      *)
+        create_usage
+        ;;
+    esac
+  done
+
+  if [[ $# -gt 0 ]]; then
+    create_usage
+  fi
+
+  if [[ "$session_explicit" -eq 0 ]]; then
+    prompt_session_name
+  else
+    validate_session_name "$session"
+  fi
+
+  if bridge_has_tty; then
+    exec "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_attach.py" -s "$session" </dev/tty >/dev/tty 2>&1
+  fi
+  exec "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_attach.py" -s "$session"
+}
+
+list_rooms() {
+  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_daemon_ctl.py" status --json |
+    "$BRIDGE_PYTHON" -c 'import json,sys
+rows=json.load(sys.stdin)
+for row in rows:
+    print("\t".join(str(row.get(k) or "") for k in ("session","status","participants","targets")))'
+}
+
+choose_room() {
+  if [[ -n "$session" ]]; then
+    return 0
+  fi
+  rooms=()
+  while IFS= read -r row; do
+    rooms+=("$row")
+  done < <(list_rooms)
+  if [[ "${#rooms[@]}" -eq 0 ]]; then
+    echo "no bridge rooms found"
+    exit 0
+  fi
+  labels=()
+  local row name status participants targets
+  for row in "${rooms[@]}"; do
+    IFS=$'\t' read -r name status participants targets <<< "$row"
+    labels+=("$name [$status] agents=${participants:-none} $targets")
+  done
+  if ! choice="$(bridge_select_menu "Bridge rooms" "${labels[@]}")"; then
+    exit 130
+  fi
+  IFS=$'\t' read -r session _ <<< "${rooms[$choice]}"
+}
+
+room_summary() {
+  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_manage_summary.py" --session "$session"
+}
+
+list_aliases() {
+  "$BRIDGE_PYTHON" - "$BRIDGE_STATE_DIR/$session/session.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+try:
+    data=json.loads(Path(sys.argv[1]).read_text())
+except Exception:
+    data={}
+for alias in sorted((data.get("participants") or {}).keys()):
+    print(alias)
+PY
+}
+
+join_agent() {
+  if bridge_has_tty; then
+    "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_join.py" -s "$session" </dev/tty >/dev/tty 2>&1
+  else
+    "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_join.py" -s "$session"
+  fi
+}
+
+leave_agent() {
+  aliases=()
+  while IFS= read -r alias; do
+    aliases+=("$alias")
+  done < <(list_aliases)
+  if [[ "${#aliases[@]}" -eq 0 ]]; then
+    echo "no agents in room"
+    return 0
+  fi
+  if ! choice="$(bridge_select_menu "Select agent to leave" "${aliases[@]}")"; then
+    return 130
+  fi
+  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_leave.py" -s "$session" --alias "${aliases[$choice]}"
+}
+
+clear_agent() {
+  aliases=()
+  while IFS= read -r alias; do
+    aliases+=("$alias")
+  done < <(list_aliases)
+  if [[ "${#aliases[@]}" -eq 0 ]]; then
+    echo "no agents in room"
+    return 0
+  fi
+  if ! choice="$(bridge_select_menu "Select agent to clear" "${aliases[@]}")"; then
+    return 130
+  fi
+  local alias="${aliases[$choice]}"
+  set +e
+  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_clear_peer.py" --session "$session" --from bridge --allow-spoof --to "$alias"
+  local code=$?
+  set -e
+  if [[ "$code" -eq 0 ]]; then
+    return 0
+  fi
+  if ! retry="$(bridge_select_menu "Clear $alias failed. Retry with --force?" "Retry with --force" "Cancel")"; then
+    return 130
+  fi
+  if [[ "$retry" == "0" ]]; then
+    "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_clear_peer.py" --session "$session" --from bridge --allow-spoof --to "$alias" --force
+  fi
+}
+
+stop_room() {
+  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_daemon_ctl.py" stop -s "$session"
+  if "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_daemon_ctl.py" status -s "$session" --json |
+    "$BRIDGE_PYTHON" -c 'import json,sys; raise SystemExit(0 if not json.load(sys.stdin) else 1)'
+  then
+    session=""
+    choose_room
+  fi
+}
+
+reload_daemon() {
+  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_daemon_ctl.py" restart -s "$session"
+}
+
+show_status() {
+  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_daemon_ctl.py" status -s "$session"
+}
+
+show_all_status() {
+  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_daemon_ctl.py" status --all
+}
+
+tail_daemon_log() {
+  local log_file="$BRIDGE_LOG_DIR/$session.daemon.log"
+  if [[ ! -f "$log_file" ]]; then
+    echo "no daemon log found: $log_file"
+    return 0
+  fi
+  if bridge_has_tty; then
+    echo "Tailing $log_file (Ctrl-C to return)." > /dev/tty
+    set +e
+    tail -n 80 -f "$log_file" </dev/tty >/dev/tty 2>&1
+    set -e
+  else
+    tail -n 120 "$log_file"
+  fi
+}
+
+clear_peer_view_cache() {
+  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_captures.py" summary -s "$session"
+  local title
+  title="Clear peer view cache for $session?"$'\n'"This removes agent_view_peer snapshots/cursors only. It does not affect messages, panes, or daemon state."
+  if ! choice="$(bridge_select_menu "$title" \
+    "Clear peer view cache" \
+    "Cancel")"; then
+    return 130
+  fi
+  if [[ "$choice" != "0" ]]; then
+    return 0
+  fi
+  "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_captures.py" clear -s "$session"
+}
+
+cmd_manage() {
+  session=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -s|--session)
+        session="$2"
+        shift 2
+        ;;
+      --status)
+        exec "$BRIDGE_PYTHON" "$BRIDGE_LIBEXEC_DIR/bridge_daemon_ctl.py" status --all
+        ;;
+      -h|--help)
+        manage_usage 0
+        ;;
+      *)
+        manage_usage
+        ;;
+    esac
+  done
+
+  choose_room
+
+  while true; do
+    summary_text="$(room_summary 2>/dev/null || true)"
+    menu_title="Room: $session"
+    [[ -n "$summary_text" ]] && menu_title="$menu_title"$'\n'"$summary_text"
+    if ! action="$(bridge_select_menu "$menu_title" \
+      "Join agent pane" \
+      "Leave agent" \
+      "Clear agent context" \
+      "Show daemon status" \
+      "Tail daemon log" \
+      "Clear peer view cache" \
+      "Reload daemon" \
+      "Stop daemon" \
+      "Back/select another room" \
+      "Quit")"; then
+      exit 130
+    fi
+    case "$action" in
+      0) join_agent ;;
+      1) leave_agent ;;
+      2) clear_agent ;;
+      3) show_status ;;
+      4) tail_daemon_log ;;
+      5) clear_peer_view_cache ;;
+      6) reload_daemon ;;
+      7) stop_room ;;
+      8) session=""; choose_room ;;
+      9) exit 0 ;;
+      *) echo "invalid action" >&2 ;;
+    esac
+  done
+}
+
+cmd_healthcheck() {
+  exec "$_bridge_bin_dir/bridge_healthcheck.sh" "$@"
+}
+
+top_level_menu() {
+  local interactive=0
+  if bridge_has_tty; then
+    interactive=1
+  fi
+  while true; do
+    if ! action="$(bridge_select_menu "Agent Bridge" \
+      "Create new room" \
+      "Manage existing room" \
+      "Status" \
+      "Quit")"; then
+      exit 130
+    fi
+    case "$action" in
+      0) cmd_attach ;;
+      1) cmd_manage ;;
+      2)
+        show_all_status
+        if [[ "$interactive" -eq 0 ]]; then
+          exit 0
+        fi
+        ;;
+      3) exit 0 ;;
+      *) echo "invalid action" >&2 ;;
+    esac
+  done
+}
+
+main() {
+  if [[ $# -eq 0 ]]; then
+    top_level_menu
+  fi
+
+  local command="$1"
+  shift
+  case "$command" in
+    attach|create)
+      cmd_attach "$@"
+      ;;
+    manage)
+      cmd_manage "$@"
+      ;;
+    status)
+      if [[ $# -gt 0 ]]; then
+        usage
+      fi
+      show_all_status
+      ;;
+    healthcheck)
+      cmd_healthcheck "$@"
+      ;;
+    help|-h|--help)
+      usage 0
+      ;;
+    *)
+      echo "agent-bridge: unknown command: $command" >&2
+      usage
+      ;;
+  esac
+}
+
+main "$@"

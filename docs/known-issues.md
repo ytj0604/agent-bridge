@@ -162,7 +162,7 @@ When a user types `/clear` directly in a peer pane, the daemon treats the
 peer as detached: identity rotation, fingerprint, and routing state cannot be
 recovered without a controlled-clear marker. The alias remains visible in
 session state but stops receiving new bridge traffic. Recovery is to clear
-that peer through `bridge_manage`, through another agent's
+that peer through `agent-bridge manage`, through another agent's
 `agent_clear_peer <alias>`, or by asking the peer itself to `agent_clear_peer`
 its own alias. Operationally users should not invoke `/clear` directly while
 bridge routing is active.

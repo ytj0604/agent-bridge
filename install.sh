@@ -301,6 +301,7 @@ EOF
   chmod +x "$path"
 }
 
+write_shim agent-bridge "$root/bin/agent-bridge"
 write_shim bridge_run "$root/bin/bridge_run.sh"
 write_shim bridge_manage "$root/bin/bridge_manage.sh"
 write_shim bridge_healthcheck "$root/bin/bridge_healthcheck.sh"

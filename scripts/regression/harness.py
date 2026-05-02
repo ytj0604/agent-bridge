@@ -12,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 LIBEXEC = ROOT / "libexec" / "agent-bridge"
 DIRECT_EXECUTABLE_TARGETS = (
+    ("agent_bridge_target", Path("bin/agent-bridge")),
     ("bridge_run_target", Path("bin/bridge_run.sh")),
     ("bridge_manage_target", Path("bin/bridge_manage.sh")),
     ("bridge_healthcheck_target", Path("bin/bridge_healthcheck.sh")),

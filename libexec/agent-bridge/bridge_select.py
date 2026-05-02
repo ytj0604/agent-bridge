@@ -30,7 +30,11 @@ def render(fd: int, title: str, items: list[str], selected: int, rendered: int) 
 
 def interactive_select(title: str, items: list[str]) -> int:
     fd = os.open("/dev/tty", os.O_RDWR)
-    old = termios.tcgetattr(fd)
+    try:
+        old = termios.tcgetattr(fd)
+    except termios.error:
+        os.close(fd)
+        raise OSError("no usable controlling tty")
     selected = 0
     rendered = 0
     try:
@@ -81,7 +85,10 @@ def main() -> int:
         return 1
     try:
         if os.path.exists("/dev/tty") and os.access("/dev/tty", os.R_OK | os.W_OK):
-            selected = interactive_select(args.title, args.items)
+            try:
+                selected = interactive_select(args.title, args.items)
+            except OSError:
+                selected = fallback_select(args.title, args.items)
         else:
             selected = fallback_select(args.title, args.items)
     except KeyboardInterrupt:
