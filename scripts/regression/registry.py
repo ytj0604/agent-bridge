@@ -559,6 +559,7 @@ def scenarios() -> list[Scenario]:
         ('target_recovery_env_disable_blocks', moved['target_recovery_env_disable_blocks']),
         ('tmux_display_pane_empty_metadata_is_unavailable', moved['tmux_display_pane_empty_metadata_is_unavailable']),
         ('codex_rollout_path_regex_is_strict', moved['codex_rollout_path_regex_is_strict']),
+        ('process_start_time_falls_back_to_ps_lstart', moved['process_start_time_falls_back_to_ps_lstart']),
         ('target_recovery_only_matching_alias_recovers', moved['target_recovery_only_matching_alias_recovers']),
         ('hook_unknown_preserves_verified_process_identity', moved['hook_unknown_preserves_verified_process_identity']),
         ('probe_tmux_access_failure_unknown', moved['probe_tmux_access_failure_unknown']),
