@@ -807,6 +807,24 @@ def scenario_codex_rollout_path_regex_is_strict(label: str, tmpdir: Path) -> Non
     print(f"  PASS  {label}")
 
 
+def scenario_process_start_time_falls_back_to_ps_lstart(label: str, tmpdir: Path) -> None:
+    old_run = bridge_pane_probe.run
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "Sun May  3 16:16:53 2026    \n", "")
+
+    bridge_pane_probe.run = fake_run  # type: ignore[assignment]
+    try:
+        start_time = bridge_pane_probe.process_start_time(123456789)
+    finally:
+        bridge_pane_probe.run = old_run  # type: ignore[assignment]
+    assert_true(start_time == "ps-lstart:Sun May 3 16:16:53 2026", f"{label}: ps lstart fallback not normalized: {start_time!r}")
+    assert_true(calls == [["ps", "-p", "123456789", "-o", "lstart="]], f"{label}: unexpected ps fallback calls: {calls}")
+    print(f"  PASS  {label}")
+
+
 def scenario_target_recovery_only_matching_alias_recovers(label: str, tmpdir: Path) -> None:
     with isolated_identity_env(tmpdir) as state_root_path:
         session_a = "019dce7c-3126-7983-88c0-a3d80cb6f556"
@@ -1386,6 +1404,7 @@ SCENARIOS = [
     ('target_recovery_env_disable_blocks', scenario_target_recovery_env_disable_blocks),
     ('tmux_display_pane_empty_metadata_is_unavailable', scenario_tmux_display_pane_empty_metadata_is_unavailable),
     ('codex_rollout_path_regex_is_strict', scenario_codex_rollout_path_regex_is_strict),
+    ('process_start_time_falls_back_to_ps_lstart', scenario_process_start_time_falls_back_to_ps_lstart),
     ('target_recovery_only_matching_alias_recovers', scenario_target_recovery_only_matching_alias_recovers),
     ('hook_unknown_preserves_verified_process_identity', scenario_hook_unknown_preserves_verified_process_identity),
     ('probe_tmux_access_failure_unknown', scenario_probe_tmux_access_failure_unknown),

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from pathlib import Path
+import os
 import re
 import subprocess
 
@@ -16,6 +17,15 @@ CODEX_ROLLOUT_PATH_RE = re.compile(
 )
 
 
+def _probe_env() -> dict:
+    # Force C locale so date-formatting commands (ps lstart, sysctl kern.boottime)
+    # produce stable, locale-independent strings used as identity fingerprints.
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    env["LANG"] = "C"
+    return env
+
+
 def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd,
@@ -24,6 +34,7 @@ def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
         stderr=subprocess.PIPE,
         check=check,
         timeout=PROCESS_PROBE_TIMEOUT_SECONDS,
+        env=_probe_env(),
     )
 
 
@@ -205,24 +216,44 @@ def infer_agent_type(pane: dict, process_table: dict | None = None) -> str:
 
 def boot_id() -> str:
     try:
-        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        if value:
+            return value
     except OSError:
+        pass
+    try:
+        proc = run(["sysctl", "-n", "kern.boottime"], check=False)
+    except (OSError, subprocess.TimeoutExpired):
         return ""
+    if proc.returncode != 0:
+        return ""
+    return " ".join(proc.stdout.split())
 
 
 def process_start_time(pid: int) -> str:
     try:
         raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return ""
+        return process_start_time_from_ps(pid)
     end = raw.rfind(")")
     if end < 0:
-        return ""
+        return process_start_time_from_ps(pid)
     rest = raw[end + 1 :].strip().split()
     # Field 22 (starttime) is index 19 after stripping pid + comm.
     if len(rest) <= 19:
-        return ""
+        return process_start_time_from_ps(pid)
     return rest[19]
+
+
+def process_start_time_from_ps(pid: int) -> str:
+    try:
+        proc = run(["ps", "-p", str(pid), "-o", "lstart="], check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    value = " ".join(proc.stdout.split())
+    return f"ps-lstart:{value}" if value else ""
 
 
 def process_tree(root_pid: int, process_table: dict) -> list[tuple[int, int]]:
