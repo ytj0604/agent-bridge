@@ -686,6 +686,7 @@ def _assert_send_peer_body_error(
     assert_true(proc.returncode == 2, f"{label}: {case} should exit 2, got {proc.returncode}, stderr={proc.stderr!r}")
     assert_true(proc.stdout == "", f"{label}: {case} should not print stdout: {proc.stdout!r}")
     assert_true(proc.stderr.startswith(f"agent_send_peer: {code}: "), f"{label}: {case} missing stable code {code!r}: {proc.stderr!r}")
+    assert_true("run agent_list_peers if command syntax is unclear." in proc.stderr, f"{label}: {case} missing syntax recovery hint: {proc.stderr!r}")
     for token in tokens:
         assert_true(token in proc.stderr, f"{label}: {case} missing token {token!r}: {proc.stderr!r}")
 

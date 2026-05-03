@@ -49,6 +49,7 @@ PIPED_STDIN_INLINE_CONFLICT_MESSAGE = (
     "piped stdin and an inline body cannot be combined. Pick one: either remove the pipe and pass the inline body "
     "as a single argument, or drop the inline body and use --stdin with stdin/heredoc."
 )
+SYNTAX_RECOVERY_HINT = "run agent_list_peers if command syntax is unclear."
 REQUEST_SENT_HINT = (
     "REQUEST_SENT: result arrives later as a new [bridge:*] prompt. "
     "Do independent work only; do not sleep/poll or keep this turn open waiting."
@@ -81,7 +82,7 @@ def body_input_error(code: str) -> BodyInputError:
 
 
 def format_body_input_error(error: BodyInputError) -> str:
-    return f"agent_send_peer: {error.code}: {error.message}"
+    return f"agent_send_peer: {error.code}: {error.message} {SYNTAX_RECOVERY_HINT}"
 
 
 def build_parser() -> argparse.ArgumentParser:

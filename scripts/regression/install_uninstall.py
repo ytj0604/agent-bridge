@@ -82,8 +82,9 @@ def _write_fake_uninstall_tree(root: Path) -> None:
     shutil.copy2(ROOT / "uninstall.sh", root / "uninstall.sh")
     libexec = root / "libexec" / "agent-bridge"
     libexec.mkdir(parents=True, exist_ok=True)
-    for name in ("bridge_uninstall_hooks.py", "bridge_codex_config.py", "bridge_util.py"):
+    for name in ("bridge_uninstall_hooks.py", "bridge_codex_config.py", "bridge_skill_install.py", "bridge_paths.py", "bridge_util.py"):
         shutil.copy2(LIBEXEC / name, libexec / name)
+    shutil.copytree(ROOT / "skills", root / "skills", dirs_exist_ok=True)
 
 
 def _write_fake_cli_tree(root: Path, marker: Path) -> None:
@@ -327,6 +328,9 @@ def _write_fake_install_tree(root: Path, *, omit: Path | None = None) -> None:
     helper = root / "libexec" / "agent-bridge" / "bridge_set_editor_mode.py"
     helper.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / "libexec" / "agent-bridge" / "bridge_set_editor_mode.py", helper)
+    for name in ("bridge_skill_install.py", "bridge_paths.py", "bridge_util.py"):
+        shutil.copy2(ROOT / "libexec" / "agent-bridge" / name, helper.parent / name)
+    shutil.copytree(ROOT / "skills", root / "skills", dirs_exist_ok=True)
     for _, relative in INSTALL_SHIM_TARGETS:
         if omit is not None and relative == omit:
             continue
@@ -375,6 +379,7 @@ def _write_fake_healthcheck_tree(root: Path) -> None:
         root / "libexec" / "agent-bridge",
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
+    shutil.copytree(ROOT / "skills", root / "skills", dirs_exist_ok=True)
     for _, relative in DIRECT_EXECUTABLE_TARGETS:
         target = root / relative
         if relative == Path("bin/bridge_healthcheck.sh"):
@@ -412,6 +417,20 @@ def _fake_healthcheck_env(tmpdir: Path, root: Path, fakebin: Path) -> dict[str, 
     env.pop("AGENT_BRIDGE" + "_PYTHON", None)
     env["PATH"] = f"{fakebin}:{root / 'bin'}:{root / 'model-bin'}:{env.get('PATH', '')}"
     _write_seed_hook_configs(Path(env["HOME"]))
+    subprocess.run(
+        [
+            sys.executable,
+            str(root / "libexec" / "agent-bridge" / "bridge_skill_install.py"),
+            "install",
+            "--source",
+            str(root / "skills" / "agent-bridge"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
     return env
 
 
@@ -486,6 +505,229 @@ def _run_bridge_set_editor_mode(path: Path, *, dry_run: bool = False, env_extra:
         env=env,
         timeout=10,
     )
+
+
+def _skill_targets_from_env(env: dict[str, str]) -> tuple[Path, Path]:
+    claude = Path(env["HOME"]) / ".claude" / "skills" / "agent-bridge"
+    codex = Path(env["CODEX_HOME"]) / "skills" / "agent-bridge"
+    return claude, codex
+
+
+def _read_manifest(target: Path) -> dict:
+    return json.loads((target / ".agent-bridge-managed.json").read_text(encoding="utf-8"))
+
+
+def scenario_install_sh_skills_dry_run_no_write(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "install-skills-dry"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir / "skill-dry-env")
+    claude, codex = _skill_targets_from_env(env)
+
+    proc = _run_fake_install(root, tmpdir / "shims-skill-dry", env=env, extra_args=["--dry-run"])
+    assert_true(proc.returncode == 0, f"{label}: dry-run install should succeed: {proc.stderr!r}")
+    assert_true("dry-run: claude: install skill" in proc.stdout, f"{label}: dry-run should preview Claude skill: {proc.stdout!r}")
+    assert_true("dry-run: codex: install skill" in proc.stdout, f"{label}: dry-run should preview Codex skill: {proc.stdout!r}")
+    assert_true("restart Codex" in proc.stdout and "existing Claude Code sessions" in proc.stdout, f"{label}: post-install reload notes expected: {proc.stdout!r}")
+    assert_true(not claude.exists(), f"{label}: dry-run must not create Claude skill target")
+    assert_true(not codex.exists(), f"{label}: dry-run must not create Codex skill target")
+    assert_true(not (Path(env["HOME"]) / ".codex" / "skills" / "agent-bridge").exists(), f"{label}: dry-run must not use inherited/default Codex path")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_skills_real_install_writes_targets(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "install-skills-real"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir / "skill-real-env")
+    claude, codex = _skill_targets_from_env(env)
+
+    proc = _run_fake_install(root, tmpdir / "shims-skill-real", env=env)
+    assert_true(proc.returncode == 0, f"{label}: real install should succeed: {proc.stderr!r}")
+    for target in (claude, codex):
+        assert_true((target / "SKILL.md").is_file(), f"{label}: SKILL.md installed at {target}")
+        assert_true((target / "references" / "command-contract.md").is_file(), f"{label}: command contract installed at {target}")
+        assert_true((target / ".agent-bridge-managed.json").is_file(), f"{label}: manifest installed at {target}")
+    assert_true((codex / "agents" / "openai.yaml").is_file(), f"{label}: Codex openai.yaml installed")
+    assert_true("allow_implicit_invocation: true" in (codex / "agents" / "openai.yaml").read_text(encoding="utf-8"), f"{label}: Codex implicit invocation enabled")
+    assert_true(not (claude / "agents" / "openai.yaml").exists(), f"{label}: Claude target should not get Codex openai.yaml")
+    assert_true(str(codex).startswith(env["CODEX_HOME"]), f"{label}: Codex target must be under CODEX_HOME")
+    assert_true(not (Path(env["HOME"]) / ".codex" / "skills" / "agent-bridge").exists(), f"{label}: install must not write HOME/.codex when CODEX_HOME is set")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_skills_reinstall_updates_stale(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "install-skills-reinstall"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir / "skill-reinstall-env")
+    claude, _codex = _skill_targets_from_env(env)
+
+    first = _run_fake_install(root, tmpdir / "shims-skill-reinstall", env=env)
+    assert_true(first.returncode == 0, f"{label}: first install should succeed: {first.stderr!r}")
+    stale = claude / "SKILL.md"
+    stale.write_text("stale\n", encoding="utf-8")
+    obsolete = claude / "obsolete.txt"
+    obsolete.write_text("old managed file\n", encoding="utf-8")
+    manifest = _read_manifest(claude)
+    manifest["files"].append("obsolete.txt")
+    (claude / ".agent-bridge-managed.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    second = _run_fake_install(root, tmpdir / "shims-skill-reinstall", env=env)
+    assert_true(second.returncode == 0, f"{label}: reinstall should succeed: {second.stderr!r}")
+    assert_true(stale.read_text(encoding="utf-8") == (root / "skills" / "agent-bridge" / "SKILL.md").read_text(encoding="utf-8"), f"{label}: stale managed SKILL.md should be refreshed")
+    assert_true(not obsolete.exists(), f"{label}: obsolete manifest-listed file should be removed")
+    print(f"  PASS  {label}")
+
+
+def scenario_uninstall_sh_skills_removes_only_managed_files(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "uninstall-skills-managed"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    _write_fake_uninstall_tree(root)
+    env = _fake_install_env(tmpdir / "skill-uninstall-env")
+    claude, codex = _skill_targets_from_env(env)
+    install = _run_fake_install(root, tmpdir / "shims-skill-uninstall", env=env)
+    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
+    for target in (claude, codex):
+        (target / "user-note.txt").write_text("keep me\n", encoding="utf-8")
+
+    proc = _run_fake_uninstall(root, env=env, extra_args=["--keep-hooks", "--keep-shims"])
+    assert_true(proc.returncode == 0, f"{label}: uninstall should succeed: {proc.stderr!r}")
+    for target in (claude, codex):
+        assert_true(not (target / "SKILL.md").exists(), f"{label}: managed SKILL.md removed from {target}")
+        assert_true(not (target / ".agent-bridge-managed.json").exists(), f"{label}: manifest removed from {target}")
+        assert_true((target / "user-note.txt").read_text(encoding="utf-8") == "keep me\n", f"{label}: unrelated file preserved in {target}")
+    print(f"  PASS  {label}")
+
+
+def scenario_uninstall_sh_skills_preserves_unrelated_skills(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "uninstall-skills-preserve"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    _write_fake_uninstall_tree(root)
+    env = _fake_install_env(tmpdir / "skill-preserve-env")
+    other_claude = Path(env["HOME"]) / ".claude" / "skills" / "other-skill" / "SKILL.md"
+    other_codex = Path(env["CODEX_HOME"]) / "skills" / "other-skill" / "SKILL.md"
+    other_claude.parent.mkdir(parents=True)
+    other_codex.parent.mkdir(parents=True)
+    other_claude.write_text("other claude\n", encoding="utf-8")
+    other_codex.write_text("other codex\n", encoding="utf-8")
+    install = _run_fake_install(root, tmpdir / "shims-skill-preserve", env=env)
+    assert_true(install.returncode == 0, f"{label}: install should succeed: {install.stderr!r}")
+
+    proc = _run_fake_uninstall(root, env=env, extra_args=["--keep-hooks", "--keep-shims"])
+    assert_true(proc.returncode == 0, f"{label}: uninstall should succeed: {proc.stderr!r}")
+    assert_true(other_claude.read_text(encoding="utf-8") == "other claude\n", f"{label}: unrelated Claude skill preserved")
+    assert_true(other_codex.read_text(encoding="utf-8") == "other codex\n", f"{label}: unrelated Codex skill preserved")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_skills_invalid_destination_fails_cleanly(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "install-skills-invalid-dest"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir / "skill-invalid-env")
+    bad_parent = Path(env["HOME"]) / ".claude" / "skills"
+    bad_parent.parent.mkdir(parents=True)
+    bad_parent.write_text("not a directory\n", encoding="utf-8")
+
+    proc = _run_fake_install(root, tmpdir / "shims-skill-invalid", env=env)
+    assert_true(proc.returncode != 0, f"{label}: invalid destination should fail")
+    assert_true("expected directory path" in proc.stderr or "refusing claude skill target" in proc.stderr, f"{label}: targeted destination error expected: {proc.stderr!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_skills_refuses_unmanaged_existing_target(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "install-skills-unmanaged"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir / "skill-unmanaged-env")
+    claude, _codex = _skill_targets_from_env(env)
+    claude.mkdir(parents=True)
+    (claude / "SKILL.md").write_text("user skill\n", encoding="utf-8")
+
+    proc = _run_fake_install(root, tmpdir / "shims-skill-unmanaged", env=env)
+    assert_true(proc.returncode != 0, f"{label}: unmanaged existing skill must fail")
+    assert_true("refusing to overwrite unmanaged existing claude skill" in proc.stderr, f"{label}: targeted unmanaged error expected: {proc.stderr!r}")
+    assert_true((claude / "SKILL.md").read_text(encoding="utf-8") == "user skill\n", f"{label}: unmanaged SKILL.md must not be clobbered")
+
+    dry_env = _fake_install_env(tmpdir / "skill-unmanaged-dry-env")
+    dry_claude, _dry_codex = _skill_targets_from_env(dry_env)
+    dry_claude.mkdir(parents=True)
+    (dry_claude / "SKILL.md").write_text("dry user skill\n", encoding="utf-8")
+    dry_proc = _run_fake_install(root, tmpdir / "shims-skill-unmanaged-dry", env=dry_env, extra_args=["--dry-run"])
+    assert_true(dry_proc.returncode != 0, f"{label}: dry-run unmanaged existing skill must fail")
+    assert_true("refusing to overwrite unmanaged existing claude skill" in dry_proc.stderr, f"{label}: dry-run targeted unmanaged error expected: {dry_proc.stderr!r}")
+    assert_true((dry_claude / "SKILL.md").read_text(encoding="utf-8") == "dry user skill\n", f"{label}: dry-run unmanaged SKILL.md must not be clobbered")
+    print(f"  PASS  {label}")
+
+
+def scenario_install_sh_skills_rejects_broken_target_symlink(label: str, tmpdir: Path) -> None:
+    root = tmpdir / "install-skills-broken-symlink"
+    root.mkdir()
+    _write_fake_install_tree(root)
+    env = _fake_install_env(tmpdir / "skill-broken-symlink-env")
+    claude, _codex = _skill_targets_from_env(env)
+    claude.parent.mkdir(parents=True)
+    try:
+        claude.symlink_to(tmpdir / "missing-target")
+    except (OSError, NotImplementedError):
+        print(f"  PASS  {label} (symlink unsupported; skipped)")
+        return
+
+    proc = _run_fake_install(root, tmpdir / "shims-skill-broken-symlink", env=env)
+    assert_true(proc.returncode != 0, f"{label}: broken symlink target should fail")
+    assert_true("symlinked path component" in proc.stderr, f"{label}: targeted symlink error expected: {proc.stderr!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_skill_manifest_rejects_malicious_paths(label: str, tmpdir: Path) -> None:
+    import importlib
+    skill = importlib.import_module("bridge_skill_install")
+    skill = importlib.reload(skill)
+
+    target = tmpdir / "target"
+    target.mkdir()
+    for raw in ("../other", "/tmp/x", "", "./x", "a//b", "a/", "a/./b"):
+        try:
+            rel = skill.validate_manifest_relative_path(raw)
+            skill.validate_target_path(target, rel)
+        except ValueError:
+            continue
+        raise AssertionError(f"{label}: unsafe manifest path should reject: {raw!r}")
+
+    (target / "dir-entry").mkdir()
+    try:
+        skill.validate_target_path(target, skill.validate_manifest_relative_path("dir-entry"), must_be_file=True)
+        raise AssertionError(f"{label}: listed directory path should reject")
+    except ValueError:
+        pass
+
+    outside = tmpdir / "outside"
+    outside.mkdir()
+    link = target / "link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        print(f"  PASS  {label} (symlink unsupported; skipped symlink branch)")
+        return
+    try:
+        skill.validate_target_path(target, skill.validate_manifest_relative_path("link/file.txt"))
+        raise AssertionError(f"{label}: nested symlink missing-child path should reject")
+    except ValueError:
+        pass
+    existing = link / "existing.txt"
+    try:
+        existing.write_text("outside\n", encoding="utf-8")
+    except FileNotFoundError:
+        pass
+    try:
+        skill.validate_target_path(target, skill.validate_manifest_relative_path("link/existing.txt"))
+        raise AssertionError(f"{label}: nested symlink existing-child path should reject")
+    except ValueError:
+        pass
+    print(f"  PASS  {label}")
 
 
 def scenario_python_env_override_removed_from_tracked_files(label: str, tmpdir: Path) -> None:
@@ -1387,6 +1629,15 @@ SCENARIOS = [
     ('direct_exec_targets_executable', scenario_direct_exec_targets_executable),
     ('healthcheck_executable_helper_distinguishes_states', scenario_healthcheck_executable_helper_distinguishes_states),
     ('python_env_override_removed_from_tracked_files', scenario_python_env_override_removed_from_tracked_files),
+    ('install_sh_skills_dry_run_no_write', scenario_install_sh_skills_dry_run_no_write),
+    ('install_sh_skills_real_install_writes_targets', scenario_install_sh_skills_real_install_writes_targets),
+    ('install_sh_skills_reinstall_updates_stale', scenario_install_sh_skills_reinstall_updates_stale),
+    ('uninstall_sh_skills_removes_only_managed_files', scenario_uninstall_sh_skills_removes_only_managed_files),
+    ('uninstall_sh_skills_preserves_unrelated_skills', scenario_uninstall_sh_skills_preserves_unrelated_skills),
+    ('install_sh_skills_invalid_destination_fails_cleanly', scenario_install_sh_skills_invalid_destination_fails_cleanly),
+    ('install_sh_skills_refuses_unmanaged_existing_target', scenario_install_sh_skills_refuses_unmanaged_existing_target),
+    ('install_sh_skills_rejects_broken_target_symlink', scenario_install_sh_skills_rejects_broken_target_symlink),
+    ('skill_manifest_rejects_malicious_paths', scenario_skill_manifest_rejects_malicious_paths),
     ('install_sh_python_version_gate', scenario_install_sh_python_version_gate),
     ('bridge_healthcheck_sh_python_version_gate', scenario_bridge_healthcheck_sh_python_version_gate),
     ('bridge_healthcheck_agent_bridge_contracts', scenario_bridge_healthcheck_agent_bridge_contracts),

@@ -31,16 +31,28 @@ when the model is operating from compressed context.
   A skill is triggered by the model/tooling recognizing that the current task is
   relevant, not by shell interception of `agent_send_peer` or another command.
 - The skill therefore improves recall probability; it does not guarantee that a
-  model that has completely forgotten Agent Bridge will rediscover it.
-- Do not put the full current cheat sheet directly in `SKILL.md`. For Codex,
-  the local skill guidance uses progressive disclosure: skill metadata is always
-  visible, `SKILL.md` is loaded when triggered, and reference files are loaded
-  only when needed. The skill body must stay short.
+  model that has completely forgotten Agent Bridge will rediscover it. After
+  context compaction, invocation depends entirely on the user's next prompt
+  matching the skill description semantically — short follow-ups like "next
+  step" will not trigger the skill.
+- Do not put the full current cheat sheet directly in `SKILL.md`. Both Claude
+  Code and Codex use progressive disclosure: skill name + description are
+  always visible to the model, `SKILL.md` body loads when the skill triggers,
+  and `references/` files load only when `SKILL.md` tells the model to read
+  them. Keep `SKILL.md` under ~500 lines.
 - The source of truth for command syntax remains the installed bridge commands,
   especially `agent_list_peers` and each command's `--help`.
-- Claude Code and Codex may differ in skill discovery, install location,
-  scoping, and refresh behavior. The implementation must verify both tools
-  empirically instead of assuming identical semantics.
+- Claude Code and Codex have verified-similar skill mechanisms but differ on
+  two operational points that the installer and healthcheck must handle:
+  - **Hot-reload**: Claude Code picks up new skills mid-session; Codex
+    requires a restart to load a newly installed skill.
+  - **Invocation policy**: Codex has an optional `agents/openai.yaml` with a
+    `policy.allow_implicit_invocation` flag. Claude Code uses
+    `disable-model-invocation` / `user-invocable` frontmatter fields.
+- Claude Code carries up to 5K tokens of an invoked skill across compaction
+  and shares a 25K total budget across invoked skills; if many skills are
+  invoked in one session the bridge skill may be evicted. This is a soft cap,
+  not a guarantee.
 
 ## Skill Design
 
@@ -90,8 +102,11 @@ Recommended references:
 
 - `references/command-contract.md`
   - More detailed command selection and examples.
-  - Can be generated from `bridge_instructions.model_cheat_sheet()` or kept as
-    a checked-in template synchronized by tests.
+  - **Must** be generated from `bridge_instructions.model_cheat_sheet()` at
+    install time, or kept as a checked-in file with a regression test that
+    diffs it against `model_cheat_sheet_text()`. Drift between the runtime
+    cheat sheet and the skill reference is the highest-impact failure mode
+    (see Risks); a manual sync policy is not sufficient.
 - `references/recovery.md`
   - Watchdog, interrupt, cancel, clear, aggregate recovery flows.
 - `references/anti-patterns.md`
@@ -100,6 +115,24 @@ Recommended references:
 
 Keep the body small enough that loading the skill is cheap. Long examples and
 edge-case semantics belong in references.
+
+### Codex-specific Skill Files
+
+Codex supports an optional `agents/openai.yaml` alongside `SKILL.md` that
+controls UI metadata and invocation policy. Decide and document explicitly:
+
+- `policy.allow_implicit_invocation`: recommended `true` so the skill can fire
+  on description match without requiring the user to type `$agent-bridge`.
+  Justification: the whole point of the skill is post-compaction recall; an
+  explicit-only policy defeats that goal.
+- Display name / short description for the Codex skill picker.
+
+Claude Code equivalent decisions to capture in frontmatter:
+
+- `disable-model-invocation` should be left at default (false) so Claude can
+  auto-invoke. Same justification as above.
+- `user-invocable` should be left at default (true) so the user can manually
+  re-invoke after compaction (`/agent-bridge` or whatever Claude exposes).
 
 ## Probe Prompt Changes
 
@@ -144,8 +177,15 @@ skills/agent-bridge/
 
 Add installer support:
 
-- Copy/update the skill into the Codex user skill directory.
-- Copy/update the skill into the Claude Code user skill directory.
+- Copy/update the skill into Codex at `${CODEX_HOME:-$HOME/.codex}/skills/agent-bridge/`.
+  Codex skill installation should live in `bridge_codex_config.py` (or a
+  sibling module) so it reuses the existing managed-marker pattern that
+  module already uses for `config.toml` keys. `install.sh` should dispatch,
+  not duplicate that logic.
+- Copy/update the skill into Claude Code at `~/.claude/skills/agent-bridge/`
+  (user scope). Project scope is not appropriate — Agent Bridge attaches to
+  arbitrary working directories and the skill must be visible regardless of
+  cwd.
 - Use explicit begin/end ownership markers or a manifest so uninstall can
   remove only Agent Bridge-owned skill files.
 - Support `--dry-run`.
@@ -154,18 +194,24 @@ Add installer support:
   operator knows bridge recall support was not installed.
 - Add `--skip-skills` only if there is a clear operator need; default should be
   install skills.
+- Post-install message must distinguish reload behavior:
+  - Claude Code: "skill is active in any new or existing Claude Code session."
+  - Codex: "restart Codex for the skill to become available."
+  Without this, operators will reasonably assume a uniform post-install state
+  and file false bug reports against Codex skill discovery.
 
-Open questions to resolve before implementation:
+Resolved facts (previously open questions):
 
-- Exact Codex user-skill install path in the deployed environment.
-- Exact Claude Code user-skill install path and whether project/user scope is
-  preferable.
-- Whether either tool requires restart/reload after skill install.
-- Whether skill names can contain hyphens consistently in both tools.
-- Whether Claude Code supports references with the same loading behavior and
-  path conventions as Codex.
-
-Do not hardcode unverified paths without a healthcheck and regression strategy.
+- Codex user-skill path: `${CODEX_HOME:-$HOME/.codex}/skills/<name>/`,
+  `SKILL.md` required, optional `agents/openai.yaml`, optional
+  `references/`/`scripts/`/`assets/` subdirectories.
+- Claude Code user-skill path: `~/.claude/skills/<name>/SKILL.md`. User scope
+  is the right scope for this tool (see above).
+- Hot-reload: Claude Code yes (mid-session); Codex no (restart required).
+- Hyphens in skill names: allowed in both. `agent-bridge` is valid.
+- Progressive disclosure with `references/`: supported in both, same
+  convention. `SKILL.md` references files in prose; the model reads them on
+  demand.
 
 ## Healthcheck And Uninstall
 
@@ -174,6 +220,8 @@ Extend `bridge_healthcheck` with skill checks:
 - `codex_agent_bridge_skill_installed`
 - `claude_agent_bridge_skill_installed`
 - `agent_bridge_skill_source_valid`
+- `agent_bridge_skill_references_in_sync` — generated/diffed against
+  `bridge_instructions.model_cheat_sheet_text()`.
 - Optional: `agent_bridge_skill_references_present`
 
 Healthcheck should report:
@@ -182,6 +230,10 @@ Healthcheck should report:
 - whether `SKILL.md` exists
 - whether the frontmatter has expected `name` and `description`
 - whether references exist
+- for Codex: whether the skill is on disk only ("installed, restart Codex to
+  activate") vs. observably loaded. If observability is not feasible, report
+  "installed; activation requires Codex restart" as a normal post-install
+  state rather than a warning.
 
 Extend uninstall:
 
@@ -206,65 +258,115 @@ Add docs/contracts scenarios:
 - `SKILL.md` body contains the mandatory recovery rule to run
   `agent_list_peers`.
 - References are one level deep and directly linked from `SKILL.md`.
+- `references/command-contract.md` content equals
+  `bridge_instructions.model_cheat_sheet_text()` (or is regenerated from it
+  by the test). This is a hard test, not a soft contract.
 - Probe prompt remains compact and points to `agent_list_peers` rather than
   duplicating the full cheat sheet.
 
-Add behavioral/manual validation:
+Add behavioral/manual validation. Phase 2 needs a concrete protocol so the
+skill's effectiveness is measurable before Phase 3 shrinks the probe:
 
-- Start fresh Codex and Claude Code sessions after install.
+- Start fresh Codex and Claude Code sessions after install. For Codex,
+  remember the regression run must restart the codex process; an "install
+  then immediately spawn codex from the same script" test will false-negative
+  on first-trigger.
 - Confirm the skill is visible/available in each tool.
 - Ask a bridge-related question without showing command syntax and check whether
   the skill loads or is discoverable.
 - Compact context or simulate a long session, then ask the agent to message a
   peer and verify it uses `agent_list_peers` or correct bridge commands.
+- Trigger-rate measurement: define a fixed set of natural phrasings (e.g., 10
+  prompts ranging from explicit "send a bridge message to X" to terse "ask
+  the reviewer") and measure invocation rate per tool. Record a baseline
+  number; Phase 3 (probe shrink) should not proceed if the rate falls below
+  an explicit threshold (e.g., <70% on the explicit-phrasing subset).
 - Verify a non-bridge coding task does not load the skill unnecessarily.
 
 ## Migration Strategy
 
-Phase 1: Add skill source and install/healthcheck/uninstall support.
+Phase 1: Add skill source and install/healthcheck/uninstall support for both
+Codex and Claude Code.
 
 - Do not shrink probe yet.
-- Validate skill availability in both tools.
+- Validate skill availability in both tools (with awareness of Codex restart
+  requirement).
 - Keep existing `agent_list_peers` behavior unchanged.
+- Codex install path goes through `bridge_codex_config.py`'s marker pattern;
+  Claude install is direct file placement under `~/.claude/skills/`.
 
 Phase 2: Add tests and manual evals for skill-trigger behavior.
 
-- Check whether task wording reliably triggers the skill.
+- Run the trigger-rate measurement defined in the Regression Plan and record
+  a baseline.
 - Tune skill description for discovery.
 - Keep `SKILL.md` short; move details to references.
+- Decide an explicit threshold for advancing to Phase 3. Without a number,
+  Phase 3 ships on vibes.
+
+Phase 3 prerequisite: improve recovery surface area for the
+skill-not-triggered path.
+
+- Update watchdog wake notices, body-input error codes, and other bridge
+  error messages to explicitly say "run `agent_list_peers` if command syntax
+  is unclear." The skill is one recovery path; making the bridge itself
+  remind the agent to run `agent_list_peers` is a complementary path that
+  works even when the skill does not trigger. This was Phase 4 in the
+  original plan; promoting it ahead of probe shrink reduces the blast radius
+  of skill-trigger misses.
 
 Phase 3: Shrink probe prompt.
 
 - Remove detailed command manual content from `probe_prompt()`.
 - Keep bootstrap rules and exact reply instruction.
 - Run docs contract tests around probe compactness and required safety tokens.
+- Gate this phase on Phase 2 trigger-rate threshold AND Phase 3 prerequisite
+  shipped.
 
 Phase 4: Iterate on recovery UX.
 
 - Consider adding a small model-facing command such as `agent_bridge_help` only
-  if skill triggering remains unreliable.
-- Consider making watchdog/bridge error messages explicitly say
-  "run `agent_list_peers` if command syntax is unclear."
+  if skill triggering remains unreliable after Phase 2 tuning.
+- Re-evaluate compaction-budget eviction: if real sessions invoke many
+  skills, the bridge skill may be evicted from the 25K Claude budget;
+  consider whether to recommend `user-invocable` re-invocation in the probe.
 
 ## Success Criteria
 
 - Probe prompt is materially shorter.
-- Agents can recover bridge command usage after compaction.
-- Exact command contracts remain available through `agent_list_peers`.
+- Measured skill trigger rate on the Phase 2 phrasing set meets the explicit
+  threshold (without a number, this criterion is unfalsifiable).
+- Agents can recover bridge command usage after compaction when the user's
+  next prompt provides any reasonable bridge-related signal.
+- Exact command contracts remain available through `agent_list_peers`, and
+  the skill reference stays equal to `model_cheat_sheet_text()` by test.
 - Installing Agent Bridge also installs bridge skill support for both Codex and
-  Claude Code.
+  Claude Code; post-install message correctly distinguishes Claude (live) vs.
+  Codex (restart required).
+- Invocation policy is explicitly recorded in `agents/openai.yaml` and
+  `SKILL.md` frontmatter, not left at defaults by accident.
 - Skill installation is visible in healthcheck and reversible by uninstall.
 - Non-bridge tasks do not routinely load the bridge skill.
 
 ## Risks
 
 - Skill trigger is heuristic and may not fire when the model forgets bridge
-  exists.
-- Different skill semantics between Codex and Claude Code may require separate
-  packaging or install paths.
+  exists or when the user's next prompt is too terse to match the
+  description. Mitigated, not eliminated, by the Phase 3 prerequisite of
+  pointing watchdog/error messages at `agent_list_peers`.
+- Codex requires a restart to pick up a newly installed skill; users who
+  install during an active session and then send peer messages without
+  restarting will see no skill effect. Mitigated by the post-install
+  message; not eliminated.
 - A verbose skill can recreate the same context-bloat problem as the current
   probe prompt.
 - Stale skill files can become worse than no skill if they diverge from command
   behavior. Runtime command help and `agent_list_peers` must stay authoritative.
+  Hard-test-enforced sync between `model_cheat_sheet_text()` and
+  `references/command-contract.md` is required, not optional.
 - Automatically installing into user-level skill directories may surprise users
   unless install output and uninstall behavior are clear.
+- Claude Code shares a 25K-token budget across invoked skills with 5K
+  reattachment per skill after compaction. In sessions that invoke many
+  skills, the bridge skill may be evicted; recovery then depends on
+  re-invocation, which depends on the next user prompt.

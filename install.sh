@@ -372,6 +372,13 @@ fi
 # This runs after hook setup, so hook hard failures abort before this config edit.
 configure_claude_editor_mode
 
+skill_args=("$libexec_dir/bridge_skill_install.py" install --source "$root/skills/agent-bridge")
+if [[ "$dry_run" == "1" ]]; then
+  skill_args+=(--dry-run)
+fi
+echo "install Agent Bridge skills"
+"$python_bin" "${skill_args[@]}"
+
 if ! command -v tmux >/dev/null 2>&1; then
   echo "warning: tmux not found on PATH. Agent Bridge attaches to tmux panes, so bridge_run will fail until tmux is installed." >&2
   echo "         install with your package manager, e.g. 'apt install tmux' or 'brew install tmux'." >&2

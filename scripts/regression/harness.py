@@ -381,6 +381,7 @@ def _fake_install_env(tmpdir: Path, *, path_prefix: Path | None = None) -> dict[
     env = dict(os.environ)
     env.pop("AGENT_BRIDGE" + "_PYTHON", None)
     env["HOME"] = str(tmpdir / "home")
+    env["CODEX_HOME"] = str(tmpdir / "codex-home")
     env["SHELL"] = "/bin/bash"
     env["XDG_BIN_HOME"] = str(tmpdir / "xdg-bin")
     env["XDG_CONFIG_HOME"] = str(tmpdir / "xdg-config")

@@ -13,6 +13,7 @@ from .harness import (
 
 import bridge_instructions  # noqa: E402
 import bridge_response_guard  # noqa: E402
+import bridge_skill_install  # noqa: E402
 
 
 def scenario_agent_bridge_help_and_status_contract(label: str, tmpdir: Path) -> None:
@@ -81,6 +82,46 @@ def scenario_agent_bridge_help_and_status_contract(label: str, tmpdir: Path) -> 
     assert_true(piped_status.returncode == 0, f"{label}: piped menu Status should exit 0: stdout={piped_status.stdout!r} stderr={piped_status.stderr!r}")
     assert_true("Traceback" not in piped_status.stderr, f"{label}: piped menu fallback must not traceback: {piped_status.stderr!r}")
     assert_true(direct.stdout in piped_status.stdout, f"{label}: piped menu Status should print all-room status: {piped_status.stdout!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_agent_bridge_skill_source_contracts(label: str, tmpdir: Path) -> None:
+    source = ROOT / "skills" / "agent-bridge"
+    skill = source / "SKILL.md"
+    text = skill.read_text(encoding="utf-8")
+    description = ""
+    lines = text.splitlines()
+    if lines and lines[0] == "---":
+        for line in lines[1:]:
+            if line == "---":
+                break
+            if line.startswith("description:"):
+                description = line.split(":", 1)[1].strip()
+                break
+    required_commands = [
+        "agent_send_peer",
+        "agent_view_peer",
+        "agent_wait_status",
+        "agent_aggregate_status",
+        "agent_alarm",
+        "agent_extend_wait",
+        "agent_cancel_message",
+        "agent_interrupt_peer",
+        "agent_clear_peer",
+    ]
+    for command in required_commands:
+        assert_true(command in description, f"{label}: SKILL.md description missing trigger command {command!r}")
+    assert_true("agent_list_peers" in text and "first run" in text.lower(), f"{label}: SKILL.md body must include mandatory agent_list_peers recovery rule")
+    for rel in (
+        "references/command-contract.md",
+        "references/recovery.md",
+        "references/anti-patterns.md",
+    ):
+        assert_true(rel in text, f"{label}: SKILL.md must directly link {rel}")
+        assert_true((source / rel).is_file(), f"{label}: linked reference missing: {rel}")
+    actual = bridge_skill_install.normalize_command_contract_text((source / "references" / "command-contract.md").read_text(encoding="utf-8"))
+    expected = bridge_instructions.model_cheat_sheet_text()
+    assert_true(actual == expected, f"{label}: command-contract.md must stay in sync with model_cheat_sheet_text()")
     print(f"  PASS  {label}")
 
 
@@ -616,6 +657,7 @@ def scenario_aggregate_status_doc_surfaces_leg_level_and_anti_polling(label: str
 
 SCENARIOS = [
     ('agent_bridge_help_and_status_contract', scenario_agent_bridge_help_and_status_contract),
+    ('agent_bridge_skill_source_contracts', scenario_agent_bridge_skill_source_contracts),
     ('view_peer_doc_surfaces_disclose_search_semantics', scenario_view_peer_doc_surfaces_disclose_search_semantics),
     ('interrupt_peer_doc_surfaces_disclose_no_op_race', scenario_interrupt_peer_doc_surfaces_disclose_no_op_race),
     ('interrupt_peer_doc_surfaces_no_queued_active_directive', scenario_interrupt_peer_doc_surfaces_no_queued_active_directive),

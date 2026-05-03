@@ -38,6 +38,7 @@ WATCHDOG_REQUIRES_AUTO_RETURN_ERROR = "watchdog_requires_auto_return"
 WATCHDOG_REQUIRES_AUTO_RETURN_TEXT = (
     "watchdog requires auto_return; use --no-auto-return without --watchdog or set --watchdog 0"
 )
+SYNTAX_RECOVERY_HINT = "run agent_list_peers if command syntax is unclear."
 ALARM_NOTICE_MAX_NOTES = 3
 ALARM_NOTICE_NOTE_CHARS = 80
 ALARM_NOTICE_TOTAL_CHARS = 400
@@ -662,7 +663,8 @@ def build_watchdog_fire_text(d, wd: dict) -> str:
         return (
             f"[bridge:watchdog] aggregate {agg} has not completed within its deadline. "
             f"{d._aggregate_watchdog_progress_text(agg, wd)} "
-            "Inspect with agent_view_peer or stop a slow peer via agent_interrupt_peer."
+            "Inspect with agent_view_peer or stop a slow peer via agent_interrupt_peer. "
+            f"{SYNTAX_RECOVERY_HINT}"
         )
     kind = str(wd.get("ref_kind") or "request")
     to = str(wd.get("ref_to") or "(unknown)")
@@ -681,7 +683,8 @@ def build_watchdog_fire_text(d, wd: dict) -> str:
             f"{elapsed_text} without a response. Choose ONE of:\n"
             f"  agent_extend_wait {msg_id} <sec>   (keep waiting on this same request)\n"
             f"  agent_interrupt_peer {to}          (cancel and stop the peer)\n"
-            f"  agent_view_peer {to}               (inspect what the peer is doing)"
+            f"  agent_view_peer {to}               (inspect what the peer is doing)\n"
+            f"{SYNTAX_RECOVERY_HINT}"
         )
     if phase == WATCHDOG_PHASE_DELIVERY and status in {"inflight", "submitted"}:
         return (
@@ -689,12 +692,14 @@ def build_watchdog_fire_text(d, wd: dict) -> str:
             f"{elapsed_text} (status={status}). Choose ONE of:\n"
             f"  agent_extend_wait {msg_id} <sec>   (keep waiting on this same delivery attempt)\n"
             f"  agent_interrupt_peer {to}          (cancel and stop the peer)\n"
-            f"  agent_view_peer {to}               (inspect the peer pane)"
+            f"  agent_view_peer {to}               (inspect the peer pane)\n"
+            f"{SYNTAX_RECOVERY_HINT}"
         )
     return (
         f"[bridge:watchdog] Your {kind} {msg_id} to {to} is in unexpected watchdog phase "
         f"{phase!r} with queue status={status} after {elapsed_text}. "
-        f"Inspect with agent_interrupt_peer {to} --status or agent_view_peer {to}."
+        f"Inspect with agent_interrupt_peer {to} --status or agent_view_peer {to}. "
+        f"{SYNTAX_RECOVERY_HINT}"
     )
 
 

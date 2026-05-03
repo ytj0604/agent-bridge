@@ -7,9 +7,23 @@ import os
 import shutil
 from pathlib import Path
 
+import bridge_instructions
+import bridge_skill_install
 from bridge_identity import backfill_session_process_identities
 from bridge_participants import load_session
 from bridge_paths import bin_dir, hook_dir, install_root, libexec_dir, log_root, model_bin_dir, run_root, runtime_config_file, state_root
+
+REQUIRED_SKILL_COMMANDS = [
+    "agent_send_peer",
+    "agent_view_peer",
+    "agent_wait_status",
+    "agent_aggregate_status",
+    "agent_alarm",
+    "agent_extend_wait",
+    "agent_cancel_message",
+    "agent_interrupt_peer",
+    "agent_clear_peer",
+]
 
 
 def check_writable(path: Path) -> tuple[bool, str]:
@@ -31,6 +45,83 @@ def check_executable(path: Path) -> tuple[bool, str]:
     if not os.access(path, os.X_OK):
         return False, f"{path}: exists but is not executable"
     return True, str(path)
+
+
+def _frontmatter(text: str) -> dict[str, str]:
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    out: dict[str, str] = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        out[key.strip()] = value.strip()
+    return out
+
+
+def check_skill_source_valid(source: Path | None = None) -> tuple[bool, str]:
+    source = source or bridge_skill_install.default_skill_source()
+    skill = source / "SKILL.md"
+    references = [
+        source / "references" / "command-contract.md",
+        source / "references" / "recovery.md",
+        source / "references" / "anti-patterns.md",
+    ]
+    try:
+        text = skill.read_text(encoding="utf-8")
+    except OSError as exc:
+        return False, f"{skill}: {exc}"
+    meta = _frontmatter(text)
+    if meta.get("name") != "agent-bridge":
+        return False, f"{skill}: frontmatter name must be agent-bridge"
+    description = meta.get("description") or ""
+    missing_commands = [cmd for cmd in REQUIRED_SKILL_COMMANDS if cmd not in description]
+    if missing_commands:
+        return False, f"{skill}: description missing trigger commands: {', '.join(missing_commands)}"
+    if "agent_list_peers" not in text:
+        return False, f"{skill}: missing mandatory agent_list_peers recovery rule"
+    for ref in references:
+        rel = ref.relative_to(source).as_posix()
+        if rel not in text:
+            return False, f"{skill}: does not link {rel}"
+        if not ref.is_file():
+            return False, f"{ref}: missing"
+    return True, str(source)
+
+
+def check_skill_references_in_sync(source: Path | None = None) -> tuple[bool, str]:
+    source = source or bridge_skill_install.default_skill_source()
+    contract = source / "references" / "command-contract.md"
+    try:
+        actual = bridge_skill_install.normalize_command_contract_text(contract.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return False, f"{contract}: {exc}"
+    expected = bridge_instructions.model_cheat_sheet_text()
+    if actual != expected:
+        return False, f"{contract}: differs from bridge_instructions.model_cheat_sheet_text()"
+    return True, f"{contract}: in sync"
+
+
+def check_installed_skill(kind: str, target: Path) -> tuple[bool, str]:
+    skill = target / "SKILL.md"
+    manifest = bridge_skill_install.manifest_path(target)
+    if not target.exists():
+        return False, f"{target}: missing skill target"
+    if not target.is_dir():
+        return False, f"{target}: not a directory"
+    if not manifest.is_file():
+        return False, f"{manifest}: missing Agent Bridge manifest"
+    if not skill.is_file():
+        return False, f"{skill}: missing"
+    if kind == "codex":
+        openai = target / "agents" / "openai.yaml"
+        if not bridge_skill_install.codex_openai_allows_implicit_invocation(openai):
+            return False, f"{openai}: missing policy.allow_implicit_invocation: true"
+        return True, f"{target}: installed; restart Codex to activate"
+    return True, f"{target}: installed; active in new or existing Claude Code sessions"
 
 
 def hook_command_status(path: Path, agent: str) -> tuple[bool, str]:
@@ -153,6 +244,14 @@ def main() -> int:
     add("claude_hooks", ok, detail)
     ok, detail = hook_command_status(Path.home() / ".codex" / "hooks.json", "codex")
     add("codex_hooks", ok, detail)
+    ok, detail = check_skill_source_valid()
+    add("agent_bridge_skill_source_valid", ok, detail)
+    ok, detail = check_skill_references_in_sync()
+    add("agent_bridge_skill_references_in_sync", ok, detail)
+    ok, detail = check_installed_skill("claude", bridge_skill_install.claude_skill_target())
+    add("claude_agent_bridge_skill_installed", ok, detail)
+    ok, detail = check_installed_skill("codex", bridge_skill_install.codex_skill_target())
+    add("codex_agent_bridge_skill_installed", ok, detail)
 
     if args.json:
         print(json.dumps(checks, ensure_ascii=True, indent=2))
@@ -202,6 +301,10 @@ def main() -> int:
         "agent_wait_status_model_tool",
         "agent_aggregate_status_model_tool",
         "bridge_hook_entrypoint",
+        "agent_bridge_skill_source_valid",
+        "agent_bridge_skill_references_in_sync",
+        "claude_agent_bridge_skill_installed",
+        "codex_agent_bridge_skill_installed",
     }
     return 1 if any((not c["ok"]) and c["name"] in hard_failures for c in checks) else 0
 

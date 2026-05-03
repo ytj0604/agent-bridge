@@ -511,6 +511,31 @@ def scenario_delivery_watchdog_submitted_extend_and_text(label: str, tmpdir: Pat
     wd = _watchdogs_for_message(d, "msg-delivery-submitted", "delivery")[0][1]
     text = d.build_watchdog_fire_text(wd)
     assert_true("status=submitted" in text and "agent_extend_wait msg-delivery-submitted <sec>" in text, f"{label}: submitted delivery text should be actionable: {text!r}")
+    assert_true("run agent_list_peers if command syntax is unclear." in text, f"{label}: submitted delivery text should include syntax recovery hint: {text!r}")
+    print(f"  PASS  {label}")
+
+
+def scenario_response_watchdog_text_includes_syntax_recovery(label: str, tmpdir: Path) -> None:
+    participants = {"claude": {"alias": "claude", "pane": "%99"}, "codex": {"alias": "codex", "pane": "%98"}}
+    d = make_daemon(tmpdir, participants)
+    msg = test_message("msg-response-text", frm="claude", to="codex", status="delivered")
+    msg["delivered_ts"] = utc_now()
+    d.queue.update(lambda queue: queue.append(msg))
+
+    text = d.build_watchdog_fire_text({
+        "sender": "claude",
+        "deadline": time.time(),
+        "watchdog_phase": "response",
+        "ref_message_id": "msg-response-text",
+        "ref_aggregate_id": None,
+        "ref_to": "codex",
+        "ref_kind": "request",
+        "ref_intent": "test",
+        "is_alarm": False,
+    })
+
+    assert_true("has been processing" in text and "agent_extend_wait msg-response-text <sec>" in text, f"{label}: response text should be actionable: {text!r}")
+    assert_true("run agent_list_peers if command syntax is unclear." in text, f"{label}: response text should include syntax recovery hint: {text!r}")
     print(f"  PASS  {label}")
 
 def scenario_delivery_watchdog_aggregate_pending_extend_rejected(label: str, tmpdir: Path) -> None:
@@ -773,6 +798,7 @@ def scenario_aggregate_response_watchdog_text_uses_progress(label: str, tmpdir: 
     assert_true(f"aggregate {agg_id} has not completed" in text, f"{label}: aggregate response text should identify aggregate: {text!r}")
     assert_true("Replied: 1/2" in text and "Missing peers: w2" in text, f"{label}: aggregate response text should include progress: {text!r}")
     assert_true("not completed bridge delivery" not in text, f"{label}: aggregate response text should not use delivery wording: {text!r}")
+    assert_true("run agent_list_peers if command syntax is unclear." in text, f"{label}: aggregate response text should include syntax recovery hint: {text!r}")
     print(f"  PASS  {label}")
 
 def scenario_aggregate_completion_suppresses_pending_watchdog_wake(label: str, tmpdir: Path) -> None:
@@ -1215,6 +1241,7 @@ def scenario_alarm_fire_text_includes_rearm_hint(label: str, tmpdir: Path) -> No
     with_note = d.build_watchdog_fire_text({"is_alarm": True, "alarm_body": "check build"})
     assert_true("Note: check build" in with_note, f"{label}: alarm text must preserve custom note: {with_note!r}")
     assert_true(hint in with_note, f"{label}: alarm note text must include re-arm hint: {with_note!r}")
+    assert_true("agent_list_peers" not in no_note and "agent_list_peers" not in with_note, f"{label}: alarm text should not include command syntax recovery hint")
     assert_true(with_note.index("Note: check build") < with_note.index(hint), f"{label}: note should precede re-arm hint: {with_note!r}")
     print(f"  PASS  {label}")
 
@@ -1236,6 +1263,7 @@ def scenario_watchdog_pending_text_omits_held_interrupt(label: str, tmpdir: Path
     assert_true("held_interrupt" not in text, f"{label}: watchdog text must not mention held_interrupt: {text!r}")
     assert_true("--clear-hold" not in text, f"{label}: watchdog text must not recommend clear-hold: {text!r}")
     assert_true("agent_interrupt_peer codex --status" in text, f"{label}: watchdog text should still recommend status inspection: {text!r}")
+    assert_true("run agent_list_peers if command syntax is unclear." in text, f"{label}: unexpected phase text should include syntax recovery hint: {text!r}")
     print(f"  PASS  {label}")
 
 def _import_extend_wait_module():
@@ -2036,6 +2064,7 @@ SCENARIOS = [
     ('pending_watchdog_wake_removed_on_terminal', scenario_pending_watchdog_wake_removed_on_terminal),
     ('delivery_watchdog_extend_replaces_wake', scenario_delivery_watchdog_extend_replaces_wake),
     ('delivery_watchdog_submitted_extend_and_text', scenario_delivery_watchdog_submitted_extend_and_text),
+    ('response_watchdog_text_includes_syntax_recovery', scenario_response_watchdog_text_includes_syntax_recovery),
     ('delivery_watchdog_aggregate_pending_extend_rejected', scenario_delivery_watchdog_aggregate_pending_extend_rejected),
     ('delivery_watchdog_replaced_by_response_on_delivered', scenario_delivery_watchdog_replaced_by_response_on_delivered),
     ('delivery_watchdog_requeue_cancels', scenario_delivery_watchdog_requeue_cancels),

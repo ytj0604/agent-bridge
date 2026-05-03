@@ -7,15 +7,16 @@ bin_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"
 dry_run="0"
 remove_hooks="1"
 remove_shims="1"
+remove_skills="1"
 remove_state="0"
 remove_repo="0"
 
 usage() {
   local code="${1:-2}"
   cat >&2 <<'EOF'
-usage: uninstall.sh [--dry-run] [--bin-dir DIR] [--keep-hooks] [--keep-shims] [--state] [--repo]
+usage: uninstall.sh [--dry-run] [--bin-dir DIR] [--keep-hooks] [--keep-shims] [--keep-skills] [--state] [--repo]
 
-Default uninstall removes stable shims and Claude/Codex hook entries.
+Default uninstall removes stable shims, Agent Bridge-managed skills, and Claude/Codex hook entries.
 It does not delete state/log/run files or the repo checkout unless requested.
 EOF
   exit "$code"
@@ -40,6 +41,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --keep-shims)
       remove_shims="0"
+      shift
+      ;;
+    --keep-skills)
+      remove_skills="0"
       shift
       ;;
     --state)
@@ -105,6 +110,19 @@ if [[ "$remove_shims" == "1" ]]; then
       run_or_print rm -f "$path"
     fi
   done
+fi
+
+if [[ "$remove_skills" == "1" ]]; then
+  helper="$libexec_dir/bridge_skill_install.py"
+  skill_args=("uninstall")
+  if [[ "$dry_run" == "1" ]]; then
+    skill_args+=("--dry-run")
+  fi
+  echo "remove Agent Bridge-managed skills"
+  if ! python3 "$helper" "${skill_args[@]}"; then
+    echo "uninstall.sh: skill removal helper failed; aborting" >&2
+    exit 1
+  fi
 fi
 
 if [[ "$remove_state" == "1" ]]; then
