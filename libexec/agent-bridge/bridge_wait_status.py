@@ -11,6 +11,7 @@ import sys
 
 from bridge_daemon_client import ensure_daemon_running
 from bridge_identity import resolve_caller_from_pane
+from bridge_instructions import BRIDGE_RESPONSE_WAIT_FOOTER
 from bridge_participants import active_participants, load_session, room_status
 from bridge_paths import run_root
 
@@ -22,6 +23,11 @@ WAIT_STATUS_SECTION_NAMES = (
     "alarms",
     "watchdogs",
 )
+
+
+def print_response_wait_footer() -> None:
+    sys.stdout.flush()
+    print(BRIDGE_RESPONSE_WAIT_FOOTER, file=sys.stderr)
 
 
 def send_command(bridge_session: str, payload: dict) -> tuple[bool, dict, str]:
@@ -514,6 +520,7 @@ def main() -> int:
             print(json.dumps(why_json_output(response, why_model), ensure_ascii=False, indent=2))
         else:
             print(format_why_text(why_model))
+        print_response_wait_footer()
         return 0
 
     output = {
@@ -525,6 +532,7 @@ def main() -> int:
         "summary": response.get("summary") or {},
     } if args.summary else response
     print(json.dumps(output, ensure_ascii=False, indent=2))
+    print_response_wait_footer()
     return 0
 
 

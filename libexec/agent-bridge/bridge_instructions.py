@@ -2,6 +2,13 @@
 from __future__ import annotations
 
 
+BRIDGE_RESPONSE_WAIT_FOOTER = (
+    "Waiting for a bridge response? End your turn. The response will arrive later "
+    "as a new [bridge:*] prompt, submitted to you like a user prompt; do not poll "
+    "status commands for progress."
+)
+
+
 def model_cheat_sheet() -> list[str]:
     return [
         "Commands:",

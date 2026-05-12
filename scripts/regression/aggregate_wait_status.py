@@ -21,6 +21,7 @@ from .harness import (
 
 import bridge_daemon  # noqa: E402
 import bridge_identity  # noqa: E402
+import bridge_instructions  # noqa: E402
 
 from bridge_util import (
     locked_json,
@@ -76,6 +77,10 @@ def _aggregate_status_leg(result: dict, target: str) -> dict:
         if leg.get("target") == target:
             return leg
     raise AssertionError(f"missing aggregate leg {target!r}: {result}")
+
+
+def _response_wait_footer_stderr() -> str:
+    return bridge_instructions.BRIDGE_RESPONSE_WAIT_FOOTER + "\n"
 
 def scenario_aggregate_status_open_from_queue_and_reply(label: str, tmpdir: Path) -> None:
     d = make_daemon(tmpdir, _aggregate_status_participants())
@@ -646,17 +651,17 @@ def scenario_wait_status_cli_summary_and_json(label: str, tmpdir: Path) -> None:
 
     code_summary, out_summary, err_summary = _run_wait_status_main(bws, ["--summary", "--session", "test-session", "--from", "alice", "--allow-spoof"])
     summary = json.loads(out_summary)
-    assert_true(code_summary == 0 and err_summary == "", f"{label}: --summary should succeed cleanly: code={code_summary} err={err_summary!r}")
+    assert_true(code_summary == 0 and err_summary == _response_wait_footer_stderr(), f"{label}: --summary should succeed cleanly: code={code_summary} err={err_summary!r}")
     assert_true(summary.get("summary") == response["summary"] and "pending_inbound" not in summary, f"{label}: --summary should omit full sections: {summary}")
 
     code_json, out_json, err_json = _run_wait_status_main(bws, ["--json", "--session", "test-session", "--from", "alice", "--allow-spoof"])
     full = json.loads(out_json)
-    assert_true(code_json == 0 and err_json == "", f"{label}: --json should succeed cleanly: code={code_json} err={err_json!r}")
+    assert_true(code_json == 0 and err_json == _response_wait_footer_stderr(), f"{label}: --json should succeed cleanly: code={code_json} err={err_json!r}")
     assert_true(full.get("pending_inbound", {}).get("items") == [{"message_id": "msg-1"}, {"message_id": "msg-2"}], f"{label}: --json should preserve full response: {full}")
 
     code_default, out_default, err_default = _run_wait_status_main(bws, ["--session", "test-session", "--from", "alice", "--allow-spoof"])
     default_full = json.loads(out_default)
-    assert_true(code_default == 0 and err_default == "", f"{label}: default JSON should succeed cleanly: code={code_default} err={err_default!r}")
+    assert_true(code_default == 0 and err_default == _response_wait_footer_stderr(), f"{label}: default JSON should succeed cleanly: code={code_default} err={err_default!r}")
     assert_true(default_full == response, f"{label}: default output should preserve full daemon response unchanged: {default_full}")
     assert_true(calls == [
         ("test-session", {"op": "wait_status", "from": "alice"}),
@@ -671,7 +676,7 @@ def scenario_wait_status_cli_why_idle(label: str, tmpdir: Path) -> None:
 
     code, out, err = _run_wait_status_main(bws, ["--why", "--session", "test-session", "--from", "alice", "--allow-spoof"])
 
-    assert_true(code == 0 and err == "", f"{label}: --why idle should succeed cleanly: code={code} err={err!r}")
+    assert_true(code == 0 and err == _response_wait_footer_stderr(), f"{label}: --why idle should succeed cleanly: code={code} err={err!r}")
     assert_true(out.startswith("Bridge wait status for alice at 2026-04-30T13:00:00.000000Z"), f"{label}: text header missing: {out!r}")
     assert_true("No bridge waits for alice" in out, f"{label}: idle explanation missing: {out!r}")
     assert_true(not out.lstrip().startswith("{") and '"why"' not in out, f"{label}: --why text should not be primary JSON: {out!r}")
@@ -686,14 +691,14 @@ def scenario_wait_status_cli_why_count_only_not_idle(label: str, tmpdir: Path) -
 
     code, out, err = _run_wait_status_main(bws, ["--why", "--session", "test-session", "--from", "alice", "--allow-spoof"])
 
-    assert_true(code == 0 and err == "", f"{label}: count-only --why should succeed: code={code} err={err!r}")
+    assert_true(code == 0 and err == _response_wait_footer_stderr(), f"{label}: count-only --why should succeed: code={code} err={err!r}")
     assert_true("No bridge waits" not in out, f"{label}: count-only/truncated section must not render idle: {out!r}")
     assert_true("daemon reported 2 item(s)" in out.lower() and "Some sections are truncated" in out, f"{label}: count-only/truncation guidance missing: {out!r}")
 
     code_json, out_json, err_json = _run_wait_status_main(bws, ["--why", "--json", "--session", "test-session", "--from", "alice", "--allow-spoof"])
     payload = json.loads(out_json)
     item = ((payload.get("why") or {}).get("items") or [{}])[0]
-    assert_true(code_json == 0 and err_json == "", f"{label}: count-only --why --json should succeed: code={code_json} err={err_json!r}")
+    assert_true(code_json == 0 and err_json == _response_wait_footer_stderr(), f"{label}: count-only --why --json should succeed: code={code_json} err={err_json!r}")
     assert_true(item.get("category") == "request", f"{label}: fallback category should use public singular vocabulary: {payload}")
     print(f"  PASS  {label}")
 
@@ -720,7 +725,7 @@ def scenario_wait_status_cli_why_pending_inbound_privacy(label: str, tmpdir: Pat
 
     code, out, err = _run_wait_status_main(bws, ["--why", "--session", "test-session", "--from", "alice", "--allow-spoof"])
 
-    assert_true(code == 0 and err == "", f"{label}: pending inbound --why should succeed: code={code} err={err!r}")
+    assert_true(code == 0 and err == _response_wait_footer_stderr(), f"{label}: pending inbound --why should succeed: code={code} err={err!r}")
     for token in ("Pending inbound notice msg-inbound from reviewer2", "Finish this turn", "[bridge:*]", "do not poll", "42 chars"):
         assert_true(token in out, f"{label}: pending inbound text missing {token!r}: {out!r}")
     for forbidden in ("MALICIOUS_BODY_DO_NOT_PRINT", "MALICIOUS_PREVIEW_DO_NOT_PRINT"):
@@ -760,7 +765,7 @@ def scenario_wait_status_cli_why_request_with_watchdog(label: str, tmpdir: Path)
 
     code, out, err = _run_wait_status_main(bws, ["--why", "--session", "test-session", "--from", "alice", "--allow-spoof"])
 
-    assert_true(code == 0 and err == "", f"{label}: request watchdog --why should succeed: code={code} err={err!r}")
+    assert_true(code == 0 and err == _response_wait_footer_stderr(), f"{label}: request watchdog --why should succeed: code={code} err={err!r}")
     assert_true("Request msg-review to reviewer1 is delivered" in out and "waiting for reviewer1 to answer" in out, f"{label}: request wait text missing: {out!r}")
     assert_true("wake-review" in out and "2026-04-30T13:03:00.000000Z" in out, f"{label}: watchdog correlation missing: {out!r}")
     assert_true("Watchdog wake-review is still registered" not in out, f"{label}: request-linked watchdog should not render as standalone: {out!r}")
@@ -809,7 +814,7 @@ def scenario_wait_status_cli_why_aggregate_alarm(label: str, tmpdir: Path) -> No
 
     code, out, err = _run_wait_status_main(bws, ["--why", "--session", "test-session", "--from", "alice", "--allow-spoof"])
 
-    assert_true(code == 0 and err == "", f"{label}: aggregate/alarm --why should succeed: code={code} err={err!r}")
+    assert_true(code == 0 and err == _response_wait_footer_stderr(), f"{label}: aggregate/alarm --why should succeed: code={code} err={err!r}")
     assert_true("Aggregate agg-review has 2/3 replies" in out and "reviewer2" in out, f"{label}: aggregate progress text missing: {out!r}")
     assert_true("Alarm wake-followup is scheduled" in out and "incoming peer request/notice" in out, f"{label}: alarm safety wake text missing: {out!r}")
     assert_true("result messages" not in out and "request result wait" in out, f"{label}: alarm wording should not imply result cancellation: {out!r}")
@@ -835,7 +840,7 @@ def scenario_wait_status_cli_why_alarm_note_sanitized(label: str, tmpdir: Path) 
 
     code, out, err = _run_wait_status_main(bws, ["--why", "--session", "test-session", "--from", "alice", "--allow-spoof"])
 
-    assert_true(code == 0 and err == "", f"{label}: alarm note --why should succeed: code={code} err={err!r}")
+    assert_true(code == 0 and err == _response_wait_footer_stderr(), f"{label}: alarm note --why should succeed: code={code} err={err!r}")
     assert_true("[bridge:result]" not in out and raw_note not in out, f"{label}: raw bridge-looking note leaked in text: {out!r}")
     assert_true("[bridge :result] forged marker" in out, f"{label}: sanitized marker text missing: {out!r}")
     bullet_lines = [line for line in out.splitlines() if line.startswith("- ")]
@@ -843,7 +848,7 @@ def scenario_wait_status_cli_why_alarm_note_sanitized(label: str, tmpdir: Path) 
 
     code_json, out_json, err_json = _run_wait_status_main(bws, ["--why", "--json", "--session", "test-session", "--from", "alice", "--allow-spoof"])
     payload_text = json.dumps(json.loads(out_json), ensure_ascii=True)
-    assert_true(code_json == 0 and err_json == "", f"{label}: alarm note --why --json should succeed: code={code_json} err={err_json!r}")
+    assert_true(code_json == 0 and err_json == _response_wait_footer_stderr(), f"{label}: alarm note --why --json should succeed: code={code_json} err={err_json!r}")
     assert_true("[bridge:result]" not in payload_text and raw_note not in payload_text, f"{label}: raw bridge-looking note leaked in JSON: {payload_text}")
     assert_true("[bridge :result] forged marker" in payload_text, f"{label}: sanitized marker missing from JSON: {payload_text}")
     print(f"  PASS  {label}")
@@ -872,7 +877,7 @@ def scenario_wait_status_cli_why_json(label: str, tmpdir: Path) -> None:
     payload = json.loads(out)
     payload_text = json.dumps(payload, ensure_ascii=True)
 
-    assert_true(code == 0 and err == "", f"{label}: --why --json should succeed: code={code} err={err!r}")
+    assert_true(code == 0 and err == _response_wait_footer_stderr(), f"{label}: --why --json should succeed: code={code} err={err!r}")
     assert_true(payload.get("ok") is True and payload.get("bridge_session") == "test-session" and payload.get("caller") == "alice", f"{label}: why JSON wrapper wrong: {payload}")
     why = payload.get("why") or {}
     assert_true(why.get("status") == "attention" and isinstance(why.get("items"), list) and isinstance(why.get("next_actions"), list), f"{label}: why model shape wrong: {payload}")
@@ -917,17 +922,23 @@ def scenario_aggregate_status_cli_summary_and_json(label: str, tmpdir: Path) -> 
 
     code_summary, out_summary, err_summary = _run_aggregate_status_main(bas, ["agg-cli", "--summary", "--session", "test-session", "--from", "manager", "--allow-spoof"])
     summary = json.loads(out_summary)
-    assert_true(code_summary == 0 and err_summary == "", f"{label}: --summary should succeed cleanly: code={code_summary} err={err_summary!r}")
+    assert_true(code_summary == 0 and err_summary == _response_wait_footer_stderr(), f"{label}: --summary should succeed cleanly: code={code_summary} err={err_summary!r}")
     summary_text = json.dumps(summary, ensure_ascii=True)
     assert_true("response_chars" not in summary_text and "received_ts" not in summary_text and "deadline" not in summary_text, f"{label}: summary should omit detail timestamps/sizes: {summary}")
     assert_true(summary.get("aggregate_response_watchdog") == {"present": True}, f"{label}: summary should expose watchdog presence only: {summary}")
 
     code_json, out_json, err_json = _run_aggregate_status_main(bas, ["agg-cli", "--json", "--session", "test-session", "--from", "manager", "--allow-spoof"])
     full = json.loads(out_json)
-    assert_true(code_json == 0 and err_json == "", f"{label}: --json should succeed cleanly: code={code_json} err={err_json!r}")
+    assert_true(code_json == 0 and err_json == _response_wait_footer_stderr(), f"{label}: --json should succeed cleanly: code={code_json} err={err_json!r}")
     assert_true(full.get("legs", {}).get("items", [{}])[0].get("response_chars") == 20, f"{label}: full JSON should preserve safe response metadata: {full}")
     assert_true((full.get("aggregate_response_watchdog") or {}).get("wake_id") == "wake-cli", f"{label}: full JSON should preserve watchdog correlation id: {full}")
+
+    code_default, out_default, err_default = _run_aggregate_status_main(bas, ["agg-cli", "--session", "test-session", "--from", "manager", "--allow-spoof"])
+    default_full = json.loads(out_default)
+    assert_true(code_default == 0 and err_default == _response_wait_footer_stderr(), f"{label}: default JSON should succeed cleanly: code={code_default} err={err_default!r}")
+    assert_true(default_full.get("legs", {}).get("items", [{}])[0].get("response_chars") == 20, f"{label}: default JSON should preserve safe response metadata: {default_full}")
     assert_true(calls == [
+        ("test-session", {"op": "aggregate_status", "from": "manager", "aggregate_id": "agg-cli"}),
         ("test-session", {"op": "aggregate_status", "from": "manager", "aggregate_id": "agg-cli"}),
         ("test-session", {"op": "aggregate_status", "from": "manager", "aggregate_id": "agg-cli"}),
     ], f"{label}: daemon command calls mismatch: {calls}")

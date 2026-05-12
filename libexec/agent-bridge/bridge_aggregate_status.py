@@ -11,6 +11,7 @@ import sys
 
 from bridge_daemon_client import ensure_daemon_running
 from bridge_identity import resolve_caller_from_pane
+from bridge_instructions import BRIDGE_RESPONSE_WAIT_FOOTER
 from bridge_participants import active_participants, load_session, room_status
 from bridge_paths import run_root
 
@@ -54,6 +55,11 @@ def aggregate_status_error_message(aggregate_id: str, error: str) -> str:
             "(unknown id, not yours, expired, or lost across daemon restart)."
         )
     return f"agent_aggregate_status: {error}"
+
+
+def print_response_wait_footer() -> None:
+    sys.stdout.flush()
+    print(BRIDGE_RESPONSE_WAIT_FOOTER, file=sys.stderr)
 
 
 def summary_response(response: dict) -> dict:
@@ -156,6 +162,7 @@ def main() -> int:
 
     output = summary_response(response) if args.summary else response
     print(json.dumps(output, ensure_ascii=False, indent=2))
+    print_response_wait_footer()
     return 0
 
 
